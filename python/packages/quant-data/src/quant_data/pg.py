@@ -179,13 +179,20 @@ class SymbolLock:
     - 写事务内（每批）仍会 ``FOR UPDATE`` 该行，保证「水位推进」与「数据写入」同事务（R-19.5），
       且所有事务的加锁顺序一致，不会死锁（R-21.6）。
 
+    锁的粒度必须与它守护的**行**同延：advisory lock 是**整个 PG 实例**唯一的，
+    而被守护的 ``sync_state`` 行的身份是「schema 里的 (exchange, symbol)」。
+    因此锁键包含 ``current_schema()``；否则同一实例上不同 schema 的同名标的
+    会互相误判为「已有同步在运行」。
+
     释放：解除 advisory lock 并关连接；异常路径同样释放。
     """
 
-    def __init__(self, conn: DbConn, exchange: str, symbol: str) -> None:
+    def __init__(self, conn: DbConn, exchange: str, symbol: str, schema: str) -> None:
         self._conn = conn
         self._exchange = exchange
         self._symbol = symbol
+        self._schema = schema
+        self._key = f"{schema}/{exchange}/{symbol}"
 
     @classmethod
     def acquire(
@@ -214,10 +221,15 @@ class SymbolLock:
                     raise SyncError(
                         "DB_TRANSACTION_ROLLBACK", "sync_state 行未建立", {"symbol": symbol}
                     )
+                schema_row = _require_row(
+                    conn.execute("SELECT current_schema() AS schema").fetchone(),
+                    "current_schema",
+                )
+                key = f"{schema_row['schema']}/{exchange}/{symbol}"
                 locked = _require_row(
                     conn.execute(
                         "SELECT pg_try_advisory_lock(hashtextextended(%s, 0)) AS locked",
-                        (f"{exchange}/{symbol}",),
+                        (key,),
                     ).fetchone(),
                     "pg_try_advisory_lock",
                 )
@@ -225,7 +237,7 @@ class SymbolLock:
                     raise SyncError(
                         "SYNC_ALREADY_RUNNING",
                         f"该标的已有同步在运行: {symbol}",
-                        {"exchange": exchange, "symbol": symbol},
+                        {"exchange": exchange, "symbol": symbol, "schema": schema_row["schema"]},
                     )
         except psycopg.errors.LockNotAvailable as exc:
             conn.close()
@@ -237,14 +249,14 @@ class SymbolLock:
         except BaseException:
             conn.close()
             raise
-        return cls(conn, exchange, symbol)
+        return cls(conn, exchange, symbol, str(schema_row["schema"]))
 
     def release(self) -> None:
         try:
             with self._conn.transaction():
                 self._conn.execute(
                     "SELECT pg_advisory_unlock(hashtextextended(%s, 0))",
-                    (f"{self._exchange}/{self._symbol}",),
+                    (self._key,),
                 )
         except psycopg.Error:  # pragma: no cover - 释放失败不掩盖主流程结果
             pass

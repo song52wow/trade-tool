@@ -99,7 +99,9 @@ describe('全局配额与并发（AC-17 / AC-24 / R-20）', () => {
       expect(batch.length).toBeGreaterThan(0);
 
       // 并发跑这一轮，每个标的各自一轮同步
-      const results = await Promise.all(SYMBOLS.map((symbol) => control.runOnce(symbol, Date.now())));
+      const results = await Promise.all(
+        SYMBOLS.map((symbol) => control.runOnce(symbol, Date.now())),
+      );
       for (const [index, error] of results.entries()) {
         if (error) failures.push(`${SYMBOLS[index]}: ${error.code}`);
       }

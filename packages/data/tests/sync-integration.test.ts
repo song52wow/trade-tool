@@ -450,7 +450,8 @@ describe('缺口检测与自动回补（R-11 / AC-7 / AC-32）', () => {
    *      （证明扫描成本有界、确实不是全表扫描）
    */
   it('AC-32 缺口检测有界：窗口内可检出，窗口外只有 verify 全表扫描才发现', async () => {
-    const DAY = 24 * MINUTE;
+    const HOUR = 60 * MINUTE;
+    const DAY = 24 * HOUR;
     await resetExchange();
     await syncSymbol(market, 'TESTAAAUSDC', { nowMs: NOW });
     const maxTime = (await watermark(ctx.pool, 'TESTAAAUSDC')).maxTime ?? 0;
@@ -462,7 +463,7 @@ describe('缺口检测与自动回补（R-11 / AC-7 / AC-32）', () => {
     expect(Number(clean.rows[0]?.verified_upto)).toBe(maxTime);
 
     // ② 窗口内（近端 3 小时）的缺口：下一轮例行同步就能检出
-    const nearVictim = maxTime - 3 * 60 * MINUTE;
+    const nearVictim = maxTime - 3 * HOUR;
     await ctx.pool.query('DELETE FROM klines_1m WHERE symbol = $1 AND time = $2', [
       'TESTAAAUSDC',
       nearVictim,
@@ -470,7 +471,7 @@ describe('缺口检测与自动回补（R-11 / AC-7 / AC-32）', () => {
     const nearRound = await syncSymbol(market, 'TESTAAAUSDC', { nowMs: NOW });
     expect(nearRound.gapsPending).toBe(1);
 
-    // ③ 窗口外（约 20 天前，超出 7 天默认回看）的缺口：例行轮次**不**检出
+    // ③ 窗口外（20 天前，超出 7 天默认回看）的缺口：例行轮次**不**检出
     const farVictim = maxTime - 20 * DAY;
     await ctx.pool.query('DELETE FROM klines_1m WHERE symbol = $1 AND time = $2', [
       'TESTAAAUSDC',
@@ -491,7 +492,7 @@ describe('缺口检测与自动回补（R-11 / AC-7 / AC-32）', () => {
     const verified = await verifySymbol(market, 'TESTAAAUSDC');
     expect(verified.gapsFound).toBe(1);
     // 全表扫描确实读了整段历史（远大于 7 天窗口）
-    expect(verified.scannedRows).toBeGreaterThan(20 * 24 * 60);
+    expect(verified.scannedRows).toBeGreaterThan(20 * 24 * 60); // 20 天 = 28,800 根
   });
 
   it('R-11.A3 data verify 做全表扫描并重建基线', async () => {
