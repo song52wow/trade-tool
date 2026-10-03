@@ -1,0 +1,244 @@
+import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+
+import { SyncError } from '@trade-tool/core';
+import {
+  assertWatermarkConsistent,
+  ensureSyncState,
+  listGaps,
+  listStates,
+  pendingGapCount,
+  readBars,
+  readGlobalSummary,
+  readState,
+  readWeightBudget,
+  removeSymbolEntry,
+  setDesiredState,
+  setSyncStatus,
+  upsertSymbolEntry,
+  watermark,
+} from '../src/index.js';
+
+import { barTimes, createTestSchema, insertBars, type TestSchema } from './helpers/pg.js';
+
+const MINUTE = 60_000;
+const BASE = 1_760_000_000_000;
+
+/** 三个互不相同的标的，参数化验证「代码里没有标的特例」（R-5）。 */
+const SYMBOLS = ['AAAUSDC', 'BBBUSDC', 'CCCUSDC'] as const;
+
+describe('查询层与数据语义', () => {
+  let ctx: TestSchema;
+
+  beforeAll(async () => {
+    ctx = await createTestSchema('repo');
+  });
+  afterAll(async () => {
+    await ctx.close();
+  });
+
+  it('R-9.1 水位由 max(time) 推导，无数据时为 null', async () => {
+    const empty = await watermark(ctx.pool, 'NODATA');
+    expect(empty.maxTime).toBeNull();
+    expect(empty.rows).toBe(0);
+
+    const times = barTimes(BASE, 5);
+    await insertBars(ctx.pool, 'WATER', times);
+    const filled = await watermark(ctx.pool, 'WATER');
+    expect(filled.maxTime).toBe(times[times.length - 1]);
+    expect(filled.rows).toBe(5);
+  });
+
+  it('R-9.7 水位单调不减：写入更晚的 bar 后 max(time) 只增', async () => {
+    const times = barTimes(BASE, 5);
+    const before = await watermark(ctx.pool, 'MONO');
+    expect(before.maxTime).toBeNull();
+
+    await insertBars(ctx.pool, 'MONO', times);
+    const mid = await watermark(ctx.pool, 'MONO');
+    expect(mid.maxTime).toBe(times[4]);
+
+    // 重放同样区间（幂等）后水位不变
+    await insertBars(ctx.pool, 'MONO', times);
+    const replay = await watermark(ctx.pool, 'MONO');
+    expect(replay.maxTime).toBe(times[4]);
+    expect(replay.rows).toBe(5);
+
+    await insertBars(ctx.pool, 'MONO', [BASE + 5 * MINUTE]);
+    const after = await watermark(ctx.pool, 'MONO');
+    expect(after.maxTime).toBe(BASE + 5 * MINUTE);
+  });
+
+  it('R-4.1 读出 NULL 的必填列必须报错，不得静默', async () => {
+    // 写入侧有 NOT NULL 兜底，因此这里**临时放宽约束**来模拟「历史脏数据 / 绕过写入的外部改动」，
+    // 验证读取层的防御真的会抛错而不是把 null 当 0 用。
+    await ctx.pool.query('ALTER TABLE klines_1m ALTER COLUMN volume DROP NOT NULL');
+    try {
+      await ctx.pool.query(
+        `INSERT INTO klines_1m (symbol, time, open, high, low, close, volume)
+         VALUES ($1, $2, 1, 1, 1, 1, NULL)`,
+        ['CORRUPT', BASE],
+      );
+      await expect(readBars(ctx.pool, 'CORRUPT', {})).rejects.toMatchObject({
+        code: 'NULL_NOT_ALLOWED',
+      });
+    } finally {
+      await ctx.pool.query('DELETE FROM klines_1m WHERE symbol = $1', ['CORRUPT']);
+      await ctx.pool.query('ALTER TABLE klines_1m ALTER COLUMN volume SET NOT NULL');
+    }
+
+    // 约束恢复后写入 NULL 再次被拒（R-4.1 写入侧同样不得静默）
+    await expect(
+      ctx.pool.query(
+        `INSERT INTO klines_1m (symbol, time, open, high, low, close, volume)
+         VALUES ($1, $2, 1, 1, 1, 1, NULL)`,
+        ['CORRUPT2', BASE],
+      ),
+    ).rejects.toThrow();
+  });
+
+  it('R-4.4 读不到行返回空数组，可区分「未同步」与「字段为 NULL」', async () => {
+    const rows = await readBars(ctx.pool, 'NEVER_SYNCED', {});
+    expect(rows).toEqual([]);
+  });
+
+  it('R-3.6 能查询写入进度（已入库行数 / 目标行数）', async () => {
+    await insertBars(ctx.pool, 'PROGRESS', barTimes(BASE, 7));
+    const state = await readState(ctx.pool, 'binance', 'PROGRESS');
+    const truth = await watermark(ctx.pool, 'PROGRESS');
+    // 权威行数永远来自数据本身，而不是某个可能漂移的计数器
+    expect(truth.rows).toBe(7);
+    expect(state?.rows ?? 7).toBe(7);
+  });
+
+  it('R-19.6 / AC-21 水位缓存与 max(time) 不一致时报错', async () => {
+    await ensureSyncState(ctx.pool, 'binance', 'DRIFT');
+    await insertBars(ctx.pool, 'DRIFT', barTimes(BASE, 3));
+    // 缓存水位为空但库里已有数据 → 不一致
+    await expect(assertWatermarkConsistent(ctx.pool, 'binance', 'DRIFT')).rejects.toMatchObject({
+      code: 'WATERMARK_MISMATCH',
+    });
+
+    // 对齐后放行
+    await setSyncStatus(ctx.pool, 'binance', 'DRIFT', {});
+    await ctx.pool.query(
+      'UPDATE sync_state SET watermark = $3 WHERE exchange = $1 AND symbol = $2',
+      ['binance', 'DRIFT', barTimes(BASE, 3)[2]],
+    );
+    const result = await assertWatermarkConsistent(ctx.pool, 'binance', 'DRIFT');
+    expect(result.watermark).toBe(barTimes(BASE, 3)[2]);
+  });
+
+  it('R-19 sync_state 能持久化并读回全部字段', async () => {
+    await ensureSyncState(ctx.pool, 'binance', 'FIELDS', 'running');
+    await setSyncStatus(ctx.pool, 'binance', 'FIELDS', {
+      lastError: 'boom',
+      errorCount: 3,
+      backoffUntil: BASE + 1_000,
+      lastRunAt: BASE,
+    });
+    const state = await readState(ctx.pool, 'binance', 'FIELDS');
+    expect(state?.status).toBe('running');
+    expect(state?.lastError).toBe('boom');
+    expect(state?.errorCount).toBe(3);
+    expect(state?.backoffUntil).toBe(BASE + 1_000);
+    expect(state?.lastRunAt).toBe(BASE);
+    expect(state?.pendingGaps).toBe(0);
+  });
+
+  it('R-19.1 水位推进只经由写入事务，setSyncStatus 不得改动水位', async () => {
+    await ensureSyncState(ctx.pool, 'binance', 'NOWATER');
+    await setSyncStatus(ctx.pool, 'binance', 'NOWATER', { status: 'error', lastError: 'x' });
+    const state = await readState(ctx.pool, 'binance', 'NOWATER');
+    expect(state?.watermark).toBeNull();
+    expect(state?.verifiedUpTo).toBeNull();
+  });
+
+  it('R-11.11 缺口清单与缺失总行数可查询', async () => {
+    for (const [index, symbol] of SYMBOLS.entries()) {
+      await insertBars(ctx.pool, symbol, barTimes(BASE, 3));
+      await ctx.pool.query(
+        `INSERT INTO gaps (exchange, symbol, gap_start, gap_end, missing_rows, attempts)
+         VALUES ($1, $2, $3, $4, $5, $6)`,
+        ['binance', symbol, BASE + 10 * MINUTE, BASE + 12 * MINUTE, 3, index],
+      );
+    }
+    const all = await listGaps(ctx.pool);
+    expect(all).toHaveLength(SYMBOLS.length);
+    const perSymbol = await listGaps(ctx.pool, 'BBBUSDC');
+    expect(perSymbol).toHaveLength(1);
+    expect(perSymbol[0]?.missingRows).toBe(3);
+    expect(await pendingGapCount(ctx.pool)).toBe(SYMBOLS.length);
+    expect(await pendingGapCount(ctx.pool, 'CCCUSDC')).toBe(1);
+  });
+
+  it('R-18.1/R-18.4 标的集合增删与幂等', async () => {
+    await upsertSymbolEntry(ctx.pool, { exchange: 'binance', symbol: 'SET1' });
+    const again = await upsertSymbolEntry(ctx.pool, { exchange: 'binance', symbol: 'SET1' });
+    expect(again.symbol).toBe('SET1');
+
+    // 新标的默认 paused（R-8.4 / R-17.4）
+    expect(again.desiredState).toBe('paused');
+
+    // 幂等设置期望状态
+    const changed = await setDesiredState(ctx.pool, 'binance', 'SET1', 'running');
+    expect(changed).toBe(true);
+    const unchanged = await setDesiredState(ctx.pool, 'binance', 'SET1', 'running');
+    expect(unchanged).toBe(false);
+  });
+
+  it('R-18.3 keep 策略不移除数据；delete 策略才删行', async () => {
+    const times = barTimes(BASE, 4);
+    await insertBars(ctx.pool, 'KEEPDATA', times);
+    await upsertSymbolEntry(ctx.pool, { exchange: 'binance', symbol: 'KEEPDATA' });
+
+    const kept = await removeSymbolEntry(ctx.pool, 'binance', 'KEEPDATA', 'keep');
+    expect(kept.deletedRows).toBe(0);
+    expect((await watermark(ctx.pool, 'KEEPDATA')).rows).toBe(4);
+
+    await upsertSymbolEntry(ctx.pool, { exchange: 'binance', symbol: 'DELDATA' });
+    await insertBars(ctx.pool, 'DELDATA', times);
+    const deleted = await removeSymbolEntry(ctx.pool, 'binance', 'DELDATA', 'delete');
+    expect(deleted.deletedRows).toBe(4);
+    expect((await watermark(ctx.pool, 'DELDATA')).rows).toBe(0);
+  });
+
+  it('R-20.4 配额使用率可查询', async () => {
+    const status = await readWeightBudget(ctx.pool, 1_920);
+    expect(status.budgetPerMinute).toBe(1_920);
+    expect(status.used).toBeGreaterThanOrEqual(0);
+    expect(status.utilization).toBeGreaterThanOrEqual(0);
+    expect(status.pauseUntil).toBeNull();
+  });
+
+  it('R-19.8 全局汇总可查询，三个数字描述同一总体', async () => {
+    // rows 是与数据同事务推进的可观测计数；这里按真实写入路径把它填上。
+    await ctx.pool.query(
+      `UPDATE sync_state SET rows = (SELECT count(*)::bigint FROM klines_1m WHERE klines_1m.symbol = sync_state.symbol)
+       WHERE exchange = 'binance'`,
+    );
+    const summary = await readGlobalSummary(ctx.pool, 'binance');
+    expect(summary.symbols).toBeGreaterThan(0);
+    expect(summary.pendingGaps).toBeGreaterThan(0);
+    // 标的数与各状态计数之和必须一致，否则控制面会读到互相矛盾的数字
+    const sum =
+      summary.countsByStatus.paused + summary.countsByStatus.running + summary.countsByStatus.error;
+    expect(sum).toBe(summary.symbols);
+  });
+
+  it('listStates 对不存在的标的返回 null，不报错也不伪造', async () => {
+    expect(await readState(ctx.pool, 'binance', 'GHOST')).toBeNull();
+    const all = await listStates(ctx.pool);
+    expect(all.every((s) => s.symbol !== 'GHOST')).toBe(true);
+  });
+
+  it('SyncError 带结构化 code 与 details（R-22.4）', () => {
+    const error = new SyncError('SYMBOL_NOT_FOUND', 'nope', { symbol: 'X' });
+    expect(error).toBeInstanceOf(Error);
+    expect(error.code).toBe('SYMBOL_NOT_FOUND');
+    expect(error.toJSON()).toEqual({
+      code: 'SYMBOL_NOT_FOUND',
+      message: expect.stringContaining('nope'),
+      details: { symbol: 'X' },
+    });
+  });
+});

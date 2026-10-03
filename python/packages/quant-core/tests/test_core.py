@@ -1,0 +1,44 @@
+from __future__ import annotations
+
+import numpy as np
+import pytest
+from quant_core import Bar, interval_to_ms, series_to_dicts
+from quant_core.indicators import ema, sma
+
+
+def test_interval_to_ms_known() -> None:
+    assert interval_to_ms("1h") == 3_600_000
+
+
+def test_interval_to_ms_unknown() -> None:
+    with pytest.raises(ValueError):
+        interval_to_ms("7m")
+
+
+def test_sma_warmup_is_nan() -> None:
+    out = sma(np.array([1.0, 2.0, 3.0, 4.0]), 3)
+    assert np.isnan(out[0]) and np.isnan(out[1])
+    assert out[2] == pytest.approx(2.0)
+    assert out[3] == pytest.approx(3.0)
+
+
+def test_sma_rejects_non_positive_window() -> None:
+    with pytest.raises(ValueError):
+        sma(np.array([1.0]), 0)
+
+
+def test_ema_starts_at_first_value() -> None:
+    out = ema(np.array([5.0, 5.0, 5.0]), 3)
+    assert out[0] == pytest.approx(5.0)
+    assert np.allclose(out, 5.0)
+
+
+def test_bar_rejects_inconsistent_high() -> None:
+    with pytest.raises(ValueError):
+        Bar(time=0, open=10.0, high=9.0, low=8.0, close=10.0, volume=1.0)
+
+
+def test_bar_roundtrip() -> None:
+    bar = Bar(time=1, open=1.0, high=2.0, low=0.5, close=1.5, volume=10.0)
+    rows = series_to_dicts([bar])
+    assert Bar.from_dicts(rows) == [bar]

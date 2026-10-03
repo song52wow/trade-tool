@@ -1,0 +1,34 @@
+# ---- Node / pnpm / Turborepo ----
+node_modules/
+dist/
+.turbo/
+*.tsbuildinfo
+.pnpm-store/
+
+# ---- Python / uv ----
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+build/
+python/dist/
+
+# ---- 运行时产物 ----
+.env
+.env.*
+!.env.example
+# 注意：`data/cache/`（不带前导 **/）会被 git 视为相对仓库根锚定，
+# 匹配不到 `apps/cli/data/cache` 这类嵌套位置。缓存目录可由代码随时重新生成，
+# 因此这里用 `**/` 显式覆盖任意层级。
+**/data/cache/
+**/data/raw/
+**/data/meta/
+**/reports/
+logs/
+*.log
+.DS_Store
+.idea/
+.vscode/

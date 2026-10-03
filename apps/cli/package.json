@@ -1,0 +1,41 @@
+{
+  "name": "@trade-tool/cli",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "license": "MIT",
+  "description": "trade-tool 命令行入口",
+  "bin": {
+    "trade-tool": "./dist/index.js"
+  },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsup",
+    "dev": "tsx watch src/index.ts",
+    "start": "tsx src/index.ts",
+    "typecheck": "tsc -p tsconfig.json",
+    "clean": "rm -rf dist"
+  },
+  "dependencies": {
+    "@trade-tool/backtest": "workspace:*",
+    "@trade-tool/core": "workspace:*",
+    "@trade-tool/data": "workspace:*",
+    "commander": "^12.1.0"
+  },
+  "devDependencies": {
+    "@trade-tool/tsconfig": "workspace:*",
+    "tsup": "^8.3.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.7.0"
+  }
+}

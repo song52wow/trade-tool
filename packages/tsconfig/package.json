@@ -1,0 +1,13 @@
+{
+  "name": "@trade-tool/tsconfig",
+  "version": "0.0.0",
+  "private": true,
+  "license": "MIT",
+  "description": "共享 TypeScript 配置预设",
+  "files": [
+    "base.json",
+    "node-library.json",
+    "app.json",
+    "README.md"
+  ]
+}

@@ -1,0 +1,20 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "quant-data"
+version = "0.0.0"
+description = "行情生成/获取与缓存，TS 侧的桥接入口"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = ["numpy>=2.1", "quant-core", "psycopg[binary]>=3.2"]
+
+[project.scripts]
+quant-data = "quant_data.__main__:main"
+
+[tool.uv.sources]
+quant-core = { workspace = true }
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/quant_data"]

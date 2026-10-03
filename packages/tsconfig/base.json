@@ -1,0 +1,5 @@
+{
+  "$schema": "https://json.schemastore.org/tsconfig",
+  "display": "Trade Tool Base",
+  "extends": "../../tsconfig.base.json"
+}

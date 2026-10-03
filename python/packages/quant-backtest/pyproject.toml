@@ -1,0 +1,17 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "quant-backtest"
+version = "0.0.0"
+description = "Python 侧回测与绩效计算"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = ["numpy>=2.1", "quant-core"]
+
+[tool.uv.sources]
+quant-core = { workspace = true }
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/quant_backtest"]

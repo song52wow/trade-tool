@@ -1,0 +1,11 @@
+packages:
+  - 'apps/*'
+  - 'packages/*'
+
+# workspace 内互相引用一律走 link，不产生幽灵副本目录
+linkWorkspacePackages: true
+
+# pnpm >= 11 依赖构建脚本白名单（strictDepBuilds 默认开启）。
+# esbuild 需要执行 postinstall 才能落地平台二进制，tsup / tsx / vitest 都依赖它。
+allowBuilds:
+  esbuild: true

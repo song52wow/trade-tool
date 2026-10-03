@@ -1,0 +1,33 @@
+{
+  "name": "trade-tool",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "packageManager": "pnpm@11.23.0",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "build": "turbo run build",
+    "dev": "turbo run dev",
+    "typecheck": "turbo run typecheck",
+    "test": "turbo run test",
+    "lint": "turbo run lint",
+    "clean": "turbo run clean",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "py:sync": "cd python && uv sync --all-packages --all-groups",
+    "py:run": "cd python && uv run",
+    "py:test": "cd python && uv run pytest",
+    "py:lint": "cd python && uv run ruff check .",
+    "py:format": "cd python && uv run ruff format .",
+    "py:typecheck": "cd python && uv run mypy",
+    "check": "pnpm run build && pnpm run test && pnpm run py:test"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "prettier": "^3.4.0",
+    "turbo": "^2.5.0",
+    "typescript": "^5.7.0"
+  }
+}
