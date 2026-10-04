@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { loadConfigOrDefault } from '@trade-tool/core';
+import { loadConfigOrDefault, normalizeSyncSymbols } from '@trade-tool/core';
 import { buildContext, createPool } from '@trade-tool/data';
 
 import { createSyncService } from './service.js';
@@ -13,13 +13,16 @@ import { createSyncService } from './service.js';
 async function main(): Promise<void> {
   const config = await loadConfigOrDefault();
 
-  // 配置里的标的集合在启动时并入集合，默认为 paused（R-8.4 / R-17.4）。
+  // 配置里的标的集合在启动时并入集合（R-8.4 / R-17.4）：
+  // 纯字符串条目默认 paused；显式写了 desiredState=running 的才在并入后立即开启。
   const pool = createPool(config.database);
   const ctx = buildContext(pool, config);
   const service = createSyncService(ctx, { config });
 
-  for (const symbol of config.sync.symbols) {
-    await service.primitives.addSymbol(symbol);
+  for (const entry of normalizeSyncSymbols(config.sync.symbols)) {
+    await service.primitives.addSymbol(entry.symbol, {
+      start: entry.desiredState === 'running',
+    });
   }
 
   await service.daemon.start();

@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { createLogger } from '@trade-tool/core';
+import { createLogger, isSyncError } from '@trade-tool/core';
 import { Command } from 'commander';
 
 import { runBacktestCommand } from './commands/backtest.js';
@@ -22,12 +22,37 @@ const log = createLogger('cli');
 /**
  * 失败语义（R-14.1）：任何失败都必须抛错并以非 0 退出码结束。
  * 错误信息写 stderr，stdout 保持干净——`--json` 输出因此永远可被管道解析。
+ *
+ * R-14.3 要求 stderr 的可读原因里**含交易所自己的 code / msg**。
+ * 交易所原始响应只落在 `SyncError.details.body` 里，而 `Error.message` 拿不到它，
+ * 于是 `minNotional` 这类拒绝原因会被整段丢掉——正好是 §0 把「高 `minNotional` 的 USDC
+ * 永续」列为验收样本时预判的失败形态。这里把 details 里与排障相关的字段补进可读文本。
  */
 function fail(error: unknown): never {
-  const message = error instanceof Error ? error.message : String(error);
-  log.error(message);
+  const log_ = log;
+  if (isSyncError(error)) {
+    log_.error(error.message);
+    const details = error.details;
+    const parts: string[] = [];
+    if (typeof details.body === 'string' && details.body.trim() !== '') {
+      parts.push(`交易所响应: ${details.body.trim()}`);
+    }
+    const exchangeCode = details.code ?? details.exchangeCode;
+    const exchangeMsg = details.msg ?? details.exchangeMsg;
+    if (typeof exchangeCode === 'string' || typeof exchangeMsg === 'string') {
+      parts.push(`交易所 code=${String(exchangeCode ?? '')} msg=${String(exchangeMsg ?? '')}`);
+    }
+    if (typeof details.startTime === 'number' || typeof details.violatingTime === 'number') {
+      parts.push(
+        `位置: startTime=${String(details.startTime)} violatingTime=${String(details.violatingTime)}`,
+      );
+    }
+    if (parts.length > 0) log_.error(parts.join(' | '));
+  } else {
+    log_.error(error instanceof Error ? error.message : String(error));
+  }
   process.exitCode = 1;
-  throw error instanceof Error ? error : new Error(message);
+  throw error instanceof Error ? error : new Error(String(error));
 }
 
 const program = new Command();
@@ -70,14 +95,26 @@ dbCmd
   .description('应用迁移（幂等，可重复执行）')
   .option('--json', '输出 JSON')
   .action(async (options: { json?: boolean }) => {
-    await runMigrate(options).catch(fail);
+    // runMigrate 会在「库比代码新」时返回 1（R-1.3），必须把返回值接到退出码上，
+    // 否则这个非 0 形同虚设。
+    try {
+      process.exitCode = await runMigrate(options);
+    } catch (error) {
+      fail(error);
+    }
   });
 dbCmd
   .command('status')
   .description('查看 schema 版本比对结果')
   .option('--json', '输出 JSON')
   .action(async (options: { json?: boolean }) => {
-    process.exitCode = await runDbStatus(options);
+    try {
+      process.exitCode = await runDbStatus(options);
+    } catch (error) {
+      // 这里必须显式走 fail()：否则异常冒到最外层那个 `catch {}` 就只剩退出码 1，
+      // stderr 一个字都没有——「失败给不出可读原因」正是 R-14.3 要禁止的形态。
+      fail(error);
+    }
   });
 
 const dataCmd = program.command('data').description('行情数据');

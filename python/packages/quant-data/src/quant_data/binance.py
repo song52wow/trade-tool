@@ -15,9 +15,11 @@ import urllib.parse
 from collections.abc import Mapping
 from dataclasses import dataclass
 
+from quant_core.io import log
+
 from .errors import SyncError
-from .http import DEFAULT_TIMEOUT_MS, Transport, binance_base_url
-from .ratelimit import WeightBudget
+from .http import DEFAULT_TIMEOUT_MS, HttpResponse, Transport, binance_base_url
+from .ratelimit import DEFAULT_RETRY_AFTER_SECONDS, WeightBudget
 
 #: 1m 周期长度（毫秒）。周期固定 1m，不提供 interval 配置项（R-6）。
 ONE_MINUTE_MS = 60_000
@@ -281,8 +283,14 @@ class BinanceClient:
         self.weight += weight
         if response.status in RATE_LIMIT_STATUSES:
             retry_after = _parse_retry_after(response.header("Retry-After"))
-            if self._budget is not None and retry_after is not None:
-                self._budget.register_pause(retry_after)
+            # R-21.4：429/418 必须**全局**暂停——配额是账号级的，一个标的被限流说明账号整体到顶了。
+            # 交易所没带 Retry-After（或给的是无法解析的 HTTP-date）时不能就此放过：
+            # 那样就只抛单标的错误、完全不暂停，正是「静默继续打满配额」的形态。
+            # 因此这里用 DEFAULT_RETRY_AFTER_SECONDS 兜底，把全局暂停一定做出来。
+            if self._budget is not None:
+                self._budget.register_pause(
+                    retry_after if retry_after is not None else DEFAULT_RETRY_AFTER_SECONDS
+                )
             raise SyncError(
                 "EXCHANGE_RATE_LIMITED",
                 f"交易所限流: HTTP {response.status}",
@@ -298,7 +306,25 @@ class BinanceClient:
                 f"交易所返回 HTTP {response.status}",
                 {"status": response.status, "body": response.error_text()},
             )
-        return response.json(context=context)
+        payload = response.json(context=context)
+        self._observe_used_weight(response)
+        return payload
+
+    def _observe_used_weight(self, response: HttpResponse) -> None:
+        """把 ``X-MBX-USED-WEIGHT-1M`` 并回全局预算（R-20.4 / AC-17）。
+
+        这是把本地账本与**账号级**真实用量对齐的唯一信号。头部解析不了就只记一行日志，
+        绝不自作猜测地填一个数——观测不到不等于用量为零。
+        """
+        if self._budget is None:
+            return
+        raw = response.header("X-MBX-USED-WEIGHT-1M")
+        if raw is None:
+            return
+        try:
+            self._budget.observe_used_weight(int(raw.strip()))
+        except ValueError:
+            log(f"WARN 无法解析 X-MBX-USED-WEIGHT-1M: {raw!r}（本轮不自校正）")
 
 
 def parse_exchange_symbols(payload: Mapping[str, object]) -> dict[str, ExchangeSymbol]:

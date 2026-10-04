@@ -1,7 +1,7 @@
 import { createLogger, type Bar, type Interval } from '@trade-tool/core';
 
 import { readCache, writeCache } from './cache.js';
-import { runPython, type PythonRuntime } from './bridge.js';
+import { runPython, seriesBufferBytes, type PythonRuntime } from './bridge.js';
 
 const log = createLogger('data:provider');
 
@@ -72,6 +72,9 @@ export async function loadBars(options: LoadBarsOptions): Promise<Bar[]> {
       '--bars',
       String(options.bars),
     ],
+    // 系列链路的 bars 走 stdout（既有合成源，AC-29 要求不回归），
+    // 因此缓冲必须随 bar 数放大，否则 4MiB 的摘要上限会在约 3 万根处硬失败。
+    maxBufferBytes: seriesBufferBytes(options.bars),
     ...(options.timeoutMs === undefined ? {} : { timeoutMs: options.timeoutMs }),
   });
 

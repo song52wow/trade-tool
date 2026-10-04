@@ -1,3 +1,5 @@
+import { randomUUID } from 'node:crypto';
+
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
 import {
@@ -8,6 +10,7 @@ import {
 } from '@trade-tool/core';
 import {
   buildContext,
+  createPool,
   ensureSyncState,
   setDesiredState,
   upsertSymbolEntry,
@@ -15,8 +18,9 @@ import {
 
 import { SyncDaemon } from '../src/daemon.js';
 import { SyncControl } from '../src/primitives.js';
+import { createSyncService } from '../src/service.js';
 
-import { createTestSchema, TEST_PG, type TestSchema } from './helpers/pg.js';
+import { createTestSchema, TEST_DATABASE_CONFIG, TEST_PG, type TestSchema } from './helpers/pg.js';
 
 const SYMBOLS = ['TESTAAAUSDC', 'TESTBBBUSDC', 'TESTCCCUSDC'] as const;
 const NOW = 1_760_000_000_000;
@@ -445,5 +449,337 @@ describe('重启后状态仍准确（R-19.4 / AC-20）', () => {
     const summary = await restarted.getSummary();
     expect(summary.countsByStatus.running).toBe(1);
     expect(summary.countsByStatus.paused).toBe(1);
+  });
+});
+
+describe('缺陷回归（本轮审计发现并修复）', () => {
+  let ctx: TestSchema;
+
+  beforeAll(async () => {
+    ctx = await createTestSchema('regress');
+  });
+  afterAll(async () => {
+    await ctx.close();
+  });
+
+  function make(
+    config = configWith(),
+    syncFn?: (s: string) => Promise<SyncRunSummary>,
+  ): SyncControl {
+    return new SyncControl(
+      buildContext(ctx.pool, config, {
+        overrides: { password: TEST_PG.password, searchPath: ctx.schema },
+      }),
+      { config, syncFn: syncFn ?? (async (s) => okSummary(s)) },
+    );
+  }
+
+  it('start 未入集合的标的报错，不造孤儿 sync_state 行（R-18.4 / R-19.8）', async () => {
+    const control = make();
+    await expect(control.start('TESTGHOSTUSDC')).rejects.toMatchObject({
+      code: 'SYMBOL_NOT_FOUND',
+    });
+    // 关键：不能凭空留下一行 running 的状态去污染汇总
+    const row = await ctx.pool.query<{ n: string }>(
+      `SELECT count(*)::bigint AS n FROM sync_state WHERE symbol = 'TESTGHOSTUSDC'`,
+    );
+    expect(Number(row.rows[0]?.n)).toBe(0);
+  });
+
+  it('回补进行中被 pause：本轮收尾写回 paused，不复活成 running（AC-16 / R-17.3）', async () => {
+    const control = make();
+    await seedSymbol(ctx.pool, 'TESTPAUSEUSDC');
+    await control.start('TESTPAUSEUSDC');
+
+    // 同步函数执行期间模拟运维 pause
+    const pausing = make(configWith(), async (symbol) => {
+      await control.pause(symbol);
+      return okSummary(symbol);
+    });
+    await pausing.runOnce('TESTPAUSEUSDC', NOW);
+
+    const row = await ctx.pool.query<{ status: string }>(
+      `SELECT status FROM sync_state WHERE symbol = 'TESTPAUSEUSDC'`,
+    );
+    expect(row.rows[0]?.status).toBe('paused');
+    const entry = (await control.listSymbols()).find((e) => e.symbol === 'TESTPAUSEUSDC');
+    expect(entry?.desiredState).toBe('paused');
+  });
+
+  it('重启后从库里恢复退避与连续失败计数（R-19.4 / R-21.2）', async () => {
+    const config = configWith({ backoffBaseMs: 5_000 });
+    const first = make(config, async () => {
+      throw new SyncError('EXCHANGE_ERROR', 'down');
+    });
+    await seedSymbol(ctx.pool, 'TESTBACKOFFUSDC');
+    await first.start('TESTBACKOFFUSDC');
+    await first.runOnce('TESTBACKOFFUSDC', NOW);
+
+    // 重启：新对象，运行时槽位是空的，必须靠 reconcile 从库里把退避灌回来
+    const daemon = new SyncDaemon(
+      buildContext(ctx.pool, config, {
+        overrides: { password: TEST_PG.password, searchPath: ctx.schema },
+      }),
+      { config, now: () => NOW, sleep: async () => undefined },
+    );
+    await daemon.reconcile();
+    expect(daemon.primitives.isSchedulable('TESTBACKOFFUSDC', NOW)).toBe(false);
+    expect(daemon.primitives.isSchedulable('TESTBACKOFFUSDC', NOW + 10_000)).toBe(true);
+  });
+
+  it('PG 可恢复错误达到阈值也进 error，不无限重试（R-21.6 / R-21.3）', async () => {
+    const config = configWith({ maxConsecutiveErrors: 2 });
+    const control = make(config, async () => {
+      throw new SyncError('DB_DEADLOCK', 'deadlock');
+    });
+    await seedSymbol(ctx.pool, 'TESTDEADLOCKUSDC');
+    await control.start('TESTDEADLOCKUSDC');
+
+    let last = await control.runOnce('TESTDEADLOCKUSDC', NOW);
+    expect(last?.code).toBe('DB_DEADLOCK');
+    // 第一次仍是退避重试
+    let row = await ctx.pool.query<{ status: string }>(
+      `SELECT status FROM sync_state WHERE symbol = 'TESTDEADLOCKUSDC'`,
+    );
+    expect(row.rows[0]?.status).toBe('running');
+
+    await control.runOnce('TESTDEADLOCKUSDC', NOW + 60_000);
+    row = await ctx.pool.query<{ status: string }>(
+      `SELECT status FROM sync_state WHERE symbol = 'TESTDEADLOCKUSDC'`,
+    );
+    expect(row.rows[0]?.status).toBe('error');
+    // 进 error 后停止自动重试：调度器按库里的 status 过滤，即使退避已过期也不再捞它
+    const daemon = new SyncDaemon(
+      buildContext(ctx.pool, config, {
+        overrides: { password: TEST_PG.password, searchPath: ctx.schema },
+      }),
+      { config, now: () => NOW + 600_000, sleep: async () => undefined },
+    );
+    const batch = await daemon.selectBatch(NOW + 600_000);
+    expect(batch.map((e) => e.symbol)).not.toContain('TESTDEADLOCKUSDC');
+  });
+
+  it('重复 addSymbol 真正无副作用：updated_at 不变（R-18.5）', async () => {
+    const before = await ctx.pool.query<{ updated_at: string }>(
+      `SELECT updated_at FROM symbols WHERE symbol = 'TESTIDEMUSDC'`,
+    );
+    const entry = await upsertSymbolEntry(ctx.pool, {
+      exchange: 'binance',
+      symbol: 'TESTIDEMUSDC',
+    });
+    const firstAt = entry.updatedAt;
+    await new Promise((r) => setTimeout(r, 5));
+    await upsertSymbolEntry(ctx.pool, { exchange: 'binance', symbol: 'TESTIDEMUSDC' });
+    const after = await ctx.pool.query<{ updated_at: string }>(
+      `SELECT updated_at FROM symbols WHERE symbol = 'TESTIDEMUSDC'`,
+    );
+    expect(Number(after.rows[0]?.updated_at)).toBe(Number(firstAt));
+    expect(before.rows).toBeDefined();
+  });
+});
+
+describe('第二轮缺陷回归（R-1.3 / R-3.3 / R-14.4 / R-20.5 / R-21.5 / R-22）', () => {
+  let ctx: TestSchema;
+
+  beforeAll(async () => {
+    ctx = await createTestSchema('regress2');
+  });
+  afterAll(async () => {
+    await ctx.close();
+  });
+
+  function makeCtx(config: TradeToolConfig, pool = ctx.pool) {
+    return buildContext(pool, config, {
+      overrides: { password: TEST_PG.password, searchPath: ctx.schema },
+    });
+  }
+
+  function make(
+    config = configWith(),
+    syncFn?: (s: string) => Promise<SyncRunSummary>,
+    pool = ctx.pool,
+  ): SyncControl {
+    return new SyncControl(makeCtx(config, pool), {
+      config,
+      syncFn: syncFn ?? (async (s) => okSummary(s)),
+    });
+  }
+
+  /**
+   * runOnce 开头的 `stillWanted()` 也要查库。若它在 try 之外抛出：
+   *   ① `finally` 不执行 → inflight 永久为 true，该标的再不被调度、还占着并发名额；
+   *   ② 异常逃出 runOnce → daemon 的 worker → tick → loop → unhandled rejection，
+   *      单标的的一次 PG 抖动直接杀掉整个守护进程（R-14.4 / R-21.1）。
+   */
+  it('R-14.4 / R-21.1 状态读取失败既不泄漏 inflight 也不抛出 runOnce', async () => {
+    let failNextQuery = true;
+    const flaky = new Proxy(ctx.pool, {
+      get(target, prop, receiver) {
+        if (prop === 'query') {
+          return async (...args: unknown[]) => {
+            if (failNextQuery) {
+              failNextQuery = false;
+              throw new SyncError('DB_CONNECTION_FAILED', 'injected');
+            }
+            return (target.query as unknown as (...a: unknown[]) => unknown)(...args);
+          };
+        }
+        const value = Reflect.get(target, prop, receiver) as unknown;
+        return typeof value === 'function'
+          ? (value as (...a: unknown[]) => unknown).bind(target)
+          : value;
+      },
+    }) as typeof ctx.pool;
+
+    const config = configWith();
+    const control = make(config, undefined, flaky);
+    await seedSymbol(ctx.pool, 'TESTFLAKYUSDC');
+
+    const error = await control.runOnce('TESTFLAKYUSDC', NOW);
+    expect(error?.code).toBe('DB_CONNECTION_FAILED');
+    // 槽位必须释放；退避是刻意的（可恢复错误），但退避结束后必须能再调度
+    expect(control.slotsSnapshot()['TESTFLAKYUSDC']?.inflight).toBe(false);
+    expect(control.isSchedulable('TESTFLAKYUSDC', NOW)).toBe(false);
+    expect(control.isSchedulable('TESTFLAKYUSDC', NOW + 60_000)).toBe(true);
+  });
+
+  /** listSymbols 按 symbol 升序，固定 slice 会让 concurrency 之外的标的永远轮不到（G-9 / R-20.5）。 */
+  it('R-20.5 公平轮转：并发上限之外的标的不被永久饿死', async () => {
+    const config = configWith({ concurrency: 2 });
+    const control = make(config);
+    const daemon = new SyncDaemon(makeCtx(config), {
+      config,
+      control,
+      now: () => NOW,
+      sleep: async () => undefined,
+    });
+    const symbols = ['TESTFAIR1USDC', 'TESTFAIR2USDC', 'TESTFAIR3USDC'];
+    for (const symbol of symbols) {
+      await seedSymbol(ctx.pool, symbol);
+      await setDesiredState(ctx.pool, 'binance', symbol, 'running');
+    }
+
+    const seen = new Set<string>();
+    for (let round = 0; round < 4; round += 1) {
+      const batch = await daemon.selectBatch(NOW + round);
+      expect(batch.length).toBeLessThanOrEqual(2);
+      for (const entry of batch) {
+        seen.add(entry.symbol);
+        // 模拟「这一轮跑过了」：`runOnce` 会写 last_run_at，调度据此轮转
+        await ctx.pool.query('UPDATE sync_state SET last_run_at = $2 WHERE symbol = $1', [
+          entry.symbol,
+          NOW + round,
+        ]);
+      }
+    }
+    expect([...seen].sort()).toEqual([...symbols].sort());
+  });
+
+  /** delete 策略只把 status 改成 paused，数据派生的缓存列会残留（R-18.3 / R-19.6 / AC-21）。 */
+  it('R-18.3 / AC-21 removeSymbol(delete) 清空数据派生的缓存列，重新加入不会永久 error', async () => {
+    await seedSymbol(ctx.pool, 'TESTDELUSDC');
+    await ctx.pool.query(
+      `INSERT INTO klines_1m (symbol, time, open, high, low, close, volume)
+       VALUES ('TESTDELUSDC', $1, 1, 1, 1, 1, 1)`,
+      [NOW],
+    );
+    await ctx.pool.query(
+      `UPDATE sync_state SET watermark = $1, verified_upto = $1, rows = 1, bytes = 100,
+         pending_gaps = 1 WHERE symbol = 'TESTDELUSDC'`,
+      [NOW],
+    );
+
+    const control = make();
+    const result = await control.removeSymbol('TESTDELUSDC', 'delete');
+    expect(result.deletedRows).toBe(1);
+
+    const row = await ctx.pool.query<{
+      watermark: string | null;
+      verified_upto: string | null;
+      rows: string;
+      bytes: string;
+      pending_gaps: number;
+    }>(
+      `SELECT watermark, verified_upto, rows, bytes, pending_gaps FROM sync_state
+        WHERE exchange = 'binance' AND symbol = 'TESTDELUSDC'`,
+    );
+    expect(row.rows[0]?.watermark).toBeNull();
+    expect(row.rows[0]?.verified_upto).toBeNull();
+    expect(Number(row.rows[0]?.rows)).toBe(0);
+    expect(Number(row.rows[0]?.bytes)).toBe(0);
+    expect(Number(row.rows[0]?.pending_gaps)).toBe(0);
+
+    // 重新加入并同步：残留水位会让本轮抛 WATERMARK_MISMATCH（且该码属人工介入 → 永久 error）
+    await seedSymbol(ctx.pool, 'TESTDELUSDC');
+    const error = await make().runOnce('TESTDELUSDC', NOW);
+    expect(error).toBeNull();
+  });
+
+  /** R-21.5 只把「缺口耗尽 / 未收盘 bar」列为需人工介入；并发竞争不该钉死标的。 */
+  it('R-21.5 SYNC_ALREADY_RUNNING 不把标的钉成 error', async () => {
+    const config = configWith();
+    const control = make(config, async () => {
+      throw new SyncError('SYNC_ALREADY_RUNNING', '另一轮在跑');
+    });
+    await seedSymbol(ctx.pool, 'TESTBUSYUSDC');
+    await control.start('TESTBUSYUSDC');
+
+    const error = await control.runOnce('TESTBUSYUSDC', NOW);
+    expect(error?.code).toBe('SYNC_ALREADY_RUNNING');
+    const row = await ctx.pool.query<{ status: string }>(
+      `SELECT status FROM sync_state WHERE symbol = 'TESTBUSYUSDC'`,
+    );
+    expect(row.rows[0]?.status).not.toBe('error');
+    // 走退避重试，而不是「停止自动重试」
+    expect(control.slotsSnapshot()['TESTBUSYUSDC']?.backoffUntil).toBe(NOW + 5_000);
+    expect(control.isSchedulable('TESTBUSYUSDC', NOW + 10_000)).toBe(true);
+  });
+
+  /**
+   * createSyncService 若给控制面与守护进程各造一个 SyncControl，两边各持一份**实例私有**的
+   * 运行时槽位：addSymbol 的并发守卫成死代码，resume() 也清不掉守护进程的退避（R-21.3 / R-22）。
+   */
+  it('R-22 控制面与守护进程共用同一个控制原语实例', async () => {
+    const config = configWith();
+    const service = createSyncService(makeCtx(config), { config });
+    expect(service.daemon.primitives).toBe(service.primitives);
+  });
+
+  /** R-1.3 / R-14.5：守护进程启动时必须先过 schema 版本闸门，而不是等第一次写库炸 UndefinedTable。 */
+  it('R-1.3 / R-14.5 守护进程启动时 schema 不匹配必须报 SCHEMA_VERSION_MISMATCH', async () => {
+    const config = configWith();
+    const schema = `tt_nomig_${randomUUID().slice(0, 8)}`;
+    const admin = createPool(TEST_DATABASE_CONFIG, {
+      overrides: { max: 2, searchPath: 'public', password: TEST_PG.password },
+    });
+    await admin.query(`CREATE SCHEMA ${schema}`);
+    await admin.end();
+
+    const pool = createPool(TEST_DATABASE_CONFIG, {
+      overrides: { max: 2, searchPath: schema, password: TEST_PG.password },
+    });
+    const previousExitCode = process.exitCode;
+    try {
+      const daemon = new SyncDaemon(
+        buildContext(pool, config, {
+          overrides: { password: TEST_PG.password, searchPath: schema },
+        }),
+        { config },
+      );
+      await expect(daemon.start()).rejects.toMatchObject({ code: 'SCHEMA_VERSION_MISMATCH' });
+    } finally {
+      // exitIfGlobalFatal 会置 process.exitCode = 1（那正是「全局性错误 → 退出」的语义），
+      // 在测试进程里必须还原，否则整个 vitest 进程会被判失败。
+      process.exitCode = previousExitCode;
+      await pool.end().catch(() => undefined);
+      const cleanup = createPool(TEST_DATABASE_CONFIG, {
+        overrides: { max: 2, searchPath: 'public', password: TEST_PG.password },
+      });
+      try {
+        await cleanup.query(`DROP SCHEMA IF EXISTS ${schema} CASCADE`);
+      } finally {
+        await cleanup.end().catch(() => undefined);
+      }
+    }
   });
 });

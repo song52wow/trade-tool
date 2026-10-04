@@ -30,7 +30,16 @@ from .errors import SyncError
 DSN_ENV = "TRADE_TOOL_PG_DSN"
 
 #: 启动时要求已应用的迁移版本（R-1.3 / R-19.7：不匹配就报错，不按旧结构继续跑）。
-REQUIRED_MIGRATION_VERSIONS: frozenset[str] = frozenset({"001_init"})
+#:
+#: 这里是**全部已知迁移**，两个方向都校验：
+#:   * ``KNOWN - applied`` 非空 → 库落后（漏跑迁移）；
+#:   * ``applied - KNOWN`` 非空 → 库比代码新（代码落后于 schema，同样是「不匹配」）。
+#: 只校验「缺不缺 required」是不够的：加迁移时忘了更新这里，写路径就会静默按旧结构跑，
+#: 而库超前时又会被完全放行——两种都属于 R-1.3 禁止的「按不匹配的 schema 继续运行」。
+#: 因此**新增迁移必须同步在这里登记**（这就是 AC-25 的「同提交更新两侧」）。
+KNOWN_MIGRATION_VERSIONS: frozenset[str] = frozenset({"001_init", "002_sync_plan"})
+
+REQUIRED_MIGRATION_VERSIONS: frozenset[str] = KNOWN_MIGRATION_VERSIONS
 
 #: 必需的表（缺表等价于 schema 未迁移，报 SCHEMA_VERSION_MISMATCH）。
 REQUIRED_TABLES: frozenset[str] = frozenset(
@@ -121,6 +130,14 @@ def ensure_schema(conn: DbConn) -> None:
             f"数据库未应用迁移: {', '.join(missing_versions)}（先执行 db migrate）",
             {"missingVersions": missing_versions, "applied": sorted(applied)},
         )
+    unknown_versions = sorted(applied - KNOWN_MIGRATION_VERSIONS)
+    if unknown_versions:
+        raise SyncError(
+            "SCHEMA_VERSION_MISMATCH",
+            f"数据库 schema 比代码新: {', '.join(unknown_versions)}"
+            "（先更新迁移文件与两侧读写代码，不得按旧结构继续运行）",
+            {"unknownVersions": unknown_versions, "known": sorted(KNOWN_MIGRATION_VERSIONS)},
+        )
 
 
 def apply_migration_files(
@@ -163,7 +180,9 @@ def apply_migration_files(
                     " ON CONFLICT (version) DO NOTHING",
                     (version, now_ms),
                 )
-        applied.append(version)
+                # 只登记**本次真正应用**的版本：无条件 append 会让「再跑一次」的返回值
+                # 与第一次完全相同，幂等性断言因此恒真、没有任何鉴别力。
+                applied.append(version)
     return applied
 
 
@@ -187,12 +206,18 @@ class SymbolLock:
     释放：解除 advisory lock 并关连接；异常路径同样释放。
     """
 
-    def __init__(self, conn: DbConn, exchange: str, symbol: str, schema: str) -> None:
+    def __init__(
+        self, conn: DbConn, exchange: str, symbol: str, schema: str, *, created: bool
+    ) -> None:
         self._conn = conn
         self._exchange = exchange
         self._symbol = symbol
         self._schema = schema
         self._key = f"{schema}/{exchange}/{symbol}"
+        #: 本次抢锁时是否**新建**了 ``sync_state`` 行。
+        #: 新建行的 ``watermark`` 必然是 NULL，而库里可能已经有 CLI 拉好的数据——
+        #: 那是「缓存未初始化」而不是「水位分叉」，调用方据此决定要不要做 AC-21 校验。
+        self.created = created
 
     @classmethod
     def acquire(
@@ -208,11 +233,12 @@ class SymbolLock:
                 # SET LOCAL 不接受绑定参数（`SET LOCAL lock_timeout = $1` 是语法错误），
                 # 必须走 set_config(name, value, is_local)。
                 conn.execute("SELECT set_config('lock_timeout', %s, true)", (LOCK_TIMEOUT,))
-                conn.execute(
+                inserted = conn.execute(
                     "INSERT INTO sync_state (exchange, symbol, status, updated_at)"
                     " VALUES (%s, %s, 'paused', %s) ON CONFLICT (exchange, symbol) DO NOTHING",
                     (exchange, symbol, now_ms),
                 )
+                created = int(inserted.rowcount or 0) > 0
                 row = conn.execute(
                     "SELECT status FROM sync_state WHERE exchange = %s AND symbol = %s FOR UPDATE",
                     (exchange, symbol),
@@ -249,7 +275,7 @@ class SymbolLock:
         except BaseException:
             conn.close()
             raise
-        return cls(conn, exchange, symbol, str(schema_row["schema"]))
+        return cls(conn, exchange, symbol, str(schema_row["schema"]), created=created)
 
     def release(self) -> None:
         try:
@@ -283,6 +309,14 @@ _STATE_COLUMNS: frozenset[str] = frozenset(
         "error_count",
         "backoff_until",
         "pending_gaps",
+        # 首次全量的规模预估（002_sync_plan，R-8.3 / R-8.6）
+        "plan_bars",
+        "plan_requests",
+        "plan_weight",
+        "plan_estimated_ms",
+        "plan_from",
+        "plan_to",
+        "plan_at",
     }
 )
 
@@ -293,6 +327,16 @@ def ensure_state_row(conn: DbConn, exchange: str, symbol: str, now_ms: int) -> N
         " VALUES (%s, %s, 'paused', %s) ON CONFLICT (exchange, symbol) DO NOTHING",
         (exchange, symbol, now_ms),
     )
+
+
+def delete_state_row(conn: DbConn, exchange: str, symbol: str) -> None:
+    """删除一行的同步状态。
+
+    只用于清理「抢锁时建出来、但标的校验随后失败」的幽灵行：`sync_state` 是
+    「标的已加入调度」的可见证据，为一个拼错的标的留一行 `paused/0 行`
+    会让 `sync status` 看起来像它已经在集合里。
+    """
+    conn.execute("DELETE FROM sync_state WHERE exchange = %s AND symbol = %s", (exchange, symbol))
 
 
 def read_state(conn: DbConn, exchange: str, symbol: str) -> DbRow | None:
@@ -418,17 +462,14 @@ def bar_close_time(bar_open_ms: int) -> int:
     return bar_open_ms + ONE_MINUTE_MS - 1
 
 
+#: 暂存表。列与类型**从 `klines_1m` 派生**（`WITH NO DATA`），不手抄一份影子定义：
+#: 迁移文件是 schema 的唯一来源（R-2.5 / AC-25），手写 DDL 会在改列类型时静默漂移。
+#: 派生之后，若 `set_types` 里的类型与真表不符，COPY BINARY 会被 PG 直接拒绝——
+#: 那是显式报错，而不是写进一批类型错误的数据。
 _STAGE_DDL = """
-CREATE TEMP TABLE IF NOT EXISTS stage_bars (
-    time          bigint            NOT NULL,
-    open          double precision  NOT NULL,
-    high          double precision  NOT NULL,
-    low           double precision  NOT NULL,
-    close         double precision  NOT NULL,
-    volume        double precision  NOT NULL,
-    quote_volume  double precision,
-    trades        bigint
-) ON COMMIT PRESERVE ROWS
+CREATE TEMP TABLE IF NOT EXISTS stage_bars AS
+SELECT time, open, high, low, close, volume, quote_volume, trades
+  FROM klines_1m WITH NO DATA
 """
 
 _COPY_SQL = (
@@ -511,6 +552,13 @@ def detect_gaps(conn: DbConn, symbol: str, start_ms: int, end_ms: int) -> list[G
     """在 ``[start_ms, end_ms]`` 内用窗口函数 ``lag()`` 检测缺口（R-11.A.1）。
 
     检测在 SQL 里完成，只把**缺口行**取回应用层，不把行情行拉进 Python。
+
+    过滤条件是 ``time - prev >= 2 * 60_000`` 而不是 ``> 60_000``：
+    ``missing_rows = (time - prev) / 60_000 - 1`` 用的是整数除法，
+    若相邻两行差 90_000（外部/手工写入的非对齐行），``> 60_000`` 会让
+    ``missing_rows = 0``、``gap_end < gap_start``，插入时直接撞 ``gaps`` 的
+    CHECK 约束，异常每轮重复出现——该标的再也同步不了。
+    差不足两分钟的行本就不是「1m bar 缺失」，跳过它们才是正确语义。
     """
     rows = conn.execute(
         "SELECT gap_start, gap_end, missing_rows FROM ("
@@ -521,9 +569,17 @@ def detect_gaps(conn: DbConn, symbol: str, start_ms: int, end_ms: int) -> list[G
         "      SELECT time, lag(time) OVER (ORDER BY time) AS prev"
         "        FROM klines_1m WHERE symbol = %s AND time BETWEEN %s AND %s"
         "    ) adjacent"
-        "   WHERE prev IS NOT NULL AND time - prev > %s"
+        "   WHERE prev IS NOT NULL AND time - prev >= %s"
         ") gaps ORDER BY gap_start",
-        (ONE_MINUTE_MS, ONE_MINUTE_MS, ONE_MINUTE_MS, symbol, start_ms, end_ms, ONE_MINUTE_MS),
+        (
+            ONE_MINUTE_MS,
+            ONE_MINUTE_MS,
+            ONE_MINUTE_MS,
+            symbol,
+            start_ms,
+            end_ms,
+            2 * ONE_MINUTE_MS,
+        ),
     ).fetchall()
     return [
         Gap(
@@ -551,9 +607,33 @@ def list_gaps(conn: DbConn, symbol: str, limit: int = 50) -> list[DbRow]:
     ).fetchall()
 
 
+def min_gap_start(conn: DbConn, symbol: str) -> int | None:
+    """最早一个待回补缺口的起点；没有缺口返回 None。
+
+    ``verified_upto`` 必须由它（而不是「本轮扫描到的第一个缺口」）推导：
+    缺口可能落在本轮扫描窗口之外，只看窗口内会把窗口外的洞标成「已验证」（R-11.A.2/A.4）。
+    """
+    row = _require_row(
+        conn.execute(
+            "SELECT min(gap_start) AS m FROM gaps WHERE symbol = %s", (symbol,)
+        ).fetchone(),
+        "min(gap_start)",
+    )
+    value = row["m"]
+    return int(value) if value is not None else None
+
+
 def insert_gaps(conn: DbConn, exchange: str, symbol: str, gaps: Iterable[Gap]) -> int:
-    """登记缺口；已存在的缺口**不覆盖**其 attempts（R-11.B5）。"""
-    payload = [(exchange, symbol, g.gap_start, g.gap_end, g.missing_rows) for g in gaps]
+    """登记缺口；已存在的缺口**不覆盖**其 attempts（R-11.B5）。
+
+    写入前再兜一次：``gaps`` 表有 ``missing_rows > 0`` 与 ``gap_end >= gap_start``
+    两条 CHECK。脏数据不该让整个标的每轮都炸在约束上——不合法的缺口直接丢弃并记日志。
+    """
+    payload = [
+        (exchange, symbol, g.gap_start, g.gap_end, g.missing_rows)
+        for g in gaps
+        if g.missing_rows > 0 and g.gap_end >= g.gap_start
+    ]
     if not payload:
         return 0
     with conn.cursor() as cur:

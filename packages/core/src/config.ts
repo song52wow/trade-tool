@@ -15,7 +15,7 @@ export const marketSchema = z.object({
    * （`ma-cross` 等策略）需要按周期取数；删掉它会直接破坏既有回测与 AC-29
    * 「`data fetch --bars 100` 不传新参数行为不变」。因此它只服务于 synthetic 回测链路。
    */
-  interval: z.enum(INTERVALS),
+  interval: z.enum(INTERVALS).default('1h'),
   /** 行情来源。`synthetic` 为离线合成（默认，保持既有链路），`binance` 为真实交易所 */
   source: z.enum(['synthetic', 'binance']).default('synthetic'),
   /** 交易所标识，作为 symbols / contract_spec / sync_state 的分区键 */
@@ -76,10 +76,41 @@ export const databaseSchema = z.object({
 
 /** 标的移除时已入库数据的处置策略（R-18.3），禁止静默删除。 */
 export const removePolicySchema = z.enum(['keep', 'archive', 'delete']);
+
+/**
+ * `sync.symbols` 的一个条目（R-13「标的集合、**每标的期望状态**」）。
+ *
+ * 两种写法都支持（示例里的 `<SYMBOL>` 是占位符——源码里不出现任何真实合约名，R-5.1）：
+ *   * `"<SYMBOL>"`——等价于 `{ symbol: "<SYMBOL>", desiredState: "paused" }`，
+ *     与既有配置向后兼容；新标的默认 paused 是 R-8.4 的硬要求
+ *     （一次添加 5 个标的 ≈ 4820 次请求的回补风暴）。
+ *   * `{ "symbol": "<SYMBOL>", "desiredState": "running" }`——显式声明「启动后就开启」，
+ *     让守护进程重启后能按配置恢复每标的意图，而不必依赖控制面再发一次 start。
+ */
+export const syncSymbolSchema = z.union([
+  z.string().min(1),
+  z.object({
+    symbol: z.string().min(1),
+    desiredState: z.enum(['paused', 'running']).default('paused'),
+  }),
+]);
+export type SyncSymbolEntry = z.infer<typeof syncSymbolSchema>;
+
+/** 把 `sync.symbols` 的两种写法归一成 `{ symbol, desiredState }`。 */
+export function normalizeSyncSymbols(
+  entries: readonly SyncSymbolEntry[],
+): { symbol: string; desiredState: 'paused' | 'running' }[] {
+  return entries.map((entry) =>
+    typeof entry === 'string'
+      ? { symbol: entry, desiredState: 'paused' as const }
+      : { symbol: entry.symbol, desiredState: entry.desiredState },
+  );
+}
+
 /** 常驻同步守护进程配置（R-13 sync 段 / R-17…R-22）。 */
 export const syncSchema = z.object({
-  /** 标的集合；新标的默认 paused（R-8.4），需显式 start 才启动首次全量 */
-  symbols: z.array(z.string().min(1)).default([]),
+  /** 标的集合 + 每标的期望状态；新标的默认 paused（R-8.4），需显式 start 才启动首次全量 */
+  symbols: z.array(syncSymbolSchema).default([]),
   /** 同时同步的标的数上限（R-20.5） */
   concurrency: z.number().int().positive().max(64).default(4),
   /** 轮询间隔（毫秒）：每轮调度之间休眠多久 */

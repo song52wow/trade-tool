@@ -44,6 +44,26 @@ function str(value: unknown): string {
   return value;
 }
 
+/**
+ * float8 列的读取校验。
+ *
+ * PG 的 `double precision` 允许存入 `'NaN'` / `'Infinity'`；`Number('NaN')` 得到 NaN，
+ * 而 `JSON.stringify(NaN)` 会写成 `null`——于是「库里是损坏数据」在 CLI 摘要里被
+ * 静默洗成「这个字段没有值」，读侧再也区分不出来（README 明确禁止 NaN/Infinity）。
+ * 与 NULL 一样：损坏必须报错，不得静默。
+ */
+function num(value: unknown, column: string, symbol: string, time: unknown): number {
+  const n = typeof value === 'number' ? value : Number(value);
+  if (!Number.isFinite(n)) {
+    throw new SyncError(
+      'NULL_NOT_ALLOWED',
+      `${symbol} time=${String(time)} 的 ${column} 不是有限数（${String(value)}）：库中存在损坏数据`,
+      { symbol, time, column },
+    );
+  }
+  return n;
+}
+
 // ---------------------------------------------------------------- klines_1m
 
 export interface Watermark {
@@ -99,12 +119,15 @@ function toBar(row: QueryResultRow, index: number, symbol: string): BarRow {
   }
   return {
     time: req(row['time'], 'time'),
-    open: Number(row['open']),
-    high: Number(row['high']),
-    low: Number(row['low']),
-    close: Number(row['close']),
-    volume: Number(row['volume']),
-    quoteVolume: row['quote_volume'] === null ? null : Number(row['quote_volume']),
+    open: num(row['open'], 'open', symbol, row['time']),
+    high: num(row['high'], 'high', symbol, row['time']),
+    low: num(row['low'], 'low', symbol, row['time']),
+    close: num(row['close'], 'close', symbol, row['time']),
+    volume: num(row['volume'], 'volume', symbol, row['time']),
+    quoteVolume:
+      row['quote_volume'] === null
+        ? null
+        : num(row['quote_volume'], 'quote_volume', symbol, row['time']),
     trades: row['trades'] === null ? null : req(row['trades'], 'trades'),
   };
 }
@@ -197,9 +220,11 @@ export async function readContractSpec(
 // ----------------------------------------------------------------- sync_state
 
 const STATE_COLUMNS = `exchange, symbol, status, watermark, verified_upto, rows, bytes,
-  last_run_at, last_success_at, last_error, error_count, backoff_until, pending_gaps, updated_at`;
+  last_run_at, last_success_at, last_error, error_count, backoff_until, pending_gaps, updated_at,
+  plan_bars, plan_requests, plan_weight, plan_estimated_ms, plan_from, plan_to, plan_at`;
 
 function toState(row: QueryResultRow, desiredState: string | null): SymbolSyncState {
+  const planBars = ms(row['plan_bars']);
   return {
     exchange: str(row['exchange']),
     symbol: str(row['symbol']),
@@ -217,6 +242,20 @@ function toState(row: QueryResultRow, desiredState: string | null): SymbolSyncSt
     updatedAt: req(row['updated_at'], 'updated_at'),
     desiredState: (desiredState ?? null) as SymbolSyncState['desiredState'],
     metadataStale: false,
+    // plan_* 是一组同写同清的可空列：plan_bars 为 NULL 即「无计划」。
+    // 其余列若为 NULL 说明写了半套（迁移/代码不一致），req() 会直接报错而不是编一个 0。
+    plan:
+      planBars === null
+        ? null
+        : {
+            bars: planBars,
+            requests: req(row['plan_requests'], 'plan_requests'),
+            weight: req(row['plan_weight'], 'plan_weight'),
+            estimatedMs: req(row['plan_estimated_ms'], 'plan_estimated_ms'),
+            from: req(row['plan_from'], 'plan_from'),
+            to: req(row['plan_to'], 'plan_to'),
+            computedAt: req(row['plan_at'], 'plan_at'),
+          },
   };
 }
 
@@ -225,10 +264,21 @@ const STATE_FROM_SYMBOLS = `
   FROM sync_state s
   LEFT JOIN symbols sym ON sym.exchange = s.exchange AND sym.symbol = s.symbol`;
 
-/** 全部标的的同步状态。集合里尚未产生过 sync_state 的标的不出现在这里。 */
-export async function listStates(pool: Pool): Promise<SymbolSyncState[]> {
+/**
+ * 全部标的的同步状态。集合里尚未产生过 sync_state 的标的不出现在这里。
+ *
+ * `exchange` 可选但**必须传**：不传会把别的交易所的同名标的也列进来，
+ * 而全局汇总是按 exchange 过滤的——于是 `sync status` 列出的标的数与汇总的标的数
+ * 会对不上（同一份输出里两个「标的数」）。测试与嵌入式调用可省略。
+ */
+export async function listStates(pool: Pool, exchange?: string): Promise<SymbolSyncState[]> {
   try {
-    const result = await pool.query<QueryResultRow>(`${STATE_FROM_SYMBOLS} ORDER BY s.symbol ASC`);
+    const result = exchange
+      ? await pool.query<QueryResultRow>(
+          `${STATE_FROM_SYMBOLS} WHERE s.exchange = $1 ORDER BY s.symbol ASC`,
+          [exchange],
+        )
+      : await pool.query<QueryResultRow>(`${STATE_FROM_SYMBOLS} ORDER BY s.symbol ASC`);
     return result.rows.map((row) => toState(row, (row['desired_state'] as string | null) ?? null));
   } catch (error) {
     throw toSyncError(error, '读取同步状态失败');
@@ -355,7 +405,14 @@ export async function upsertSymbolEntry(
        VALUES ($1, $2, COALESCE($3, 'paused'), $4, $5, $5)
        ON CONFLICT (exchange, symbol) DO UPDATE
          SET onboard_date = COALESCE(EXCLUDED.onboard_date, symbols.onboard_date),
-             updated_at = $5
+             -- 只有内容真的变了才动 updated_at：重复 addSymbol 必须**无副作用**（R-18.5），
+             -- 否则控制面无法用 updated_at 判断「这一行是否被碰过」。
+             updated_at = CASE
+               WHEN symbols.onboard_date IS DISTINCT FROM
+                    COALESCE(EXCLUDED.onboard_date, symbols.onboard_date)
+                 THEN EXCLUDED.updated_at
+               ELSE symbols.updated_at
+             END
        RETURNING exchange, symbol, desired_state, onboard_date, added_at, updated_at`,
       [entry.exchange, entry.symbol, entry.desiredState ?? null, entry.onboardDate ?? null, now],
     );
@@ -401,7 +458,9 @@ export async function ensureSyncState(
     const result = await pool.query<QueryResultRow>(
       `INSERT INTO sync_state (exchange, symbol, status, updated_at)
        VALUES ($1, $2, $3, $4)
-       ON CONFLICT (exchange, symbol) DO UPDATE SET updated_at = EXCLUDED.updated_at
+       -- 行已存在就**完全不碰**：重复 ensureSyncState 必须无副作用（R-18.5），
+       -- 也不能顺手把 status 改回 paused。
+       ON CONFLICT (exchange, symbol) DO UPDATE SET exchange = EXCLUDED.exchange
        RETURNING ${STATE_COLUMNS.replace(/\s+/g, ' ')}`,
       [exchange, symbol, status, now],
     );
@@ -417,7 +476,13 @@ export async function ensureSyncState(
  * 移除标的（R-18.3）。数据处置策略必须**显式**且可配置，禁止静默删除已入库数据。
  *   keep   保留 klines_1m 数据，只移出调度集合
  *   delete 连同 klines_1m 一起删除（仍保留 sync_state 以便审计）
- *   archive 保留数据并打上归档标记（本 schema 无归档列，等价于 keep + 记录）
+ *   archive 保留数据并打上归档标记（本 schema 无归档列，等价于 keep）
+ *
+ * **必须整段跑在同一条连接上**：``pg.Pool`` 的每次 ``query`` 各自借还连接，
+ * 用 ``pool.query('BEGIN')`` 拿到的连接与后续业务语句所在的连接并不是同一条——
+ * 于是语句根本不在同一个事务里，``ROLLBACK`` 也撤不掉已执行的 DELETE，
+ * 更糟的是那条带未提交事务的连接会回到池里，被之后任意无关查询复用并顺带提交。
+ * 因此这里用 ``pool.connect()`` 独占一条 client，finally 里一定 release。
  */
 export async function removeSymbolEntry(
   pool: Pool,
@@ -425,37 +490,126 @@ export async function removeSymbolEntry(
   symbol: string,
   policy: 'keep' | 'archive' | 'delete',
 ): Promise<{ removed: boolean; policy: 'keep' | 'archive' | 'delete'; deletedRows: number }> {
+  const client = await pool.connect();
+  let advisoryHeld = false;
+  // 与 Python 侧 `pg.SymbolLock` **完全一致**的键（schema/exchange/symbol）。
+  // 锁表达式只写一次，避免两边漂移导致锁形同虚设。
+  const advisoryKey = (placeholderFrom: number): string =>
+    `hashtextextended(current_schema() || '/' || $${placeholderFrom} || '/' || $${placeholderFrom + 1}, 0)`;
   try {
-    await pool.query('BEGIN');
+    if (policy === 'delete') {
+      // policy=delete 是**唯一**从 TS 侧删 klines_1m 的路径。Python 每轮同步会整轮持有
+      // 这个 session 级 advisory lock（批与批之间不持行锁），所以不加锁就会交错：
+      // DELETE 提交后，正在跑的那一轮会把行重新写回来、收尾还把 status 写回 running——
+      // 「已删除/已移除」的标的复活。R-3.3 要求在应用层保证单写者。
+      const locked = await client.query<{ locked: boolean }>(
+        `SELECT pg_try_advisory_lock(${advisoryKey(1)}) AS locked`,
+        [exchange, symbol],
+      );
+      if (!locked.rows[0]?.locked) {
+        throw new SyncError(
+          'SYNC_ALREADY_RUNNING',
+          `${symbol} 正在同步中，不能删除其已入库数据：请先暂停并等本轮同步结束`,
+          { exchange, symbol, policy },
+        );
+      }
+      advisoryHeld = true;
+    }
+    await client.query('BEGIN');
     try {
       if (policy === 'delete') {
-        const deleted = await pool.query('DELETE FROM klines_1m WHERE symbol = $1', [symbol]);
-        await pool.query('DELETE FROM gaps WHERE symbol = $1', [symbol]);
+        const deleted = await client.query('DELETE FROM klines_1m WHERE symbol = $1', [symbol]);
+        await client.query('DELETE FROM gaps WHERE symbol = $1', [symbol]);
         const count = deleted.rowCount ?? 0;
-        await pool.query(
-          'UPDATE sync_state SET status = $3, updated_at = $4 WHERE exchange = $1 AND symbol = $2',
+        // 数据已删，**所有由数据推导出来的缓存列必须一起清掉**。
+        // 只把 status 改成 paused 是不够的：残留的 watermark 会在该标的下一次同步时
+        // 与 max(time)=NULL 冲突，直接抛 WATERMARK_MISMATCH；那个错误码属「需人工介入」，
+        // 于是重新加入的标的每轮都失败、resume 也修不掉（R-18.3 / R-19.6 / AC-21）。
+        await client.query(
+          `UPDATE sync_state SET status = $3, watermark = NULL, verified_upto = NULL,
+             rows = 0, bytes = 0, pending_gaps = 0, last_error = NULL,
+             error_count = 0, backoff_until = NULL, updated_at = $4
+           WHERE exchange = $1 AND symbol = $2`,
           [exchange, symbol, 'paused', Date.now()],
         );
-        await pool.query('DELETE FROM symbols WHERE exchange = $1 AND symbol = $2', [
+        await client.query('DELETE FROM symbols WHERE exchange = $1 AND symbol = $2', [
           exchange,
           symbol,
         ]);
-        await pool.query('COMMIT');
+        await client.query('COMMIT');
         return { removed: true, policy, deletedRows: count };
       }
-      // keep / archive：数据与状态全部保留，只把 desired_state 置为 paused 使其停止调度。
-      const removed = await pool.query('DELETE FROM symbols WHERE exchange = $1 AND symbol = $2', [
-        exchange,
-        symbol,
-      ]);
-      await pool.query('COMMIT');
+      // keep / archive：数据与状态全部保留，只移出调度集合。
+      // 注意：移出集合后该标的的 desired_state 变为 NULL，不再被调度，
+      // 但它仍会出现在 `sync status` 列表里（sync_state 行保留用于审计）。
+      const removed = await client.query(
+        'DELETE FROM symbols WHERE exchange = $1 AND symbol = $2',
+        [exchange, symbol],
+      );
+      await client.query('COMMIT');
       return { removed: (removed.rowCount ?? 0) > 0, policy, deletedRows: 0 };
     } catch (error) {
-      await pool.query('ROLLBACK').catch(() => undefined);
+      await client.query('ROLLBACK').catch(() => undefined);
       throw error;
     }
   } catch (error) {
     throw toSyncError(error, `移除标的 ${symbol} 失败`);
+  } finally {
+    if (advisoryHeld) {
+      // 必须显式解锁再还连接：advisory lock 是 session 级的，直接 release 会把锁
+      // 留在池里的那条连接上，之后任何复用它的查询都还在持锁。
+      await client
+        .query(`SELECT pg_advisory_unlock(${advisoryKey(1)})`, [exchange, symbol])
+        .catch(() => undefined);
+    }
+    client.release();
+  }
+}
+
+/**
+ * 写入 / 清空首次全量的规模预估（迁移 002 的 plan_* 列，R-8.3 / R-8.6）。
+ *
+ * 常驻模式下新增标的默认 `paused`，控制面需要先看到「这次全量要拉多少」才能决策，
+ * 因此规模必须在**开启之前**就落到 `sync_state`，由 `sync status` 暴露；
+ * 它同时是首次全量进度的分母（已入库行数 / 目标行数）。
+ *
+ * `plan = null` 表示清空（首次全量已完成；继续留着会让进度读成「差一根没跑完」）。
+ */
+export async function setSyncPlan(
+  pool: Pool,
+  exchange: string,
+  symbol: string,
+  plan: {
+    bars: number;
+    requests: number;
+    weight: number;
+    estimatedMs: number;
+    from: number;
+    to: number;
+  } | null,
+): Promise<void> {
+  const now = Date.now();
+  try {
+    await pool.query(
+      `UPDATE sync_state SET
+         plan_bars = $3, plan_requests = $4, plan_weight = $5, plan_estimated_ms = $6,
+         plan_from = $7, plan_to = $8, plan_at = $9, updated_at = $10
+       WHERE exchange = $1 AND symbol = $2`,
+      [
+        exchange,
+        symbol,
+        plan?.bars ?? null,
+        plan?.requests ?? null,
+        plan?.weight ?? null,
+        plan?.estimatedMs ?? null,
+        plan?.from ?? null,
+        plan?.to ?? null,
+        plan === null ? null : now,
+        now,
+      ],
+    );
+  } catch (error) {
+    throw toSyncError(error, `写入 ${symbol} 首次全量规模预估失败`);
   }
 }
 
@@ -519,6 +673,9 @@ export async function setSyncStatus(
 
 // ------------------------------------------------------------- weight_budget
 
+/** 权重窗口长度（毫秒），与 Python 侧 `ratelimit.WINDOW_MS` 一致。 */
+const WEIGHT_WINDOW_MS = 60_000;
+
 export async function readWeightBudget(
   pool: Pool,
   budgetPerMinute: number,
@@ -527,10 +684,15 @@ export async function readWeightBudget(
     'SELECT window_from, used, pause_until FROM weight_budget WHERE id = 1',
   );
   const row = result.rows[0];
-  const used = Number(row?.['used'] ?? 0);
+  const windowFrom = ms(row?.['window_from']) ?? 0;
+  const stored = Number(row?.['used'] ?? 0);
+  // 窗口已滚动但还没有新请求触发重置：行里的 used 属于**上一个窗口**，
+  // 直接报出去会让 `sync status` 显示一个早就过期的使用率（R-20.4 要的是「当前窗口」）。
+  const expired = Date.now() - windowFrom >= WEIGHT_WINDOW_MS;
+  const used = expired ? 0 : stored;
   return {
     budgetPerMinute,
-    windowFrom: ms(row?.['window_from']) ?? 0,
+    windowFrom,
     used,
     pauseUntil: ms(row?.['pause_until']),
     utilization: budgetPerMinute > 0 ? used / budgetPerMinute : 0,

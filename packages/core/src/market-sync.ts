@@ -131,6 +131,30 @@ export interface SymbolSyncState {
   desiredState: DesiredState | null;
   /** 元数据是否取自过期缓存（R-7.1） */
   metadataStale: boolean;
+  /**
+   * 首次全量的规模预估（R-8.3），由 `sync status` 暴露给控制面；
+   * 首次全量跑完或本来就有历史时为 null。存在时它同时是进度的**分母**（R-8.6）。
+   */
+  plan: FirstPullPlan | null;
+}
+
+/**
+ * 首次全量的规模预估（R-8.3 / R-8.6）。
+ *
+ * `sync_state` 的 plan_* 列（迁移 002）在 TS 侧的映射：常驻模式下新增标的默认 paused，
+ * 控制面要先看到「这次全量约多少根 / 多少次请求 / 约多久」才能决定是否开启。
+ */
+export interface FirstPullPlan {
+  /** 目标 bar 数（进度分母） */
+  bars: number;
+  requests: number;
+  weight: number;
+  estimatedMs: number;
+  /** 预估区间（闭区间，epoch 毫秒） */
+  from: number;
+  to: number;
+  /** 预估计算时刻 */
+  computedAt: number;
 }
 
 /** 标的集合条目（R-18）。 */

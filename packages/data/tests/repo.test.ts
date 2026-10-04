@@ -6,6 +6,7 @@ import {
   ensureSyncState,
   listGaps,
   listStates,
+  setSyncPlan,
   pendingGapCount,
   readBars,
   readGlobalSummary,
@@ -240,5 +241,106 @@ describe('查询层与数据语义', () => {
       message: expect.stringContaining('nope'),
       details: { symbol: 'X' },
     });
+  });
+});
+
+describe('第二轮缺陷回归（R-2.5 / R-3.3 / R-4.1 / R-8.3 / R-20.4）', () => {
+  let ctx: TestSchema;
+
+  beforeAll(async () => {
+    ctx = await createTestSchema('repo2');
+  });
+  afterAll(async () => {
+    await ctx.close();
+  });
+
+  /** PG 允许 float8 存 'NaN'；Number('NaN') 会在 JSON 里被写成 null，静默洗掉「数据损坏」。 */
+  it('R-4.1 读侧遇到 NaN/Infinity 必须报错，不得静默变成 null', async () => {
+    for (const value of ["'NaN'::float8", "'Infinity'::float8"]) {
+      await ctx.pool.query(
+        `INSERT INTO klines_1m (symbol, time, open, high, low, close, volume)
+         VALUES ('NANUSDC', $1, ${value}, 1, 1, 1, 1)
+         ON CONFLICT (symbol, time) DO UPDATE SET open = EXCLUDED.open`,
+        [BASE],
+      );
+      await expect(readBars(ctx.pool, 'NANUSDC', { limit: 1 })).rejects.toMatchObject({
+        code: 'NULL_NOT_ALLOWED',
+      });
+    }
+  });
+
+  /** R-8.3 / R-8.6：首次全量的规模必须落在 sync_state 上，供控制面与 `sync status` 读。 */
+  it('R-8.3 / R-8.6 首次全量规模可写入、可读出、可清空', async () => {
+    await ensureSyncState(ctx.pool, 'binance', 'PLANUSDC');
+    expect((await readState(ctx.pool, 'binance', 'PLANUSDC'))?.plan).toBeNull();
+
+    await setSyncPlan(ctx.pool, 'binance', 'PLANUSDC', {
+      bars: 1234,
+      requests: 1,
+      weight: 10,
+      estimatedMs: 60_000,
+      from: BASE,
+      to: BASE + 1233 * MINUTE,
+    });
+    const state = await readState(ctx.pool, 'binance', 'PLANUSDC');
+    expect(state?.plan).toEqual({
+      bars: 1234,
+      requests: 1,
+      weight: 10,
+      estimatedMs: 60_000,
+      from: BASE,
+      to: BASE + 1233 * MINUTE,
+      computedAt: expect.any(Number),
+    });
+
+    await setSyncPlan(ctx.pool, 'binance', 'PLANUSDC', null);
+    expect((await readState(ctx.pool, 'binance', 'PLANUSDC'))?.plan).toBeNull();
+  });
+
+  /**
+   * R-3.3：python 侧整轮持有这个 advisory lock；delete 策略若不加锁就会与在跑的同步交错，
+   * 删掉的行被写回来（「已删除/已移除」的标的复活）。键必须与 `pg.SymbolLock` 完全一致。
+   */
+  it('R-3.3 delete 策略在同步持锁期间必须拒绝（不改数据）', async () => {
+    await upsertSymbolEntry(ctx.pool, { exchange: 'binance', symbol: 'LOCKEDUSDC' });
+    await insertBars(ctx.pool, 'LOCKEDUSDC', barTimes(BASE, 3));
+
+    const holder = await ctx.pool.connect();
+    try {
+      await holder.query(
+        `SELECT pg_advisory_lock(hashtextextended(current_schema() || '/' || $1 || '/' || $2, 0))`,
+        ['binance', 'LOCKEDUSDC'],
+      );
+      await expect(
+        removeSymbolEntry(ctx.pool, 'binance', 'LOCKEDUSDC', 'delete'),
+      ).rejects.toMatchObject({ code: 'SYNC_ALREADY_RUNNING' });
+      // 数据一行未动
+      expect(Number((await watermark(ctx.pool, 'LOCKEDUSDC')).rows)).toBe(3);
+    } finally {
+      await holder.query(
+        `SELECT pg_advisory_unlock(hashtextextended(current_schema() || '/' || $1 || '/' || $2, 0))`,
+        ['binance', 'LOCKEDUSDC'],
+      );
+      holder.release();
+    }
+
+    // 锁释放后可以正常删除
+    const removed = await removeSymbolEntry(ctx.pool, 'binance', 'LOCKEDUSDC', 'delete');
+    expect(removed.deletedRows).toBe(3);
+    expect((await watermark(ctx.pool, 'LOCKEDUSDC')).rows).toBe(0);
+  });
+
+  /** R-20.4 要的是**当前窗口**的使用率：窗口已滚动时上一窗口的残留不能报成 100%。 */
+  it('R-20.4 权重窗口已滚动时使用率报 0，而不是上一窗口的残留', async () => {
+    const stale = Date.now() - 10 * MINUTE;
+    await ctx.pool.query(
+      `UPDATE weight_budget SET window_from = $1, used = 999, pause_until = NULL WHERE id = 1`,
+      [stale],
+    );
+    const status = await readWeightBudget(ctx.pool, 1920);
+    expect(status.used).toBe(0);
+    expect(status.utilization).toBe(0);
+    // 窗口本身就是过去那一刻，保留原值以便排查
+    expect(status.windowFrom).toBe(stale);
   });
 });

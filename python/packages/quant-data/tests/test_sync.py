@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import itertools
+import time
 from collections.abc import Sequence
 from pathlib import Path
 from typing import cast
@@ -11,10 +12,10 @@ import psycopg
 import pytest
 from conftest import SQL_DIR, FakeExchange, SymbolCase, fixed_now
 from quant_data import pg
-from quant_data.binance import KLINE_LIMIT_MAX, ONE_MINUTE_MS, Kline
+from quant_data.binance import KLINE_LIMIT_MAX, ONE_MINUTE_MS, Kline, align_bar_start
 from quant_data.errors import SyncError
 from quant_data.pg import DbConn
-from quant_data.ratelimit import WeightBudget
+from quant_data.ratelimit import WINDOW_MS, WeightBudget
 from quant_data.sync import (
     DEFAULT_BATCH_SIZE,
     DEFAULT_GAP_LOOKBACK_MS,
@@ -704,12 +705,13 @@ def test_default_gap_lookback_bounds_scan_cost(
 def test_middle_deletion_is_auto_backfilled_next_round(
     conn: DbConn, fake: FakeExchange, pg_dsn: str, tmp_path: Path, symbol_case: SymbolCase
 ) -> None:
-    """AC-7 场景①：干净同步之后**人为删掉中间几行**，随后自动补回，无需人工。
+    """AC-7 场景①：干净同步之后**人为删掉中间几行**，下一轮**自动补回**，无需人工。
 
     字面的 ``[verified_upto, max(time)]`` 在这里塌缩成单点（verified_upto == max(time)），
     中间的洞永远看不见；固定回看窗口使它可被发现（本用例锁定的就是这一条）。
-    检测发生在每轮的末尾、��补在下一轮的开头，因此删除后需要两轮才完全复原——
-    同一轮不可能回补它自己还没检测到的东西。
+
+    轮次语义（★AC-7）：「下一轮 data sync 自动把缺口补回，gaps 表记录被清除」，
+    所以一轮之内必须走完「检测 → 回补 → 清除登记」——只登记就返回不算数。
     """
     now = fixed_now(fake, symbol_case.symbol)
     run_sync(_options(fake, pg_dsn, tmp_path, symbol_case.symbol, now))
@@ -725,14 +727,7 @@ def test_middle_deletion_is_auto_backfilled_next_round(
     )
     assert len(_times(conn, symbol_case.symbol)) == len(before) - 3
 
-    # 第 2 轮：回看窗口让「已验证区间之后的外部删改」被当场发现并登记。
-    detected = run_sync(_options(fake, pg_dsn, tmp_path, symbol_case.symbol, now))
-    assert detected["gapsPending"] == 1
-    registered = pg.list_gaps(conn, symbol_case.symbol)
-    assert len(registered) == 1
-    assert int(registered[0]["gap_start"]) == gap_start
-
-    # 第 3 轮：已登记的缺口**自动**回补（无需人工），登记被清除。
+    # 第 2 轮：回看窗口让它被当场发现、**当场补回**，登记被清除。
     summary = run_sync(_options(fake, pg_dsn, tmp_path, symbol_case.symbol, now))
     assert summary["gapsFilled"] == 1
     assert summary["gapsPending"] == 0
@@ -943,6 +938,49 @@ def test_watermark_mismatch_is_reported(
     assert excinfo.value.code == "WATERMARK_MISMATCH"
 
 
+def test_watermark_drift_is_reported_even_when_the_round_repairs_it(
+    conn: DbConn, fake: FakeExchange, pg_dsn: str, tmp_path: Path, symbol_case: SymbolCase
+) -> None:
+    """普通增量轮次里被篡改的水位缓存必须报错，**不能**被分批写入顺手改好（AC-21）。
+
+    这是 AC-21 真实的失效路径：分批提交会用 ``max(time)`` 覆盖 ``sync_state.watermark``，
+    轮末再校验就永远看不到分叉，于是「静默二选一」（R-19.6）成立。
+    因此判定必须基于**轮次入口的快照**。
+    """
+    now = fixed_now(fake, symbol_case.symbol)
+    run_sync(_options(fake, pg_dsn, tmp_path, symbol_case.symbol, now))
+    truth = pg.max_time(conn, symbol_case.symbol)
+    assert truth is not None
+    # 把缓存改成与权威值无关的垃圾值：增量轮次照常会写最后一根并「修好」它。
+    conn.execute(
+        "UPDATE sync_state SET watermark = %s WHERE exchange = %s AND symbol = %s",
+        (truth - 7 * ONE_MINUTE_MS, EXCHANGE, symbol_case.symbol),
+    )
+    with pytest.raises(SyncError) as excinfo:
+        run_sync(_options(fake, pg_dsn, tmp_path, symbol_case.symbol, now))
+    assert excinfo.value.code == "WATERMARK_MISMATCH"
+
+
+def test_unclosed_bar_error_wins_over_watermark_drift(
+    conn: DbConn, fake: FakeExchange, pg_dsn: str, tmp_path: Path, symbol_case: SymbolCase
+) -> None:
+    """库里多出一根未收盘 bar 时要报 R-10.3 的专属错误码，而不是笼统的水位不一致。
+
+    两种情况在库里长得一样（cached < authoritative），但 R-10.3 的诊断更有价值，
+    因此入口快照的判定必须让位给更具体的错误。
+    """
+    now = fixed_now(fake, symbol_case.symbol)
+    run_sync(_options(fake, pg_dsn, tmp_path, symbol_case.symbol, now))
+    conn.execute(
+        "INSERT INTO klines_1m (symbol, time, open, high, low, close, volume)"
+        " VALUES (%s, %s, 1, 1, 1, 1, 1)",
+        (symbol_case.symbol, now + 10 * ONE_MINUTE_MS),
+    )
+    with pytest.raises(SyncError) as excinfo:
+        run_sync(_options(fake, pg_dsn, tmp_path, symbol_case.symbol, now))
+    assert excinfo.value.code == "UNCLOSED_BAR_IN_STORE"
+
+
 def test_schema_version_mismatch_is_reported(
     conn: DbConn, fake: FakeExchange, pg_dsn: str, tmp_path: Path, symbol_case: SymbolCase
 ) -> None:
@@ -970,9 +1008,11 @@ def test_schema_version_mismatch_is_reported(
 def test_migrations_are_idempotent(conn: DbConn, pg_dsn: str) -> None:
     """迁移可重复执行且幂等（AC-1 / R-1.2）。"""
     again = pg.apply_migration_files(conn, SQL_DIR, 1)
-    assert again == ["001_init"]
-    rows = conn.execute("SELECT version FROM schema_migrations").fetchall()
-    assert [str(row["version"]) for row in rows] == ["001_init"]
+    # 第二次执行**一个新版本都不该应用**（返回值只含本次真正应用的版本）；
+    # 无条件返回全部版本会让这个断言恒真、失去鉴别力。
+    assert again == []
+    rows = conn.execute("SELECT version FROM schema_migrations ORDER BY version").fetchall()
+    assert [str(row["version"]) for row in rows] == ["001_init", "002_sync_plan"]
     pg.ensure_schema(conn)
 
 
@@ -1143,3 +1183,219 @@ def test_fetch_interrupt_keeps_committed_progress(
     assert len(final) == len(set(final)), "重跑不得产生重复行"
     assert len(final) == symbol_case.bars - 1
     assert summary["added"] == len(final) - len(committed)
+
+
+# ------------------------------------------- 第二轮缺陷回归（审计发现并修复）
+
+
+def test_detect_gaps_skips_misaligned_neighbours(conn: DbConn) -> None:
+    """相邻行差落在 (60_000, 120_000) 时不是 1m 缺口，不得生成非法的 gaps 记录。
+
+    这种非对齐行只能来自外部/手工写入（schema 不禁止）。旧实现会生成
+    ``missing_rows = 0`` 且 ``gap_end < gap_start`` 的记录，插入时撞 ``gaps`` 的
+    CHECK 约束，异常**每轮重复出现**——该标的此后再也同步不了（R-1.4 / R-11.A.1）。
+    """
+    conn.execute(
+        "INSERT INTO klines_1m (symbol, time, open, high, low, close, volume)"
+        " VALUES ('MISALIGNUSDC', 0, 1, 1, 1, 1, 1), ('MISALIGNUSDC', 90000, 1, 1, 1, 1, 1)"
+    )
+    assert pg.detect_gaps(conn, "MISALIGNUSDC", pg.PG_MIN_TIME, 10**15) == []
+    # 即便调用方显式给出非法缺口，也要被挡在约束之外，而不是炸掉整轮
+    assert (
+        pg.insert_gaps(
+            conn, EXCHANGE, "MISALIGNUSDC", [pg.Gap(gap_start=60000, gap_end=30000, missing_rows=0)]
+        )
+        == 0
+    )
+
+    # 真正的 1m 缺口（相邻差 >= 2 分钟）仍然必须检出
+    conn.execute(
+        "INSERT INTO klines_1m (symbol, time, open, high, low, close, volume)"
+        " VALUES ('MISALIGNUSDC', 240000, 1, 1, 1, 1, 1)"
+    )
+    gaps = pg.detect_gaps(conn, "MISALIGNUSDC", pg.PG_MIN_TIME, 10**15)
+    assert len(gaps) == 1
+    assert gaps[0].gap_start == 150000
+    assert gaps[0].gap_end == 180000
+    assert gaps[0].missing_rows == 1
+
+
+def test_backfill_expected_rows_counts_minute_aligned_bars(
+    conn: DbConn, fake: FakeExchange, pg_dsn: str, tmp_path: Path, symbol_case: SymbolCase
+) -> None:
+    """未对齐的 ``--from/--to`` 不能让 ``expectedRows`` 高估，否则缺口永远清不掉（R-11.B12）。"""
+    now = fixed_now(fake, symbol_case.symbol)
+    run_sync(_options(fake, pg_dsn, tmp_path, symbol_case.symbol, now))
+    closed = fake.closed_through(symbol_case.symbol)
+    start = closed - 10 * ONE_MINUTE_MS + 1  # 故意不对齐
+    end = start + 5 * ONE_MINUTE_MS - 1
+    result = run_backfill(
+        _options(fake, pg_dsn, tmp_path, symbol_case.symbol, now, from_ms=start, to_ms=end)
+    )
+    first = align_bar_start(start)
+    last = (end // ONE_MINUTE_MS) * ONE_MINUTE_MS
+    expected = (last - first) // ONE_MINUTE_MS + 1
+    # 旧公式 (to - from) // 60_000 + 1 会算出 expected + 1，`present >= expected` 永假
+    assert result["expectedRows"] == expected
+    assert result["presentRows"] == expected
+
+
+def test_backfill_reports_watermark_mismatch(
+    conn: DbConn, fake: FakeExchange, pg_dsn: str, tmp_path: Path, symbol_case: SymbolCase
+) -> None:
+    """backfill 同样会把 watermark 缓存覆盖成 max(time)，因此同样要先判定分叉（R-19.6 / AC-21）。"""
+    now = fixed_now(fake, symbol_case.symbol)
+    run_sync(_options(fake, pg_dsn, tmp_path, symbol_case.symbol, now))
+    conn.execute(
+        "UPDATE sync_state SET watermark = watermark - %s WHERE exchange = %s AND symbol = %s",
+        (ONE_MINUTE_MS, EXCHANGE, symbol_case.symbol),
+    )
+    start = fake.closed_through(symbol_case.symbol) - 5 * ONE_MINUTE_MS
+    with pytest.raises(SyncError) as excinfo:
+        run_backfill(
+            _options(fake, pg_dsn, tmp_path, symbol_case.symbol, now, from_ms=start, to_ms=start)
+        )
+    assert excinfo.value.code == "WATERMARK_MISMATCH"
+
+
+def test_backfill_rejects_unknown_symbol(
+    conn: DbConn, fake: FakeExchange, pg_dsn: str, tmp_path: Path, symbol_case: SymbolCase
+) -> None:
+    """backfill 也要做运行时元数据校验：未知标的必须是 SYMBOL_NOT_FOUND（R-7.2 / AC-13）。"""
+    now = fixed_now(fake, symbol_case.symbol)
+    start = fake.closed_through(symbol_case.symbol) - 5 * ONE_MINUTE_MS
+    with pytest.raises(SyncError) as excinfo:
+        run_backfill(
+            _options(fake, pg_dsn, tmp_path, "NOSUCHUSDC", now, from_ms=start, to_ms=start)
+        )
+    assert excinfo.value.code == "SYMBOL_NOT_FOUND"
+
+
+@pytest.mark.parametrize("command", ["sync", "backfill", "verify"])
+def test_unknown_symbol_leaves_no_ghost_state_row(
+    conn: DbConn,
+    fake: FakeExchange,
+    pg_dsn: str,
+    tmp_path: Path,
+    symbol_case: SymbolCase,
+    command: str,
+) -> None:
+    """未知标的不得在 sync_state 留下幽灵行——抢锁会先建行，校验失败必须清掉（R-19.1）。"""
+    now = fixed_now(fake, symbol_case.symbol)
+    start = fake.closed_through(symbol_case.symbol) - 5 * ONE_MINUTE_MS
+    options = _options(fake, pg_dsn, tmp_path, "NOSUCHUSDC", now, from_ms=start, to_ms=start)
+    with pytest.raises(SyncError) as excinfo:
+        if command == "sync":
+            run_sync(options)
+        elif command == "backfill":
+            run_backfill(options)
+        else:
+            run_verify(options)
+    assert excinfo.value.code == "SYMBOL_NOT_FOUND"
+    assert pg.read_state(conn, EXCHANGE, "NOSUCHUSDC") is None
+
+
+def test_gap_backfill_boundary_violation_is_not_downgraded_to_attempts(
+    conn: DbConn, fake: FakeExchange, pg_dsn: str, tmp_path: Path, symbol_case: SymbolCase
+) -> None:
+    """缺口回补撞上越界 bar 必须直接抛（R-9.4 / R-21.5），不能吞成「回补失败第 N 次」。
+
+    吞掉的后果：CLI 退出码仍是 0，操作者最终只能看到一个
+    ``GAP_ATTEMPTS_EXHAUSTED``，真正的原因（交易所无视 startTime）被埋进 last_error。
+    """
+    now = fixed_now(fake, symbol_case.symbol)
+    fake.set_hole(symbol_case.symbol, 100, 3)
+    first = run_sync(_options(fake, pg_dsn, tmp_path, symbol_case.symbol, now))
+    assert first["gapsPending"] == 1
+    attempts_before = int(pg.list_gaps(conn, symbol_case.symbol)[0]["attempts"])
+    assert attempts_before >= 1  # 轮末已经尝试过一次
+
+    fake.ignore_start_time = True
+    with pytest.raises(SyncError) as excinfo:
+        run_sync(_options(fake, pg_dsn, tmp_path, symbol_case.symbol, now))
+    assert excinfo.value.code == "BACKFILL_BOUNDARY_VIOLATION"
+    # 越界不是「缺口回补的一次失败」，attempts 不能被计进去
+    gaps = pg.list_gaps(conn, symbol_case.symbol)
+    assert len(gaps) == 1
+    assert int(gaps[0]["attempts"]) == attempts_before
+
+
+def test_first_pull_plan_is_persisted_before_writing_and_cleared_after(
+    conn: DbConn,
+    fake: FakeExchange,
+    pg_dsn: str,
+    tmp_path: Path,
+    symbol_case: SymbolCase,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """R-8.3 / R-8.6：规模必须在写第一批数据**之前**落进 sync_state，跑完后清空。
+
+    只放进一次性返回值与日志是不够的：常驻形态下控制面只能读库，
+    既看不到「要拉多少」这个决策依据，也拿不到进度的分母。
+    """
+    now = fixed_now(fake, symbol_case.symbol)
+    observed: list[tuple[int, int]] = []
+    real_write = pg.write_bars
+
+    def spy(target: DbConn, symbol: str, rows: Sequence[Kline], strategy: str) -> int:
+        row = target.execute(
+            "SELECT plan_bars, plan_requests FROM sync_state WHERE exchange = %s AND symbol = %s",
+            (EXCHANGE, symbol),
+        ).fetchone()
+        if row is not None and row["plan_bars"] is not None:
+            observed.append((int(row["plan_bars"]), int(row["plan_requests"])))
+        return real_write(target, symbol, rows, strategy)
+
+    monkeypatch.setattr(pg, "write_bars", spy)
+    summary = run_sync(_options(fake, pg_dsn, tmp_path, symbol_case.symbol, now))
+
+    estimate = _nested(summary, "estimate")
+    assert observed, "首批写入之前规模必须已经写进 sync_state"
+    assert observed[0][0] == int(cast(int, estimate["bars"]))
+    assert observed[0][1] == int(cast(int, estimate["requests"]))
+
+    # 跑完之后清空：`rows` 本身就是权威行数，留着分母会被读成「差一根没跑完」
+    state = pg.read_state(conn, EXCHANGE, symbol_case.symbol)
+    assert state is not None
+    assert state["plan_bars"] is None
+    assert state["plan_requests"] is None
+
+
+def test_ensure_schema_rejects_database_ahead_of_code(conn: DbConn) -> None:
+    """库比代码新同样是版本不匹配，必须报错（R-1.3 / R-19.7）。"""
+    conn.execute("INSERT INTO schema_migrations (version, applied_at) VALUES ('999_future', 0)")
+    try:
+        with pytest.raises(SyncError) as excinfo:
+            pg.ensure_schema(conn)
+        assert excinfo.value.code == "SCHEMA_VERSION_MISMATCH"
+    finally:
+        conn.execute("DELETE FROM schema_migrations WHERE version = '999_future'")
+    pg.ensure_schema(conn)  # 清掉之后必须恢复正常
+
+
+def test_weight_status_reports_zero_after_window_rolls(conn: DbConn) -> None:
+    """R-20.4 要的是**当前窗口**的使用率：窗口滚动后不能继续报上一窗口的残留。"""
+    budget = WeightBudget(conn, 1920)
+    budget.reserve(5)
+    conn.execute(
+        "UPDATE weight_budget SET window_from = %s, used = 999 WHERE id = 1",
+        (int(time.time() * 1000) - 2 * WINDOW_MS,),
+    )
+    status = budget.status()
+    assert status["used"] == 0
+    assert status["utilization"] == 0.0
+
+
+def test_observe_used_weight_only_increases(conn: DbConn) -> None:
+    """交易所头部的账号级用量必须并进本地预算，且**只增不减**（R-20.4 / AC-17）。"""
+    budget = WeightBudget(conn, 1920)
+    budget.reserve(5)
+    budget.observe_used_weight(50)
+    row = conn.execute("SELECT used FROM weight_budget WHERE id = 1").fetchone()
+    assert row is not None
+    assert int(row["used"]) == 50
+    # 一次偏小的观测不能把计数拉回去（保守方向）
+    budget.observe_used_weight(10)
+    row = conn.execute("SELECT used FROM weight_budget WHERE id = 1").fetchone()
+    assert row is not None
+    assert int(row["used"]) == 50

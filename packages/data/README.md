@@ -13,7 +13,10 @@
 - `db/errors.ts` — PG 错误分类（R-21.6）：连接失败 / 唯一冲突 / 事务回滚 / 死锁，
   每类的重试策略不同。
 - `db/repo.ts` — 查询层。水位的**权威来源是 `max(time)`**，`sync_state.watermark` 只是
-  可观测缓存，二者不一致时报 `WATERMARK_MISMATCH` 而不是二选一。
+  可观测缓存，二者不一致时报 `WATERMARK_MISMATCH` 而不是二选一。首次全量的规模预估
+  （迁移 `002_sync_plan` 的 `plan_*` 列）也在这里读写，供 `sync status` 暴露进度分母。
+  `removeSymbolEntry(policy='delete')` 会取与 Python 侧 `SymbolLock` **同一个键**的
+  advisory lock——删除是 TS 侧唯一写 `klines_1m` 的路径，不能与在跑的一轮同步交错。
 - `market.ts` — 控制面唯一需要认识的东西：调 Python 干活 + 查 PG 看状态，收敛成结构化输入输出。
 - `bridge.ts` — `python -m quant_data` 子进程调用。**只传控制信息**，不传数据。
 - `provider.ts` / `cache.ts` — 既有离线合成链路（`source: 'synthetic'`），行为未变。

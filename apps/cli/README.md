@@ -35,3 +35,8 @@ node apps/cli/dist/index.js <command>              # 构建产物
 - 生命周期变更（开启 / 暂停 / 恢复）**不走 CLI**，走 `@trade-tool/sync` 的控制原语。
 - 首次全量前会打印规模预估（约多少根 / 约多少次请求 / 约多少权重 / 约多少分钟）并要求显式确认，
   `-y` 可跳过确认——全量是数百次请求量级，不该「点一下就完」。
+  **`--json` 不豁免确认**：`--json` 只约束 stdout 的形状，管道/CI 里首次全量必须显式给 `-y`，
+  否则报 `CONFIG_INVALID`（规模提示走 stderr）。传了 `--from` 同样要确认——首次全量会忽略它。
+- `data fetch --source binance --bars N` 取不满 N 根时**报错退出**（不是 warning + 退出码 0）：
+  调用方必须能从退出码区分「拿全了」与「被截断」。`--source binance` 下显式传 `--interval`
+  直接报 `CONFIG_INVALID`（周期固定 1m，R-6），不静默忽略。

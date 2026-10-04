@@ -1,7 +1,6 @@
 import { createInterface } from 'node:readline/promises';
 
 import {
-  createLogger,
   intervalToMs,
   loadConfigOrDefault,
   ONE_MINUTE_MS,
@@ -26,7 +25,6 @@ import {
 import { withContext } from '../context.js';
 import { assertSchema } from './db.js';
 
-const log = createLogger('cli:data');
 const MS_PER_YEAR = 365 * 24 * 60 * 60 * 1000;
 
 /** 周期 -> 每年 bar 数，供年化指标换算。 */
@@ -142,8 +140,23 @@ async function fetchFromBinance(
         { symbol, requested: bars, from: range.from, to: range.to },
       );
     }
+    // 少一根同样不能「警告 + 退出码 0」（R-14.1 / AC-11）：用户要 N 根，
+    // 结果只给 M < N 根却成功返回，调用方无法从退出码区分「拿全了」与「被截断」。
+    // 交易所有多长历史是客观事实，因此把缺口说清楚、让它成为一次显式失败。
     if (stored.length < bars) {
-      log.warn(`${symbol} 只取到 ${stored.length}/${bars} 根：该区间在交易所侧不完整`);
+      throw new SyncError(
+        'EXCHANGE_ERROR',
+        `${symbol} 只取到 ${stored.length}/${bars} 根 1m K 线：该区间在交易所侧不完整` +
+          `（${new Date(range.from).toISOString()} → ${new Date(range.to).toISOString()}）`,
+        {
+          symbol,
+          requested: bars,
+          stored: stored.length,
+          from: range.from,
+          to: range.to,
+          earliestStored: stored[0]?.time ?? null,
+        },
+      );
     }
     return { bars: toBars(stored), symbol, interval: '1m', source: 'binance' };
   });
@@ -183,6 +196,15 @@ export async function fetchBars(overrides: DataOverrides): Promise<FetchResult> 
 
   if (source === 'binance') {
     // 1m 固定，不接受 interval——周期约束体现在 schema 表名上（R-6）。
+    // 显式传了 `--interval` 却走 binance 时必须报错，而不是静默忽略：
+    // 用户以为按自己的周期取数，实际拿到 1m，这是最典型的「静默兜底」。
+    if (overrides.interval !== undefined) {
+      throw new SyncError(
+        'CONFIG_INVALID',
+        `--source binance 固定 1m，不接受 --interval（周期由 klines_1m 表名固化，R-6）：收到 ${overrides.interval}`,
+        { interval: overrides.interval },
+      );
+    }
     return fetchFromBinance(symbol, bars);
   }
   const interval = (overrides.interval ?? config.market.interval) as Interval;
@@ -227,7 +249,23 @@ async function confirmFirstPull(
   options: { yes?: boolean | undefined; json?: boolean | undefined },
 ): Promise<SyncPlanEstimate | undefined> {
   const estimate = await withContext((ctx) => estimateFirstPull(ctx, symbol));
-  if (options.json) return estimate;
+  if (options.json) {
+    // `--json` 只约束 **stdout 的形状**（必须是纯 JSON），不是「跳过确认」的开关。
+    // 原实现 `if (options.json) return estimate;` 让 `data sync --json` 在无交互确认的
+    // 情况下直接发起约上千次请求的首次全量——R-8.3 要求的显式确认被一行 JSON 需求绕过。
+    // 规模提示放进 stderr（`--json` 允许），确认仍必须由 `--yes` 给出。
+    console.error(
+      `标的 ${symbol} 尚无历史数据，本次将执行**首次全量**：` +
+        `约 ${estimate.bars.toLocaleString('en-US')} 根 / ` +
+        `${estimate.requests.toLocaleString('en-US')} 次请求 / ` +
+        `约 ${Math.max(1, Math.round(estimate.estimatedMs / 60_000))} 分钟。` +
+        '（--json 下不再交互确认，请加 --yes 表示确认）',
+    );
+    if (options.yes) return estimate;
+    throw new SyncError('CONFIG_INVALID', '首次全量需要显式确认：--json 模式请加 --yes 继续', {
+      ...estimate,
+    });
+  }
   console.error(
     [
       `标的 ${symbol} 尚无历史数据，本次将执行**首次全量**（无「缩短范围」选项）：`,
@@ -238,6 +276,18 @@ async function confirmFirstPull(
     ].join('\n'),
   );
   if (options.yes) return estimate;
+
+  // 非交互上下文（CI / cron / 管道）里 `rl.question()` 永远等不到输入：
+  // 事件循环一旦排空，Node 会以「unsettled top-level await」+ 退出码 13 收场，
+  // 既不是可读的失败原因，也分不清是取消还是崩溃（R-14.3）。
+  // 必须显式报错并指向 --yes，而不是让进程神秘退出。
+  if (!process.stdin.isTTY) {
+    throw new SyncError(
+      'CONFIG_INVALID',
+      '首次全量需要显式确认，但当前 stdin 不是终端、无法交互确认。请显式加 --yes 继续',
+      { symbol },
+    );
+  }
 
   const rl = createInterface({ input: process.stdin, output: process.stderr });
   try {
@@ -290,7 +340,10 @@ export async function runSync(flags: SyncFlags): Promise<number> {
     await assertSchema(ctx.pool);
     const before = await watermark(ctx.pool, symbol);
 
-    if (from === undefined && before.maxTime === null) {
+    // 首次全量一律要确认：**不能**用「有没有传 --from」来判断。
+    // 无历史时 Python 侧会忽略 --from 并从 onboardDate 全量（R-8.2 不提供缩短首次范围的手段），
+    // 原条件 `from === undefined && ...` 于是让 `data sync --from <ms>` 静默发起整段全量。
+    if (before.maxTime === null) {
       await confirmFirstPull(symbol, flags);
     }
 
@@ -371,6 +424,11 @@ export async function runSymbols(flags: {
     );
   }
   return withContext(async (ctx) => {
+    // exchangeInfo 也是出网请求，必须过全局限速器；限速器的令牌桶就在 PG 的
+    // weight_budget 表里（R-20.2），因此这条命令同样要先过 schema 闸门。
+    // 否则未迁移的库会在 Python 侧撞上 `relation "weight_budget" does not exist`，
+    // 被兜底成 INTERNAL_ERROR——报错原因与真实问题对不上（R-1.3 / R-19.7）。
+    await assertSchema(ctx.pool);
     const result = await listExchangeSymbols(ctx, { refresh: flags.refresh ?? false });
     if (flags.json) {
       console.log(JSON.stringify(result.symbols.map((s) => s.symbol)));

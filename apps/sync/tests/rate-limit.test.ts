@@ -138,3 +138,43 @@ describe('全局配额与并发（AC-17 / AC-24 / R-20）', () => {
     expect(exchange.requests.exchangeInfo).toBeLessThanOrEqual(3); // 单例缓存：3 个标的只拉一次
   });
 });
+
+describe('首次全量规模落库（R-8.3 / R-8.6）', () => {
+  it('addSymbol 在「开启之前」就把规模写进 sync_state，并由状态可查', async () => {
+    // 换一个从未同步过的标的（已有历史的标的没有「首次全量规模」）
+    const day = 24 * 60 * 60 * 1000;
+    const onboardDate = NOW - 5 * day;
+    exchange.setSymbols([
+      ...makeMockSymbols(NOW),
+      { symbol: 'TESTPLANUSDC', contractType: 'PERPETUAL', status: 'TRADING', onboardDate },
+    ]);
+    // 元数据有磁盘缓存：强制重拉，否则新标的会以 SYMBOL_NOT_FOUND 收场
+    await rm(join(metaDir, 'exchangeInfo.json'), { force: true });
+
+    const control = makeControl();
+    const entry = await control.addSymbol('TESTPLANUSDC');
+    // R-8.4：新标的默认 paused——控制面要先看到代价再决定是否开启
+    expect(entry.desiredState).toBe('paused');
+
+    const row = await ctx.pool.query<{
+      plan_bars: string | null;
+      plan_requests: string | null;
+      plan_weight: string | null;
+      plan_from: string | null;
+      plan_to: string | null;
+    }>(
+      `SELECT plan_bars, plan_requests, plan_weight, plan_from, plan_to
+         FROM sync_state WHERE exchange = 'binance' AND symbol = 'TESTPLANUSDC'`,
+    );
+    const plan = row.rows[0];
+    expect(plan?.plan_bars).not.toBeNull();
+    expect(Number(plan?.plan_bars)).toBeGreaterThan(0);
+    expect(Number(plan?.plan_requests)).toBeGreaterThan(0);
+    expect(Number(plan?.plan_weight)).toBeGreaterThan(0);
+    // 起点来自运行时 onboardDate（对齐到 1m 边界），不是任何硬编码值
+    const from = Number(plan?.plan_from);
+    expect(from).toBeGreaterThanOrEqual(onboardDate);
+    expect(from).toBeLessThan(onboardDate + 60_000);
+    expect(Number(plan?.plan_to)).toBeGreaterThan(from);
+  });
+});

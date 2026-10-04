@@ -108,14 +108,43 @@ class WeightBudget:
                 "pauseUntil": None,
                 "utilization": 0.0,
             }
+        window_from = int(row["window_from"])
         used = int(row["used"])
+        # 窗口已经滚动过一次，但还没有任何请求触发重置：此时行里的 used 是**上一个窗口**
+        # 的残留，直接报出去会让 `sync status` 显示一个早就过期的 100%。
+        # 「当前窗口的使用量」在窗口滚动后就是 0，直到下一次 reserve 写下新的窗口起点。
+        if self._clock_ms() - window_from >= WINDOW_MS:
+            used = 0
         return {
             "budgetPerMinute": self._budget,
-            "windowFrom": int(row["window_from"]),
+            "windowFrom": window_from,
             "used": used,
             "pauseUntil": int(row["pause_until"]) if row["pause_until"] is not None else None,
             "utilization": round(used / self._budget, 6),
         }
+
+    def observe_used_weight(self, used_weight: int) -> None:
+        """并入交易所回传的 ``X-MBX-USED-WEIGHT-1M``（只增不减）。
+
+        本地令牌桶记的是「**我们以为**自己用了多少」；交易所的响应头是**账号级**的权威值
+        （可能包含别的客户端或人工排查的消耗）。不读它，本地模型就会在漂移后继续以为
+        还有额度，AC-17 的「始终低于上限」也就只剩本地账本自说自话。
+
+        只增不减是刻意的保守方向：一次偏小的观测不会把计数拉回去。
+        """
+        if used_weight < 0:
+            return
+        with self._conn.transaction():
+            row = self._conn.execute(
+                "SELECT used FROM weight_budget WHERE id = 1 FOR UPDATE"
+            ).fetchone()
+            if row is None:
+                return
+            current = int(row["used"])
+            if used_weight > current:
+                self._conn.execute(
+                    "UPDATE weight_budget SET used = %s WHERE id = 1", (used_weight,)
+                )
 
     def _try_reserve(self, weight: int) -> tuple[bool, int]:
         """一次预留尝试，返回 ``(是否成功, 需等待毫秒)``。"""

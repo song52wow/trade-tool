@@ -23,6 +23,8 @@ export interface RunPythonOptions {
   cwd?: string;
   /** 额外环境变量。PG DSN 等敏感值只走这里，不进 argv。 */
   env?: NodeJS.ProcessEnv;
+  /** 覆盖 stdout 缓冲上限。摘要链路用默认的小上限；系列链路按 bar 数放大。 */
+  maxBufferBytes?: number;
 }
 
 const DEFAULT_TIMEOUT_MS = 60_000;
@@ -34,8 +36,31 @@ const DEFAULT_TIMEOUT_MS = 60_000;
  */
 const PYTHON_ERROR_PREFIX = 'QUANT_DATA_ERROR ';
 
-/** maxBuffer 现在只承载**小摘要**（行数 / 时间范围 / 状态码），不再是数据量的约束（R-2.2）。 */
+/**
+ * maxBuffer 对**摘要链路**（sync / backfill / verify / symbols / resolve / estimate）而言
+ * 只承载小摘要，不再是数据量的约束（R-2.2）。
+ */
 const SUMMARY_BUFFER_BYTES = 4 * 1024 * 1024;
+
+/**
+ * **系列链路**（`generate`）的 stdout 上限。
+ *
+ * 与摘要链路分开是有原因的：R-2.1 禁止的是**K 线数据**经 stdout 传输，
+ * 而 `generate` 是既有���**确定性合成源**，它的 bars 本来就经 stdout 回给 TS
+ * （AC-29 要求这条离线链路不得回归）。把它塞进 4MiB 的摘要上限会导致
+ * `--bars` 在约 3 万根处硬失败——而 `config.market.bars` 允许到 10 万，
+ * 也就是「schema 认定合法的入参在运行期炸掉」，且被归成 INTERNAL_ERROR（违反「不静默兜底」）。
+ *
+ * 因此这里按请求的 bar 数给一个明确的预算，并且**越界时给出可读的 CONFIG_INVALID**
+ * 而不是 Node 的 maxBuffer 报错。
+ */
+const BYTES_PER_SERIES_BAR = 256;
+const MIN_SERIES_BUFFER_BYTES = SUMMARY_BUFFER_BYTES;
+
+/** 按 bar 数计算系列链路需要的 stdout 预算（留 2 倍余量覆盖 JSON 结构开销）。 */
+export function seriesBufferBytes(bars: number): number {
+  return Math.max(MIN_SERIES_BUFFER_BYTES, bars * BYTES_PER_SERIES_BAR * 2);
+}
 
 export interface PythonErrorPayload {
   code: string;
@@ -105,12 +130,13 @@ export interface PythonResult<T> {
 export async function runPython<T>(options: RunPythonOptions): Promise<PythonResult<T>> {
   const { file, args } = buildCommand(options);
   const cwd = options.cwd ?? findRepoRoot();
+  const maxBuffer = options.maxBufferBytes ?? SUMMARY_BUFFER_BYTES;
   log.debug(`spawn ${file} ${args.join(' ')}`);
   try {
     const { stdout } = await execFileAsync(file, args, {
       cwd,
       timeout: options.timeoutMs ?? DEFAULT_TIMEOUT_MS,
-      maxBuffer: SUMMARY_BUFFER_BYTES,
+      maxBuffer,
       env: { ...process.env, ...options.env },
     });
     return { value: JSON.parse(stdout) as T, stdout };
@@ -121,6 +147,14 @@ export async function runPython<T>(options: RunPythonOptions): Promise<PythonRes
 
     if (payload) {
       throw new SyncError(payload.code as SyncErrorCode, payload.message, payload.details ?? {});
+    }
+    if (err.code === 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER' || /maxBuffer/i.test(err.message)) {
+      // 越界要说清是什么、为什么、怎么办，而不是把 Node 的底层报错当 INTERNAL_ERROR 抛出去。
+      throw new SyncError(
+        'CONFIG_INVALID',
+        `python 子进程 stdout 超过上限（${maxBuffer} 字节）：${file} ${args.join(' ')}`,
+        { argv: args, maxBufferBytes: maxBuffer },
+      );
     }
     if (err.code === 'ETIMEDOUT' || err.code === 'SIGTERM') {
       throw new SyncError(

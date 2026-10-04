@@ -72,6 +72,19 @@ function printState(state: SymbolSyncState): void {
     `已验证 ${state.verifiedUpTo === null ? '-' : new Date(state.verifiedUpTo).toISOString()}`,
     `${state.rows.toLocaleString('en-US')} 行`,
   ];
+  // R-8.3 / R-8.6：首次全量的规模（决策依据）与进度（已入库 / 目标）。
+  // 只在计划存在时打印——已有历史的标的本就没有「首次全量规模」。
+  if (state.plan) {
+    const done = state.rows >= state.plan.bars;
+    parts.push(
+      `首拉计划 约 ${state.plan.bars.toLocaleString('en-US')} 根 / ` +
+        `${state.plan.requests.toLocaleString('en-US')} 次请求 / ` +
+        `约 ${Math.max(1, Math.round(state.plan.estimatedMs / 60_000))} 分钟` +
+        (done
+          ? '（已完成）'
+          : `  进度 ${state.rows.toLocaleString('en-US')}/${state.plan.bars.toLocaleString('en-US')}`),
+    );
+  }
   if (state.pendingGaps > 0) parts.push(`缺口 ${state.pendingGaps}`);
   if (state.lastError) parts.push(`错误 ${state.lastError}`);
   console.log(parts.join('  '));

@@ -14,7 +14,17 @@ export async function runMigrate(options: { json?: boolean } = {}): Promise<numb
     const result: MigrateResult = await migrate(pool);
     if (options.json) {
       console.log(JSON.stringify(result, null, 2));
-      return 0;
+      return result.current === result.latest ? 0 : 1;
+    }
+    // 「库比代码新」必须报错（R-1.3 / R-19.7）。只看 `applied.length === 0` 会把它
+    // 误报成「已是最新」：例如库里已应用 999_future 而代码只到 001_init，migrate 无事可做，
+    // 于是 exit 0，直到某条命令按旧 schema 静默跑崩。
+    if (result.current !== result.latest) {
+      console.error(
+        `[SCHEMA_VERSION_MISMATCH] 数据库 schema（${result.current || '<空>'}）` +
+          `与代码（${result.latest}）不一致：请更新迁移文件与两侧读写代码。`,
+      );
+      return 1;
     }
     if (result.applied.length === 0) {
       console.log(`数据库 schema 已是最新（${result.current}），无变更。`);

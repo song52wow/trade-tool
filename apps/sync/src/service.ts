@@ -30,6 +30,10 @@ export function createSyncService(ctx: MarketContext, options: SyncServiceOption
   const primitives = new SyncControl(ctx, { config: options.config, exchange: options.exchange });
   const daemon = new SyncDaemon(ctx, {
     config: options.config,
+    // **共享同一个控制原语实例**：否则控制面拿到的 primitives 与守护进程内部的是两份
+    // 实例私有的运行时槽位，addSymbol 的并发守卫成死代码、resume() 也清不掉守护进程的退避，
+    // 显式恢复要等最长 backoffMaxMs（默认 5 分钟）才生效（R-21.3 / R-22）。
+    control: primitives,
     ...(options.now ? { now: options.now } : {}),
     ...(options.sleep ? { sleep: options.sleep } : {}),
   });

@@ -363,18 +363,9 @@ describe('缺口检测与自动回补（R-11 / AC-7 / AC-32）', () => {
     ]);
     expect((await watermark(ctx.pool, 'TESTAAAUSDC')).rows).toBe(before.length - victim.length);
 
-    // 轮次语义（R-11.B.6）：缺口检测在**本轮末尾**进行，本轮只负责登记；
-    // 「优先回补已登记的缺口」发生在**下一轮**开头。所以这里需要两轮。
-    const detect = await syncSymbol(market, 'TESTAAAUSDC', { nowMs: NOW });
-    expect(detect.gapsPending).toBe(1);
-    expect(detect.gapsFilled).toBe(0);
-    const registered = await getGaps(market, 'TESTAAAUSDC');
-    expect(registered).toHaveLength(1);
-    // 删掉的就是 [t0, t0+4m] 这 5 根本身，因此缺口闭区间就是它们的首尾
-    expect(registered[0]?.missingRows).toBe(victim.length);
-    expect(registered[0]?.gapStart).toBe(victim[0]?.time);
-    expect(registered[0]?.gapEnd).toBe(victim[victim.length - 1]?.time);
-
+    // 轮次语义（★AC-7）：「下一轮 data sync 自动把缺口补回，gaps 表记录被清除」,
+    // 因此一轮之内必须走完「检测 → 回补 → 清除登记」，
+    // 不能只登记就返回、把修复推到再下一轮。
     const repair = await syncSymbol(market, 'TESTAAAUSDC', { nowMs: NOW });
     expect(repair.gapsFilled).toBe(1);
     expect(repair.gapsPending).toBe(0);
@@ -397,9 +388,15 @@ describe('缺口检测与自动回补（R-11 / AC-7 / AC-32）', () => {
       victim[victim.length - 1]?.time,
     ]);
 
-    // 第一轮：交易所正常 → 缺口被检测并登记
-    const detect = await syncSymbol(market, 'TESTAAAUSDC', { nowMs: NOW });
+    // 第一轮：缺口被检测并登记。
+    // 这里刻意关掉回补：交易所此刻还是好的，若允许回补则缺口会在**同一轮**就被补掉（★AC-7），
+    // 后面「交易所持续失败 → 永远补不上」的前提就不成立了。
+    const detect = await syncSymbol(market, 'TESTAAAUSDC', {
+      nowMs: NOW,
+      allowBackfill: false,
+    });
     expect(detect.gapsPending).toBe(1);
+    expect(detect.gapsFilled).toBe(0);
 
     // 此后交易所对该标的持续失败 → 缺口永远补不上
     exchange.failKlines('TESTAAAUSDC', {
@@ -468,8 +465,10 @@ describe('缺口检测与自动回补（R-11 / AC-7 / AC-32）', () => {
       'TESTAAAUSDC',
       nearVictim,
     ]);
+    // 一轮之内「检出并补回」（★AC-7）：pending 归零、filled 为 1。
     const nearRound = await syncSymbol(market, 'TESTAAAUSDC', { nowMs: NOW });
-    expect(nearRound.gapsPending).toBe(1);
+    expect(nearRound.gapsFilled).toBe(1);
+    expect(nearRound.gapsPending).toBe(0);
 
     // ③ 窗口外（20 天前，超出 7 天默认回看）的缺口：例行轮次**不**检出
     const farVictim = maxTime - 20 * DAY;
@@ -478,9 +477,9 @@ describe('缺口检测与自动回补（R-11 / AC-7 / AC-32）', () => {
       farVictim,
     ]);
     const farRound = await syncSymbol(market, 'TESTAAAUSDC', { nowMs: NOW });
-    // 上一轮登记的近端缺口已在本轮开头被回补，所以 pending 归零
+    // 近端缺口已在上一轮当场补完，本轮例行扫描又回看不到远端那个洞 → 本轮无事可做
     expect(farRound.gapsPending).toBe(0);
-    expect(farRound.gapsFilled).toBe(1);
+    expect(farRound.gapsFilled).toBe(0);
     // 20 天前那个洞仍在库里 —— 例行扫描没有回看到那么远，成本因此有界
     const stillMissing = await ctx.pool.query<{ n: string }>(
       'SELECT count(*)::bigint AS n FROM klines_1m WHERE symbol = $1 AND time = $2',

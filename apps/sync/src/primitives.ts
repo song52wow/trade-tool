@@ -1,4 +1,5 @@
 import {
+  createLogger,
   SyncError,
   type GapRecord,
   type RemovePolicy,
@@ -10,6 +11,7 @@ import {
 } from '@trade-tool/core';
 import {
   ensureSyncState,
+  estimateFirstPull,
   getAllStates,
   getGaps,
   getState,
@@ -18,9 +20,11 @@ import {
   removeSymbolEntry,
   requireContract,
   setDesiredState,
+  setSyncPlan,
   setSyncStatus,
   syncSymbol,
   upsertSymbolEntry,
+  watermark,
   type MarketContext,
 } from '@trade-tool/data';
 
@@ -78,6 +82,11 @@ export interface ControlPrimitives {
 /**
  * 需要控制面显式人工介入的错误（R-21.5）：不得自动重试掩盖，必须保持 error
  * 并在 lastError 中留下位置信息。
+ *
+ * 注意这里**不含** `SYNC_ALREADY_RUNNING`：它表示「同一标的已有另一轮在跑」
+ * （另一个守护进程、或运维手工执行 `data sync`），是完全良性且瞬时的并发结果。
+ * 把它当人工介入会因一次正常竞争就把该标的钉死成 error，而 `resume()` 之后
+ * 只要竞争仍在就会再次钉死——那是把可恢复的并发误报成故障（R-21.3 / R-21.5）。
  */
 const MANUAL_INTERVENTION_CODES = new Set([
   'GAP_ATTEMPTS_EXHAUSTED',
@@ -89,8 +98,9 @@ const MANUAL_INTERVENTION_CODES = new Set([
   'NOT_PERPETUAL',
   'NOT_TRADING',
   'SCHEMA_VERSION_MISMATCH',
-  'SYNC_ALREADY_RUNNING',
 ]);
+
+const log = createLogger('sync:control');
 
 /** PG 侧可恢复错误：有限重试即可（连接失败 / 死锁 / 事务回滚）。 */
 const RECOVERABLE_PG_CODES = new Set([
@@ -142,6 +152,14 @@ export class SyncControl implements ControlPrimitives {
       onboardDate: spec.onboardDate,
     });
     await ensureSyncState(this.ctx.pool, this.exchange, symbol, 'paused');
+    // R-8.3：常驻模式下新标的默认 paused，控制面要**先看到代价**才决定是否开启首次全量
+    //（一次全量是数百~上千次请求量级）。因此在开启之前就把规模预估写进 sync_state，
+    // 由 `sync status` 暴露；它同时是进度的分母（R-8.6）。
+    // 只有确实无历史的标的才需要计划：已有历史就是增量，没有「首次全量规模」。
+    if ((await watermark(this.ctx.pool, symbol)).maxTime === null) {
+      const plan = await estimateFirstPull(this.ctx, symbol);
+      await setSyncPlan(this.ctx.pool, this.exchange, symbol, plan);
+    }
     // 幂等：已经是目标状态则不重复写（R-18.5 / R-17.2）。
     if (options.start) await this.start(symbol);
     return (await this.listSymbols()).find((item) => item.symbol === symbol) ?? entry;
@@ -159,10 +177,12 @@ export class SyncControl implements ControlPrimitives {
     // 立即停止该标的的调度；暂停不删除任何数据（R-17.5）。
     const slot = this.slot(symbol);
     slot.backoffUntil = null;
+    slot.consecutiveErrors = 0;
+    // 状态写失败不能吞：吞掉的话控制面会看到一个「已移除却仍是 running」的标的（R-19 / 不静默兜底）。
     await setSyncStatus(this.ctx.pool, this.exchange, symbol, {
       status: 'paused',
       lastError: null,
-    }).catch(() => null);
+    });
     return { symbol, policy, deletedRows: result.deletedRows };
   }
 
@@ -172,9 +192,16 @@ export class SyncControl implements ControlPrimitives {
 
   // -------------------------------------------------------------- 生命周期
 
-  /** 开启：paused → running。幂等；已 running 则直接返回当前状态（R-17.2）。 */
+  /**
+   * 开启：paused → running。幂等；已 running 则直接返回当前状态（R-17.2）。
+   *
+   * 标的必须**已在集合内**：否则 ``ensureSyncState`` 会凭空造出一行 ``sync_state``，
+   * 而 ``setDesiredState`` 因为集合里没有它而更新 0 行——于是控制面收到一个
+   * 「running」的返回，但 ``desired_state`` 是 NULL、daemon 永远不会调度它，
+   * 汇总里却一直把它算作 running（R-18.4 / R-19.8）。
+   */
   async start(symbol: string): Promise<SymbolSyncState> {
-    await ensureSyncState(this.ctx.pool, this.exchange, symbol, 'paused');
+    await this.requireMembership(symbol);
     await setDesiredState(this.ctx.pool, this.exchange, symbol, 'running');
     // 先落库再生效（R-17.3）：跨进程的控制面立即就能看到 running。
     return this.markRunning(symbol);
@@ -182,6 +209,7 @@ export class SyncControl implements ControlPrimitives {
 
   /** 暂停：running → paused。幂等。**不删除任何数据**（R-17.5）。 */
   async pause(symbol: string): Promise<SymbolSyncState> {
+    await this.requireMembership(symbol);
     await setDesiredState(this.ctx.pool, this.exchange, symbol, 'paused');
     return this.markPaused(symbol);
   }
@@ -191,12 +219,22 @@ export class SyncControl implements ControlPrimitives {
    * 连续失败达上限后进入 error 并**停止自动重试**，只能靠这里显式恢复。
    */
   async resume(symbol: string): Promise<SymbolSyncState> {
-    await ensureSyncState(this.ctx.pool, this.exchange, symbol, 'paused');
+    await this.requireMembership(symbol);
     await setDesiredState(this.ctx.pool, this.exchange, symbol, 'running');
     const slot = this.slot(symbol);
     slot.backoffUntil = null;
     slot.consecutiveErrors = 0;
     return this.markRunning(symbol);
+  }
+
+  /** 标的必须在集合内，否则报结构化的 SYMBOL_NOT_FOUND（R-18.4 / R-22.4）。 */
+  private async requireMembership(symbol: string): Promise<void> {
+    const entries = await this.listSymbols();
+    if (!entries.some((entry) => entry.symbol === symbol)) {
+      throw new SyncError('SYMBOL_NOT_FOUND', `标的 ${symbol} 不在集合中，请先 addSymbol`, {
+        symbol,
+      });
+    }
   }
 
   private async markRunning(symbol: string): Promise<SymbolSyncState> {
@@ -256,6 +294,20 @@ export class SyncControl implements ControlPrimitives {
   }
 
   /**
+   * 从持久化状态恢复运行时槽位（R-19.4 / R-21.2）。
+   * 调度判断只看内存槽位，因此重启后必须把 `backoff_until` 与 `error_count` 灌回来，
+   * 否则退避中的标的会被立刻重新调度、连续失败阈值也被清零。
+   */
+  restoreRuntimeSlot(
+    symbol: string,
+    values: { backoffUntil: number | null; consecutiveErrors: number },
+  ): void {
+    const slot = this.slot(symbol);
+    slot.backoffUntil = values.backoffUntil;
+    slot.consecutiveErrors = values.consecutiveErrors;
+  }
+
+  /**
    * 执行一轮同步。**单标的失败绝不抛出**——调用方（daemon）必须继续处理其它标的（R-21.1）。
    * 返回 null 表示成功，非 null 是结构化错误。
    */
@@ -264,6 +316,14 @@ export class SyncControl implements ControlPrimitives {
     if (slot.inflight) return null; // 同一标的同时只允许一个任务（R-3.3）
     slot.inflight = true;
     try {
+      // 本轮开始时控制面的意图。一轮首次全量可以跑好几分钟，期间完全可能 pause / removeSymbol；
+      // 没有这份快照就分不清「一直想跑」与「中途被叫停」（R-17.3 / AC-16）。
+      //
+      // **必须在 try 之内**：这一步会查库，查库失败（PG 抖动）若发生在 try 之外，
+      // `finally` 就不会执行——inflight 永久为 true（该标的此后永不被调度，
+      // 还永久占着一个并发名额），异常还会逃出 runOnce 把整个守护进程带走
+      //（R-14.4「单标的失败不得终止进程」/ R-21.1）。
+      const wantedAtStart = await this.stillWanted(symbol);
       await setSyncStatus(this.ctx.pool, this.exchange, symbol, {
         lastRunAt: nowMs,
         status: 'running',
@@ -271,8 +331,11 @@ export class SyncControl implements ControlPrimitives {
       await this.syncFn(symbol);
       slot.consecutiveErrors = 0;
       slot.backoffUntil = null;
+      // 收尾时若意图在本轮内被改掉（pause 或移出集合），就写 paused。
+      // 无条件写 running 会把暂停状态盖掉，造成「desired_state=paused 但 status=running」。
+      const wantedNow = await this.stillWanted(symbol);
       await setSyncStatus(this.ctx.pool, this.exchange, symbol, {
-        status: 'running',
+        status: wantedAtStart && !wantedNow ? 'paused' : 'running',
         lastError: null,
         errorCount: 0,
         backoffUntil: null,
@@ -284,6 +347,17 @@ export class SyncControl implements ControlPrimitives {
     } finally {
       slot.inflight = false;
     }
+  }
+
+  /**
+   * 该标的此刻是否仍「在集合内且期望 running」。
+   * 只用于**收尾**判断：一轮首次全量可以跑好几分钟，期间运维完全可能 pause 或 removeSymbol，
+   * 无条件写回 running 会把暂停状态盖掉，造成「desired_state=paused 但 status=running」的
+   * 自相矛盾（R-17.3 / AC-16）。
+   */
+  private async stillWanted(symbol: string): Promise<boolean> {
+    const entries = await this.listSymbols();
+    return entries.some((entry) => entry.symbol === symbol && entry.desiredState === 'running');
   }
 
   /**
@@ -302,10 +376,22 @@ export class SyncControl implements ControlPrimitives {
     slot.consecutiveErrors += 1;
 
     // PG 连接失败不消耗交易所配额，但需要退避重试（R-21.6）。
+    // 「有限重试」同样适用于这一支：持续死锁的标的不能以最长 5 分钟的退避永远重试，
+    // 那正是 R-21.6 要避免的形态——到阈值就进 error，停下等人工介入（R-21.3）。
     if (RECOVERABLE_PG_CODES.has(syncError.code)) {
+      if (slot.consecutiveErrors >= this.config.sync.maxConsecutiveErrors) {
+        slot.backoffUntil = null;
+        await this.writeStatusSafely(symbol, {
+          status: 'error',
+          lastError: syncError.message,
+          errorCount: slot.consecutiveErrors,
+          backoffUntil: null,
+        });
+        return syncError;
+      }
       const delay = this.backoffDelay(slot.consecutiveErrors);
       slot.backoffUntil = nowMs + delay;
-      await setSyncStatus(this.ctx.pool, this.exchange, symbol, {
+      await this.writeStatusSafely(symbol, {
         lastError: syncError.message,
         errorCount: slot.consecutiveErrors,
         backoffUntil: slot.backoffUntil,
@@ -317,7 +403,7 @@ export class SyncControl implements ControlPrimitives {
     const exhausted = MANUAL_INTERVENTION_CODES.has(syncError.code);
     if (exhausted || slot.consecutiveErrors >= this.config.sync.maxConsecutiveErrors) {
       slot.backoffUntil = null;
-      await setSyncStatus(this.ctx.pool, this.exchange, symbol, {
+      await this.writeStatusSafely(symbol, {
         status: 'error',
         lastError: syncError.message,
         errorCount: slot.consecutiveErrors,
@@ -328,12 +414,35 @@ export class SyncControl implements ControlPrimitives {
 
     const delay = this.backoffDelay(slot.consecutiveErrors);
     slot.backoffUntil = nowMs + delay;
-    await setSyncStatus(this.ctx.pool, this.exchange, symbol, {
+    await this.writeStatusSafely(symbol, {
       lastError: syncError.message,
       errorCount: slot.consecutiveErrors,
       backoffUntil: slot.backoffUntil,
     });
     return syncError;
+  }
+
+  /**
+   * 写失败状态，**永不抛出**。
+   *
+   * 原因：handleFailure 是 runOnce 的收尾路径，而 runOnce 向 daemon 承诺
+   * 「单标的失败绝不抛出」（R-21.1）。如果这里再抛（比如 PG 恰好也挂了），
+   * 异常会从 runOnce 逃到 worker → `Promise.all` → `tick()` → `loop()`，
+   * 最终以 unhandled rejection 直接杀掉守护进程——单标的的状态写失败
+   * 不该有这种后果。写不进去就记录，状态由下一轮或控制面修正。
+   */
+  private async writeStatusSafely(
+    symbol: string,
+    patch: Parameters<typeof setSyncStatus>[3],
+  ): Promise<void> {
+    try {
+      await setSyncStatus(this.ctx.pool, this.exchange, symbol, patch);
+    } catch (error) {
+      log.error(
+        `${symbol} 同步状态写库失败（本轮已按失败处理，状态待下一轮修正）：` +
+          `${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
   }
 
   /** 指数退避 + 上限（R-21.2）。 */

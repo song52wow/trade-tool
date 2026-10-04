@@ -27,20 +27,28 @@ export interface MigrateResult {
   latest: string;
 }
 
-/** bootstrap：迁移文件自己会建表，但记录版本必须先有地方存。 */
-const BOOTSTRAP = `
-CREATE TABLE IF NOT EXISTS schema_migrations (
-    version    text PRIMARY KEY,
-    applied_at bigint NOT NULL
-)`;
-
 function newest(migrations: readonly MigrationFile[]): string {
   const last = migrations[migrations.length - 1];
   if (!last) throw new SyncError('CONFIG_INVALID', '迁移目录中没有任何 .sql 文件');
   return last.version;
 }
 
+/**
+ * 表不存在时按「一个版本都没应用」处理。
+ *
+ * `schema_migrations` 的 DDL **只在 `sql/*.sql` 里**（R-2.5：迁移文件是 schema 的唯一来源），
+ * 本模块不再内联一份影子定义——否则日后改了 SQL 而忘了这里，两处会静默漂移。
+ * 代价是首次迁移前这张表确实不存在，此时 to_regclass 返回 NULL，按空集合处理即可。
+ */
+async function schemaTableExists(client: PoolClient): Promise<boolean> {
+  const result = await client.query<{ reg: string | null }>(
+    `SELECT to_regclass('schema_migrations')::text AS reg`,
+  );
+  return result.rows[0]?.reg != null;
+}
+
 async function appliedVersions(client: PoolClient): Promise<Set<string>> {
+  if (!(await schemaTableExists(client))) return new Set();
   const result = await client.query<{ version: string }>('SELECT version FROM schema_migrations');
   return new Set(result.rows.map((row) => row.version));
 }
@@ -54,7 +62,6 @@ export async function migrate(pool: Pool, options: MigrateOptions = {}): Promise
 
   const client = await pool.connect();
   try {
-    await client.query(BOOTSTRAP);
     const already = await appliedVersions(client);
     const applied: string[] = [];
     const skipped: string[] = [];
@@ -94,6 +101,7 @@ export async function migrate(pool: Pool, options: MigrateOptions = {}): Promise
 }
 
 async function currentVersion(client: PoolClient): Promise<string> {
+  if (!(await schemaTableExists(client))) return '';
   const result = await client.query<{ version: string | null }>(
     'SELECT max(version) AS version FROM schema_migrations',
   );
@@ -123,7 +131,6 @@ export async function schemaStatus(
   const known = migrations.map((m) => m.version);
   const client = await pool.connect();
   try {
-    await client.query(BOOTSTRAP);
     const applied = [...(await appliedVersions(client))].sort();
     const appliedSet = new Set(applied);
     const knownSet = new Set(known);

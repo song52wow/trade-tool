@@ -26,14 +26,16 @@ trade-tool/
 ## 依赖方向
 
 ```
-apps/cli ──> packages/backtest ──┐
-    │            └──────────────> packages/core <── packages/data <── python/quant-*
-    ├──> packages/data ──────────┘            ↑
-    └──> apps/sync ───────────────────────────┘
+apps/cli ──┬─> packages/backtest ──> packages/core
+           └─> packages/data ───────> packages/core
+apps/sync ────> packages/data ───────> packages/core
+                      │
+                      └─(唯一跨语言接缝: python -m quant_data)─> python/quant-*
 ```
 
 规则：`core` 不依赖任何 workspace 包；包之间只依赖 `core`；跨语言只允许从 `packages/data` 出去；
 `apps/sync` **不得**绕过 `packages/data` 直接连 PG 写入。
+`apps/cli` 与 `apps/sync` 是**两个独立入口**，彼此不依赖（CLI 只读 `sync status`，不改生命周期）。
 
 ## 环境要求
 
@@ -76,6 +78,15 @@ trade-tool sync status --json                          # 同步状态与全局�
 `start` / `pause` / `resume` / `getStatus` / `getSummary`），全部幂等、类型完整、不依赖 HTTP 框架，
 供控制面直接 `import`。生命周期变更**不走 CLI**，走这套原语。
 
+配置里的标的集合支持两种写法——纯字符串（默认 `paused`）或显式给出每标的期望状态：
+
+```jsonc
+{ "sync": { "symbols": ["SOLUSDC", { "symbol": "DOGEUSDC", "desiredState": "running" }] } }
+```
+
+新增标的默认 `paused`（R-8.4），规模预估会在**开启之前**写进 `sync_state`，
+由 `sync status` 暴露，控制面据此决定要不要开始首次全量。
+
 ```ts
 import { createSyncServiceFromConfig } from '@trade-tool/sync';
 
@@ -106,6 +117,8 @@ TS 与 Python 通过 `packages/data/src/bridge.ts` 交互。**v0.1.0 起，跨�
 1. Python 模块通过 `-m` 启动，因此 `src/quant_x/__main__.py` 必须存在。
 2. **K 线数据只经 PostgreSQL 传输，不经 stdout**。桥接只传控制信息：命令、参数、结果摘要
    （行数、时间范围、状态码）。因此 `maxBuffer` 不再是数据量的约束。
+   唯一例外是既有的 `generate`（**离线合成源**）：它的 bars 本来就经 stdout 回给 TS，
+   AC-29 要求这条链路不得回归，因此 `bridge.ts` 给它单独的、按 bar 数放大的 stdout 预算。
 3. 成功时 stdout = 单个 JSON 文档（就是那份摘要），日志一律走 stderr；不允许 `NaN` / `Infinity`。
 4. 失败时退出码非 0，且 **stderr 最后一行**固定为
    `QUANT_DATA_ERROR {"code":"...","message":"...","details":{...}}`，错误码与 TS 侧 `SyncErrorCode` 一一对应。
@@ -120,6 +133,10 @@ TS 与 Python 通过 `packages/data/src/bridge.ts` 交互。**v0.1.0 起，跨�
 
 ## 当前状态
 
-- **真实行情**：Binance USDⓈ-M 永续 1m K 线已接入 PostgreSQL，标的全部运行时解析，无任何硬编码。
+- **真实行情**：Binance USDⓈ-M 永续 1m K 线已接入 PostgreSQL。**同步链路的标的全部运行时解析**，
+  没有任何标的白名单或按标的的特例逻辑；`onboardDate` / `contractType` / `status` 一律来自
+  `exchangeInfo`（R-5 / R-7）。
+  默认配置里的 `market.symbol`（`BTCUSDT`）只服务**离线合成源与回测**，同步链路不读它——
+  `data sync` 必须显式给 `--symbol`。
 - **离线链路仍在**：`source: 'synthetic'` 走 `generate_series`，默认行为与既有测试不变。
 - 回测为单标的、单持仓、收盘成交模型，扣双边手续费与滑点。

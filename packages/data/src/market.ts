@@ -125,6 +125,9 @@ export async function listExchangeSymbols(
   options: { refresh?: boolean } = {},
 ): Promise<ListSymbolsResult> {
   return invoke<ListSymbolsResult>(ctx, {
+    // exchangeInfo 也是出网请求，必须经过同一个全局限速器（R-20.2）。
+    // 不注入 DSN 时 Python 侧拿不到配额桶，`symbols` / `resolve` 会绕开限速器直连交易所。
+    withDsn: true,
     args: [
       'symbols',
       ...baseArgs(ctx),
@@ -137,6 +140,8 @@ export async function listExchangeSymbols(
 /** 精确匹配 + 校验标的（R-7.2）。失败抛带错误码的 SyncError。 */
 export async function resolveContract(ctx: MarketContext, symbol: string): Promise<ExchangeSymbol> {
   return invoke<ExchangeSymbol>(ctx, {
+    // addSymbol 的元数据校验走的就是这里，同样要过限速器（R-20.2）。
+    withDsn: true,
     args: ['resolve', ...baseArgs(ctx), '--symbol', symbol, ...metadataArgs(ctx)],
   });
 }
@@ -148,6 +153,9 @@ export async function estimateFirstPull(
   options: { nowMs?: number } = {},
 ): Promise<SyncPlanEstimate> {
   return invoke<SyncPlanEstimate>(ctx, {
+    // 刻意**不注入** DSN：R-8.3 要求规模预估不需要数据库，
+    // 这样在还没有迁移过的库上也能先算给人看。代价是这一次 exchangeInfo 不经限速器，
+    // 但它有进程内单例 + 1 小时 TTL，暴露面可以忽略。
     args: [
       'estimate',
       ...baseArgs(ctx),
@@ -252,6 +260,7 @@ export interface VerifyResult {
 
 /** 全表缺口扫描并重建 verified_upto 基线（R-11.A3 ② / R-15）。 */
 export async function verifySymbol(ctx: MarketContext, symbol: string): Promise<VerifyResult> {
+  // 与 syncSymbol / backfillRange 一致：数据命令进入前先过版本闸门（R-1.3 / R-19.7）。
   const { assertSchemaVersion } = await import('./db/migrate.js');
   await assertSchemaVersion(ctx.pool);
   return invoke<VerifyResult>(ctx, {
@@ -270,7 +279,9 @@ export async function getState(
 }
 
 export async function getAllStates(ctx: MarketContext): Promise<SymbolSyncState[]> {
-  return repo.listStates(ctx.pool);
+  // 按 exchange 过滤：全局汇总是按 exchange 统计的，不过滤会让 `sync status`
+  // 列出的标的数与汇总数出自两个不同的总体。
+  return repo.listStates(ctx.pool, ctx.exchange);
 }
 
 export async function getGaps(ctx: MarketContext, symbol?: string) {
