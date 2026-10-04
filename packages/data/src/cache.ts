@@ -1,5 +1,5 @@
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
-import { resolve } from 'node:path';
+import { isAbsolute, resolve } from 'node:path';
 
 import { resolveHome } from '@trade-tool/core';
 
@@ -11,9 +11,17 @@ export interface CacheEntry<T> {
   value: T;
 }
 
+/**
+ * 缓存目录。传入的**相对**路径按 `TRADE_TOOL_HOME` 解析，与 `rawDir` / `metaDir` /
+ * `reports` 同一套约定；绝对路径原样使用。
+ *
+ * 之前这里按 `process.cwd()` 解析相对路径，于是同一个 cacheDir 在
+ * `pnpm --filter … start`（cwd = apps/cli）与仓库根直跑之间会落到两个不同目录，
+ * `TRADE_TOOL_HOME` 对缓存也完全失效——看起来像缓存失效的重复下载。
+ */
 function cacheRoot(dir?: string): string {
-  if (dir) return resolve(process.cwd(), dir);
-  return resolve(resolveHome(), 'data', 'cache');
+  if (!dir) return resolve(resolveHome(), 'data', 'cache');
+  return isAbsolute(dir) ? dir : resolve(resolveHome(), dir);
 }
 
 function cacheFile(key: string, dir?: string): string {
