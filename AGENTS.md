@@ -12,7 +12,17 @@
 ```bash
 pnpm install     # TS 依赖（Node >= 22, pnpm >= 11）
 pnpm py:sync     # Python 依赖（uv >= 0.11）
+cp .env.example .env   # 项目内配置：TRADE_TOOL_HOME + TRADE_TOOL_PG_PASSWORD
+docker compose up -d   # PostgreSQL 16，变量取自 .env
 ```
+
+`pnpm` 必须与 `package.json` 的 `packageManager` 字段一致，否则在仓库内**任何** pnpm 命令都会
+以 `Cannot verify the identity of the @pnpm/exe…` 失败（`pnpm -v` 也不例外）。
+
+本机配置与密码一律走仓库根的 `.env`，**不要让用户往 shell 里 export**。`apps/cli` 与
+`apps/sync` 的入口第一行调 `loadProjectEnv()`（`packages/core/src/env.ts`），因此
+凡是新增的、需要在运行期读到的环境变量，只要写进 `.env.example` 并在入口之前加载即可；
+`bridge.ts` 透传 `process.env`，Python 子进程自动继承。已存在的环境变量不被 `.env` 覆盖。
 
 pnpm 11 会在安装时拦截依赖的构建脚本。当前只有 `esbuild` 被批准（见 `pnpm-workspace.yaml` 的
 `allowBuilds`）。**新增带 postinstall 的依赖时，不要用 `--ignore-scripts` 绕过**，
@@ -62,7 +72,8 @@ pnpm check      # = build + TS 测试 + Python 测试
 ## 测试用 PostgreSQL
 
 `packages/data` 与 `apps/sync` 的测试需要一个可重复的 PG（默认 `127.0.0.1:5432/trade_tool`，
-密码 `trade`）。每个用例跑在**随机命名的独立 schema** 上，从空库执行迁移，结束时整段
+密码 `trade`）——`docker compose up -d` 起的库正好就是这套默认值，测试不需要额外环境变量。
+每个用例跑在**随机命名的独立 schema** 上，从空库执行迁移，结束时整段
 `DROP SCHEMA … CASCADE`——测试**不得连生产库**。
 
 需要真实交易所的用例用 `tests/helpers/mock-exchange.ts` 起一个本地假 HTTP 服务器，

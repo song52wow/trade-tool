@@ -1,8 +1,11 @@
 #!/usr/bin/env node
-import { loadConfigOrDefault, normalizeSyncSymbols } from '@trade-tool/core';
+import { loadConfigOrDefault, loadProjectEnv, normalizeSyncSymbols } from '@trade-tool/core';
 import { buildContext, createPool } from '@trade-tool/data';
 
 import { createSyncService } from './service.js';
+
+// 必须在 loadConfigOrDefault / createPool 之前：配置路径与数据库密码都从环境变量来。
+loadProjectEnv();
 
 /**
  * 守护进程入口。

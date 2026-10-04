@@ -1,0 +1,37 @@
+# 本地开发依赖：PostgreSQL 16。K 线只经 PostgreSQL 传输（AGENTS.md 硬性约定 2），
+# 所以 db migrate / data fetch / data sync / 全部 TS 与 Python 测试都以它为前提。
+#
+# 变量从仓库根的 .env 自动读取（compose 的默认行为），密码因此只有一处来源。
+# 应用侧无需再 export：apps/cli 与 apps/sync 启动时会加载同一个 .env。
+#
+#   docker compose up -d      # 起库
+#   docker compose ps         # 看健康状态
+#   docker compose down       # 停库（保留数据卷）
+
+services:
+  postgres:
+    image: postgres:16
+    container_name: trade-tool-pg
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${TRADE_TOOL_PG_USER:-trade}
+      POSTGRES_PASSWORD: ${TRADE_TOOL_PG_PASSWORD:-trade}
+      POSTGRES_DB: ${TRADE_TOOL_PG_DATABASE:-trade_tool}
+    ports:
+      # 只绑 127.0.0.1：数据库是本机开发依赖，不该暴露到局域网。
+      - '127.0.0.1:${TRADE_TOOL_PG_PORT:-5432}:5432'
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - pg_isready -U ${TRADE_TOOL_PG_USER:-trade} -d ${TRADE_TOOL_PG_DATABASE:-trade_tool}
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 10s
+
+volumes:
+  pgdata:
+    # 固定卷名，便于手工 docker run 起的同名库与 compose 之间交接。
+    name: trade-tool-pgdata

@@ -20,6 +20,9 @@ python/dist/
 .env
 .env.*
 !.env.example
+# TRADE_TOOL_HOME 指向的工作根目录（见 .env.example）：配置文件与各类数据都落在这里。
+# 整段忽略，避免 trade-tool.config.json 这类本机状态混进 git status。
+.local/
 # 注意：`data/cache/`（不带前导 **/）会被 git 视为相对仓库根锚定，
 # 匹配不到 `apps/cli/data/cache` 这类嵌套位置。缓存目录可由代码随时重新生成，
 # 因此这里用 `**/` 显式覆盖任意层级。

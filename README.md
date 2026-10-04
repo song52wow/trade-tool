@@ -41,7 +41,23 @@ apps/sync ────> packages/data ───────> packages/core
 
 Node >= 22、pnpm >= 11、uv >= 0.11、PostgreSQL >= 16。运行 `pnpm --filter @trade-tool/cli start -- doctor` 自检。
 
-数据库密码**只经环境变量注入**，不写进配置文件：
+配置与密码都放在**项目内的 `.env`**，不需要往 shell 里 export：
+
+```bash
+cp .env.example .env      # 按本机情况改，主要是 TRADE_TOOL_HOME 与 TRADE_TOOL_PG_PASSWORD
+```
+
+`.env` 已被 `.gitignore` 忽略，`.env.example` 是入库的模板。`apps/cli` 与 `apps/sync`
+启动时会自动加载仓库根的 `.env`（`packages/core` 的 `loadProjectEnv()`，底层是 Node 内置的
+`process.loadEnvFile`），因此连同 Python 子进程（`bridge.ts` 透传 `process.env`）都能拿到密码。
+**已存在的环境变量不会被 `.env` 覆盖**，CI 与生产注入的值始终优先。
+
+`TRADE_TOOL_HOME` 是工作根目录：配置文件、`data/cache`、`data/raw`、`data/meta`、
+`reports/` 全部相对它解析。它必须是**绝对路径**——相对路径按进程 cwd 解析，而
+`pnpm --filter … start` 的 cwd 是 `apps/cli`，直跑 `dist` 又是仓库根。
+
+数据库密码**只经环境变量注入**，不写进配置文件（`config init` 生成的 JSON 里写
+`database.password` 会被直接拒绝）：
 
 ```bash
 export TRADE_TOOL_PG_PASSWORD=...        # 变量名可由 database.passwordEnv 改
@@ -53,6 +69,9 @@ export TRADE_TOOL_PG_PASSWORD=...        # 变量名可由 database.passwordEnv 
 pnpm install          # 装 TS 依赖
 pnpm py:sync          # 装 Python 依赖（uv）
 pnpm build            # turbo 构建全部 TS 包
+cp .env.example .env  # 项目内配置，见上
+
+docker compose up -d  # PostgreSQL 16（变量取自 .env，与应用同源）
 
 pnpm --filter @trade-tool/cli start -- config init
 pnpm --filter @trade-tool/cli start -- db migrate        # 迁移（幂等）
@@ -60,7 +79,22 @@ pnpm --filter @trade-tool/cli start -- data fetch -b 500 # 离线合成数据
 pnpm --filter @trade-tool/cli start -- backtest -b 500
 ```
 
-行情缓存在 `data/cache/`，回测报告在 `reports/`。K 线本体存在 PostgreSQL 的 `klines_1m` 表里。
+行情缓存在 `$TRADE_TOOL_HOME/data/cache/`，回测报告在 `$TRADE_TOOL_HOME/reports/`。
+K 线本体存在 PostgreSQL 的 `klines_1m` 表里。
+
+## 本地数据库（docker compose）
+
+`compose.yaml` 只定义一个 `postgres:16` 服务，变量从 `.env` 自动读取——密码因此只有一处来源，
+应用侧不用再 export。它只绑 `127.0.0.1`，数据落在命名卷 `trade-tool-pgdata`。
+
+```bash
+docker compose up -d      # 起库（首次会拉镜像）
+docker compose ps         # 等 STATUS 变成 healthy
+docker compose down       # 停库，保留数据卷
+```
+
+本机没有 Docker Desktop 时用 colima（本仓库的 docker context 指向它）：`colima start`
+之后容器带 `restart: unless-stopped`，colima 起来时会自动恢复。
 
 ## 常驻同步（v0.1.0）
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { createLogger, isSyncError } from '@trade-tool/core';
+import { createLogger, isSyncError, loadProjectEnv } from '@trade-tool/core';
 import { Command } from 'commander';
 
 import { runBacktestCommand } from './commands/backtest.js';
@@ -16,6 +16,10 @@ import {
 import { runDbStatus, runMigrate } from './commands/db.js';
 import { runSyncStatus } from './commands/sync.js';
 import { collectDiagnostics } from './doctor.js';
+
+// 必须在任何读取 process.env 的代码之前：配置路径（TRADE_TOOL_HOME）与数据库密码
+// 都从环境变量来，入口不加载 .env 就只能靠 shell export（loadProjectEnv 不覆盖已存在的变量）。
+loadProjectEnv();
 
 const log = createLogger('cli');
 
