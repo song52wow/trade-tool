@@ -1,4 +1,4 @@
-import type { RemovePolicy } from '@trade-tool/core';
+import type { RemovePolicy, SyncPlanEstimate } from '@trade-tool/core';
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 
 import { ApiError, api } from './api.js';
@@ -16,8 +16,12 @@ const REFRESH_MS = 5_000;
 type Toast = { id: number; text: string; kind: 'ok' | 'err' };
 
 type Pending =
-  /** 首次全量：先算规模再确认（R-8.3 硬约束），确认后只写意图，由守护进程执行 */
-  | { kind: 'startFirstPull'; symbol: string; target: number }
+  /**
+   * 首次全量：先算规模再确认（R-8.3 硬约束），确认后只写意图，由守护进程执行。
+   * 存整个 `estimate` 而不是只存 `bars`：请求数 / 权重 / 耗时都是**服务端算出来的**，
+   * 页面自己按 1500 与 1920 重算一遍等于把同一套规则维护两份，改一处就会悄悄对不上。
+   */
+  | { kind: 'startFirstPull'; symbol: string; estimate: SyncPlanEstimate }
   /** 守护进程不在线：意图会记录但不会拉数据，必须说清楚再让用户决定 */
   | { kind: 'startOffline'; symbol: string }
   | { kind: 'verify'; symbol: string }
@@ -176,7 +180,7 @@ export function App() {
         setBusy(symbol);
         try {
           const estimate = await api.estimate(symbol);
-          setPending({ kind: 'startFirstPull', symbol, target: estimate.bars });
+          setPending({ kind: 'startFirstPull', symbol, estimate });
         } catch (error) {
           report(error);
         } finally {
@@ -487,7 +491,7 @@ export function App() {
           <div className="est-grid">
             <div className="card">
               <div className="label">目标行数</div>
-              <div className="value">{fmtNumber(pending.target)}</div>
+              <div className="value">{fmtNumber(pending.estimate.bars)}</div>
             </div>
             <div className="card">
               <div className="label">已入库</div>
@@ -496,13 +500,15 @@ export function App() {
               </div>
             </div>
             <div className="card">
-              <div className="label">按 1500 根/请求</div>
-              <div className="value">{fmtNumber(Math.ceil(pending.target / 1500))} 次</div>
+              <div className="label">预计请求数</div>
+              <div className="value">{fmtNumber(pending.estimate.requests)} 次</div>
             </div>
             <div className="card">
-              <div className="label">按 1920 权重/分钟</div>
+              {/* 权重与耗时都直接取服务端的估算值：单位换算（权重 → 毫秒）是后端的事，
+                  在这里再算一遍只会引入一份会漂移的副本。 */}
+              <div className="label">预计权重 / 耗时</div>
               <div className="value">
-                {fmtDuration((Math.ceil(pending.target / 1500) * 10 * 1000) / 1920)}
+                {fmtNumber(pending.estimate.weight)} · {fmtDuration(pending.estimate.estimatedMs)}
               </div>
             </div>
           </div>

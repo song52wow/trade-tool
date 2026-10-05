@@ -9,7 +9,7 @@ import { SyncError } from '@trade-tool/core';
 export const DEFAULT_BAR_LIMIT = 300;
 
 /**
- * 单次取数的硬上限（R-23.3）。
+ * 单次取数的硬上限（R-23.5）。
  *
  * 这是给 HTTP 查询路径设的闸门。这条 SQL 走主键倒序 LIMIT，本身不贵，但参数一旦能
  * 放到十万行，响应体与序列化就会变成一次无上限的重活儿——而它挂在页面首屏的刷新

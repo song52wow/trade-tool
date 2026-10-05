@@ -178,7 +178,13 @@ export interface SyncOptions {
   nowMs?: number | undefined;
   maxGapAttempts?: number | undefined;
   batchSize?: number | undefined;
-  /** 是否允许首次全量回补；false 时新增标的只能查询不能拉历史（R-8.4） */
+  /**
+   * 本轮是否回补**已登记的缺口**（R-11.B6）；false 时只检测与登记，不尝试修复。
+   *
+   * 刻意不叫「允许首次全量」：首次全量由「库里有没有历史」决定，没有开关（R-8.2），
+   * 拦住回补风暴的闸门是新增标的默认 `paused`（R-8.4）。这个按调用粒度的开关只服务
+   * 「先只登记缺口、留到下一轮再修」的场景（测试用它把「检测到」与「补得上」拆开断言）。
+   */
   allowBackfill?: boolean | undefined;
 }
 

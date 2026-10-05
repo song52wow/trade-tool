@@ -41,12 +41,30 @@ export function statusForCode(code: SyncErrorCode): number {
   return STATUS_BY_CODE[code];
 }
 
+/**
+ * 去掉 `SyncError` 在 message 里自带的那层 `[CODE] ` 前缀。
+ *
+ * `SyncError` 的构造函数把 message 存成 `"[CODE] 正文"`（CLI 靠它一行说清错误）；
+ * HTTP 响应体若原样透传，页面再按 `[code] message` 拼一次就显示成 `[CODE] [CODE] 正文`。
+ * 错误体已经把 code 放在**单独字段**里，message 只该是正文。
+ */
+function stripCodePrefix(code: string, message: string): string {
+  const prefix = `[${code}] `;
+  return message.startsWith(prefix) ? message.slice(prefix.length) : message;
+}
+
 /** 未知异常一律 500，并保留原始信息——不吞异常，也不伪装成已知错误。 */
 export function toErrorBody(error: unknown): { status: number; body: unknown } {
   if (error instanceof SyncError) {
     return {
       status: statusForCode(error.code),
-      body: { error: { code: error.code, message: error.message, details: error.details } },
+      body: {
+        error: {
+          code: error.code,
+          message: stripCodePrefix(error.code, error.message),
+          details: error.details,
+        },
+      },
     };
   }
   const message = error instanceof Error ? error.message : String(error);

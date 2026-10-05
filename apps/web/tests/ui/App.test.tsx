@@ -278,7 +278,18 @@ describe('「开始同步」的分支', () => {
       baseHandlers({
         '/api/overview': overview,
         '/api/symbols': { items: [empty] },
-        '/api/symbols/BTCUSDC/estimate': { symbol: 'BTCUSDC', estimate: { bars: 3_719_360 } },
+        '/api/symbols/BTCUSDC/estimate': {
+          symbol: 'BTCUSDC',
+          estimate: {
+            symbol: 'BTCUSDC',
+            bars: 3_719_360,
+            requests: 2_480,
+            weight: 24_800,
+            estimatedMs: 775_000,
+            from: NOW - 86_400_000,
+            to: NOW,
+          },
+        },
         '/api/symbols/BTCUSDC/start': row('BTCUSDC', { desiredState: 'running' }),
       }),
     );
@@ -290,6 +301,10 @@ describe('「开始同步」的分支', () => {
     // 先出预估弹窗，**还没有**写意图
     await waitFor(() => expect(calls).toContain('/api/symbols/BTCUSDC/estimate'));
     expect(screen.getByText('3,719,360')).toBeTruthy();
+    // 请求数 / 权重 / 耗时都取**服务端**的估算值。曾是页面按 1500 与 1920 自己重算，
+    // 且把「权重 → 毫秒」算成 ×1000（正确是 ×60_000）：77.5 万毫秒的估算被显示成「0 秒」。
+    expect(screen.getByText('2,480 次')).toBeTruthy();
+    expect(screen.getByText(/24,800 · 12\.9 分钟/)).toBeTruthy();
     expect(calls).not.toContain('/api/symbols/BTCUSDC/start');
 
     // 弹窗的确认按钮与行内按钮同名，按 DOM 顺序取最后一个（弹窗在后）。
@@ -324,7 +339,8 @@ describe('「开始同步」的分支', () => {
     // 离线横幅常驻可见
     expect(screen.getByText(/守护进程未运行/)).toBeTruthy();
 
-    fireEvent.click(screen.getByRole('button', { name: '开始同步' }));
+    // 按钮标签本身就写明不会拉数据（R-25.5），不是只在 title 里说
+    fireEvent.click(screen.getByRole('button', { name: '开始同步（不会拉数据）' }));
 
     // 弹解释窗，且**没有**发出 start
     await waitFor(() => expect(screen.getByText(/只是把期望状态写进数据库/)).toBeTruthy());
@@ -375,6 +391,32 @@ describe('行内同步按钮', () => {
     await waitFor(() => screen.getByText('BTCUSDC'));
 
     expect(screen.getByRole('button', { name: '开始同步' })).toBeTruthy();
+  });
+
+  it('守护进程离线时按钮标签本身说明「不会拉数据」（R-25.5 / AC-42）', async () => {
+    // 只改 title 不够：title 要悬停才看得到，行内那一眼仍写着「同步中」而数据一动不动，
+    // 正是 R-24 / R-25 要禁止的界面。
+    stubFetch({
+      '/api/overview': {
+        ...overview,
+        daemon: { ...overview.daemon, state: 'stopped', pid: null, lastBeatAt: null, ageMs: null },
+      },
+      '/api/symbols': { items: [row('BTCUSDC', { desiredState: 'running' })] },
+      '/api/jobs': { items: [] },
+      '/api/exchange': {
+        exchange: 'binance',
+        count: 0,
+        cachedAt: NOW,
+        ageMs: 0,
+        stale: false,
+        symbols: [],
+      },
+    });
+    render(<App />);
+    await waitFor(() => screen.getByText('BTCUSDC'));
+
+    expect(screen.getByRole('button', { name: /守护进程未运行/ })).toBeTruthy();
+    expect(screen.queryByRole('button', { name: /^同步中 · 暂停$/ })).toBeNull();
   });
 });
 

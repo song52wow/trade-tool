@@ -1,6 +1,6 @@
 # @trade-tool/web — 控制面
 
-HTTP API + 前端看板，把 `apps/cli` 的日常操作变成网页操作（对应设计文档的 N-7）。
+HTTP API + 前端看板，把 `apps/cli` 的日常操作变成网页操作（对应设计文档的 R-23 … R-25）。
 
 ## 跑起来
 

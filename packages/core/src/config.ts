@@ -125,8 +125,6 @@ export const syncSchema = z.object({
   maxConsecutiveErrors: z.number().int().positive().default(5),
   /** removeSymbol 时已入库数据的处置策略 */
   onRemove: removePolicySchema.default('keep'),
-  /** 是否允许执行首次全量回补；false 时新增标的仍为 paused（R-8.4） */
-  allowBackfill: z.boolean().default(true),
 });
 
 export const configSchema = z.object({

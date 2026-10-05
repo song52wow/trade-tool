@@ -112,6 +112,10 @@ export function SymbolTable(props: {
                       ) : row.desiredState === 'running' ? (
                         // 期望状态是 running 时**只给暂停**：数据由常驻守护进程持续拉取，
                         // 「开始同步」此刻没有意义，重复出现只会让人以为要再点一次。
+                        //
+                        // 守护进程离线时**标签本身**必须说实话（R-25.5）：只改 title 不够
+                        // ——title 要悬停才看得到，行内那一眼仍写着「同步中」，而数据一动不动，
+                        // 正是 R-24/R-25 要禁止的那种界面。
                         <button
                           className="syncing"
                           disabled={busy}
@@ -123,7 +127,7 @@ export function SymbolTable(props: {
                           onClick={() => props.onLifecycle(symbol, 'pause')}
                         >
                           <span className="dot" aria-hidden="true" />
-                          同步中 · 暂停
+                          {props.daemonOnline ? '同步中 · 暂停' : '同步中（守护进程未运行）· 暂停'}
                         </button>
                       ) : (
                         <button
@@ -136,7 +140,7 @@ export function SymbolTable(props: {
                           }
                           onClick={() => props.onStart(symbol)}
                         >
-                          开始同步
+                          {props.daemonOnline ? '开始同步' : '开始同步（不会拉数据）'}
                         </button>
                       )}
                       {row.desiredState === 'running' && state?.status === 'error' ? (

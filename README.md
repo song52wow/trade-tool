@@ -6,7 +6,8 @@
 trade-tool/
 ├── apps/
 │   ├── cli/                     @trade-tool/cli        命令行入口（一次性命令）
-│   └── sync/                    @trade-tool/sync       常驻同步守护进程 + 控制原语
+│   ├── sync/                    @trade-tool/sync       常驻同步守护进程 + 控制原语
+│   └── web/                     @trade-tool/web        控制面：HTTP API + 看板（直接 import 原语）
 ├── packages/
 │   ├── tsconfig/                @trade-tool/tsconfig   共享 tsconfig 预设
 │   ├── core/                    @trade-tool/core       领域模型 / 配置 / 策略接口
@@ -29,13 +30,15 @@ trade-tool/
 apps/cli ──┬─> packages/backtest ──> packages/core
            └─> packages/data ───────> packages/core
 apps/sync ────> packages/data ───────> packages/core
+apps/web ─────> packages/sync ───────> packages/data ──> packages/core
                       │
                       └─(唯一跨语言接缝: python -m quant_data)─> python/quant-*
 ```
 
 规则：`core` 不依赖任何 workspace 包；包之间只依赖 `core`；跨语言只允许从 `packages/data` 出去；
-`apps/sync` **不得**绕过 `packages/data` 直接连 PG 写入。
-`apps/cli` 与 `apps/sync` 是**两个独立入口**，彼此不依赖（CLI 只读 `sync status`，不改生命周期）。
+`apps/sync` 与 `apps/web` **不得**绕过 `packages/data` 直接连 PG 读写。
+`apps/cli`、`apps/sync`、`apps/web` 是**三个独立入口**：CLI 只读 `sync status`、不改生命周期；
+控制面只写 `desired_state`（先落库再生效），真正拉数据的始终是 `apps/sync` 守护进程。
 
 ## 环境要求
 
@@ -84,9 +87,10 @@ K 线本体存在 PostgreSQL 的 `klines_1m` 表里。
 
 ## 控制面（`apps/web`）
 
-`docs/…sync.md` 的 N-7 把控制面列为下期，`@trade-tool/sync` 的原语就是为它准备的交付边界。
-现在 `apps/web` 把它接上了：Hono 提供 JSON API，Vite + React 提供看板，**直接 import 原语**，
-不 shell out 解析 stdout。
+`docs/…sync.md` 最初把控制面列为下期，只交付数据层原语（R-22）——`@trade-tool/sync`
+的原语就是为它准备的交付边界。现在 `apps/web` 把它接上了（R-23 … R-25）：
+Hono 提供 JSON API，Vite + React 提供看板，**直接 import 原语**，不 shell out 解析 stdout。
+本期不做的只剩**鉴权 / 多用户**（N-7）。
 
 ```bash
 pnpm build

@@ -102,8 +102,12 @@ describe('元数据运行时解析（R-7 / AC-13 / AC-14）', () => {
    * `market.interval` 仍然存在，但它只服务 synthetic 回测链路（§0.1 明确本次不动
    * `packages/backtest`）。这里把配置里的 interval 改成 1d，验证同步链路完全不受影响：
    * 入库的行距仍然是 60_000，且发往交易所的请求不携带 interval 参数。
+   *
+   * 单独给 120s 预算（与 AC-10 同因）：这条用例要跑完一整轮真实 Python 子进程 +
+   * 分批 COPY 写入，孤立跑约 12s，但在 `pnpm check` 里与其余集成用例排队时会逼近
+   * 全局 30s 上限并被判超时——那是机器负载，不是行为回归。
    */
-  it('R-6 周期固定 1m：配置里的 interval 不影响同步链路', async () => {
+  it('R-6 周期固定 1m：配置里的 interval 不影响同步链路', { timeout: 120_000 }, async () => {
     await resetExchange();
     const skewed: TradeToolConfig = { ...config, market: { ...config.market, interval: '1d' } };
     const skewedMarket = buildContext(ctx.pool, skewed, {

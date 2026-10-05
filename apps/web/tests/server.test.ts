@@ -365,6 +365,25 @@ describe('SyncError → HTTP 映射', () => {
     expect(body.error.code).toBe('INTERNAL_ERROR');
     expect(body.error.message).toContain('undefined is not a function');
   });
+
+  it('SyncError 的 message 不再自带一遍 [CODE] 前缀', async () => {
+    // `SyncError` 的 message 本身就是 "[CODE] 正文"（CLI 靠它一行说清错误），而响应体
+    // 已经把 code 放在单独字段里；原样透传会让页面拼出 `[CODE] [CODE] 正文`。
+    const app = buildApp(
+      fakeDeps({
+        listSymbols: async () => {
+          throw new SyncError('DB_CONNECTION_FAILED', '连不上 PostgreSQL');
+        },
+      }),
+    );
+
+    const res = await app.request('/api/symbols');
+    const body = (await res.json()) as { error: { code: string; message: string } };
+
+    expect(res.status).toBe(503);
+    expect(body.error.code).toBe('DB_CONNECTION_FAILED');
+    expect(body.error.message).toBe('连不上 PostgreSQL');
+  });
 });
 
 describe('详情返回结构', () => {

@@ -7,8 +7,8 @@ import { SyncControl, type ControlPrimitives } from './primitives.js';
 /**
  * 把「原语 + 守护进程 + 连接池」组装成一个控制面可直接持有的对象。
  *
- * 页面 / HTTP API 不在本期（N-7），但控制面应该已经能直接 import 这套原语（R-22.2），
- * 所以本工厂是本期真正的交付面。
+ * `apps/web` 就是按这个形状持有它的（R-22.2 / R-24.6）：原语给 HTTP 路由用，
+ * 守护进程仍然只能由这个入口启动——控制面**不得**自己再起一个（N-8 / R-24.5）。
  */
 
 export interface SyncServiceOptions {

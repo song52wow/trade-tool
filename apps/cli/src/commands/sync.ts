@@ -7,7 +7,7 @@ import { assertSchema } from './db.js';
 /**
  * `sync status` —— 同步状态的只读视图（R-15）。
  *
- * 生命周期**变更**不走这里：CLI 保持一次性命令语义（R-14.4 / R-15.4），
+ * 生命周期**变更**不走这里：CLI 保持一次性命令语义（R-14 A / R-15 第 5 条），
  * 开启/暂停/恢复走 `@trade-tool/sync` 导出的原语（R-22）。
  */
 export async function runSyncStatus(flags: {

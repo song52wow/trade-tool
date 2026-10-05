@@ -17,7 +17,13 @@ loadProjectEnv();
 
 const HOST_ENV = 'TRADE_TOOL_WEB_HOST';
 const PORT_ENV = 'TRADE_TOOL_WEB_PORT';
-const DEFAULT_HOST = '0.0.0.0';
+/**
+ * 默认**只监听回环**（R-24.8 / N-7）：本期不做鉴权 / 多用户，而控制面能触发首次全量、
+ * 也能读库里的全部数据——默认绑到 `0.0.0.0` 等于把一个无认证的控制面交给整个局域网。
+ * 确实需要局域网访问时，由使用者在 `.env` 里显式写 `TRADE_TOOL_WEB_HOST=0.0.0.0`
+ * （`.env.example` 有说明），那是知情选择，而不是默认值。
+ */
+const DEFAULT_HOST = '127.0.0.1';
 const DEFAULT_PORT = 8787;
 
 function readPort(raw: string | undefined): number {
@@ -67,7 +73,9 @@ async function main(): Promise<void> {
     );
   } else {
     app.use('/*', serveStatic({ root: uiDir, rewriteRequestPath: (p) => p }));
-    // 单页应用：非 /api 的未知路径一律回 index.html，让前端路由接管。
+    // 前端没有客户端路由（单页、无 URL 状态），因此**不存在**需要回退到 index.html 的路径。
+    // 这条兜底只服务一个目的：未命中的非 /api 路径如实回 404，而不是把 index.html
+    // 当成「什么都能匹配」的答案回给一个要 CSS / 图片 / 数据的请求。
     app.get('*', (c) => c.text('', 404));
   }
 
@@ -79,7 +87,7 @@ async function main(): Promise<void> {
       `trade-tool 控制面已启动：http://${host}:${info.port}`,
       `  配置    ${resolveConfigPath()}`,
       `  前端    ${uiDir ?? '<未构建>'}`,
-      `  监听    ${host}:${info.port}（无鉴权，局域网内可访问）`,
+      `  监听    ${host}:${info.port}（无鉴权；非回环地址时局域网内可访问）`,
     ];
     console.log(lines.join('\n'));
   });

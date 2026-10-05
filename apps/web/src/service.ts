@@ -25,7 +25,7 @@ import {
   type MarketContext,
   type Pool,
 } from '@trade-tool/data';
-import { createSyncService, type SyncService } from '@trade-tool/sync';
+import { createSyncService, HEARTBEAT_INTERVAL_MS, type SyncService } from '@trade-tool/sync';
 
 import { clampBarLimit } from './bars.js';
 import { JobRegistry, type JobRunnerOptions } from './jobs.js';
@@ -96,10 +96,12 @@ export function createWebRuntime(config: TradeToolConfig): WebRuntime {
   /**
    * 心跳超阈值的下限 60s。
    *
-   * 上限跟着守护进程的心跳间隔（10s）走，取 3 倍留出抖动余量；下限则保证即便有人把
-   * `pollIntervalMs` 配得极小，阈值也不会小到一次网络抖动就误报离线。
+   * 上界跟着守护进程的**心跳间隔**（`HEARTBEAT_INTERVAL_MS`，10s）走，取 3 倍留出抖动
+   * 余量——判超时用的是「心跳年龄」，节拍当然要按心跳，而不是按同步轮次的
+   * `pollIntervalMs`（默认 15s；拿它去乘会把阈值算歪，且默认值下永远被 60s 下限盖住）。
+   * 下限保证即便有人把心跳间隔调得极小，阈值也不会小到一次调度延迟就误报离线。
    */
-  const daemonStaleMs = Math.max(60_000, config.sync.pollIntervalMs * 3);
+  const daemonStaleMs = Math.max(60_000, HEARTBEAT_INTERVAL_MS * 3);
 
   const daemonStatus = async (now: number): Promise<DaemonStatusDto> => {
     const beat = await readDaemonHeartbeat(pool, ctx.exchange, daemonStaleMs, now);

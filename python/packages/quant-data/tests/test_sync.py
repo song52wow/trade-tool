@@ -715,9 +715,11 @@ def test_gap_detection_scan_is_bounded(
     symbol_case: SymbolCase,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """每轮只扫 [min(verified_upto, max(time)-lookback), max(time)]，不随历史线性增长。
+    """每轮只扫 [max(first_bar, max(time) - lookback), max(time)]，不随历史线性增长。
 
     AC-32 的可执行断言：把回看窗口调小后，扫描行数是**常数**，与已入库行数无关。
+    下界刻意**不取** ``verified_upto``（干净同步后它等于 max(time)，窗口会塌缩成一个点，
+    看不见 AC-7 的人为删行）——理由见 ``sync.DEFAULT_GAP_LOOKBACK_MS``。
     """
     now = fixed_now(fake, symbol_case.symbol)
     lookback = 10 * ONE_MINUTE_MS
@@ -1495,3 +1497,25 @@ def test_observe_used_weight_only_increases(conn: DbConn) -> None:
     row = conn.execute("SELECT used FROM weight_budget WHERE id = 1").fetchone()
     assert row is not None
     assert int(row["used"]) == 50
+
+
+def test_observe_used_weight_survives_window_rollover(conn: DbConn) -> None:
+    """窗口滚动后回写的观测值必须算进**新窗口**，不能被旧窗口的残留顶掉（R-20.8 / AC-17）。
+
+    时序：本地窗口起点在 2 分钟前、``used`` 还是旧窗口的 999；此时交易所头部报 30——
+    若照旧值只做「只增不减」，30 < 999 就被丢掉，而下一轮 reserve 把 used 归零后，
+    新窗口的账本直接少了这 30。
+    """
+    budget = WeightBudget(conn, 1920)
+    conn.execute(
+        "INSERT INTO weight_budget (id, window_from, used) VALUES (1, %s, 999)"
+        " ON CONFLICT (id) DO UPDATE SET window_from = EXCLUDED.window_from, used = EXCLUDED.used,"
+        " pause_until = NULL",
+        (int(time.time() * 1000) - 2 * WINDOW_MS,),
+    )
+    budget.observe_used_weight(30)
+    row = conn.execute("SELECT window_from, used FROM weight_budget WHERE id = 1").fetchone()
+    assert row is not None
+    assert int(row["used"]) == 30
+    # 窗口起点同时被重新锚定，否则这次写入会在下一次 reserve 时被当成旧窗口残留清掉。
+    assert int(time.time() * 1000) - int(row["window_from"]) < WINDOW_MS

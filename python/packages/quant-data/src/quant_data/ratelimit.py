@@ -131,19 +131,29 @@ class WeightBudget:
         还有额度，AC-17 的「始终低于上限」也就只剩本地账本自说自话。
 
         只增不减是刻意的保守方向：一次偏小的观测不会把计数拉回去。
+
+        但「只增不减」只在**同一个窗口内**成立：窗口已经滚动过而本地还没发出下一次
+        reserve 时，行里的 ``used`` 是**上一个窗口**的残留（:meth:`status` 正是这么读的），
+        此时把它当基线就会把新窗口的观测值顶掉、让新窗口凭空多背一个旧数字。
+        因此滚动过就把 ``window_from`` 重新锚到此刻，再写回观测值。
         """
         if used_weight < 0:
             return
+        now = self._clock_ms()
         with self._conn.transaction():
             row = self._conn.execute(
-                "SELECT used FROM weight_budget WHERE id = 1 FOR UPDATE"
+                "SELECT window_from, used FROM weight_budget WHERE id = 1 FOR UPDATE"
             ).fetchone()
             if row is None:
                 return
+            window_from = int(row["window_from"])
             current = int(row["used"])
+            if now - window_from >= WINDOW_MS:
+                window_from, current = now, 0
             if used_weight > current:
                 self._conn.execute(
-                    "UPDATE weight_budget SET used = %s WHERE id = 1", (used_weight,)
+                    "UPDATE weight_budget SET window_from = %s, used = %s WHERE id = 1",
+                    (window_from, used_weight),
                 )
 
     def _try_reserve(self, weight: int) -> tuple[bool, int]:
