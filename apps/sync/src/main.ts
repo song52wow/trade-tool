@@ -32,7 +32,9 @@ async function main(): Promise<void> {
 
   const shutdown = async (signal: string) => {
     console.error(`\n收到 ${signal}，停止同步守护进程…`);
+    // 池是这里建的，所以这里关。顺序：先停守护进程（删心跳行、停刷新），再关池。
     await service.close();
+    await pool.end().catch(() => undefined);
     process.exit(0);
   };
   process.on('SIGINT', () => void shutdown('SIGINT'));

@@ -56,12 +56,30 @@ const GLOBAL_FATAL_CODES = new Set([
  */
 const HEARTBEAT_INTERVAL_MS = 10_000;
 
+/**
+ * 优雅退出时等待在途轮次收尾的上限。
+ *
+ * 不能无限等：worker 里的检查点只保证**不再开始**下一个标的，不打断已经在途的
+ * `runOnce`，而一轮首次全量可达几十分钟。`stop()` 一旦无限等，SIGTERM 就会挂到
+ * 几十分钟之后才退出。
+ *
+ * 截断它不丢数据：首次全量是边拉边写、水位只记已落库的部分，下次启动从水位续传。
+ * 10s 足够让一个正常的增量轮次收尾。
+ */
+const STOP_DRAIN_TIMEOUT_MS = 10_000;
+
 export interface DaemonOptions {
   config: TradeToolConfig;
   /** 测试可注入固定时钟 */
   now?: () => number;
   /** 测试可注入的休眠实现 */
   sleep?: (ms: number) => Promise<void>;
+  /**
+   * 心跳刷新间隔（测试可注入）。生产用 HEARTBEAT_INTERVAL_MS。
+   * 暴露它是因为「循环退出后心跳是否真的停了」只能用时间差证明，
+   * 按生产值测就得让每个用例等 10 秒。
+   */
+  heartbeatIntervalMs?: number;
   /**
    * 与调用方共享的控制原语实例。
    *
@@ -84,6 +102,7 @@ export class SyncDaemon {
   private stopping = false;
   private loopPromise: Promise<void> | null = null;
   private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
+  private readonly heartbeatIntervalMs: number;
 
   constructor(ctx: MarketContext, options: DaemonOptions) {
     this.ctx = ctx;
@@ -92,6 +111,7 @@ export class SyncDaemon {
       options.control ?? new SyncControl(ctx, { config: options.config, exchange: ctx.exchange });
     this.now = options.now ?? (() => Date.now());
     this.sleep = options.sleep ?? ((ms: number) => new Promise((r) => setTimeout(r, ms)));
+    this.heartbeatIntervalMs = options.heartbeatIntervalMs ?? HEARTBEAT_INTERVAL_MS;
   }
 
   get primitives(): SyncControl {
@@ -241,7 +261,7 @@ export class SyncDaemon {
       void upsertDaemonHeartbeat(this.ctx.pool, this.ctx.exchange).catch((error: unknown) => {
         log.warn(`刷新守护进程心跳失败：${(error as Error)?.message ?? String(error)}`);
       });
-    }, HEARTBEAT_INTERVAL_MS);
+    }, this.heartbeatIntervalMs);
     // 心跳不该拖住进程退出
     this.heartbeatTimer.unref?.();
 
@@ -268,6 +288,12 @@ export class SyncDaemon {
         }
       } catch (error) {
         this.running = false;
+        // 循环退出就必须停刷心跳，否则控制面会把「进程还活着」读成「有人在干活」——
+        // 实测踩过：SCHEMA_VERSION_MISMATCH 让循环退出后，心跳定时器仍独立每 10s 刷新，
+        // 页面显示守护进程在线，而数据一动不动，正是 R-17.6 禁止的那种骗人界面。
+        // 这里**不删**心跳行：进程确实还活着，删掉会让页面报 stopped（「去启动进程」），
+        // 而真实处置是查日志。留着让它自然变旧即可，读取方按阈值判成 stale。
+        this.stopHeartbeat();
         this.exitIfGlobalFatal(error);
         throw error;
       }
@@ -292,14 +318,23 @@ export class SyncDaemon {
     process.exitCode = 1;
   }
 
-  async stop(): Promise<void> {
-    this.stopping = true;
-    this.running = false;
+  /** 停掉心跳刷新。循环退出与优雅退出都要走这里，语义相同：不再声称有人在同步。 */
+  private stopHeartbeat(): void {
     if (this.heartbeatTimer !== null) {
       clearInterval(this.heartbeatTimer);
       this.heartbeatTimer = null;
     }
-    await this.loopPromise?.catch(() => undefined);
+  }
+
+  async stop(): Promise<void> {
+    this.stopping = true;
+    this.running = false;
+    this.stopHeartbeat();
+    // 有界等待在途轮次收尾（理由见 STOP_DRAIN_TIMEOUT_MS）。
+    await Promise.race([
+      this.loopPromise?.catch(() => undefined) ?? Promise.resolve(),
+      this.sleep(STOP_DRAIN_TIMEOUT_MS),
+    ]);
     // 优雅退出删掉心跳，让「行不存在」就是确切的离线，而不是靠阈值猜。
     // 删不掉也不该让停止失败——那只是让页面多显示几秒「在线」。
     await deleteDaemonHeartbeat(this.ctx.pool, this.ctx.exchange).catch((error: unknown) => {

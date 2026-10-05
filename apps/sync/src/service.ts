@@ -40,16 +40,33 @@ export function createSyncService(ctx: MarketContext, options: SyncServiceOption
   return {
     primitives,
     daemon,
-    close: () => ctx.pool.end(),
+    // 只停守护进程，**不关连接池**——池是调用方传进来的（ctx.pool），不是这里建的。
+    // 擅自关掉别人的池，会让调用方在 close() 之后任何一次查询都撞上
+    // 「Cannot use a pool after calling end」（apps/web 与测试都踩过）。
+    //
+    // 顺序也不能反：删心跳行、停心跳定时器都在 daemon.stop() 里，只关池的话 SIGTERM 的
+    // 「优雅退出」什么也没做，库里会留下一个永远不再刷新的心跳行，页面把它读成 stale
+    // （「进程还在但不对劲，查日志」），而进程其实已经退出了——该报的是 stopped。
+    close: () => daemon.stop(),
   };
 }
 
-/** 便捷入口：自行建池，调用方只负责 `close()`。 */
+/**
+ * 便捷入口：**自行建池**，因此 `close()` 负责连池一起关掉。
+ * 用 `createSyncService` 的调用方自己建池，也就自己负责 `pool.end()`。
+ */
 export function createSyncServiceFromConfig(
   config: TradeToolConfig,
   options: Omit<SyncServiceOptions, 'config'> = {},
 ): SyncService {
   const pool = createPool(config.database);
   const ctx = buildContext(pool, config, options.exchange ? { exchange: options.exchange } : {});
-  return createSyncService(ctx, { config, ...options });
+  const service = createSyncService(ctx, { config, ...options });
+  return {
+    ...service,
+    close: async () => {
+      await service.close();
+      await pool.end();
+    },
+  };
 }
