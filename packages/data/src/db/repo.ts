@@ -762,3 +762,101 @@ export async function readGlobalSummary(pool: Pool, exchange: string): Promise<G
     throw toSyncError(error, '读取全局汇总失败');
   }
 }
+
+// ---------------------------------------------------------------- 守护进程心跳
+
+/** 心跳行。只读出来用于展示与判定，不参与任何写入决策。 */
+export interface DaemonHeartbeat {
+  exchange: string;
+  pid: number;
+  startedAt: number;
+  lastBeatAt: number;
+}
+
+/**
+ * 写入 / 刷新心跳（守护进程侧）。
+ *
+ * `started_at` 用 COALESCE 保留首次启动时刻：定时器每轮都调它，若无脑覆盖，
+ * 页面上的「已运行」就会永远是几秒。
+ */
+export async function upsertDaemonHeartbeat(
+  pool: Pool,
+  exchange: string,
+  nowMs: number = Date.now(),
+  pid: number = process.pid,
+): Promise<void> {
+  try {
+    await pool.query(
+      `INSERT INTO daemon_heartbeat (exchange, pid, started_at, last_beat)
+       VALUES ($1, $2, $3, $3)
+       ON CONFLICT (exchange) DO UPDATE
+         SET pid = EXCLUDED.pid,
+             last_beat = EXCLUDED.last_beat,
+             -- 只在进程身份变化时重置启动时刻，避免换进程后沿用旧的 started_at
+             started_at = CASE WHEN daemon_heartbeat.pid IS DISTINCT FROM EXCLUDED.pid
+                               THEN EXCLUDED.started_at ELSE daemon_heartbeat.started_at END`,
+      [exchange, pid, nowMs],
+    );
+  } catch (error) {
+    throw toSyncError(error, '写入守护进程心跳失败');
+  }
+}
+
+/**
+ * 删除心跳（优雅退出时调用）。
+ *
+ * 删掉而不是只停止刷新：这样「行不存在」就是**确切**的离线，而不是「还得靠阈值猜」。
+ * 被 kill -9 时不会走到这里，那类崩溃由 `readDaemonHeartbeat` 的阈值兜底。
+ */
+export async function deleteDaemonHeartbeat(pool: Pool, exchange: string): Promise<void> {
+  try {
+    await pool.query('DELETE FROM daemon_heartbeat WHERE exchange = $1', [exchange]);
+  } catch (error) {
+    throw toSyncError(error, '删除守护进程心跳失败');
+  }
+}
+
+/**
+ * 读心跳并判定在线（控制面侧）。
+ *
+ * 三种结果，不要压成两个：
+ *   * `running`  —— 心跳存在且在阈值内；
+ *   * `stale`    —— 心跳存在但超阈值，进程被强杀或卡死（心跳不再刷新）；
+ *   * `stopped`  —— 没有心跳行，守护进程从未启动或已优雅退出。
+ *
+ * `stopped` 与 `stale` 必须分开：前者是「没开」，用户该去启动它；后者是「开了但
+ * 不对劲」，用户该去查日志。合成一个「离线」会把两种处置混成同一句话。
+ */
+export async function readDaemonHeartbeat(
+  pool: Pool,
+  exchange: string,
+  staleAfterMs: number,
+  nowMs: number = Date.now(),
+): Promise<
+  | { state: 'running'; pid: number; startedAt: number; lastBeatAt: number; ageMs: number }
+  | { state: 'stale'; pid: number; startedAt: number; lastBeatAt: number; ageMs: number }
+  | { state: 'stopped'; pid: null; startedAt: null; lastBeatAt: null; ageMs: null }
+> {
+  try {
+    const result = await pool.query<{
+      pid: number;
+      started_at: string;
+      last_beat: string;
+    }>('SELECT pid, started_at, last_beat FROM daemon_heartbeat WHERE exchange = $1', [exchange]);
+    const row = result.rows[0];
+    if (!row) {
+      return { state: 'stopped', pid: null, startedAt: null, lastBeatAt: null, ageMs: null };
+    }
+    const lastBeatAt = req(row['last_beat'], 'daemon_heartbeat.last_beat');
+    const ageMs = Math.max(0, nowMs - lastBeatAt);
+    const base = {
+      pid: row['pid'],
+      startedAt: req(row['started_at'], 'daemon_heartbeat.started_at'),
+      lastBeatAt,
+      ageMs,
+    };
+    return ageMs > staleAfterMs ? { state: 'stale', ...base } : { state: 'running', ...base };
+  } catch (error) {
+    throw toSyncError(error, '读取守护进程心跳失败');
+  }
+}

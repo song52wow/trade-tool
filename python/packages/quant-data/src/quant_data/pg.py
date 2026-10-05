@@ -37,7 +37,9 @@ DSN_ENV = "TRADE_TOOL_PG_DSN"
 #: 只校验「缺不缺 required」是不够的：加迁移时忘了更新这里，写路径就会静默按旧结构跑，
 #: 而库超前时又会被完全放行——两种都属于 R-1.3 禁止的「按不匹配的 schema 继续运行」。
 #: 因此**新增迁移必须同步在这里登记**（这就是 AC-25 的「同提交更新两侧」）。
-KNOWN_MIGRATION_VERSIONS: frozenset[str] = frozenset({"001_init", "002_sync_plan"})
+KNOWN_MIGRATION_VERSIONS: frozenset[str] = frozenset(
+    {"001_init", "002_sync_plan", "003_daemon_heartbeat"}
+)
 
 REQUIRED_MIGRATION_VERSIONS: frozenset[str] = KNOWN_MIGRATION_VERSIONS
 

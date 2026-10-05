@@ -12,10 +12,13 @@ import {
   readGlobalSummary,
   readState,
   readWeightBudget,
+  deleteDaemonHeartbeat,
+  readDaemonHeartbeat,
   removeSymbolEntry,
   setDesiredState,
   setSyncStatus,
   upsertSymbolEntry,
+  upsertDaemonHeartbeat,
   watermark,
 } from '../src/index.js';
 
@@ -342,5 +345,68 @@ describe('第二轮缺陷回归（R-2.5 / R-3.3 / R-4.1 / R-8.3 / R-20.4）', ()
     expect(status.utilization).toBe(0);
     // 窗口本身就是过去那一刻，保留原值以便排查
     expect(status.windowFrom).toBe(stale);
+  });
+});
+
+describe('守护进程心跳（控制面据它回答「有人在干活吗」）', () => {
+  let ctx: TestSchema;
+  const EX = 'binance';
+
+  beforeAll(async () => {
+    ctx = await createTestSchema('hb');
+  });
+  afterAll(async () => {
+    await ctx.close();
+  });
+
+  it('没有心跳行 = stopped，且字段全为 null（不能拿 0 冒充时间戳）', async () => {
+    const got = await readDaemonHeartbeat(ctx.pool, EX, 60_000, BASE);
+    expect(got).toEqual({
+      state: 'stopped',
+      pid: null,
+      startedAt: null,
+      lastBeatAt: null,
+      ageMs: null,
+    });
+  });
+
+  it('写入后读到 running，且 started_at 保持首次启动时刻', async () => {
+    await upsertDaemonHeartbeat(ctx.pool, EX, BASE, 111);
+    // 定时器后续刷新只动 last_beat
+    await upsertDaemonHeartbeat(ctx.pool, EX, BASE + 10_000, 111);
+
+    const got = await readDaemonHeartbeat(ctx.pool, EX, 60_000, BASE + 11_000);
+    expect(got.state).toBe('running');
+    if (got.state === 'stopped') throw new Error('unreachable');
+    expect(got.startedAt).toBe(BASE);
+    expect(got.lastBeatAt).toBe(BASE + 10_000);
+    expect(got.ageMs).toBe(1_000);
+    expect(got.pid).toBe(111);
+  });
+
+  it('超过阈值判 stale，与 stopped 分开：处置方式不同', async () => {
+    // 现在时间已经离最后一次心跳 5 分钟，远超 60s 阈值
+    const got = await readDaemonHeartbeat(ctx.pool, EX, 60_000, BASE + 300_000);
+    expect(got.state).toBe('stale');
+    if (got.state === 'stopped') throw new Error('unreachable');
+    expect(got.ageMs).toBe(290_000);
+  });
+
+  it('换进程后重置 started_at，不沿用上一个进程的启动时刻', async () => {
+    await upsertDaemonHeartbeat(ctx.pool, EX, BASE + 400_000, 222);
+    const got = await readDaemonHeartbeat(ctx.pool, EX, 60_000, BASE + 401_000);
+    if (got.state === 'stopped') throw new Error('unreachable');
+    expect(got.pid).toBe(222);
+    expect(got.startedAt).toBe(BASE + 400_000);
+  });
+
+  it('删除后回到 stopped（优雅退出）', async () => {
+    await deleteDaemonHeartbeat(ctx.pool, EX);
+    const got = await readDaemonHeartbeat(ctx.pool, EX, 60_000, BASE + 402_000);
+    expect(got.state).toBe('stopped');
+  });
+
+  it('删除不存在的行不报错（幂等，stop 路径不能因此失败）', async () => {
+    await expect(deleteDaemonHeartbeat(ctx.pool, EX)).resolves.toBeUndefined();
   });
 });

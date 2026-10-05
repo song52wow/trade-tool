@@ -48,6 +48,7 @@ pnpm check      # = build + TS 测试 + Python 测试
 | 回测循环、绩效指标、新策略      | `packages/backtest/src/strategies/`  |
 | 命令行命令                      | `apps/cli/src/commands/`             |
 | 常驻同步、生命周期、控制原语    | `apps/sync/src`                      |
+| 控制面 HTTP 路由与前端页面      | `apps/web/src` + `apps/web/ui`       |
 | 计算密集逻辑、指标、真实行情源  | `python/packages/*/src`              |
 
 ## 硬性约定
@@ -93,6 +94,32 @@ pnpm check      # = build + TS 测试 + Python 测试
 ```bash
 pnpm --filter @trade-tool/cli start -- <command>   # 源码直跑
 node apps/cli/dist/index.js <command>              # 构建产物
+pnpm --filter @trade-tool/web start                 # 控制面（http://127.0.0.1:8787）
 ```
 
 stdout 是命令结果（日志走 stderr），`--json` 时输出纯 JSON，便于管道处理。
+
+## 控制面（apps/web）
+
+日常操作的网页形态，做法上有三条**硬约束**，改代码时别绕过：
+
+1. **重活儿不阻塞 HTTP**：首次全量/校验只登记 job 并返回 id（R-17.6），进度每次从
+   `sync_state` 重读，不许用内存计数当进度。
+2. **单写者**：控制面作业不得接管 `desired_state = running` 的标的，返回 409 并提示先
+   pause——那是 `apps/sync` 守护进程的地盘（R-3.3）。页面与守护进程靠「先落库再生效」
+   协作，**不要**在控制面里再起一个守护进程。
+3. **首次全量必须先算规模**（R-8.3），没有「缩短范围」的选项。判据是「库里有没有历史」：
+   没有历史要先 `GET /api/symbols/:symbol/estimate` 并要求确认，已有历史只是增量。
+4. **不假装在同步**：「开始同步」只写 `desired_state`，干活的是独立进程 `apps/sync`。
+   守护进程离线时页面必须如实显示（横幅 + 卡片 + 按钮标签），不允许出现「显示同步中、
+   数据却不动」的界面。存活读 `daemon_heartbeat` 表，三态 `running` / `stale` / `stopped`
+   分开（处置方式不同：继续用 / 查日志 / 去启动）。**改心跳刷新时机时注意**：必须用独立
+   于同步轮次的定时器，只在轮次边界写会被长达几十分钟的首次全量误判成离线。
+
+标的口径是 `symbols` 集合 ∪ `sync_state`，与 `readGlobalSummary` 的计数保持一致；
+只列集合成员会让「用 `data fetch` 写过但没进集合」的标的带着真实数据从页面上消失。
+
+路由只依赖 `WebDeps` 接口，测试用纯替身（不连 PG、不出网）；需要 DOM 的 UI 用例在文件
+顶部声明 `@vitest-environment jsdom`，并 import `tests/ui/setup.ts`（recharts 依赖
+`ResizeObserver`）。**首屏取数用 `useLayoutEffect`**：effect 里抛异常会中止同一次 commit
+里剩下的全部 effect，图表组件一个 `ResizeObserver` 就能让整页停在「读取中」。

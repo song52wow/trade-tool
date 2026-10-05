@@ -1,0 +1,505 @@
+:root {
+  color-scheme: dark;
+  --bg: #0f1115;
+  --panel: #171a21;
+  --panel-2: #1d212a;
+  --line: #2a2f3a;
+  --text: #e6e8ec;
+  --muted: #9aa3b2;
+  --accent: #4c8dff;
+  --ok: #3fb950;
+  --warn: #d29922;
+  --err: #f85149;
+  --radius: 8px;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font:
+    14px/1.5 -apple-system,
+    BlinkMacSystemFont,
+    'Segoe UI',
+    'PingFang SC',
+    'Hiragino Sans GB',
+    'Microsoft YaHei',
+    sans-serif;
+}
+
+code,
+.mono {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+}
+
+.app {
+  max-width: 1400px;
+  margin: 0 auto;
+  padding: 20px 24px 64px;
+}
+
+header.top {
+  display: flex;
+  align-items: baseline;
+  gap: 12px;
+  flex-wrap: wrap;
+  margin-bottom: 4px;
+}
+
+header.top h1 {
+  font-size: 18px;
+  margin: 0;
+}
+
+.spacer {
+  flex: 1;
+}
+
+.muted {
+  color: var(--muted);
+}
+
+.banner {
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--err);
+  background: rgba(248, 81, 73, 0.08);
+  padding: 10px 14px;
+  border-radius: var(--radius);
+  margin: 12px 0;
+}
+
+.banner.warn {
+  border-left-color: var(--warn);
+  background: rgba(210, 153, 34, 0.08);
+}
+
+/* 「同步中 · 暂停」：一个按钮同时表达「正在跑」与「怎么停下来」 */
+button.syncing {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--ok);
+  border-color: rgba(63, 185, 80, 0.45);
+  background: rgba(63, 185, 80, 0.1);
+}
+
+button.syncing .dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--ok);
+  animation: pulse 1.4s ease-in-out infinite;
+}
+
+@keyframes pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.25;
+  }
+}
+
+/* 尊重系统的「减少动效」：脉冲只是辅助提示，不该是理解状态的前提 */
+@media (prefers-reduced-motion: reduce) {
+  button.syncing .dot {
+    animation: none;
+  }
+}
+
+/* 详情面板里的「数据体检」：低频重操作，给独立空间而不是挤进行内按钮 */
+.verify-box {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  margin-top: 18px;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+}
+
+.verify-box button {
+  flex: 0 0 auto;
+}
+
+.cards {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+  gap: 12px;
+  margin: 16px 0;
+}
+
+.card {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 12px 14px;
+}
+
+.card .label {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.card .value {
+  font-size: 20px;
+  margin-top: 4px;
+  font-variant-numeric: tabular-nums;
+}
+
+.panel {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 16px;
+  margin: 16px 0;
+}
+
+.panel > h2 {
+  font-size: 14px;
+  margin: 0 0 12px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+  font-variant-numeric: tabular-nums;
+}
+
+/* 表格列多且都不换行，必须给独立横向滚动：否则窄屏上整页被撑宽，
+   右侧列被挤出屏幕，而且没法用手指单独横滑某一段。 */
+.table-scroll {
+  overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
+  margin: 0 -4px;
+  padding: 0 4px;
+}
+
+.table-scroll > table {
+  min-width: 860px;
+}
+
+th {
+  text-align: left;
+  color: var(--muted);
+  font-weight: 500;
+  font-size: 12px;
+  padding: 6px 8px;
+  border-bottom: 1px solid var(--line);
+  white-space: nowrap;
+}
+
+td {
+  padding: 7px 8px;
+  border-bottom: 1px solid rgba(42, 47, 58, 0.55);
+  white-space: nowrap;
+}
+
+tr.clickable:hover td {
+  background: var(--panel-2);
+  cursor: pointer;
+}
+
+tr.selected td {
+  background: var(--panel-2);
+}
+
+button {
+  background: var(--panel-2);
+  color: var(--text);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 4px 10px;
+  cursor: pointer;
+  font-size: 12px;
+}
+
+button:hover:not(:disabled) {
+  border-color: var(--accent);
+}
+
+button:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+button.primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+}
+
+button.danger {
+  border-color: rgba(248, 81, 73, 0.6);
+  color: #ffb3ae;
+}
+
+input,
+select {
+  background: var(--bg);
+  color: var(--text);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 5px 8px;
+  font-size: 13px;
+}
+
+.tag {
+  display: inline-block;
+  border-radius: 999px;
+  padding: 1px 8px;
+  font-size: 11px;
+  border: 1px solid var(--line);
+}
+
+.tag.running,
+.tag.ok {
+  color: var(--ok);
+  border-color: rgba(63, 185, 80, 0.5);
+}
+
+.tag.paused,
+.tag.muted {
+  color: var(--muted);
+}
+
+.tag.error {
+  color: var(--err);
+  border-color: rgba(248, 81, 73, 0.5);
+}
+
+.tag.warn {
+  color: var(--warn);
+  border-color: rgba(210, 153, 34, 0.5);
+}
+
+.bar {
+  height: 6px;
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  overflow: hidden;
+}
+
+.bar > i {
+  display: block;
+  height: 100%;
+  background: var(--accent);
+}
+
+.bar.thin {
+  height: 4px;
+}
+
+.row {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+.grid2 {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 16px;
+}
+
+@media (max-width: 980px) {
+  .grid2 {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+.kv {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: 4px 14px;
+}
+
+.kv dt {
+  color: var(--muted);
+}
+
+.kv dd {
+  margin: 0;
+}
+
+dialog {
+  background: var(--panel);
+  color: var(--text);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 20px;
+  max-width: 560px;
+  width: 92%;
+}
+
+dialog::backdrop {
+  background: rgba(0, 0, 0, 0.6);
+}
+
+.est-grid {
+  display: grid;
+  /* auto-fit 而不是固定 4 列：确认弹窗在窄屏上放得下 */
+  grid-template-columns: repeat(auto-fit, minmax(110px, 1fr));
+  gap: 10px;
+  margin: 12px 0;
+}
+
+.est-grid .card {
+  background: var(--bg);
+}
+
+.toast {
+  position: fixed;
+  right: 20px;
+  bottom: 20px;
+  max-width: 460px;
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--accent);
+  background: var(--panel);
+  padding: 10px 14px;
+  border-radius: var(--radius);
+  z-index: 10;
+}
+
+.toast.err {
+  border-left-color: var(--err);
+}
+
+.chart-box {
+  height: 220px;
+}
+
+/* ---------- 窄屏 ---------- */
+
+/* 表格横向滚动的提示只在窄屏出现，桌面端表格整列可见，不需要 */
+.scroll-hint {
+  display: none;
+  margin: 0 0 6px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+@media (max-width: 640px) {
+  .scroll-hint {
+    display: block;
+  }
+
+  .app {
+    padding: 14px 12px 56px;
+  }
+
+  header.top h1 {
+    font-size: 16px;
+  }
+
+  .cards {
+    grid-template-columns: repeat(auto-fit, minmax(132px, 1fr));
+    gap: 8px;
+  }
+
+  .card {
+    padding: 10px;
+  }
+
+  /* 窄屏下体检说明与按钮必须换行，否则长文案会把按钮挤出视口 */
+  .verify-box {
+    flex-direction: column;
+    align-items: stretch;
+    gap: 10px;
+  }
+
+  .card .value {
+    font-size: 17px;
+  }
+
+  .panel {
+    padding: 12px;
+  }
+
+  /* 表格单元格内边距收一点，让同样的列能多露出一列 */
+  th,
+  td {
+    padding: 6px 6px;
+    font-size: 13px;
+  }
+
+  /* toast 固定 460px + right 20px 在 375px 屏上必然溢出：改成左右各留边 */
+  .toast {
+    left: 12px;
+    right: 12px;
+    bottom: 12px;
+    max-width: none;
+  }
+
+  .kv {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 2px;
+  }
+
+  .kv dt {
+    margin-top: 6px;
+  }
+}
+
+/* ---------- 标的下拉选择 ---------- */
+
+.picker {
+  position: relative;
+  width: 100%;
+  max-width: 460px;
+}
+
+.picker > input {
+  width: 100%;
+}
+
+.picker-list {
+  position: absolute;
+  z-index: 20;
+  top: calc(100% + 4px);
+  left: 0;
+  right: 0;
+  max-height: 280px;
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.45);
+}
+
+.picker-list button {
+  display: block;
+  width: 100%;
+  text-align: left;
+  border: none;
+  border-radius: 0;
+  border-bottom: 1px solid rgba(42, 47, 58, 0.6);
+  background: transparent;
+  padding: 8px 10px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 13px;
+}
+
+.picker-list button:hover,
+.picker-list button[aria-selected='true'] {
+  background: rgba(76, 141, 255, 0.16);
+}
+
+.picker-empty {
+  padding: 10px;
+  color: var(--muted);
+  font-size: 12px;
+}

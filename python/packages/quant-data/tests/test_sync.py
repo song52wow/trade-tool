@@ -1012,7 +1012,11 @@ def test_migrations_are_idempotent(conn: DbConn, pg_dsn: str) -> None:
     # 无条件返回全部版本会让这个断言恒真、失去鉴别力。
     assert again == []
     rows = conn.execute("SELECT version FROM schema_migrations ORDER BY version").fetchall()
-    assert [str(row["version"]) for row in rows] == ["001_init", "002_sync_plan"]
+    assert [str(row["version"]) for row in rows] == [
+        "001_init",
+        "002_sync_plan",
+        "003_daemon_heartbeat",
+    ]
     pg.ensure_schema(conn)
 
 

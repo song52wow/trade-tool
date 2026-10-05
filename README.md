@@ -82,6 +82,44 @@ pnpm --filter @trade-tool/cli start -- backtest -b 500
 行情缓存在 `$TRADE_TOOL_HOME/data/cache/`，回测报告在 `$TRADE_TOOL_HOME/reports/`。
 K 线本体存在 PostgreSQL 的 `klines_1m` 表里。
 
+## 控制面（`apps/web`）
+
+`docs/…sync.md` 的 N-7 把控制面列为下期，`@trade-tool/sync` 的原语就是为它准备的交付边界。
+现在 `apps/web` 把它接上了：Hono 提供 JSON API，Vite + React 提供看板，**直接 import 原语**，
+不 shell out 解析 stdout。
+
+```bash
+pnpm build
+pnpm --filter @trade-tool/web start        # http://127.0.0.1:8787（地址见 .env）
+```
+
+能做：状态总览（行数/占用/缺口/配额/可同步标的数/守护进程在线状态）、标的集合增删、
+同步开关、带规模预估与二次确认的首次全量、数据体检、缺口清单、每标的的覆盖时间线。
+
+界面上**只有一个主流程**：「开始同步」→「同步中 · 暂停」。点开始后守护进程先补全历史，
+之后每轮增量拉取最新——补全与实时是同一个持续动作，不拆成两个按钮。行内不再有
+「拉取」「校验」：全量/增量由守护进程负责，「数据体检」是低频重操作，放在详情面板里。
+
+四条约束是硬来的，不是实现偏好：
+
+- **重活儿不阻塞 HTTP** —— 首次全量是几十分钟量级，接口只登记作业并返回 job id（R-17.6），
+  进度每次从 `sync_state` 重读，关掉页面也不影响。
+- **单写者** —— 作业拒绝接管 `desired_state = running` 的标的并返回 409，提示先 pause；
+  那是 `apps/sync` 守护进程的地盘（R-3.3）。
+- **首次全量必须先算规模** —— 点「开始同步」时若该标的库里还没有历史，先请求
+  `GET /api/symbols/:symbol/estimate` 拿行数/请求数/权重，弹确认框，没有「缩短范围」的
+  选项（R-8.3）。已有历史时只是增量，直接开。
+- **不假装在同步** —— 「开始同步」本身只写 `desired_state`，真正干活的是独立的
+  `apps/sync` 进程。守护进程没在跑时，页面挂常驻横幅、按钮标签与卡片都如实显示
+  「未运行」，点开始也会先说明「意图会记录但不会拉数据」。存活判定读
+  `daemon_heartbeat` 表（`003_daemon_heartbeat.sql`）：守护进程用**独立于同步轮次**的
+  定时器刷 `last_beat`（一轮首次全量可达几十分钟，只在轮次边界写会被误判成离线），
+  优雅退出删行，被强杀则由阈值判超时。三态 `running` / `stale` / `stopped` 分开报，
+  因为处置方式不同：前者继续用，`stale` 去查日志，`stopped` 去启动进程。
+
+守护进程仍是独立的 `apps/sync` 进程：控制面只写 `desired_state`，两边靠「先落库再生效」
+（R-19）协作，不需要新通信机制。细节见 `apps/web/README.md`。
+
 ## 本地数据库（docker compose）
 
 `compose.yaml` 只定义一个 `postgres:16` 服务，变量从 `.env` 自动读取——密码因此只有一处来源，

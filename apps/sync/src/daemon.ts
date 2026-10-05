@@ -5,7 +5,13 @@ import {
   type SymbolSyncState,
   type TradeToolConfig,
 } from '@trade-tool/core';
-import { assertSchemaVersion, getAllStates, type MarketContext } from '@trade-tool/data';
+import {
+  assertSchemaVersion,
+  deleteDaemonHeartbeat,
+  getAllStates,
+  upsertDaemonHeartbeat,
+  type MarketContext,
+} from '@trade-tool/data';
 
 import { SyncControl } from './primitives.js';
 
@@ -37,6 +43,19 @@ const GLOBAL_FATAL_CODES = new Set([
   'METADATA_FETCH_FAILED',
 ]);
 
+/**
+ * 心跳刷新间隔。
+ *
+ * 必须**独立于同步轮次**用定时器写，不能只在 `loop()` 每轮开头写一次：一轮首次全量
+ * 可以跑几十分钟（实测 BTCUSDT 预算 12.9 分钟、受延迟支配约 40 分钟），期间
+ * `loop()` 一直卡在 `await this.tick()` 里不会回到循环，轮次边界的心跳会因此变旧，
+ * 控制面就会在同步**正在进行中**把它误判成离线。
+ *
+ * 10s 的取值理由：与 `sync.pollIntervalMs`（默认 15s）同量级但更密，短到进程刚崩
+ * 就能很快被看出异常，长到不会给 PG 带来可察觉的写入压力（6 次/分钟，单行 upsert）。
+ */
+const HEARTBEAT_INTERVAL_MS = 10_000;
+
 export interface DaemonOptions {
   config: TradeToolConfig;
   /** 测试可注入固定时钟 */
@@ -64,6 +83,7 @@ export class SyncDaemon {
   private running = false;
   private stopping = false;
   private loopPromise: Promise<void> | null = null;
+  private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
 
   constructor(ctx: MarketContext, options: DaemonOptions) {
     this.ctx = ctx;
@@ -212,6 +232,19 @@ export class SyncDaemon {
       throw error;
     }
 
+    // 心跳先落一行再开定时器：控制面据此回答「有人在干活吗」。
+    // 启动失败时不能留下心跳行，否则页面会显示在线而其实没在跑。
+    await upsertDaemonHeartbeat(this.ctx.pool, this.ctx.exchange);
+    this.heartbeatTimer = setInterval(() => {
+      // 心跳写失败不能影响同步：吞掉并继续，让读取方按超时判离线即可。
+      // 反过来让它冒泡会变成一个未处理的 Promise 拒绝，直接终止进程（R-14.4）。
+      void upsertDaemonHeartbeat(this.ctx.pool, this.ctx.exchange).catch((error: unknown) => {
+        log.warn(`刷新守护进程心跳失败：${(error as Error)?.message ?? String(error)}`);
+      });
+    }, HEARTBEAT_INTERVAL_MS);
+    // 心跳不该拖住进程退出
+    this.heartbeatTimer.unref?.();
+
     this.loopPromise = this.loop();
     // 不能把 loop 的拒绝留成 unhandled rejection：Node 默认会直接终止进程，
     // 日志里只剩下一个没有任何上下文的堆栈（R-14.4 要求错误可读、且单标的失败不终止进程）。
@@ -262,7 +295,16 @@ export class SyncDaemon {
   async stop(): Promise<void> {
     this.stopping = true;
     this.running = false;
+    if (this.heartbeatTimer !== null) {
+      clearInterval(this.heartbeatTimer);
+      this.heartbeatTimer = null;
+    }
     await this.loopPromise?.catch(() => undefined);
+    // 优雅退出删掉心跳，让「行不存在」就是确切的离线，而不是靠阈值猜。
+    // 删不掉也不该让停止失败——那只是让页面多显示几秒「在线」。
+    await deleteDaemonHeartbeat(this.ctx.pool, this.ctx.exchange).catch((error: unknown) => {
+      log.warn(`删除守护进程心跳失败：${(error as Error)?.message ?? String(error)}`);
+    });
   }
 }
 
