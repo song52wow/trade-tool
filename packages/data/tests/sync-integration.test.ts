@@ -257,6 +257,13 @@ describe('首次全量与增量续传（R-8 / R-9 / AC-2 / AC-3）', () => {
     expect(after[after.length - 2]?.close).toBe(secondLast?.close);
   });
 
+  // 预算按工作量单独给，不动 vitest.config.ts 的全局 30s：
+  // 本用例串行做三个标的的首次全量（onboardDate 分别在 30 / 120 / 7 天前，
+  // 合计约 22.6 万根 bar、1130 次 mock 请求，每次都要过一遍 Python 桥接），
+  // 是最重的单标的全量用例（AC-2 约 9s、AC-5 约 15s）的三到四倍。
+  // 抬高全局值会让真正卡死的用例也要等两分钟才暴露，因此只放宽这一个。
+  // 另外它只能证明「起点来自运行时元数据」，用不着把数据量砍小来换时间——
+  // 砍小反而会弱化「起点互不相同」这条断言的前提。
   it('AC-10 多标的全量都成功，起点各按自己的 onboardDate', async () => {
     await resetExchange();
     const starts = new Map<string, number>();
@@ -270,7 +277,7 @@ describe('首次全量与增量续传（R-8 / R-9 / AC-2 / AC-3）', () => {
     }
     // 三个标的的起点互不相同：证明起点真的来自运行时元数据
     expect(new Set(starts.values()).size).toBe(SYMBOLS.length);
-  });
+  }, 120_000);
 });
 
 describe('幂等与写策略（R-12 / AC-5 / AC-31）', () => {
