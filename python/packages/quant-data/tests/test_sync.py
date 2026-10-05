@@ -5,13 +5,14 @@ from __future__ import annotations
 import itertools
 import time
 from collections.abc import Sequence
+from dataclasses import replace
 from pathlib import Path
 from typing import cast
 
 import psycopg
 import pytest
 from conftest import SQL_DIR, FakeExchange, SymbolCase, fixed_now
-from quant_data import pg
+from quant_data import pg, sync
 from quant_data.binance import KLINE_LIMIT_MAX, ONE_MINUTE_MS, Kline, align_bar_start
 from quant_data.errors import SyncError
 from quant_data.pg import DbConn
@@ -36,7 +37,7 @@ def _options(
     dsn: str,
     meta_dir: Path,
     symbol: str,
-    now: int,
+    now: int | None,
     *,
     from_ms: int | None = None,
     to_ms: int | None = None,
@@ -59,6 +60,16 @@ def _options(
         gap_lookback_ms=gap_lookback_ms,
         page_limit=page_limit,
     )
+
+
+def _fixed_clock(monkeypatch: pytest.MonkeyPatch, values: Sequence[int]) -> None:
+    """把 ``sync.now_ms`` 换成一个按序给出固定值的时钟（用完后保持最后一个值）。
+
+    用来表达「轮首抓一次时钟、之后每页现读一次」：单测无法让真实时间前进，
+    只有把这两类读取分开喂值，才能证明判据用的是哪一个。
+    """
+    ticks = itertools.chain(values, itertools.repeat(values[-1]))
+    monkeypatch.setattr(sync, "now_ms", lambda: next(ticks))
 
 
 def _nested(summary: dict[str, object], key: str) -> dict[str, object]:
@@ -489,6 +500,87 @@ def test_unclosed_bar_in_store_raises(
         run_sync(_options(fake, pg_dsn, tmp_path, symbol_case.symbol, now))
     assert excinfo.value.code == "UNCLOSED_BAR_IN_STORE"
     assert excinfo.value.details["time"] == rogue
+
+
+def test_store_holding_the_in_progress_bar_is_reported(
+    conn: DbConn, fake: FakeExchange, pg_dsn: str, tmp_path: Path, symbol_case: SymbolCase
+) -> None:
+    """库里存着交易所**当前那根**（进行中）时必须报错（R-10.3 的观测判据）。
+
+    这是 ``observation.open_bar_time`` 那一级的判据：拉取时丢掉的末位就是「交易所此刻
+    这根」，库内最后一根必须严格早于它。与本地时钟无关，因此本地时钟快慢都不影响判定。
+    """
+    now = fixed_now(fake, symbol_case.symbol)
+    run_sync(_options(fake, pg_dsn, tmp_path, symbol_case.symbol, now))
+    in_progress = fake.in_progress(symbol_case.symbol)
+    conn.execute(
+        "INSERT INTO klines_1m (symbol, time, open, high, low, close, volume)"
+        " VALUES (%s, %s, 1, 1, 1, 1, 1)",
+        (symbol_case.symbol, in_progress),
+    )
+    with pytest.raises(SyncError) as excinfo:
+        run_sync(_options(fake, pg_dsn, tmp_path, symbol_case.symbol, now))
+    assert excinfo.value.code == "UNCLOSED_BAR_IN_STORE"
+    assert excinfo.value.details["time"] == in_progress
+    assert excinfo.value.details["exchangeOpenBar"] == in_progress
+
+
+def test_long_round_does_not_report_unclosed_bar(
+    conn: DbConn, fake: FakeExchange, pg_dsn: str, tmp_path: Path, symbol_case: SymbolCase
+) -> None:
+    """长轮次不得因为收尾校验而被打断（本用例对应「首次全量/配额等待必然误报」）。
+
+    轮首时刻与末页拉取时刻相差几分钟是常态：首次全量实测十几到几十分钟，
+    ``WeightBudget.reserve`` 也可能 sleep 到下一个 60s 窗口。此时库里最后一根是交易所
+    **已收盘**的 bar（写入路径丢掉了进行中的末位），只是它收盘发生在轮首之后。
+    拿轮首时钟判定会把它误判成未收盘 → 常驻侧立刻把标的钉成 error（需人工 resume），
+    一次正常同步就此中断。这里用「轮首时刻比交易所当前 bar 早 4 分钟」表达长轮次。
+    """
+    in_progress = fake.in_progress(symbol_case.symbol)
+    round_start = in_progress - 4 * ONE_MINUTE_MS
+    first = run_sync(_options(fake, pg_dsn, tmp_path, symbol_case.symbol, round_start))
+    assert int(cast(int, first["added"])) > 0
+
+    stored = _times(conn, symbol_case.symbol)
+    assert max(stored) == in_progress - ONE_MINUTE_MS  # 进行中的那根一根都没入库
+    # 前置条件：最后一根确实是「轮首之后」才收盘的——旧判据必报错
+    assert pg.bar_close_time(max(stored)) > round_start
+
+    # 同一陈旧轮首时钟下的增量轮次同样不得报错，且不重复写
+    second = run_sync(_options(fake, pg_dsn, tmp_path, symbol_case.symbol, round_start))
+    assert second["added"] == 0
+    assert pg.max_time(conn, symbol_case.symbol) == in_progress - ONE_MINUTE_MS
+
+
+def test_bounded_pull_uses_per_page_clock_for_closed_check(
+    conn: DbConn,
+    fake: FakeExchange,
+    pg_dsn: str,
+    tmp_path: Path,
+    symbol_case: SymbolCase,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """限区间请求的「是否收盘」必须用**当页**时钟，轮首时钟会把本轮才收盘的尾巴丢掉。
+
+    丢掉的尾巴不会被记成缺口——完整性判定只在 ``[from, to]`` 内比对——也就不会报错，
+    一次正常的追赶会静默少几根（违反「不静默兜底」）。这里让时钟按序返回
+    「轮首时刻、拉页时刻」，把两个时刻分开；单测无法让真实时间前进，只能这样表达。
+    """
+    in_progress = fake.in_progress(symbol_case.symbol)
+    round_start = in_progress - 4 * ONE_MINUTE_MS
+    page_time = fixed_now(fake, symbol_case.symbol)
+    _fixed_clock(monkeypatch, [round_start, page_time])
+
+    # now=None：走生产路径的「现读时钟」，才能被上面注入的序列替换（注入 now_ms 会固定整轮）。
+    options = replace(
+        _options(fake, pg_dsn, tmp_path, symbol_case.symbol, None),
+        to_ms=in_progress,
+    )
+    run_sync(options)
+
+    stored = _times(conn, symbol_case.symbol)
+    assert max(stored) == in_progress - ONE_MINUTE_MS
+    assert len(stored) == symbol_case.bars - 1
 
 
 def test_boundary_violation_raises_and_history_untouched(

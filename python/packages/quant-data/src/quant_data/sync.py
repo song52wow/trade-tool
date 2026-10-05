@@ -2,8 +2,9 @@
 
 一轮 ``sync`` 的固定顺序（对应需求）：
 a. 单写者锁（``pg.SymbolLock``）→ b. 元数据解析与校验 → c. **优先回补已登记缺口**（R-11.B6）
-→ d. 由起点决定写入策略（R-9.3）→ e/f. 分页拉取、去重、边界校验 → g. 丢弃最后一根（R-10.1）
-→ h. 分批 ``COPY`` 写入并同事务推进水位（R-3.2 / R-19.5）→ i. 最后一根自愈校验（R-10.3）
+→ d. 由起点决定写入策略（R-9.3）→ e/f. 分页拉取、去重、边界校验 → g. 丢弃最后一根（R-10.1），
+并把它的开盘时刻留作收尾校验的时钟无关判据 → h. 分批 ``COPY`` 写入并同事务推进水位
+（R-3.2 / R-19.5）→ i. 最后一根自愈校验（R-10.3，**判据不得复用轮首时钟**，见 ``_round_clock``）
 → j. 增量缺口检测（R-11.A）→ k. 全局权重预算（R-20）→ l. NOT NULL 语义（R-4）。
 """
 
@@ -12,7 +13,7 @@ from __future__ import annotations
 import math
 import os
 import time
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -128,6 +129,24 @@ def _validate_options(
                 {"from": opts.from_ms, "to": opts.to_ms},
             )
     return opts.now_ms if opts.now_ms is not None else now_ms()
+
+
+def _round_clock(opts: SyncOptions, round_now: int) -> Callable[[], int]:
+    """本轮的读时钟函数：**除单测注入外，每次调用都现读一次**。
+
+    - 注入了 ``now_ms``（R-10.4 的单测固定时钟）：恒返回它，用例才可复现；
+    - 否则：真读系统时钟，绝不把轮首那一刻复用到底。
+
+    为什么复用轮首时刻是错的：写入路径判定「是否收盘」靠的是**交易所返回的末位**
+    （R-10.1，与本地时钟无关），而一轮完全可能因为首次全量（实测十几到几十分钟）、
+    全局权重预算等待（``WeightBudget.reserve`` 会 sleep 到下一个 60s 窗口）或缺口回补
+    跨过整分钟边界。此时用轮首时钟去判「库里最后一根是否未收盘」，会把本轮刚写入的、
+    其实已经收盘的 bar 判成未收盘（``UNCLOSED_BAR_IN_STORE`` 误报），
+    在常驻侧直接把标的钉成 ``error`` 并中断同步。
+    """
+    if opts.now_ms is not None:
+        return lambda: round_now
+    return now_ms
 
 
 def _resolve_dsn(opts: SyncOptions) -> str | None:
@@ -312,8 +331,26 @@ def _assert_within_boundary(rows: Sequence[Kline], start_ms: int, symbol: str) -
 
 
 def _keep_closed(page: list[Kline], now: int) -> list[Kline]:
-    """丢掉所有尚未收盘的 bar（``closeTime > now``），其余全部保留。"""
+    """丢掉所有尚未收盘的 bar（``closeTime > now``），其余全部保留。
+
+    ``now`` 由调用方按**当页拉取时刻**现读（:func:`_round_clock`）。用轮首时刻会把本轮
+    才收盘的尾部 bar 一起丢掉，而限区间请求的完整性判定只在 ``[from, to]`` 内比对，
+    丢掉的尾巴既不会报错也不会记成缺口——那就是静默少数据。
+    """
     return [row for row in page if row.close_time <= now]
+
+
+@dataclass(slots=True)
+class PullObservation:
+    """拉取过程中留下的「交易所当前那根 bar」的开盘时刻（R-10.3 的时钟无关判据）。
+
+    开放式请求（无 ``endTime``）返回的末位就是交易所**正在形成**的那根 bar（R-10.1），
+    它会被无条件丢弃；把它的开盘时刻记在这里，收尾校验就能问「库里最后一根是否严格早于
+    交易所此刻这根」，而不必拿本地时钟当「是否收盘」的权威（本地时钟既可能落后交易所，
+    也可能是轮首抓的旧值）。
+    """
+
+    open_bar_time: int | None = None
 
 
 def _iter_pull(
@@ -321,7 +358,8 @@ def _iter_pull(
     symbol: str,
     start_ms: int,
     end_ms: int | None,
-    now: int,
+    clock: Callable[[], int],
+    observation: PullObservation | None = None,
 ) -> Iterator[list[Kline]]:
     """按页产出 1m bar（已按区间过滤、已去重、已丢弃未收盘末根）。
 
@@ -335,7 +373,8 @@ def _iter_pull(
     （144 万根 ≈ 上百 MB），恰好抵消了流式的意义。
 
     末位处理规则见原 ``_pull_range`` 的说明：开放式请求无条件丢弃末位（与时钟无关），
-    指定 ``endTime`` 的请求只丢弃 ``closeTime > now`` 的。
+    并把该末位记进 ``observation``（逐页覆盖，最后一个非空页的值即交易所此刻的最新 bar）；
+    指定 ``endTime`` 的请求只丢弃 ``closeTime > clock()`` 的，且**每页现读一次时钟**。
     """
     emitted_upto = start_ms - ONE_MINUTE_MS
     cursor = start_ms
@@ -344,7 +383,12 @@ def _iter_pull(
         page = client.klines(symbol, cursor, end_ms, limit)
         if not page:
             return
-        kept = page[:-1] if end_ms is None else _keep_closed(page, now)
+        if end_ms is None:
+            if observation is not None:
+                observation.open_bar_time = page[-1].time
+            kept = page[:-1]
+        else:
+            kept = _keep_closed(page, clock())
         # 边界校验（R-9.4）必须在去重**之前**：去重是按「已产出的最大 time」丢更早的行，
         # 若先去过重，交易所无视 startTime 返回的越界 bar 会被静默丢掉，
         # AC-31 要求抛出的 BACKFILL_BOUNDARY_VIOLATION 就永远不会发生。
@@ -378,15 +422,15 @@ def _pull_range(
     symbol: str,
     start_ms: int,
     end_ms: int | None,
-    now: int,
+    clock: Callable[[], int],
 ) -> list[Kline]:
-    """把整段拉成一个列表。**只用于小范围**（单页量级）。
+    """把整段拉成一个列表。**只用于小范围**（单页量级，如缺口回补）。
 
     首次全量与大区间必须走 :func:`_stream_pull_and_write`：把 144 万根全部攒在内存里
     再写，不仅峰值内存随数据量线性增长，而且中断后水位从未推进，重跑要整段重来。
     """
     collected: dict[int, Kline] = {}
-    for fresh in _iter_pull(client, symbol, start_ms, end_ms, now):
+    for fresh in _iter_pull(client, symbol, start_ms, end_ms, clock):
         for row in fresh:
             collected.setdefault(row.time, row)
     return [collected[key] for key in sorted(collected)]
@@ -432,7 +476,7 @@ def _stream_pull_and_write(
     end_ms: int | None,
     strategy: str,
     now: int,
-) -> int:
+) -> tuple[int, PullObservation]:
     """边拉边写：攒够 ``batch_size`` 就 ``COPY`` + 提交 + 推进水位，再继续拉下一页。
 
     这是 R-3.2 / R-8.5 / AC-6 的落点，也是与「先拉完再写」的本质区别：
@@ -441,10 +485,15 @@ def _stream_pull_and_write(
     - **峰值内存是 O(batch_size)**，与数据总量无关——首次全量 144 万行不会撑爆内存；
     - 边界校验（R-9.4）按批执行，与「全量校验后再写」等价：任何一根
       ``time < startTime`` 都会在它所在的那一批抛错，此前已提交的批次保持有效。
+
+    返回 ``(新增行数, 拉取过程中观察到的交易所当前 bar)``。后者目前只有 ``run_sync``
+    用得着（R-10.3 的收尾校验），而那个判定必须在写完——可能已过很久——之后才做。
     """
     added = 0
     known_rows: int | None = None
     buffer: list[Kline] = []
+    observation = PullObservation()
+    clock = _round_clock(opts, now)
 
     def commit(chunk: Sequence[Kline]) -> None:
         """写入一批并在**同一事务内**推进可观测状态（R-19.5）。"""
@@ -459,25 +508,49 @@ def _stream_pull_and_write(
             known_rows = _advance_progress(writer, opts, batch_added, now, known_rows)
             added += batch_added
 
-    for fresh in _iter_pull(client, opts.symbol, start_ms, end_ms, now):
+    for fresh in _iter_pull(client, opts.symbol, start_ms, end_ms, clock, observation):
         buffer.extend(fresh)
         while len(buffer) >= opts.batch_size:
             commit(buffer[: opts.batch_size])
             del buffer[: opts.batch_size]
     if buffer:
         commit(buffer)
-    return added
+    return added, observation
 
 
-def _assert_last_bar_closed(writer: DbConn, symbol: str, now: int) -> None:
+def _assert_last_bar_closed(
+    writer: DbConn,
+    symbol: str,
+    observation: PullObservation,
+    clock: Callable[[], int],
+) -> None:
     """库内最后一根必须已收盘（R-10.3）。
 
     增量起点含最后一根，重拉 + UPSERT 已把它覆盖；这里在写完后再校验一次，
     仍不满足就抛错——**不得静默继续**。
+
+    判据分两级，优先用**与本地时钟无关**的那一级：
+
+    1. ``observation.open_bar_time``（本轮拉取看到的、交易所当前正在形成的那根 bar）：
+       库里最后一根必须**严格早于**它。这是精确判据——写入路径丢掉的正是这根末位；
+    2. 拿不到观测时（本轮一页都没拉到：库里最后一根已跑到交易所最新数据之后）
+       退回本地时钟，并且**必须现读**（``clock``）。绝不能用轮首那一刻：一轮可能跨过
+       整分钟边界，用轮首时钟会把本轮刚写入的、已收盘的 bar 误判成未收盘，
+       把一次正常的同步打断（见 :func:`_round_clock`）。
     """
     last = pg.last_bar_time(writer, symbol)
     if last is None:
         return
+    observed = observation.open_bar_time
+    if observed is not None:
+        if last < observed:
+            return
+        raise SyncError(
+            "UNCLOSED_BAR_IN_STORE",
+            f"库内最后一根 bar 尚未收盘: {symbol} time={last} exchangeOpenBar={observed}",
+            {"symbol": symbol, "time": last, "exchangeOpenBar": observed},
+        )
+    now = clock()
     close_time = pg.bar_close_time(last)
     if close_time > now:
         raise SyncError(
@@ -507,6 +580,9 @@ def _backfill_registered_gaps(
     state = pg.read_state(writer, opts.exchange, opts.symbol)
     verified = state.get("verified_upto") if state is not None else None
     verified_ms = int(verified) if verified is not None else None
+    # 缺口区间全在历史里，本来就不该出现未收盘 bar；仍然用现读时钟而不是轮首时刻——
+    # 让「是否收盘」的判据在全仓库只有一处来源，比在两种时钟之间挑一个更不容易出错。
+    clock = _round_clock(opts, now)
     for gap in pg.list_gaps(writer, opts.symbol):
         gap_start = int(gap["gap_start"])
         if skip is not None and gap_start in skip:
@@ -521,7 +597,7 @@ def _backfill_registered_gaps(
         try:
             # 缺口区间天然很小（几根到几百根），单事务内整段写完；
             # 这里刻意不走流式：删除 gap 记录与推进 verified_upto 必须在同一事务里判定（R-11.B8）。
-            rows = _pull_range(client, opts.symbol, gap_start, gap_end, now)
+            rows = _pull_range(client, opts.symbol, gap_start, gap_end, clock)
             _assert_within_boundary(rows, gap_start, opts.symbol)
             with writer.transaction():
                 # 缺口回补一律 DO NOTHING：绝不误改已存在的正确数据（R-11.B7）。
@@ -821,10 +897,14 @@ def run_sync(opts: SyncOptions) -> dict[str, object]:
 
         # e–h. 边拉边写：每批一个事务，提交后才推进水位（R-3.2 / AC-6）。
         # 边界校验在每批内执行，与「全量校验后再写」等价（R-9.4）。
-        added = _stream_pull_and_write(writer, opts, client, start_ms, opts.to_ms, strategy, now)
+        added, pull_observation = _stream_pull_and_write(
+            writer, opts, client, start_ms, opts.to_ms, strategy, now
+        )
 
-        # i. 最后一根自愈校验。
-        _assert_last_bar_closed(writer, item.symbol, now)
+        # i. 最后一根自愈校验（R-10.3）。判据优先用「本轮拉取看到的交易所当前那根 bar」，
+        # 与本地时钟无关；退回本地时钟时也必须现读——用轮首的 now 会把本轮刚写入的、
+        # 已经收盘的 bar 误判成未收盘（长轮次必然命中，见 _round_clock）。
+        _assert_last_bar_closed(writer, item.symbol, pull_observation, _round_clock(opts, now))
 
         # j. 增量缺口检测。
         gaps_pending, _verified = _detect_and_register_gaps(writer, opts, now)
@@ -936,7 +1016,9 @@ def run_backfill(opts: SyncOptions) -> dict[str, object]:
             raise
         # 同样是边拉边写：`data backfill --from --to` 的区间完全可能横跨整个历史，
         # 先攒完再写会把内存吃满，且中断后水位不推进（与 AC-6 冲突）。
-        added = _stream_pull_and_write(
+        # 限区间请求的收盘判据在拉取时就按现读时钟执行了（`_keep_closed`），
+        # R-10.3 的收尾校验只属于 `run_sync`，这里不需要那个观测。
+        added, _observation = _stream_pull_and_write(
             writer, opts, client, opts.from_ms, opts.to_ms, "do-nothing", now
         )
         # 分母必须按**对齐到 1m 开盘时刻**的行数算，否则未对齐入参会高估（R-11.B12）。
