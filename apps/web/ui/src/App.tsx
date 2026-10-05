@@ -36,6 +36,13 @@ export function App() {
   const [knownSymbols, setKnownSymbols] = useState<string[]>([]);
   const [autoRefresh, setAutoRefresh] = useState(true);
   const [loadError, setLoadError] = useState<string | null>(null);
+  /**
+   * 全局刷新计数。每成功刷新一次 +1，详情里的 K 线图拿它当刷新信号。
+   *
+   * 用它而不是让图自己开定时器：页面只有一个刷新节奏，图自己轮询会出现「关掉自动刷新
+   * 后图还在动」这种界面与事实不一致（R-19 的诚实性要求）。
+   */
+  const [tick, setTick] = useState(0);
   const toastId = useRef(0);
 
   const notify = useCallback((text: string, kind: 'ok' | 'err' = 'ok') => {
@@ -60,6 +67,8 @@ export function App() {
       setJobs(j);
       // 成功即清错：横幅必须能自己消失，否则修好后它还赖着不走。
       setLoadError(null);
+      // 只在成功时推进 tick：读取失败时让图再去拉一次同样的数据没有意义。
+      setTick((prev) => prev + 1);
     } catch (error) {
       // 加载失败必须是**常驻可见**的，不能只弹一下 toast——那等于静默失败（AGENTS.md 第 9 条）。
       setLoadError(
@@ -438,6 +447,7 @@ export function App() {
               now={now}
               verifying={verifyingSymbol === selected}
               onVerify={() => setPending({ kind: 'verify', symbol: selected })}
+              tick={tick}
             />
           )}
         </div>

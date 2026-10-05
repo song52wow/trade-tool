@@ -428,3 +428,72 @@ describe('守护进程卡片', () => {
     expect(screen.getByText(/守护进程未运行/)).toBeTruthy();
   });
 });
+
+/**
+ * 详情页里的 K 线（R-23）。
+ *
+ * 这一组要验的是**接线**：选中标的 → 详情里出现 K 线面板 → 真的去 `/bars` 取数。
+ * 组件自己的行为在 CandleChart / PriceChart 的用例里验，这里只看拼装。
+ */
+describe('详情页 K 线', () => {
+  function detailStub(bars: unknown[], detail: SymbolRowDto = row('BTCUSDC')) {
+    return {
+      '/api/overview': overview,
+      '/api/symbols': { items: [detail] },
+      '/api/jobs': { items: [] },
+      '/api/exchange': {
+        exchange: 'binance',
+        count: 1,
+        cachedAt: NOW,
+        ageMs: 0,
+        stale: false,
+        symbols: [
+          {
+            exchange: 'binance',
+            symbol: 'BTCUSDC',
+            contractType: 'PERPETUAL',
+            status: 'TRADING',
+            onboardDate: NOW - 86_400_000,
+          },
+        ],
+      },
+      // 详情与 K 线是两条不同形状的响应：没有各自的 handler，前缀匹配会让
+      // `/api/symbols/BTCUSDC` 拿到列表的 { items }，详情页拿到一个空壳。
+      '/api/symbols/BTCUSDC/bars': { symbol: 'BTCUSDC', limit: 300, items: bars },
+      '/api/symbols/BTCUSDC': { ...detail, contract: null, gaps: [], estimate: null },
+    };
+  }
+
+  const bars = Array.from({ length: 4 }, (_, i) => ({
+    time: NOW - (3 - i) * 60_000,
+    open: 100 + i,
+    high: 101 + i,
+    low: 99 + i,
+    close: 100.5 + i,
+    volume: 12,
+  }));
+
+  it('选中已有历史的标的后画出 K 线，并说明数据读自本地库', async () => {
+    const calls = stubFetch(detailStub(bars));
+    render(<App />);
+
+    await waitFor(() => expect(screen.getByText('BTCUSDC')).toBeTruthy());
+    fireEvent.click(screen.getAllByText('BTCUSDC')[0]!);
+
+    await waitFor(() => expect(screen.getByText(/读自本地库/)).toBeTruthy());
+    expect(calls.some((c) => c.startsWith('/api/symbols/BTCUSDC/bars'))).toBe(true);
+    // 区间可切
+    expect(screen.getByTitle(/最近 60 分钟/)).toBeTruthy();
+  });
+
+  it('库里没有历史的标的：K 线区给可执行的下一步，而不是空图', async () => {
+    const bare = row('BTCUSDC', { hasHistory: false, state: null });
+    stubFetch(detailStub([], bare));
+    render(<App />);
+
+    await waitFor(() => expect(screen.getByText('BTCUSDC')).toBeTruthy());
+    fireEvent.click(screen.getAllByText('BTCUSDC')[0]!);
+
+    await waitFor(() => expect(screen.getByText(/库里还没有 BTCUSDC/)).toBeTruthy());
+  });
+});

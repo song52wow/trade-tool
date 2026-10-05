@@ -1,6 +1,7 @@
 import type { GapRecord, RemovePolicy } from '@trade-tool/core';
 
 import type {
+  BarsDto,
   ExchangeListDto,
   JobDto,
   OverviewDto,
@@ -14,6 +15,12 @@ export class ApiError extends Error {
     readonly code: string,
     message: string,
     readonly details?: Record<string, unknown>,
+    /**
+     * HTTP 状态码。与 `code` 分开：`code` 说的是**哪一类**错误，状态码能区分
+     * 「服务端明确拒绝」（4xx 带 code）与「路由根本不存在」（404 且响应体不是本服务的
+     * 错误体）——后者说明连的进程不是这份代码，提示必须不一样。
+     */
+    readonly status?: number,
   ) {
     super(message);
     this.name = 'ApiError';
@@ -22,10 +29,26 @@ export class ApiError extends Error {
 
 const JSON_HEADERS = { 'content-type': 'application/json' };
 
+/**
+ * 错误响应的正文**未必**是 JSON：Hono 对未注册的路由直接回一段纯文本 `404 Not Found`。
+ * 让 `JSON.parse` 在那里抛错，等于把「这个进程没有这条路由」显示成一句
+ * `Unexpected token 'o'`，把真正的原因彻底盖掉。
+ */
+function parseErrorBody(text: string): unknown {
+  if (text === '') return null;
+  try {
+    return JSON.parse(text);
+  } catch {
+    return null;
+  }
+}
+
 async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
   const res = await fetch(path, init);
   const text = await res.text();
-  const payload: unknown = text ? JSON.parse(text) : null;
+  // 成功响应必须是 JSON：解析不了就是服务端违约，让它当场抛出来，而不是悄悄
+  // 当成 null 传下去（AGENTS.md 第 9 条：不静默兜底）。
+  const payload: unknown = res.ok ? (text === '' ? null : JSON.parse(text)) : parseErrorBody(text);
   if (!res.ok) {
     const err = (
       payload as {
@@ -36,6 +59,7 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
       err?.code ?? 'HTTP_ERROR',
       err?.message ?? `${res.status} ${res.statusText}`,
       err?.details,
+      res.status,
     );
   }
   return payload as T;
@@ -52,6 +76,26 @@ export const api = {
   overview: () => request<OverviewDto>('/api/overview'),
   symbols: () => request<{ items: SymbolRowDto[] }>('/api/symbols').then((r) => r.items),
   symbol: (s: string) => request<SymbolDetailDto>(`/api/symbols/${encodeURIComponent(s)}`),
+  /**
+   * 最近 limit 根 1m K 线（升序）。只读本地库，limit 超上限由服务端截断。
+   *
+   * 404 在这里单列，因为它的含义非常具体：路由是在**进程启动时**注册的，所以 404
+   * 几乎总是「正在访问的控制面是改动前的旧进程」——前端已经是新的，后端还没重启。
+   * 这与「库里没数据」（200 + 空数组）完全相反：前者要重启，后者要去同步。报一句
+   * 笼统的 `404 Not Found`，用户根本判断不出该做哪件事。
+   */
+  bars: (s: string, limit: number) =>
+    request<BarsDto>(`/api/symbols/${encodeURIComponent(s)}/bars?limit=${String(limit)}`).catch(
+      (error: unknown) => {
+        if (error instanceof ApiError && error.status === 404) {
+          throw new ApiError(
+            'CONTROL_PLANE_STALE',
+            `控制面没有 /bars 路由：它还是改动前启动的旧进程。重启 trade-tool 控制面后刷新页面即可（页面本身已是新的）。`,
+          );
+        }
+        throw error;
+      },
+    ),
   exchange: (refresh = false) =>
     request<ExchangeListDto>(`/api/exchange${refresh ? '?refresh=true' : ''}`),
   addSymbol: (symbol: string) => post<SymbolRowDto>('/api/symbols', { symbol }),

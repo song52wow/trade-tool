@@ -163,6 +163,40 @@ export async function readBars(
   }
 }
 
+/**
+ * 取**最后 N 根**（升序返回），可选 `to` 作为闭区间上界。
+ *
+ * 为什么不能直接给 `readBars` 传 `limit`：它按 `time ASC LIMIT n` 取，给 limit 拿到的是
+ * 区间**最早**的 n 根。看盘要的是最近这一段，所以这里先 DESC 取回再翻正——图表与
+ * 「库里最新数据长什么样」都必须看这一端。
+ *
+ * 与 `readBars` 一样：读不到行返回空数组（调用方据此区分「没同步」与「字段为 NULL」），
+ * 且复用同一组列与同一个 `toBar` 映射，不另持影子定义（R-2.5）。
+ */
+export async function readLatestBars(
+  pool: Pool,
+  symbol: string,
+  range: { limit?: number; to?: number } = {},
+): Promise<BarRow[]> {
+  try {
+    const values: unknown[] = [symbol];
+    let upper = '';
+    if (range.to !== undefined) {
+      values.push(range.to);
+      upper = ` AND time <= $${values.length}`;
+    }
+    values.push(range.limit ?? 10_000);
+    const result = await pool.query<QueryResultRow>(
+      `SELECT ${BAR_COLUMNS} FROM klines_1m WHERE symbol = $1${upper} ORDER BY time DESC LIMIT $${values.length}`,
+      values,
+    );
+    // 倒序取回是为了「取最新」，但对外一律升序：下游（图表、CSV）都按时间正序消费。
+    return result.rows.map((row, index) => toBar(row, index, symbol)).reverse();
+  } catch (error) {
+    throw toSyncError(error, `读取 ${symbol} 最近 K 线失败`);
+  }
+}
+
 /** 库内最后一根 bar，用于「丢弃最后一根」后的自愈校验（R-10.3）。 */
 export async function lastBar(pool: Pool, symbol: string): Promise<BarRow | null> {
   try {

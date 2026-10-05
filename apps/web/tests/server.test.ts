@@ -1,6 +1,7 @@
 import { SyncError } from '@trade-tool/core';
 import { describe, expect, it } from 'vitest';
 
+import { MAX_BAR_LIMIT } from '../src/bars.js';
 import { buildApp, type WebDeps } from '../src/server.js';
 import type { JobDto, OverviewDto, SymbolDetailDto, SymbolRowDto } from '../src/types.js';
 
@@ -102,6 +103,13 @@ function fakeDeps(overrides: Partial<WebDeps> = {}): WebDeps & { calls: string[]
     listGaps: async (symbol) => {
       calls.push(`gaps:${symbol}`);
       return [];
+    },
+    listBars: async (symbol, options) => {
+      calls.push(`bars:${symbol}:${String(options.limit)}`);
+      return [
+        { time: NOW - 60_000, open: 1, high: 2, low: 0.5, close: 1.5, volume: 10 },
+        { time: NOW, open: 1.5, high: 2.5, low: 1, close: 2, volume: 12 },
+      ];
     },
     estimate: async (symbol) => {
       calls.push(`estimate:${symbol}`);
@@ -373,5 +381,76 @@ describe('详情返回结构', () => {
     expect(body).toHaveProperty('contract');
     expect(body).toHaveProperty('gaps');
     expect(body).toHaveProperty('estimate');
+  });
+});
+
+/**
+ * K 线取数路由（R-23）。
+ *
+ * 重点不是「能返回 K 线」，而是**闸门**：`limit` 来自 URL，是唯一能放大这条查询的旋钮，
+ * 非法值必须报错、超限必须截断，并且回包里的 `limit` 是**实际生效值**，页面据此说明
+ * 自己看到的不是全部。
+ */
+describe('GET /api/symbols/:symbol/bars', () => {
+  it('不传 limit 用缺省 300', async () => {
+    const deps = fakeDeps();
+    const app = buildApp(deps);
+    const res = await app.request('/api/symbols/AAAUSDT/bars');
+
+    expect(res.status).toBe(200);
+    expect(deps.calls).toContain('bars:AAAUSDT:300');
+  });
+
+  it('回包带上生效 limit 与升序 bar', async () => {
+    const app = buildApp(fakeDeps());
+    const body = (await (await app.request('/api/symbols/AAAUSDT/bars?limit=120')).json()) as {
+      symbol: string;
+      limit: number;
+      items: { time: number; close: number }[];
+    };
+
+    expect(body.symbol).toBe('AAAUSDT');
+    expect(body.limit).toBe(120);
+    expect(body.items).toHaveLength(2);
+    expect(body.items[0]?.time).toBeLessThan(body.items[1]?.time ?? 0);
+  });
+
+  it('超上限截断，并把截断后的值如实回传', async () => {
+    const deps = fakeDeps();
+    const app = buildApp(deps);
+    const res = await app.request('/api/symbols/AAAUSDT/bars?limit=999999');
+    const body = (await res.json()) as { limit: number };
+
+    expect(body.limit).toBe(MAX_BAR_LIMIT);
+    expect(deps.calls).toContain(`bars:AAAUSDT:${String(MAX_BAR_LIMIT)}`);
+  });
+
+  it('非法 limit 报 400 且**不落到查询层**', async () => {
+    for (const raw of ['0', '-5', '1.5', 'abc']) {
+      const deps = fakeDeps();
+      const app = buildApp(deps);
+      const res = await app.request(`/api/symbols/AAAUSDT/bars?limit=${raw}`);
+
+      expect(res.status).toBe(400);
+      expect(((await res.json()) as { error: { code: string } }).error.code).toBe('CONFIG_INVALID');
+      // 静默换成缺省值会让人以为「数据就这么多」，所以必须一次查询都不发
+      expect(deps.calls.some((c) => c.startsWith('bars:'))).toBe(false);
+    }
+  });
+
+  it('库里没有该标的数据时 200 + 空数组，不是 404', async () => {
+    const app = buildApp(fakeDeps({ listBars: async () => [] }));
+    const res = await app.request('/api/symbols/NEVERSYNCED/bars');
+    const body = (await res.json()) as { items: unknown[] };
+
+    expect(res.status).toBe(200);
+    expect(body.items).toEqual([]);
+  });
+
+  it('symbol 前后空格照旧归一化（与其它路由同一口径）', async () => {
+    const deps = fakeDeps();
+    const app = buildApp(deps);
+    await app.request('/api/symbols/%20AAAUSDT%20/bars');
+    expect(deps.calls.some((c) => c === 'bars:AAAUSDT:300')).toBe(true);
   });
 });

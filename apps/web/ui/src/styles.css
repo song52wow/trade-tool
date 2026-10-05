@@ -381,6 +381,86 @@ dialog::backdrop {
   height: 220px;
 }
 
+/* ---------- K 线（R-23） ---------- */
+
+.price-chart {
+  margin-top: 6px;
+}
+
+.chart-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  margin-bottom: 4px;
+}
+
+.chart-head .chip {
+  padding: 2px 8px;
+  font-size: 11px;
+  line-height: 1.6;
+  color: var(--muted);
+}
+
+.chart-head .chip.active {
+  color: var(--text);
+  border-color: var(--accent);
+  background: rgba(76, 141, 255, 0.12);
+}
+
+.chart-error {
+  color: var(--err);
+  margin: 4px 0 0;
+}
+
+/* 提示框绝对定位在图上，所以容器必须是定位上下文 */
+.candle-wrap {
+  position: relative;
+  width: 100%;
+}
+
+.candle-wrap svg {
+  display: block;
+  overflow: visible;
+}
+
+.candle-tip {
+  position: absolute;
+  z-index: 2;
+  pointer-events: none;
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+  border-left-width: 2px;
+  border-radius: var(--radius);
+  padding: 6px 8px;
+  font-size: 11px;
+  min-width: 132px;
+  box-shadow: 0 4px 12px rgb(0 0 0 / 35%);
+}
+
+.candle-tip dl {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 1px 8px;
+  margin: 4px 0 0;
+}
+
+.candle-tip dt {
+  color: var(--muted);
+}
+
+.candle-tip dd {
+  margin: 0;
+  text-align: right;
+}
+
+.candle-legend {
+  display: flex;
+  gap: 12px;
+  font-size: 11px;
+  margin-top: 4px;
+}
+
 /* ---------- 窄屏 ---------- */
 
 /* 表格横向滚动的提示只在窄屏出现，桌面端表格整列可见，不需要 */

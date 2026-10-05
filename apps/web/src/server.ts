@@ -1,9 +1,11 @@
 import { Hono } from 'hono';
 import { SyncError, type GapRecord, type RemovePolicy } from '@trade-tool/core';
 
+import { parseBarLimit } from './bars.js';
 import { toErrorBody } from './errors.js';
 import type {
   AddSymbolBody,
+  BarDto,
   ExchangeListDto,
   JobDto,
   LifecycleAction,
@@ -29,6 +31,8 @@ export interface WebDeps {
   removeSymbol(symbol: string, policy: RemovePolicy): Promise<void>;
   lifecycle(symbol: string, action: LifecycleAction): Promise<SymbolRowDto>;
   listGaps(symbol: string): Promise<GapRecord[]>;
+  /** 最近 N 根 1m K 线，升序。limit 已由路由夹到上限内，这里拿到的就是生效值。 */
+  listBars(symbol: string, options: { limit: number }): Promise<BarDto[]>;
   estimate(symbol: string): Promise<SymbolDetailDto['estimate']>;
   startJob(input: {
     kind: 'full' | 'verify';
@@ -132,6 +136,19 @@ export function buildApp(deps: WebDeps): Hono {
   app.get('/api/symbols/:symbol/gaps', async (c) => {
     const symbol = normalizeSymbol(c.req.param('symbol'));
     return c.json({ symbol, items: await deps.listGaps(symbol) });
+  });
+
+  /**
+   * K 线图取数（R-23）：最近 N 根，**只读本地库**。
+   *
+   * 不出网、不写库，也不占用交易所配额——它是纯读，因此可以挂在页面的刷新节奏上。
+   * 库里没有该标的数据时返回 `items: []`（200），不是 404：这个标的确实可能存在于
+   * 页面之外的库里而只是没同步过，「没数据」是正常答案，页面要如实显示空状态。
+   */
+  app.get('/api/symbols/:symbol/bars', async (c) => {
+    const symbol = normalizeSymbol(c.req.param('symbol'));
+    const limit = parseBarLimit(c.req.query('limit'));
+    return c.json({ symbol, limit, items: await deps.listBars(symbol, { limit }) });
   });
 
   /** 规模预估（R-8.3）：首次全量前必须先算给人看，确认弹窗的数据就来自这里。 */

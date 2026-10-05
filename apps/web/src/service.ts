@@ -17,6 +17,7 @@ import {
   listExchangeSymbols,
   readBars,
   readDaemonHeartbeat,
+  readLatestBars,
   resolveContract,
   schemaStatus,
   syncSymbol,
@@ -26,10 +27,12 @@ import {
 } from '@trade-tool/data';
 import { createSyncService, type SyncService } from '@trade-tool/sync';
 
+import { clampBarLimit } from './bars.js';
 import { JobRegistry, type JobRunnerOptions } from './jobs.js';
 import { mergeSymbolRows } from './rows.js';
 import type { WebDeps } from './server.js';
 import type {
+  BarDto,
   DaemonStatusDto,
   ExchangeListDto,
   OverviewDto,
@@ -174,6 +177,28 @@ export function createWebRuntime(config: TradeToolConfig): WebRuntime {
 
     async listGaps(symbol): Promise<GapRecord[]> {
       return getGaps(ctx, symbol);
+    },
+
+    /**
+     * 最近 N 根 1m K 线（R-23）。
+     *
+     * 只读本地 `klines_1m`，不出网也不写库——所以它能挂在页面的刷新节奏上，代价只是一
+     * 次走主键的倒序 LIMIT。这里再夹一次上限：路由已经夹过，但 `WebRuntime` 也会被
+     * 直接调用（测试、将来的其它前端），上限不能只长在 HTTP 那一层。
+     *
+     * `quote_volume` / `trades` 读出来但不进 DTO：图上用不到，白白撑大每次响应。
+     */
+    async listBars(symbol, options): Promise<BarDto[]> {
+      const limit = clampBarLimit(options?.limit);
+      const bars = await readLatestBars(pool, symbol, { limit });
+      return bars.map(({ time, open, high, low, close, volume }) => ({
+        time,
+        open,
+        high,
+        low,
+        close,
+        volume,
+      }));
     },
 
     // 预估要出网读元数据但**不写库**（R-8.3），所以由确认弹窗按需单独触发。

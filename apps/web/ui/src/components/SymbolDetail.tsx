@@ -1,6 +1,7 @@
 import { fmtAgo, fmtDate, fmtNumber, fmtTime } from '../format.js';
 import type { SymbolDetailDto } from '../../../src/types';
 import { CoverageChart } from './CoverageChart.js';
+import { PriceChart } from './PriceChart.js';
 
 export function SymbolDetail(props: {
   detail: SymbolDetailDto;
@@ -8,12 +9,26 @@ export function SymbolDetail(props: {
   /** 全表体检（verify）进行中 */
   verifying: boolean;
   onVerify: () => void;
+  /** 随全局刷新递增，K 线图跟着它更新 */
+  tick: number;
 }) {
   const { state, coverage, contract, gaps, exchange, desiredState, inCollection, hasHistory } =
     props.detail;
   return (
     <div>
-      <div className="grid2">
+      {/* K 线放在最上面：这个面板回答的第一个问题是「同步下来的数据长什么样」，
+          覆盖时间线与合约规格是它的补充说明。 */}
+      <div>
+        <h2 style={{ fontSize: 13, color: 'var(--muted)', fontWeight: 500 }}>K 线</h2>
+        <PriceChart
+          symbol={props.detail.symbol}
+          totalRows={state?.rows ?? null}
+          hasHistory={hasHistory}
+          tick={props.tick}
+        />
+      </div>
+
+      <div className="grid2" style={{ marginTop: 18 }}>
         <div>
           <h2 style={{ fontSize: 13, color: 'var(--muted)', fontWeight: 500 }}>覆盖时间线</h2>
           <CoverageChart coverage={coverage} />

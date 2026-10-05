@@ -79,6 +79,32 @@ export interface SymbolDetailDto extends SymbolRowDto {
   estimate: SyncPlanEstimate | null;
 }
 
+/**
+ * 一根 1m K 线（控制面 K 线图用，R-23）。
+ *
+ * 时间沿用 Bar 契约的**毫秒时间戳**（跨语言契约就是 schema，列是 bigint 毫秒），不在
+ * DTO 层转成 ISO 字符串：图上要按时间算坐标、算缺口，转字符串就得多解析一次。epoch
+ * 毫秒远小于 2^53，JSON number 往返无损。
+ *
+ * 只带画图必需的六列：`quote_volume` / `trades` 在本视图里没有用途，带上只是让每次
+ * 首屏响应更大；它们仍在 `klines_1m` 里，随时可查。
+ */
+export interface BarDto {
+  time: number;
+  open: number;
+  high: number;
+  low: number;
+  close: number;
+  volume: number;
+}
+
+/** 图表取数结果。`limit` 是**实际生效**的上限，页面据此如实说明是否被截断。 */
+export interface BarsDto {
+  symbol: string;
+  limit: number;
+  items: BarDto[];
+}
+
 /** exchangeInfo 概览；不返回全量列表，避免每次轮询都传几百个标的。 */
 export interface ExchangeOverviewDto {
   exchange: string;
