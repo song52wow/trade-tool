@@ -1,6 +1,8 @@
 import { fmtAgo, fmtDate, fmtNumber, fmtTime } from '../format.js';
+import type { DerivedIntervalDto } from '../../../src/types';
 import type { SymbolDetailDto } from '../../../src/types';
 import { CoverageChart } from './CoverageChart.js';
+import { ALL_INTERVALS } from './gaps.js';
 import { PriceChart } from './PriceChart.js';
 
 export function SymbolDetail(props: {
@@ -9,11 +11,23 @@ export function SymbolDetail(props: {
   /** 全表体检（verify）进行中 */
   verifying: boolean;
   onVerify: () => void;
+  /** 重建派生表（aggregate）进行中 */
+  aggregating: boolean;
+  onAggregate: () => void;
   /** 随全局刷新递增，K 线图跟着它更新 */
   tick: number;
 }) {
-  const { state, coverage, contract, gaps, exchange, desiredState, inCollection, hasHistory } =
-    props.detail;
+  const {
+    state,
+    coverage,
+    contract,
+    gaps,
+    exchange,
+    desiredState,
+    inCollection,
+    hasHistory,
+    derived,
+  } = props.detail;
   return (
     <div>
       {/* K 线放在最上面：这个面板回答的第一个问题是「同步下来的数据长什么样」，
@@ -25,8 +39,19 @@ export function SymbolDetail(props: {
           totalRows={state?.rows ?? null}
           hasHistory={hasHistory}
           tick={props.tick}
+          derived={derived}
+          onAggregate={props.onAggregate}
+          aggregating={props.aggregating}
         />
       </div>
+
+      {/* 派生周期表（R-7.5 / AC-15）：回答「为什么没有 4h 蜡烛」。
+          数字由 SQL 从 1m 推导，库里没有扣留表——与图上的留白同源。 */}
+      <DerivedTable
+        derived={derived}
+        aggregating={props.aggregating}
+        onAggregate={props.onAggregate}
+      />
 
       <div className="grid2" style={{ marginTop: 18 }}>
         <div>
@@ -135,6 +160,88 @@ export function SymbolDetail(props: {
           </tbody>
         </table>
       )}
+    </div>
+  );
+}
+
+/**
+ * 每周期的桶数与扣留原因（v0.2.0 R-7.5 / AC-15）。
+ *
+ * 「被扣留」必须**说清是哪一种**：
+ *   * 未收盘 —— 数据末端那个桶还没走完，等下一批 1m 落库就出现；
+ *   * 未全覆盖 —— 桶内上游 1m 有缺口，写进去就是一根半截蜡烛（R-3.5）。
+ * 只给一个总数的话，用户看到「少 3 根」仍然不知道该等还是该查缺口。
+ */
+function DerivedTable(props: {
+  derived: Record<string, DerivedIntervalDto>;
+  aggregating: boolean;
+  onAggregate: () => void;
+}) {
+  return (
+    <div className="verify-box" style={{ marginTop: 18 }}>
+      <div style={{ flex: 1, minWidth: 0 }}>
+        <strong>派生周期</strong>
+        <table style={{ marginTop: 6 }}>
+          <thead>
+            <tr>
+              <th>周期</th>
+              <th>已入库桶</th>
+              <th>未收盘扣留</th>
+              <th>未全覆盖扣留</th>
+              <th>缺失 1m 分钟</th>
+            </tr>
+          </thead>
+          <tbody>
+            {ALL_INTERVALS.filter((i) => i !== '1m').map((interval) => {
+              const stats = props.derived[interval];
+              if (stats === undefined) {
+                return (
+                  <tr key={interval}>
+                    <td className="mono">{interval}</td>
+                    <td colSpan={4} className="muted">
+                      读取中…
+                    </td>
+                  </tr>
+                );
+              }
+              if ('withheldReason' in stats) {
+                return (
+                  <tr key={interval}>
+                    <td className="mono">{interval}</td>
+                    <td colSpan={4} className="muted">
+                      未启用派生（aggregateIntervals 为空）
+                    </td>
+                  </tr>
+                );
+              }
+              return (
+                <tr key={interval}>
+                  <td className="mono">{interval}</td>
+                  <td>{fmtNumber(stats.buckets)}</td>
+                  <td>{fmtNumber(stats.withheldNotClosed)}</td>
+                  <td style={stats.withheldIncomplete > 0 ? { color: 'var(--warn)' } : undefined}>
+                    {fmtNumber(stats.withheldIncomplete)}
+                  </td>
+                  <td style={stats.missingMinutes > 0 ? { color: 'var(--warn)' } : undefined}>
+                    {fmtNumber(stats.missingMinutes)}
+                  </td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+        <p className="muted" style={{ margin: '6px 0 0', fontSize: 12 }}>
+          只写「已收盘且 1m 全覆盖」的桶；未收盘的等下一批，1m 有缺口的被扣留并在图上留白
+          （不插值、不写半截蜡烛）。数字由 SQL 从 1m 推导，库里没有单独的扣留表。
+        </p>
+      </div>
+      <button
+        disabled={props.aggregating}
+        title="从库内 1m 重算全部派生桶（只写派生表，不拉数据、不消耗配额）"
+        onClick={props.onAggregate}
+      >
+        {props.aggregating ? '重建中…' : '重建派生表'}
+      </button>
     </div>
   );
 }

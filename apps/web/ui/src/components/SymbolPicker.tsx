@@ -32,8 +32,8 @@ export function SymbolPicker(props: SymbolPickerProps) {
   const matches = useMemo(() => {
     const q = props.value.trim().toUpperCase();
     if (q === '') return props.options;
-    // 分档排序。实测输入 `BTC` 时 exchangeInfo 顺序把 BTCUSDT 排在第 5 位
-    // （BTCDOMUSDT / BTCU / BTCUSD1 / BTCUSDC 在前），而绝大多数人要的就是 BTCUSDT。
+    // 分档排序。exchangeInfo 的返回顺序对「用户最可能想要的那个」没有保证：
+    // 输入某个基础资产前缀时，它的永续往往排在几个无关的同前缀合约之后。
     // 分档：完全相等 > 前缀命中的 USDT 永续 > 其它前缀 > 含子串；同档按长度再按字典序，
     // 保证结果稳定（不依赖交易所返回顺序，也不会每次输入都跳）。
     const rank = (s: string): number => {

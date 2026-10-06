@@ -48,12 +48,28 @@ export async function runSyncStatus(flags: {
     } else {
       for (const state of states) printState(state);
     }
-    const { countsByStatus, totalRows, pendingGaps, rateLimit } = summary;
+    const { countsByStatus, totalRows, pendingGaps, rateLimit, derived } = summary;
     console.log('');
     console.log(
       `标的 ${summary.symbols} 个（running ${countsByStatus.running} / paused ${countsByStatus.paused} / error ${countsByStatus.error}）` +
         `  入库 ${totalRows.toLocaleString('en-US')} 行  待回补缺口 ${pendingGaps}`,
     );
+    // v0.2.0 R-8.2 / AC-16：派生表的行数与**实测**体积。
+    // 体积读 `pg_total_relation_size`，不沿用附录 B.2 的单行估算——那条估算至今未实测，
+    // 而 `sync_state.bytes` 一直按它推进。`totalRows` / `totalBytes` 仍是 1m 语义、字段名不变。
+    if (derived.length > 0) {
+      console.log('派生表（实测体积，含索引摊销）：');
+      for (const item of derived) {
+        console.log(
+          `  ${item.interval.padEnd(4)} ${item.rows.toLocaleString('en-US').padStart(10)} 行` +
+            `  ${(item.bytes / 1024 / 1024).toFixed(2)} MB`,
+        );
+      }
+    } else {
+      // 空数组**不能**显示成「0 个桶」：那是「未启用派生」，与「启用了但确实为空」
+      // 是两种状态，用户据此该去改配置还是去等数据（R-8.4 / AC-22）。
+      console.log('派生表：未启用派生（data.aggregateIntervals 为空）');
+    }
     console.log(
       `配额：本窗口已用 ${rateLimit.used}/${rateLimit.budgetPerMinute}（${(rateLimit.utilization * 100).toFixed(1)}%）` +
         (rateLimit.pauseUntil

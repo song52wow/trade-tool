@@ -9,6 +9,7 @@ import type {
   DesiredState,
   GapRecord,
   RemovePolicy,
+  StoredInterval,
   SyncPlanEstimate,
   SyncSummary,
   SymbolSyncState,
@@ -16,7 +17,13 @@ import type {
 import type { SchemaStatus } from '@trade-tool/data';
 
 export type LifecycleAction = 'start' | 'pause' | 'resume';
-export type JobKind = 'full' | 'verify';
+/**
+ * 作业类型：`full` 一轮同步 / `verify` 全表缺口扫描 / `aggregate` 派生重建。
+ *
+ * `aggregate` 是 v0.2.0 新增的：重建是**几十分钟量级**的重活儿，同样只登记 id、
+ * 立即返回（R-7.6 / R-24.1），不许挂在 HTTP 请求上等。
+ */
+export type JobKind = 'full' | 'verify' | 'aggregate';
 export type JobStatus = 'running' | 'succeeded' | 'failed';
 
 /** 作业进度。目标行数只在有规模预估时存在（`verify` 没有行数目标）。 */
@@ -77,17 +84,26 @@ export interface SymbolDetailDto extends SymbolRowDto {
   contract: ContractSpec | null;
   gaps: GapRecord[];
   estimate: SyncPlanEstimate | null;
+  /**
+   * 每周期的「已入库桶数 / 被扣留桶数 / 扣留原因」（v0.2.0 R-7.5 / AC-15）。
+   *
+   * 数字由 SQL 从 1m 推导，库里**没有**扣留表（R-3.5）——页面与写库判据同源，
+   * 不会出现「页面说少一根、库里其实有」的分裂。
+   */
+  derived: Record<string, DerivedIntervalDto>;
 }
 
 /**
- * 一根 1m K 线（控制面 K 线图用，R-23）。
+ * 一根 K 线（控制面 K 线图用，R-23）。
  *
  * 时间沿用 Bar 契约的**毫秒时间戳**（跨语言契约就是 schema，列是 bigint 毫秒），不在
  * DTO 层转成 ISO 字符串：图上要按时间算坐标、算缺口，转字符串就得多解析一次。epoch
  * 毫秒远小于 2^53，JSON number 往返无损。
  *
  * 只带画图必需的六列：`quote_volume` / `trades` 在本视图里没有用途，带上只是让每次
- * 首屏响应更大；它们仍在 `klines_1m` 里，随时可查。
+ * 首屏响应更大；它们仍在 `klines_1m` 与派生表里，随时可查。
+ *
+ * 1m 与派生周期**共用同一个形状**（R-6.3）：控制面切换周期时图表组件不该换一套类型。
  */
 export interface BarDto {
   time: number;
@@ -101,9 +117,28 @@ export interface BarDto {
 /** 图表取数结果。`limit` 是**实际生效**的上限，页面据此如实说明是否被截断。 */
 export interface BarsDto {
   symbol: string;
+  /** 本次回包对应的周期（**实际生效值**）。缺省请求即 `1m`（R-7.1）。 */
+  interval: StoredInterval;
+  /** 桶宽（毫秒）。页面用它把缺口换算成「几根 / 几段 / 最长连续」（R-7.3）。 */
+  intervalMs: number;
   limit: number;
   items: BarDto[];
 }
+
+/**
+ * 单个派生周期在详情页的展示口径（v0.2.0 R-7.5 / AC-15）。
+ *
+ * `withheldReason: 'disabled'` 表示**未启用派生**（`aggregateIntervals: []`）——
+ * 与「启用了、但这个周期一个桶都没有」必须能在界面上分开说（AC-22 / R-8.4）。
+ */
+export type DerivedIntervalDto =
+  | {
+      buckets: number;
+      withheldNotClosed: number;
+      withheldIncomplete: number;
+      missingMinutes: number;
+    }
+  | { withheldReason: 'disabled' };
 
 /** exchangeInfo 概览；不返回全量列表，避免每次轮询都传几百个标的。 */
 export interface ExchangeOverviewDto {

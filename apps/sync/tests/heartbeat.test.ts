@@ -46,6 +46,8 @@ function okSummary(symbol: string): SyncRunSummary {
     requests: 1,
     weight: 1,
     metadataStale: false,
+    // v0.2.0：未启用派生时是 null（与「启用了但没写桶」区分，AC-22）
+    aggregated: null,
   };
 }
 
@@ -85,11 +87,45 @@ describe('守护进程心跳：进程在 ≠ 有人在同步', () => {
     });
   }
 
+  it('一轮成功同步返回摘要，且循环期间心跳持续刷新（对照下两条的「停止刷新」）', async () => {
+    // 这条是「进程在 ≠ 有人在同步」的**正向**对照：循环活着时心跳必须被刷新。
+    // 少了它，两条异常路径（循环退出 / 优雅退出）就只证明了「不再刷新」，
+    // 却没有证明「本来在刷新」——那样的话「心跳根本没被实现过」也会全绿。
+    const control = new SyncControl(makeCtx(), {
+      config,
+      syncFn: async (symbol) => okSummary(symbol),
+    });
+    await upsertSymbolEntry(ctx.pool, { exchange: 'binance', symbol: SYMBOL });
+    await ensureSyncState(ctx.pool, 'binance', SYMBOL, 'paused');
+    await control.start(SYMBOL);
+
+    const daemon = new SyncDaemon(makeCtx(), {
+      config,
+      control,
+      sleep: async () => undefined,
+      heartbeatIntervalMs: BEAT_MS,
+    });
+    await daemon.start();
+    const first = await readBeat(ctx.pool);
+    expect(first, '启动后应先落一行心跳').not.toBeNull();
+
+    // 调度一轮，确认循环在跑（runOnce 由 daemon 内部驱动，这里直接验证原语可用）
+    const error = await control.runOnce(SYMBOL, NOW);
+    expect(error, '成功的一轮必须返回 null（失败才返回结构化错误）').toBeNull();
+
+    await new Promise((resolve) => setTimeout(resolve, BEAT_MS * 3));
+    const second = await readBeat(ctx.pool);
+    expect(second, '循环在跑时心跳应被刷新').not.toBeNull();
+    expect(second ?? 0).toBeGreaterThan(first ?? 0);
+
+    await daemon.stop();
+  });
+
   it('循环因全局性错误退出后不再刷心跳，但心跳行保留（让页面报 stale 而非 stopped）', async () => {
     // SCHEMA_VERSION_MISMATCH 在 GLOBAL_FATAL_CODES 里：循环会抛错退出，进程还活着。
     const control = new SyncControl(makeCtx(), {
       config,
-      syncFn: async (symbol) => {
+      syncFn: async () => {
         throw new SyncError('SCHEMA_VERSION_MISMATCH', '库内多出 003');
       },
     });

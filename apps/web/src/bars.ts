@@ -1,3 +1,4 @@
+import { parseStoredInterval } from '@trade-tool/data';
 import { SyncError } from '@trade-tool/core';
 
 /**
@@ -5,6 +6,10 @@ import { SyncError } from '@trade-tool/core';
  *
  * 1m 下约 5 小时：够看清一段形态，又不至于让每次首屏响应过大。看更长区间由页面显式
  * 选择，不靠「默认多给点」解决。
+ *
+ * 派生周期沿用同一个根数缺省：300 根 4h 约 50 天、300 根 1d 约 10 个月，量级都还在
+ * 一次响应能承受的范围内；而**按时间**换算根数会让不同周期出现完全不同的 limit，
+ * 那正是「用户以为在看 4h、实际只拿到 5 天数据」这类误解的来源（R-7.1）。
  */
 export const DEFAULT_BAR_LIMIT = 300;
 
@@ -37,4 +42,17 @@ export function parseBarLimit(raw: string | undefined): number {
     throw new SyncError('CONFIG_INVALID', `limit 必须是正整数，收到：${raw}`, { limit: raw });
   }
   return Math.min(parsed, MAX_BAR_LIMIT);
+}
+
+/**
+ * 解析 `?interval=`（v0.2.0 R-7.1）。
+ *
+ * 缺省 `1m`（向后兼容）；非法或**未实现**的周期（`5m` / `2h` / `foo`）报
+ * `CONFIG_INVALID` → 400。
+ *
+ * **绝不静默回落到 1m**：用户以为在看 4h、实际拿到 1m，正是最典型的静默兜底——
+ * 图能画出来，只是每根蜡烛只有 1 分钟数据，不报错也没人发现。
+ */
+export function parseIntervalParam(raw: string | undefined) {
+  return parseStoredInterval(raw);
 }

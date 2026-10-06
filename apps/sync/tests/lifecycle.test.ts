@@ -44,6 +44,8 @@ function okSummary(symbol: string): SyncRunSummary {
     requests: 1,
     weight: 1,
     metadataStale: false,
+    // v0.2.0：未启用派生时是 null（与「启用了但没写桶」区分，AC-22）
+    aggregated: null,
   };
 }
 

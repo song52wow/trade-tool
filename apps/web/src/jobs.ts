@@ -7,6 +7,11 @@ export interface JobRunnerOptions {
   /** 真正跑首次全量 / 增量；resolve 出来的值原样进 `result`。 */
   runFull(symbol: string): Promise<Record<string, unknown>>;
   runVerify(symbol: string): Promise<Record<string, unknown>>;
+  /**
+   * 重建派生 K 线（v0.2.0）。与 full / verify 同为长任务，同样只登记 id 就返回。
+   * 缺省实现走 `syncSymbol` 之外的独立动作——它不拉数据，只重算本地派生表。
+   */
+  runAggregate(symbol: string): Promise<Record<string, unknown>>;
   /** 读进度：`rows` 来自 `sync_state`，是权威水位之外的观测值。 */
   readProgress(symbol: string): Promise<{ rows: number | null; pendingGaps: number | null }>;
   /** 该标的是否被守护进程接管（desired_state = running）。为真时拒绝启动本进程作业。 */
@@ -143,7 +148,7 @@ export class JobRegistry {
     // 用户会撞上一个自己完全无法理解的 SYNC_ALREADY_RUNNING。
     let outcome: JobStatus = 'succeeded';
     try {
-      const run = job.kind === 'full' ? this.options.runFull : this.options.runVerify;
+      const run = this.runFor(job.kind);
       job.result = await run(job.symbol);
     } catch (error) {
       outcome = 'failed';
@@ -158,6 +163,12 @@ export class JobRegistry {
       this.runningBySymbol.delete(job.symbol);
       job.status = outcome;
     }
+  }
+
+  private runFor(kind: JobKind): (symbol: string) => Promise<Record<string, unknown>> {
+    if (kind === 'full') return this.options.runFull;
+    if (kind === 'verify') return this.options.runVerify;
+    return this.options.runAggregate;
   }
 
   private async trackProgress(

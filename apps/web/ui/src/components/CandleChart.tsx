@@ -1,6 +1,12 @@
 import { useLayoutEffect, useRef, useState } from 'react';
 
 import type { BarDto } from '../../../src/types';
+import { describeSpan, gapStats, minutesToBars } from './gaps.js';
+
+// 缺口统计住在 gaps.ts（纯计算，1m 与派生周期共用），这里转出以保持
+// `CandleChart` 作为「图表相关」的单一入口——既有测试与调用方都从这里取。
+export { gapStats, describeSpan, minutesToBars } from './gaps.js';
+export type { GapStats } from './gaps.js';
 
 /**
  * K 线（蜡烛图）。手写 SVG，不套 recharts。
@@ -9,10 +15,11 @@ import type { BarDto } from '../../../src/types';
  * **「同步下来的数据长什么样、哪里是空的」**。横轴必须按**时间**而不是按序号排布——
  * 按序号排会把缺口悄悄抹平，一段 3 天的空洞会显示成连续下跌，那是骗人的界面（R-4.4
  * 的同一个道理：缺的东西要看得见）。缺口统计因此直接写在图下方，不藏进 tooltip。
+ *
+ * 桶宽 ``barMs`` 是**必填**：v0.2.0 起周期可以是 15m / 1h / 4h / 1d，
+ * 写死 60_000 会让「缺一根 4h」被当成「缺一分钟」。
  */
-
-/** 1m 是固化决定（R-6），所以「缺一根」的判据只能是 60s 步进，不做多周期推断。 */
-export const BAR_MS = 60_000;
+export const DEFAULT_BAR_MS = 60_000;
 
 /**
  * 红涨绿跌。
@@ -85,6 +92,7 @@ export function layoutCandles(
   bars: readonly BarDto[],
   width: number,
   height: number = HEIGHT,
+  barMs: number = DEFAULT_BAR_MS,
 ): CandleLayout {
   const plotLeft = PAD_LEFT;
   const plotWidth = Math.max(1, width - PAD_LEFT - PAD_RIGHT);
@@ -97,9 +105,9 @@ export function layoutCandles(
   const first = bars[0]?.time ?? 0;
   const last = bars[bars.length - 1]?.time ?? first;
   // 单根 bar（或全平价）也要有非零跨度，否则横轴除零、图直接消失。
-  const t1 = last > first ? last : first + BAR_MS;
+  const t1 = last > first ? last : first + barMs;
   const { lo, hi, maxVolume } = extent(bars);
-  const slot = plotWidth / ((t1 - first) / BAR_MS + 1);
+  const slot = plotWidth / ((t1 - first) / barMs + 1);
 
   return {
     width,
@@ -146,58 +154,12 @@ export function priceTicks(lo: number, hi: number, count = 5): number[] {
   return ticks;
 }
 
-export function timeTicks(t0: number, t1: number, count = 6): number[] {
+export function timeTicks(t0: number, t1: number, count = 6, barMs = DEFAULT_BAR_MS): number[] {
   if (t1 <= t0) return [t0];
-  const step = Math.max(BAR_MS, Math.round((t1 - t0) / count / BAR_MS) * BAR_MS);
+  const step = Math.max(barMs, Math.round((t1 - t0) / count / barMs) * barMs);
   const ticks: number[] = [];
   for (let t = t0; t <= t1; t += step) ticks.push(t);
   return ticks;
-}
-
-export interface GapStats {
-  /** 首末两根之间应有的分钟数（含端点） */
-  expected: number;
-  present: number;
-  missing: number;
-  /** 连续缺失的段数 */
-  holes: number;
-  /** 连续缺失最长的一段（分钟） */
-  longest: number;
-}
-
-/**
- * 窗口内的缺口统计。
- *
- * **只在首末两根之间算**：图上就只画这一段，头尾还没同步到的部分属于「覆盖范围」，
- * 由上面的覆盖时间线负责说。空输入返回 null——没有数据时不该显示「缺 0 根」。
- */
-export function gapStats(bars: readonly BarDto[]): GapStats | null {
-  if (bars.length === 0) return null;
-  const first = bars[0]?.time ?? 0;
-  const last = bars[bars.length - 1]?.time ?? first;
-  const expected = Math.floor((last - first) / BAR_MS) + 1;
-  let holes = 0;
-  let longest = 0;
-  let run = 0;
-  for (let i = 1; i < bars.length; i += 1) {
-    const prev = bars[i - 1]?.time ?? first;
-    const cur = bars[i]?.time ?? first;
-    const missing = Math.max(0, Math.round((cur - prev) / BAR_MS) - 1);
-    if (missing > 0) {
-      holes += 1;
-      run += missing;
-      if (run > longest) longest = run;
-    } else {
-      run = 0;
-    }
-  }
-  return {
-    expected,
-    present: bars.length,
-    missing: Math.max(0, expected - bars.length),
-    holes,
-    longest,
-  };
 }
 
 /**
@@ -289,12 +251,19 @@ function Tooltip(props: { bar: BarDto; x: number; y: number; plotRight: number }
   );
 }
 
-export function CandleChart(props: { bars: readonly BarDto[]; height?: number }) {
+export function CandleChart(props: {
+  bars: readonly BarDto[];
+  height?: number;
+  /** 桶宽（毫秒）。缺省 1m；派生周期必须显式传入，否则缺口会被按分钟误算。 */
+  barMs?: number;
+  interval?: string;
+}) {
   const bars = props.bars;
   const [ref, width] = useMeasuredWidth();
   const [hover, setHover] = useState<number | null>(null);
   const height = props.height ?? HEIGHT;
-  const layout = layoutCandles(bars, width, height);
+  const barMs = props.barMs ?? DEFAULT_BAR_MS;
+  const layout = layoutCandles(bars, width, height, barMs);
 
   if (bars.length === 0) return <div className="candle-wrap" ref={ref} />;
 
@@ -330,7 +299,7 @@ export function CandleChart(props: { bars: readonly BarDto[]; height?: number })
         width={width}
         height={height}
         role="img"
-        aria-label={`${bars.length} 根 1m K 线，${fmtStamp(layout.t0)} 至 ${fmtStamp(layout.t1)}`}
+        aria-label={`${bars.length} 根 ${props.interval ?? '1m'} K 线，${fmtStamp(layout.t0)} 至 ${fmtStamp(layout.t1)}`}
         onMouseMove={(e) => pick(e.clientX, e.currentTarget.getBoundingClientRect())}
         onMouseLeave={() => setHover(null)}
       >
@@ -356,7 +325,7 @@ export function CandleChart(props: { bars: readonly BarDto[]; height?: number })
           </g>
         ))}
 
-        {timeTicks(layout.t0, layout.t1).map((t) => (
+        {timeTicks(layout.t0, layout.t1, 6, barMs).map((t) => (
           <text
             key={`t-${String(t)}`}
             x={xOf(layout, t)}
@@ -500,9 +469,22 @@ export function CandleChart(props: { bars: readonly BarDto[]; height?: number })
   );
 }
 
-/** 缺口说明。**显式写在图下方**：空档是这个项目要让人看见的东西（R-11）。 */
-export function GapNotice(props: { bars: readonly BarDto[] }) {
-  const stats = gapStats(props.bars);
+/**
+ * 缺口说明。**显式写在图下方**：空档是这个项目要让人看见的东西（R-11）。
+ *
+ * 量化**按所选周期报**（v0.2.0 R-7.3）：4h 图上写「缺 30 分钟」是错的——那 30 分钟是
+ * 上游 1m 的根因，在 4h 尺度上表现为「少了 1 根（约 4 小时）」。两句都要说，用户才
+ * 分得清「4h 数据本身没写进来」与「1m 有洞导致 4h 被扣留」。
+ */
+export function GapNotice(props: {
+  bars: readonly BarDto[];
+  barMs?: number;
+  interval?: string;
+  /** 上游 1m 缺口的分钟数（服务端按同一区间算好）；给了就一并说明根因 */
+  upstreamMissingMinutes?: number | null;
+}) {
+  const barMs = props.barMs ?? DEFAULT_BAR_MS;
+  const stats = gapStats(props.bars, barMs);
   if (stats === null) return null;
   if (stats.missing === 0) {
     return (
@@ -513,9 +495,18 @@ export function GapNotice(props: { bars: readonly BarDto[] }) {
   }
   return (
     <p className="mono" style={{ fontSize: 11, margin: '6px 0 0', color: 'var(--warn)' }}>
-      窗口内应有 {stats.expected.toLocaleString('zh-CN')} 根，实有{' '}
-      {stats.present.toLocaleString('zh-CN')} 根 ：缺 {stats.missing.toLocaleString('zh-CN')} 分钟 /{' '}
-      {stats.holes} 段，最长连续 {stats.longest.toLocaleString('zh-CN')} 分钟（图上的空白就是它）
+      窗口内应有 {stats.expected.toLocaleString('zh-CN')} 根 {props.interval ?? '1m'}，实有{' '}
+      {stats.present.toLocaleString('zh-CN')} 根：缺 {stats.missing.toLocaleString('zh-CN')} 根 /{' '}
+      {stats.holes} 段，最长连续 {stats.longest.toLocaleString('zh-CN')} 根（
+      {describeSpan(barMs, stats.longest)}，图上的空白就是它）
+      {props.upstreamMissingMinutes ? (
+        <>
+          {' '}
+          · 根因在上游 1m：该区间缺 {props.upstreamMissingMinutes.toLocaleString('zh-CN')} 分钟（ 约{' '}
+          {minutesToBars(props.upstreamMissingMinutes, barMs).toLocaleString('zh-CN')} 根{' '}
+          {props.interval ?? '1m'}）
+        </>
+      ) : null}
     </p>
   );
 }

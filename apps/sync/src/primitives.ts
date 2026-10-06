@@ -98,6 +98,14 @@ const MANUAL_INTERVENTION_CODES = new Set([
   'NOT_PERPETUAL',
   'NOT_TRADING',
   'SCHEMA_VERSION_MISMATCH',
+  // v0.2.0 R-9.3：聚合失败需人工介入。
+  //
+  // AGGREGATION_FAILED 意味着**该批 1m 已整批回滚**（连水位都没推进）——自动重试
+  // 掩盖它，只会让标的反复失败而没人知道是派生层坏了；正确处置是把
+  // `data.aggregateIntervals` 显式设成 `[]` 恢复 1m 同步，再排查派生。
+  // AGGREGATION_MISMATCH 来自 `data aggregate --check`，是人工校验的产物。
+  'AGGREGATION_FAILED',
+  'AGGREGATION_MISMATCH',
 ]);
 
 const log = createLogger('sync:control');

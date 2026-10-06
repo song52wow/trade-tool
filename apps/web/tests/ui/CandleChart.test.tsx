@@ -20,6 +20,7 @@ import type { BarDto } from '../../src/types';
 afterEach(cleanup);
 
 const MINUTE = 60_000;
+const FOUR_HOURS = 4 * 60 * MINUTE;
 const BASE = 1_760_000_000_000;
 
 function bar(time: number, close: number, overrides: Partial<BarDto> = {}): BarDto {
@@ -105,14 +106,17 @@ describe('刻度', () => {
 
 describe('缺口统计', () => {
   it('连续无缺口时 missing = 0', () => {
-    const stats = gapStats(series(10));
+    const stats = gapStats(series(10), MINUTE);
     expect(stats).toEqual({ expected: 10, present: 10, missing: 0, holes: 0, longest: 0 });
   });
 
-  it('中间缺一段：报出段数与最长连续分钟数', () => {
-    // 00,01,02,03 之后跳到 10（缺 06 分钟：04~09）
+  it('中间缺一段：报出段数与最长连续根数', () => {
+    // 00,01,02,03 之后跳到 10（缺 6 根：04~09）
     const times = [0, 1, 2, 3, 10].map((m) => BASE + m * MINUTE);
-    const stats = gapStats(times.map((t, i) => bar(t, 100 + i)));
+    const stats = gapStats(
+      times.map((t, i) => bar(t, 100 + i)),
+      MINUTE,
+    );
 
     expect(stats?.present).toBe(5);
     expect(stats?.missing).toBe(6);
@@ -122,14 +126,42 @@ describe('缺口统计', () => {
 
   it('多段缺口分别计数', () => {
     const times = [0, 1, 5, 6, 20].map((m) => BASE + m * MINUTE);
-    const stats = gapStats(times.map((t, i) => bar(t, 100 + i)));
+    const stats = gapStats(
+      times.map((t, i) => bar(t, 100 + i)),
+      MINUTE,
+    );
 
     expect(stats?.holes).toBe(2);
     expect(stats?.longest).toBe(13); // 07~19
   });
 
   it('空数据返回 null（没有数据 ≠ 缺 0 根）', () => {
-    expect(gapStats([])).toBeNull();
+    expect(gapStats([], MINUTE)).toBeNull();
+  });
+
+  /**
+   * v0.2.0 R-7.3：桶宽是必填的，缺口一律按**根**统计。
+   *
+   * 同一组时间戳在 1m 步进下「缺 6 根」，在 4h 步进下只「缺 0 根」——因为相邻两桶
+   * 只隔 4 小时。写死 60_000 的实现会在 4h 图上把这个 4 小时的空洞说成「缺 1 分钟」。
+   */
+  it('按桶宽统计：4h 步进下同样的时间戳不是缺口', () => {
+    const times = [0, 1, 2, 3].map((h) => BASE + h * FOUR_HOURS);
+    const bars = times.map((t, i) => bar(t, 100 + i));
+    expect(gapStats(bars, FOUR_HOURS)?.missing).toBe(0);
+    // 若误用 1m 步进，会得出 707 分钟的假缺口
+    expect(gapStats(bars, MINUTE)?.missing).toBe(717);
+  });
+
+  it('4h 图上缺一根报 1 根（= 4 小时），不是 1 分钟', () => {
+    const times = [0, 1, 3, 4].map((h) => BASE + h * FOUR_HOURS);
+    const stats = gapStats(
+      times.map((t, i) => bar(t, 100 + i)),
+      FOUR_HOURS,
+    );
+    expect(stats?.missing).toBe(1);
+    expect(stats?.holes).toBe(1);
+    expect(stats?.longest).toBe(1);
   });
 });
 
@@ -212,12 +244,34 @@ describe('GapNotice', () => {
     expect(getByText(/无缺口/)).toBeTruthy();
   });
 
-  it('有缺口时把缺多少分钟、几段、最长多长都写出来', () => {
+  it('有缺口时把缺多少、几段、最长多长都写出来（1m 用分钟）', () => {
     const times = [0, 1, 2, 3, 10].map((m) => BASE + m * MINUTE);
-    const { getByText } = render(<GapNotice bars={times.map((t, i) => bar(t, 100 + i))} />);
+    const { getByText } = render(
+      <GapNotice bars={times.map((t, i) => bar(t, 100 + i))} barMs={MINUTE} interval="1m" />,
+    );
     const text = getByText(/缺/).textContent ?? '';
     expect(text).toContain('6');
     expect(text).toContain('1 段');
+    expect(text).toContain('分钟');
+  });
+
+  it('4h 缺口按根与小时报，并说明上游 1m 根因（R-7.3）', () => {
+    const times = [0, 1, 3, 4].map((h) => BASE + h * FOUR_HOURS);
+    const { getByText } = render(
+      <GapNotice
+        bars={times.map((t, i) => bar(t, 100 + i))}
+        barMs={FOUR_HOURS}
+        interval="4h"
+        upstreamMissingMinutes={240}
+      />,
+    );
+    const text = getByText(/缺/).textContent ?? '';
+    expect(text).toContain('缺 1 根');
+    expect(text).toContain('4 小时');
+    expect(text).toContain('根因在上游 1m');
+    expect(text).toContain('240');
+    // 绝不能把 1m 的分钟口径贴到 4h 图上
+    expect(text).not.toContain('缺 1 分钟');
   });
 
   it('没有数据时什么都不说（不谎报「缺 0」）', () => {

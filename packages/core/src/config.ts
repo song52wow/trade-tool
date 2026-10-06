@@ -54,6 +54,26 @@ export const dataSchema = z.object({
   batchSize: z.number().int().positive().max(100_000).default(5_000),
   /** 缺口自动回补的尝试次数上限（R-11.9），达上限后该标的进 error */
   maxGapAttempts: z.number().int().positive().default(5),
+  /**
+   * 启用哪些派生周期（v0.2.0 R-9.1）。
+   *
+   * 只接受 `15m / 1h / 4h / 1d` 的任意子集；**出现 `1m` / `5m` / 其它一律 CONFIG_INVALID**
+   * （`1m` 是基础数据不是派生目标，`5m` 本期未实现）。`[]` = **显式关闭派生**——
+   * 那是给「聚合故障、但 1m 同步还要继续」准备的开关（R-4.6），不是运行时静默跳过：
+   * 关闭状态必须从 `sync status` / 控制面看得见（R-8.4 / AC-22）。
+   *
+   * 缺省值必须与 `sql/004_klines_agg.sql` 里的表集合一致，由 AC-1 的测试守住。
+   *
+   * **不提供**「放宽覆盖判据」「写半截桶」这类开关：未收盘、未全覆盖的桶一律不写
+   * （R-3），没有例外。
+   */
+  aggregateIntervals: z.array(z.enum(['15m', '1h', '4h', '1d'])).default(['15m', '1h', '4h', '1d']),
+  /**
+   * 补齐 / `--rebuild` 的分批大小（v0.2.0 R-5.3），keyset 分页、每批一个事务。
+   * 绝不能把整段历史一次聚合：首次全量下 1d 桶虽少，但 15m 桶有几十万，
+   * 单事务会把 WAL 与锁持有时间推到不可接受。
+   */
+  aggregateBatchBars: z.number().int().positive().max(1_000_000).default(20_000),
 });
 
 /**

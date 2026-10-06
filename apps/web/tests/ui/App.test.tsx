@@ -501,8 +501,26 @@ describe('详情页 K 线', () => {
       },
       // 详情与 K 线是两条不同形状的响应：没有各自的 handler，前缀匹配会让
       // `/api/symbols/BTCUSDC` 拿到列表的 { items }，详情页拿到一个空壳。
-      '/api/symbols/BTCUSDC/bars': { symbol: 'BTCUSDC', limit: 300, items: bars },
-      '/api/symbols/BTCUSDC': { ...detail, contract: null, gaps: [], estimate: null },
+      // v0.2.0：`/bars` 回包带上实际生效的 interval / intervalMs（页面据此换算缺口）
+      '/api/symbols/BTCUSDC/bars': {
+        symbol: 'BTCUSDC',
+        interval: '1m',
+        intervalMs: 60_000,
+        limit: 300,
+        items: bars,
+      },
+      '/api/symbols/BTCUSDC': {
+        ...detail,
+        contract: null,
+        gaps: [],
+        estimate: null,
+        derived: {
+          '15m': { buckets: 3, withheldNotClosed: 0, withheldIncomplete: 0, missingMinutes: 0 },
+          '1h': { buckets: 1, withheldNotClosed: 0, withheldIncomplete: 0, missingMinutes: 0 },
+          '4h': { buckets: 0, withheldNotClosed: 0, withheldIncomplete: 0, missingMinutes: 0 },
+          '1d': { withheldReason: 'disabled' },
+        },
+      },
     };
   }
 
@@ -524,8 +542,10 @@ describe('详情页 K 线', () => {
 
     await waitFor(() => expect(screen.getByText(/读自本地库/)).toBeTruthy());
     expect(calls.some((c) => c.startsWith('/api/symbols/BTCUSDC/bars'))).toBe(true);
+    // 周期可切（v0.2.0 R-7.4）
+    expect(screen.getByTitle('切换到 4h')).toBeTruthy();
     // 区间可切
-    expect(screen.getByTitle(/最近 60 分钟/)).toBeTruthy();
+    expect(screen.getByTitle(/最近 60 根/)).toBeTruthy();
   });
 
   it('库里没有历史的标的：K 线区给可执行的下一步，而不是空图', async () => {
@@ -536,6 +556,8 @@ describe('详情页 K 线', () => {
     await waitFor(() => expect(screen.getByText('BTCUSDC')).toBeTruthy());
     fireEvent.click(screen.getAllByText('BTCUSDC')[0]!);
 
-    await waitFor(() => expect(screen.getByText(/库里还没有 BTCUSDC/)).toBeTruthy());
+    // v0.2.0：空状态必须说明原因并给出下一步，文案里带上标的与动作
+    await waitFor(() => expect(screen.getByText(/库里还没有 BTCUSDC 的任何 1m 数据/)).toBeTruthy());
+    expect(screen.getByText(/开始同步后/)).toBeTruthy();
   });
 });

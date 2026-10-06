@@ -83,7 +83,15 @@ pnpm --filter @trade-tool/cli start -- backtest -b 500
 ```
 
 行情缓存在 `$TRADE_TOOL_HOME/data/cache/`，回测报告在 `$TRADE_TOOL_HOME/reports/`。
-K 线本体存在 PostgreSQL 的 `klines_1m` 表里。
+K 线本体存在 PostgreSQL 的 `klines_1m` 表里；`15m` / `1h` / `4h` / `1d` 由它**本地派生**
+（随同步自动增量，不向交易所取高周期接口），只写「已收盘且 1m 全覆盖」的桶——桶内缺一根
+就不写，图上留白而不是画一根半截蜡烛。手动补齐 / 重建 / 校验走：
+
+```bash
+pnpm --filter @trade-tool/cli start -- data aggregate -s <SYMBOL>            # 补齐
+pnpm --filter @trade-tool/cli start -- data aggregate -s <SYMBOL> --rebuild  # 先删后算
+pnpm --filter @trade-tool/cli start -- data aggregate -s <SYMBOL> --check    # 只读校验
+```
 
 ## 控制面（`apps/web`）
 

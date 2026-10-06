@@ -21,6 +21,12 @@ const STATUS_BY_CODE = {
   WATERMARK_MISMATCH: 409,
   NULL_NOT_ALLOWED: 500,
   GAP_ATTEMPTS_EXHAUSTED: 409,
+  // 派生周期（v0.2.0 R-9.3）
+  // AGGREGATION_FAILED 是 500：派生写失败是服务端数据层的问题，用户改请求也没用；
+  // AGGREGATION_MISMATCH 是 409：库里的派生数据与 1m 已经对不上，属于「状态冲突」，
+  // 处置方式是 --rebuild，而不是重试同一个请求。
+  AGGREGATION_FAILED: 500,
+  AGGREGATION_MISMATCH: 409,
   // 数据库
   DB_CONNECTION_FAILED: 503,
   DB_DEADLOCK: 503,

@@ -38,16 +38,22 @@ DSN_ENV = "TRADE_TOOL_PG_DSN"
 #: 而库超前时又会被完全放行——两种都属于 R-1.3 禁止的「按不匹配的 schema 继续运行」。
 #: 因此**新增迁移必须同步在这里登记**（这就是 AC-25 的「同提交更新两侧」）。
 KNOWN_MIGRATION_VERSIONS: frozenset[str] = frozenset(
-    {"001_init", "002_sync_plan", "003_daemon_heartbeat"}
+    {"001_init", "002_sync_plan", "003_daemon_heartbeat", "004_klines_agg"}
 )
 
 REQUIRED_MIGRATION_VERSIONS: frozenset[str] = KNOWN_MIGRATION_VERSIONS
 
 #: 必需的表（缺表等价于 schema 未迁移，报 SCHEMA_VERSION_MISMATCH）。
+#: 派生表也在其中：它们的表名是「周期 → 表」映射的一部分，缺表意味着读侧白名单
+#: 指向一张不存在的表（R-1.6 / v0.2.0 R-1.1）。
 REQUIRED_TABLES: frozenset[str] = frozenset(
     {
         "schema_migrations",
         "klines_1m",
+        "klines_15m",
+        "klines_1h",
+        "klines_4h",
+        "klines_1d",
         "contract_spec",
         "sync_state",
         "gaps",
@@ -228,27 +234,40 @@ class SymbolLock:
         exchange: str,
         symbol: str,
         now_ms: int,
+        *,
+        create_state_row: bool = True,
     ) -> SymbolLock:
+        """抢单写者锁。
+
+        ``create_state_row=False`` 用于**只读派生 / 派生重建**这类不改同步进度的操作
+        （v0.2.0 R-5.5）：它们需要同一个锁键（否则会与正在跑的同步交错写派生表），
+        但绝不能因为跑一次重建就在 ``sync_state`` 里多出一行幽灵状态——
+        库里已有数据、只是没进集合的标的，不该因为跑一次 ``data aggregate`` 就
+        变成「已被纳管」。
+        """
         conn = connect(dsn)
         try:
             with conn.transaction():
                 # SET LOCAL 不接受绑定参数（`SET LOCAL lock_timeout = $1` 是语法错误），
                 # 必须走 set_config(name, value, is_local)。
                 conn.execute("SELECT set_config('lock_timeout', %s, true)", (LOCK_TIMEOUT,))
-                inserted = conn.execute(
-                    "INSERT INTO sync_state (exchange, symbol, status, updated_at)"
-                    " VALUES (%s, %s, 'paused', %s) ON CONFLICT (exchange, symbol) DO NOTHING",
-                    (exchange, symbol, now_ms),
-                )
-                created = int(inserted.rowcount or 0) > 0
-                row = conn.execute(
-                    "SELECT status FROM sync_state WHERE exchange = %s AND symbol = %s FOR UPDATE",
-                    (exchange, symbol),
-                ).fetchone()
-                if row is None:  # pragma: no cover - 上一句刚插入过
-                    raise SyncError(
-                        "DB_TRANSACTION_ROLLBACK", "sync_state 行未建立", {"symbol": symbol}
+                created = False
+                if create_state_row:
+                    inserted = conn.execute(
+                        "INSERT INTO sync_state (exchange, symbol, status, updated_at)"
+                        " VALUES (%s, %s, 'paused', %s) ON CONFLICT (exchange, symbol) DO NOTHING",
+                        (exchange, symbol, now_ms),
                     )
+                    created = int(inserted.rowcount or 0) > 0
+                    row = conn.execute(
+                        "SELECT status FROM sync_state"
+                        " WHERE exchange = %s AND symbol = %s FOR UPDATE",
+                        (exchange, symbol),
+                    ).fetchone()
+                    if row is None:  # pragma: no cover - 上一句刚插入过
+                        raise SyncError(
+                            "DB_TRANSACTION_ROLLBACK", "sync_state 行未建立", {"symbol": symbol}
+                        )
                 schema_row = _require_row(
                     conn.execute("SELECT current_schema() AS schema").fetchone(),
                     "current_schema",
@@ -678,6 +697,10 @@ def truncate_all(conn: DbConn) -> None:
     with conn.transaction():
         for table in (
             "klines_1m",
+            "klines_15m",
+            "klines_1h",
+            "klines_4h",
+            "klines_1d",
             "contract_spec",
             "sync_state",
             "gaps",

@@ -75,7 +75,11 @@ afterAll(async () => {
  * 从而让一批用例集体假失败。
  */
 async function resetExchange(): Promise<void> {
-  await ctx.pool.query('TRUNCATE klines_1m, gaps, sync_state, symbols, contract_spec');
+  // 派生表也必须清：v0.2.0 起 1m 写入会顺带产出派生桶，跨用例残留会让
+  // 「本轮 upserted = 0」这类断言被上一轮的残留干扰。
+  await ctx.pool.query(
+    'TRUNCATE klines_1m, klines_15m, klines_1h, klines_4h, klines_1d, gaps, sync_state, symbols, contract_spec',
+  );
   await ctx.pool.query(
     'UPDATE weight_budget SET window_from = 0, used = 0, pause_until = NULL WHERE id = 1',
   );

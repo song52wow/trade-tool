@@ -11,6 +11,7 @@ import {
   type SyncRunSummary,
 } from '@trade-tool/core';
 import {
+  aggregateSymbol,
   backfillRange,
   estimateFirstPull,
   getGaps,
@@ -381,6 +382,74 @@ export async function runVerify(flags: SyncFlags): Promise<number> {
     await assertSchema(ctx.pool);
     const result = await verifySymbol(ctx, symbol);
     console.log(JSON.stringify(result, null, 2));
+    return 0;
+  });
+}
+
+/**
+ * `data aggregate` —— 由库内 1m 派生 / 重建 / 校验高周期 K 线（v0.2.0 R-5）。
+ *
+ * 三种模式：
+ *   * 缺省（补齐）：区间内全部合格桶 UPSERT，不删任何已有桶；
+ *   * `--rebuild`：先删后算，修复「1m 被改动 / 派生被篡改」；
+ *   * `--check`：只读校验，报出 stale / missing / mismatch。
+ *
+ * 显式 `--intervals` 优先于配置；出现未实现周期（1m / 5m / 其它）由 Python 侧
+ * 报 CONFIG_INVALID，不静默忽略。
+ */
+export async function runAggregate(flags: {
+  symbol?: string | undefined;
+  intervals?: string | undefined;
+  from?: string | undefined;
+  to?: string | undefined;
+  rebuild?: boolean | undefined;
+  check?: boolean | undefined;
+  json?: boolean | undefined;
+}): Promise<number> {
+  const symbol = requireSymbol(flags.symbol);
+  const from = parseMs(flags.from, '--from');
+  const to = parseMs(flags.to, '--to');
+
+  return withContext(async (ctx) => {
+    await assertSchema(ctx.pool);
+    const result = await aggregateSymbol(
+      ctx,
+      symbol,
+      {
+        ...(flags.intervals === undefined
+          ? {}
+          : {
+              intervals: flags.intervals
+                .split(',')
+                .map((s) => s.trim())
+                .filter(Boolean),
+            }),
+        ...(from === undefined ? {} : { from }),
+        ...(to === undefined ? {} : { to }),
+      },
+      { rebuild: flags.rebuild === true, check: flags.check === true },
+    );
+    if (flags.json) {
+      console.log(JSON.stringify(result, null, 2));
+      return 0;
+    }
+    console.log(
+      `${symbol}  ${new Date(result.from ?? 0).toISOString()} → ${new Date(result.to ?? 0).toISOString()}` +
+        `  ${result.check ? '只读校验' : result.rebuild ? '重建（先删后算）' : '补齐'}` +
+        `  耗时 ${result.durationMs}ms`,
+    );
+    // 不许只报「成功」（R-5.6）：每周期必须报出写入数与扣留数。
+    for (const [interval, stats] of Object.entries(result.intervals)) {
+      console.log(
+        `  ${interval.padEnd(4)} 写入 ${stats.upserted.toLocaleString('en-US')} 桶` +
+          `  扣留：未收盘 ${stats.withheldNotClosed.toLocaleString('en-US')}` +
+          ` / 未全覆盖 ${stats.withheldIncomplete.toLocaleString('en-US')}` +
+          `（合计缺 ${stats.missingMinutes.toLocaleString('en-US')} 分钟 1m）`,
+      );
+    }
+    if (Object.keys(result.intervals).length === 0) {
+      console.log('  未启用派生（data.aggregateIntervals 为空）');
+    }
     return 0;
   });
 }

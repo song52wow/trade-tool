@@ -1,24 +1,59 @@
+import type { StoredInterval } from '@trade-tool/core';
 import { useCallback, useLayoutEffect, useState } from 'react';
 
 import { ApiError, api } from '../api.js';
 import { fmtDuration, fmtNumber, fmtTime } from '../format.js';
 import { CandleChart, GapNotice } from './CandleChart.js';
-import type { BarDto, BarsDto } from '../../../src/types';
+import { ALL_INTERVALS, EMPTY_BARS, intervalMs, minutesToBars } from './gaps.js';
+import type { BarDto, BarsDto, DerivedIntervalDto } from '../../../src/types';
 
 /**
  * 区间选项是**根数**，不是时间。
  *
- * 周期固定 1m（R-6），两者一一对应；写成根数可以直接变成 SQL 的 LIMIT，不必在前端
- * 先算出时间窗再去对齐分钟边界。标签由根数换算，不另写一份文案。
+ * 1m 与派生周期都按根数表达：写成根数可以直接变成 SQL 的 LIMIT，不必在前端先算出
+ * 时间窗再对齐桶边界。标签由根数 × 桶宽换算，不另写一份文案。
  */
 const RANGES = [60, 300, 720, 1440] as const;
-const BAR_MS = 60_000;
-
-const EMPTY: BarsDto = { symbol: '', limit: 0, items: [] };
 
 function reason(error: unknown): string {
   if (error instanceof ApiError) return `[${error.code}] ${error.message}`;
   return error instanceof Error ? error.message : String(error);
+}
+
+/**
+ * 空状态的原因（R-7.4）。
+ *
+ * 「这个周期一根都没有」有三种完全不同的处置，页面必须说清是哪一种，否则用户只能猜：
+ *   * 该周期尚未收盘——数据末端那个桶还没走完，等下一批 1m 落库就会出现；
+ *   * 上游 1m 有缺口——桶被**扣留**了，图上留白才是诚实的（R-3.5）；
+ *   * 尚未同步——这个标的压根没有 1m。
+ */
+function emptyReason(
+  symbol: string,
+  interval: StoredInterval,
+  hasHistory: boolean,
+  derived: Record<string, DerivedIntervalDto> | undefined,
+): string {
+  if (!hasHistory) {
+    return `库里还没有 ${symbol} 的任何 1m 数据。开始同步后这里会随入库进度长出 K 线。`;
+  }
+  if (interval === '1m') return '这个区间内库里没有 1m 数据。';
+  const stats = derived?.[interval];
+  if (stats === undefined) return `${interval} 暂无已收盘桶。`;
+  if ('withheldReason' in stats && stats.withheldReason === 'disabled') {
+    return `未启用派生（aggregateIntervals 为空），${interval} 不会写入任何桶。`;
+  }
+  if ('withheldReason' in stats) return `${interval} 暂无已收盘桶。`;
+  if (stats.buckets === 0 && stats.withheldIncomplete > 0) {
+    return (
+      `${interval} 一个桶都还没有：该周期全部被扣留，因为上游 1m 缺 ` +
+      `${fmtNumber(stats.missingMinutes)} 分钟。缺口补上后同一轮同步就会自动出现，无需重建。`
+    );
+  }
+  if (stats.buckets === 0 && stats.withheldNotClosed > 0) {
+    return `${interval} 暂无已收盘桶：数据末端那个桶还没走完，等下一批 1m 落库就会出现。`;
+  }
+  return `${interval} 在这个区间内没有已收盘的桶。`;
 }
 
 /**
@@ -30,23 +65,29 @@ function reason(error: unknown): string {
  */
 export function PriceChart(props: {
   symbol: string;
-  /** 库内总行数；用来如实说明「图上这点 vs 库里那堆」 */
+  /** 库内总行数（1m）；用来如实说明「图上这点 vs 库里那堆」 */
   totalRows: number | null;
   hasHistory: boolean;
   tick: number;
+  /** 每周期派生统计，用于空状态原因与缺口的 1m 根因（R-7.4 / R-7.5） */
+  derived?: Record<string, DerivedIntervalDto> | undefined;
+  /** 重建派生表（R-7.6）：长任务，只登记 id 就返回 */
+  onAggregate?: (() => void) | undefined;
+  aggregating?: boolean | undefined;
 }) {
+  const [interval, setInterval] = useState<StoredInterval>('1m');
   const [range, setRange] = useState<number>(300);
-  const [data, setData] = useState<BarsDto>(EMPTY);
+  const [data, setData] = useState<BarsDto>(EMPTY_BARS);
   const [loadedAt, setLoadedAt] = useState<number | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  const { symbol, hasHistory, tick } = props;
+  const { symbol, hasHistory, tick, derived } = props;
 
   useLayoutEffect(() => {
     // 库里一行都没有就别发请求：答案已经确定，省一次往返也让空状态更好解释。
     if (!hasHistory) {
-      setData(EMPTY);
+      setData(EMPTY_BARS);
       setLoadedAt(null);
       setError(null);
       setLoading(false);
@@ -55,7 +96,7 @@ export function PriceChart(props: {
     let cancelled = false;
     setLoading(true);
     void api
-      .bars(symbol, range)
+      .bars(symbol, range, interval)
       .then((result) => {
         if (cancelled) return;
         setData(result);
@@ -75,27 +116,49 @@ export function PriceChart(props: {
     return () => {
       cancelled = true;
     };
-  }, [symbol, range, tick, hasHistory]);
+  }, [symbol, range, tick, hasHistory, interval]);
 
   const bars: BarDto[] = data.items;
+  const barMs = data.intervalMs > 0 ? data.intervalMs : intervalMs(interval);
   const truncated = data.limit > 0 && data.limit < range;
   const onRange = useCallback((next: number) => setRange(next), []);
+  const onInterval = useCallback((next: StoredInterval) => setInterval(next), []);
+
+  // 派生周期的缺口根因：同一区间在上游 1m 缺了多少分钟。
+  const upstreamMissing =
+    interval === '1m'
+      ? null
+      : (() => {
+          const stats = derived?.[interval];
+          if (stats === undefined || 'withheldReason' in stats) return null;
+          return stats.missingMinutes > 0 ? stats.missingMinutes : null;
+        })();
 
   return (
     <div className="price-chart">
       <div className="chart-head">
         <span className="muted" style={{ fontSize: 12 }}>
-          1m K 线（读自本地库）
+          {interval} K 线（读自本地库）
         </span>
+        {ALL_INTERVALS.map((item) => (
+          <button
+            key={item}
+            className={interval === item ? 'chip active' : 'chip'}
+            onClick={() => onInterval(item)}
+            title={`切换到 ${item}`}
+          >
+            {item}
+          </button>
+        ))}
         <div className="spacer" />
         {RANGES.map((n) => (
           <button
             key={n}
             className={range === n ? 'chip active' : 'chip'}
             onClick={() => onRange(n)}
-            title={`最近 ${n.toLocaleString('zh-CN')} 分钟`}
+            title={`最近 ${n.toLocaleString('zh-CN')} 根`}
           >
-            {fmtDuration(n * BAR_MS)}
+            {fmtDuration(n * barMs)}
           </button>
         ))}
       </div>
@@ -109,25 +172,49 @@ export function PriceChart(props: {
 
       {!hasHistory ? (
         <p className="muted" style={{ fontSize: 12, margin: '8px 0 0' }}>
-          库里还没有 {props.symbol} 的任何数据。开始同步后这里会随入库进度长出 K 线。
+          {emptyReason(symbol, interval, hasHistory, derived)}
         </p>
       ) : bars.length === 0 ? (
-        <p className="muted" style={{ fontSize: 12, margin: '8px 0 0' }}>
-          {loading ? '正在读取 K 线…' : '这个区间内库里没有数据。'}
-        </p>
+        <div>
+          <p className="muted" style={{ fontSize: 12, margin: '8px 0 0' }}>
+            {loading ? '正在读取 K 线…' : emptyReason(symbol, interval, hasHistory, derived)}
+          </p>
+          {/* 空状态要给出可执行的下一步，而不是让用户对着空白图猜（R-7.4） */}
+          {interval !== '1m' && props.onAggregate ? (
+            <button
+              onClick={props.onAggregate}
+              disabled={props.aggregating ?? false}
+              style={{ marginTop: 8 }}
+              title="从库内 1m 重算全部派生桶（只写派生表，不拉数据）"
+            >
+              {props.aggregating ? '重建中…' : '重建派生 K 线'}
+            </button>
+          ) : null}
+        </div>
       ) : (
         <>
-          <CandleChart bars={bars} />
+          <CandleChart bars={bars} barMs={barMs} interval={interval} />
           <p className="muted mono" style={{ fontSize: 11, margin: '4px 0 0' }}>
             {loading ? '读取中 · ' : ''}
-            {bars.length.toLocaleString('zh-CN')} 根 · {fmtTime(bars[0]?.time)} →{' '}
-            {fmtTime(bars[bars.length - 1]?.time)} · 库内共 {fmtNumber(props.totalRows)} 根
+            {bars.length.toLocaleString('zh-CN')} 根 {interval} · {fmtTime(bars[0]?.time)} →{' '}
+            {fmtTime(bars[bars.length - 1]?.time)}
+            {interval === '1m'
+              ? ` · 库内共 ${fmtNumber(props.totalRows)} 根 1m`
+              : ` · 由库内 1m 派生（缺 1 根 = 缺 ${fmtDuration(barMs)}）`}
             {truncated ? ` · 请求被截断到 ${data.limit.toLocaleString('zh-CN')} 根` : ''}
             {loadedAt === null ? '' : ` · 读取于 ${fmtTime(loadedAt)}`}
           </p>
-          <GapNotice bars={bars} />
+          <GapNotice
+            bars={bars}
+            barMs={barMs}
+            interval={interval}
+            upstreamMissingMinutes={upstreamMissing}
+          />
         </>
       )}
     </div>
   );
 }
+
+/** 供测试与复用：把分钟数按周期换算成根数（避免各处各写一遍公式）。 */
+export { minutesToBars };

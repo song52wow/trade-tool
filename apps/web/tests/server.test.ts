@@ -1,4 +1,9 @@
-import { SyncError } from '@trade-tool/core';
+import {
+  DERIVED_INTERVALS,
+  INTERVAL_TABLES,
+  SyncError,
+  type StoredInterval,
+} from '@trade-tool/core';
 import { describe, expect, it } from 'vitest';
 
 import { MAX_BAR_LIMIT } from '../src/bars.js';
@@ -61,6 +66,13 @@ function fakeDeps(overrides: Partial<WebDeps> = {}): WebDeps & { calls: string[]
           totalRows: 0,
           totalBytes: 0,
           pendingGaps: 0,
+          // v0.2.0 R-8.2：派生表的行数与实测体积（`pg_total_relation_size`）
+          derived: DERIVED_INTERVALS.map((interval) => ({
+            interval,
+            table: INTERVAL_TABLES[interval],
+            rows: 0,
+            bytes: 0,
+          })),
           rateLimit: {
             budgetPerMinute: 1920,
             windowFrom: NOW,
@@ -84,7 +96,9 @@ function fakeDeps(overrides: Partial<WebDeps> = {}): WebDeps & { calls: string[]
       }) satisfies OverviewDto,
     listSymbols: async () => [row('AAAUSDT')],
     getSymbol: async (symbol) =>
-      symbol === 'AAAUSDT' ? { ...row(symbol), contract: null, gaps: [], estimate: null } : null,
+      symbol === 'AAAUSDT'
+        ? { ...row(symbol), contract: null, gaps: [], estimate: null, derived: {} }
+        : null,
     listExchangeSymbols: async (options) => {
       calls.push(`exchange:${String(options?.refresh ?? false)}`);
       return { exchange: 'binance', count: 0, cachedAt: NOW, ageMs: 0, stale: false, symbols: [] };
@@ -105,7 +119,7 @@ function fakeDeps(overrides: Partial<WebDeps> = {}): WebDeps & { calls: string[]
       return [];
     },
     listBars: async (symbol, options) => {
-      calls.push(`bars:${symbol}:${String(options.limit)}`);
+      calls.push(`bars:${symbol}:${String(options.limit)}:${options.interval}`);
       return [
         { time: NOW - 60_000, open: 1, high: 2, low: 0.5, close: 1.5, volume: 10 },
         { time: NOW, open: 1.5, high: 2.5, low: 1, close: 2, volume: 12 },
@@ -235,7 +249,14 @@ describe('buildApp 路由', () => {
     const body = (await res.json()) as { error: { code: string; details: { allowed: string[] } } };
 
     expect(res.status).toBe(400);
-    expect(body.error.details.allowed).toEqual(['start', 'pause', 'resume', 'full', 'verify']);
+    expect(body.error.details.allowed).toEqual([
+      'start',
+      'pause',
+      'resume',
+      'full',
+      'verify',
+      'aggregate',
+    ]);
   });
 
   it('首次全量返回 202 + job id，并把目标行数透传下去', async () => {
@@ -417,7 +438,7 @@ describe('GET /api/symbols/:symbol/bars', () => {
     const res = await app.request('/api/symbols/AAAUSDT/bars');
 
     expect(res.status).toBe(200);
-    expect(deps.calls).toContain('bars:AAAUSDT:300');
+    expect(deps.calls).toContain('bars:AAAUSDT:300:1m');
   });
 
   it('回包带上生效 limit 与升序 bar', async () => {
@@ -441,7 +462,7 @@ describe('GET /api/symbols/:symbol/bars', () => {
     const body = (await res.json()) as { limit: number };
 
     expect(body.limit).toBe(MAX_BAR_LIMIT);
-    expect(deps.calls).toContain(`bars:AAAUSDT:${String(MAX_BAR_LIMIT)}`);
+    expect(deps.calls).toContain(`bars:AAAUSDT:${String(MAX_BAR_LIMIT)}:1m`);
   });
 
   it('非法 limit 报 400 且**不落到查询层**', async () => {
@@ -470,6 +491,108 @@ describe('GET /api/symbols/:symbol/bars', () => {
     const deps = fakeDeps();
     const app = buildApp(deps);
     await app.request('/api/symbols/%20AAAUSDT%20/bars');
-    expect(deps.calls.some((c) => c === 'bars:AAAUSDT:300')).toBe(true);
+    expect(deps.calls.some((c) => c === 'bars:AAAUSDT:300:1m')).toBe(true);
+  });
+});
+
+/**
+ * 周期白名单（R-7.1 / R-7.2 / AC-12）。
+ *
+ * 重点是**不静默回落**：用户以为在看 4h、实际拿到 1m，正是最典型的静默兜底——图能画
+ * 出来，只是每根蜡烛只有 1 分钟数据，不报错也没人发现。因此非法周期必须 400 且**一次
+ * 查询都不发**。
+ */
+describe('GET /bars 的 ?interval=', () => {
+  it('缺省按 1m 分派，并回传生效值', async () => {
+    const deps = fakeDeps();
+    const app = buildApp(deps);
+    const res = await app.request('/api/symbols/AAAUSDT/bars');
+    const body = (await res.json()) as { interval: string; intervalMs: number; items: unknown[] };
+
+    expect(res.status).toBe(200);
+    expect(deps.calls).toContain('bars:AAAUSDT:300:1m');
+    // 桶宽必须回传：页面要靠它把缺口算成「几根」（R-7.3）
+    expect(body.interval).toBe('1m');
+    expect(body.intervalMs).toBe(60_000);
+    // items 的内容与顺序与改动前一致（AC-12，见需求 §6.4）
+    expect(body.items).toHaveLength(2);
+  });
+
+  it.each(['15m', '1h', '4h', '1d'])('合法周期 %s 被放行', async (interval) => {
+    const deps = fakeDeps();
+    const app = buildApp(deps);
+    const res = await app.request(`/api/symbols/AAAUSDT/bars?interval=${interval}`);
+
+    expect(res.status).toBe(200);
+    expect(deps.calls).toContain(`bars:AAAUSDT:300:${interval}`);
+    const body = (await res.json()) as { interval: string; intervalMs: number };
+    expect(body.interval).toBe(interval);
+    expect(body.intervalMs).toBeGreaterThan(60_000);
+  });
+
+  it.each(['5m', '2h', 'foo', '1M', '15m%20'])(
+    '未实现周期 %s 报 400 且**一次查询都不发**',
+    async (interval) => {
+      const deps = fakeDeps();
+      const app = buildApp(deps);
+      const res = await app.request(`/api/symbols/AAAUSDT/bars?interval=${interval}`);
+
+      expect(res.status).toBe(400);
+      expect(((await res.json()) as { error: { code: string } }).error.code).toBe('CONFIG_INVALID');
+      // 静默换成 1m 会让人以为「数据就这么多」，所以必须不落查询层
+      expect(deps.calls.some((c) => c.startsWith('bars:'))).toBe(false);
+    },
+  );
+
+  it('interval 与 limit 同时非法时，先报 interval（顺序稳定）', async () => {
+    const deps = fakeDeps();
+    const app = buildApp(deps);
+    const res = await app.request('/api/symbols/AAAUSDT/bars?interval=5m&limit=0');
+    expect(res.status).toBe(400);
+    expect(deps.calls).toHaveLength(0);
+  });
+});
+
+/**
+ * 重建作业（R-7.6）。
+ *
+ * 重建是几十分钟量级的重活儿：必须 **202 + job id** 立即返回，不许挂在 HTTP 请求上；
+ * 同一标的存在作业时按单写者语义报 409。
+ */
+describe('POST /api/symbols/:symbol/aggregate', () => {
+  it('返回 202 + job id，不阻塞等待重建完成', async () => {
+    const deps = fakeDeps();
+    const app = buildApp(deps);
+
+    const res = await app.request('/api/symbols/AAAUSDT/aggregate', {
+      method: 'POST',
+      body: JSON.stringify({ target: 100 }),
+      headers: { 'content-type': 'application/json' },
+    });
+
+    expect(res.status).toBe(202);
+    expect((await res.json()) as JobDto).toMatchObject({ id: 'job-aggregate', status: 'running' });
+    expect(deps.calls).toContain('job:aggregate:AAAUSDT:100');
+  });
+
+  it('同一标的已有作业在跑时 409（不并发重建）', async () => {
+    const app = buildApp(
+      fakeDeps({
+        startJob: async () => {
+          throw new SyncError('SYNC_ALREADY_RUNNING', '该标的已有作业在进行中', {
+            symbol: 'AAAUSDT',
+          });
+        },
+      }),
+    );
+    const res = await app.request('/api/symbols/AAAUSDT/aggregate', { method: 'POST' });
+    expect(res.status).toBe(409);
+  });
+
+  it('aggregate 出现在允许的动作列表里', async () => {
+    const app = buildApp(fakeDeps());
+    const res = await app.request('/api/symbols/AAAUSDT/destroy', { method: 'POST' });
+    const body = (await res.json()) as { error: { details: { allowed: string[] } } };
+    expect(body.error.details.allowed).toContain('aggregate');
   });
 });

@@ -74,6 +74,8 @@ def test_end_to_end_sync_then_idempotent_repeat(conn: DbConn, tmp_path: Path) ->
         "weight",
         "metadataStale",
         "estimate",
+        # v0.2.0 R-8.3：每周期聚合统计进 SyncRunSummary（跨语言契约，AC-25）
+        "aggregated",
     }
     assert summary["from"] == CASE.onboard_date
     assert summary["writeStrategy"] == "upsert"
@@ -246,7 +248,7 @@ def pg_dsn_of(conn: DbConn) -> str:
     )
 
 
-def TEST_SCHEMA_NAME(conn: DbConn) -> str:  # noqa: N802 - 测试辅助函数
+def TEST_SCHEMA_NAME(conn: DbConn) -> str:  # 测试辅助函数：取当前 schema
     row = conn.execute("SELECT current_schema() AS schema").fetchone()
     assert row is not None
     return str(row["schema"])

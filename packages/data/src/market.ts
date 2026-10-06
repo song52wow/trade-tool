@@ -3,6 +3,7 @@ import { resolve } from 'node:path';
 import {
   resolveHome,
   SyncError,
+  type AggregateSummary,
   type ContractSpec,
   type DataConfig,
   type RateLimitStatus,
@@ -186,6 +187,12 @@ export interface SyncOptions {
    * 「先只登记缺口、留到下一轮再修」的场景（测试用它把「检测到」与「补得上」拆开断言）。
    */
   allowBackfill?: boolean | undefined;
+  /**
+   * 覆盖派生周期集合；缺省取 `data.aggregateIntervals`。
+   * 传 `[]` 是**显式关闭派生**（R-9.2 / AC-22），不是「这次不算」——状态里会如实
+   * 显示「未启用派生」。
+   */
+  aggregateIntervals?: readonly string[] | undefined;
 }
 
 function syncArgs(ctx: MarketContext, symbol: string, options: SyncOptions): string[] {
@@ -202,6 +209,8 @@ function syncArgs(ctx: MarketContext, symbol: string, options: SyncOptions): str
     '--weight-budget',
     String(ctx.config.sync.weightBudgetPerMinute),
     ...metadataArgs(ctx),
+    '--intervals',
+    (options.aggregateIntervals ?? data.aggregateIntervals).join(','),
     ...(options.from === undefined ? [] : ['--from', String(options.from)]),
     ...(options.to === undefined ? [] : ['--to', String(options.to)]),
     ...(options.nowMs === undefined ? [] : ['--now-ms', String(options.nowMs)]),
@@ -251,6 +260,8 @@ export async function backfillRange(
       '--weight-budget',
       String(ctx.config.sync.weightBudgetPerMinute),
       ...metadataArgs(ctx),
+      '--intervals',
+      (options.aggregateIntervals ?? ctx.config.data.aggregateIntervals).join(','),
       ...(options.nowMs === undefined ? [] : ['--now-ms', String(options.nowMs)]),
     ],
     withDsn: true,
@@ -271,6 +282,55 @@ export async function verifySymbol(ctx: MarketContext, symbol: string): Promise<
   await assertSchemaVersion(ctx.pool);
   return invoke<VerifyResult>(ctx, {
     args: ['verify', ...baseArgs(ctx), '--symbol', symbol],
+    withDsn: true,
+  });
+}
+
+// ---------------------------------------------------------------- 派生周期
+
+export interface AggregateOptions {
+  /** 显式给出时以命令行为准；缺省取 `data.aggregateIntervals`（R-5.2） */
+  intervals?: readonly string[] | undefined;
+  from?: number | undefined;
+  to?: number | undefined;
+}
+
+function aggregateIntervalArgs(ctx: MarketContext, options: AggregateOptions): string[] {
+  const data = ctx.config.data;
+  return [
+    '--intervals',
+    (options.intervals ?? data.aggregateIntervals).join(','),
+    '--aggregate-batch-bars',
+    String(data.aggregateBatchBars),
+  ];
+}
+
+/**
+ * 补齐 / 重建 / 校验派生 K 线（v0.2.0 R-5）。
+ *
+ * **不进交易所、不改 `sync_state` 的水位与 rows**（R-5.4）：Python 侧只读 1m、只写派生表。
+ * 周期白名单由 Python 侧校验，出现 `1m` / `5m` / 其它一律 `CONFIG_INVALID`。
+ */
+export async function aggregateSymbol(
+  ctx: MarketContext,
+  symbol: string,
+  options: AggregateOptions = {},
+  mode: { rebuild?: boolean; check?: boolean } = {},
+): Promise<AggregateSummary> {
+  const { assertSchemaVersion } = await import('./db/migrate.js');
+  await assertSchemaVersion(ctx.pool);
+  return invoke<AggregateSummary>(ctx, {
+    args: [
+      'aggregate',
+      ...baseArgs(ctx),
+      '--symbol',
+      symbol,
+      ...aggregateIntervalArgs(ctx, options),
+      ...(options.from === undefined ? [] : ['--from', String(options.from)]),
+      ...(options.to === undefined ? [] : ['--to', String(options.to)]),
+      ...(mode.rebuild ? ['--rebuild'] : []),
+      ...(mode.check ? ['--check'] : []),
+    ],
     withDsn: true,
   });
 }

@@ -1,5 +1,6 @@
 import {
   loadConfigOrDefault,
+  STORED_INTERVALS,
   type GapRecord,
   type RemovePolicy,
   type SymbolEntry,
@@ -7,6 +8,7 @@ import {
   type TradeToolConfig,
 } from '@trade-tool/core';
 import {
+  aggregateSymbol,
   assertSchemaVersion,
   buildContext,
   createPool,
@@ -17,6 +19,7 @@ import {
   listExchangeSymbols,
   readBars,
   readDaemonHeartbeat,
+  readDerivedIntervals,
   readLatestBars,
   resolveContract,
   schemaStatus,
@@ -83,6 +86,11 @@ export function createWebRuntime(config: TradeToolConfig): WebRuntime {
   const jobs = new JobRegistry({
     runFull: async (symbol) => ({ ...(await syncSymbol(ctx, symbol, {})) }),
     runVerify: async (symbol) => ({ ...(await verifySymbol(ctx, symbol)) }),
+    // v0.2.0 R-7.6：重建派生表。走 --rebuild（先删后算），因为作业的用途就是
+    // 「修复不一致」，而补齐对已被篡改的桶无效。
+    runAggregate: async (symbol) => ({
+      ...(await aggregateSymbol(ctx, symbol, {}, { rebuild: true })),
+    }),
     readProgress: async (symbol) => {
       const state = await getState(ctx, symbol);
       return { rows: state?.rows ?? null, pendingGaps: state?.pendingGaps ?? null };
@@ -148,7 +156,12 @@ export function createWebRuntime(config: TradeToolConfig): WebRuntime {
       // 合约规格是快照：拿不到（缓存过期且出网失败）不该让整个详情页打不开，
       // 但必须显式是 null 让页面显示「未知」，不拿旧值假装有。
       const contract = await resolveContract(ctx, symbol).catch(() => null);
-      return { ...row, contract, gaps: await getGaps(ctx, symbol), estimate: null };
+      // 派生统计（R-7.5 / AC-15）：让用户能回答「为什么没有 4h 蜡烛」。
+      // 未启用派生时如实返回 withheldReason='disabled'，而不是全 0（AC-22）。
+      const derived = await readDerivedIntervals(pool, symbol, STORED_INTERVALS, {
+        enabled: config.data.aggregateIntervals.length > 0,
+      });
+      return { ...row, contract, gaps: await getGaps(ctx, symbol), estimate: null, derived };
     },
 
     async listExchangeSymbols(options): Promise<ExchangeListDto> {
@@ -182,17 +195,17 @@ export function createWebRuntime(config: TradeToolConfig): WebRuntime {
     },
 
     /**
-     * 最近 N 根 1m K 线（R-23）。
+     * 最近 N 根 K 线（R-23 / R-7.1），按所选周期。
      *
-     * 只读本地 `klines_1m`，不出网也不写库——所以它能挂在页面的刷新节奏上，代价只是一
-     * 次走主键的倒序 LIMIT。这里再夹一次上限：路由已经夹过，但 `WebRuntime` 也会被
-     * 直接调用（测试、将来的其它前端），上限不能只长在 HTTP 那一层。
+     * 只读本地表，不出网也不写库——所以它能挂在页面的刷新节奏上，代价只是一次走主键的
+     * 倒序 LIMIT。这里再夹一次上限：路由已经夹过，但 `WebRuntime` 也会被直接调用
+     * （测试、将来的其它前端），上限不能只长在 HTTP 那一层。
      *
      * `quote_volume` / `trades` 读出来但不进 DTO：图上用不到，白白撑大每次响应。
      */
     async listBars(symbol, options): Promise<BarDto[]> {
       const limit = clampBarLimit(options?.limit);
-      const bars = await readLatestBars(pool, symbol, { limit });
+      const bars = await readLatestBars(pool, symbol, { limit, interval: options?.interval });
       return bars.map(({ time, open, high, low, close, volume }) => ({
         time,
         open,

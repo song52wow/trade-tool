@@ -38,6 +38,9 @@ export type SyncErrorCode =
   | 'WATERMARK_MISMATCH'
   // 缺口（R-11.9）
   | 'GAP_ATTEMPTS_EXHAUSTED'
+  // 派生周期（v0.2.0 R-9.3）
+  | 'AGGREGATION_FAILED'
+  | 'AGGREGATION_MISMATCH'
   // 数据库（R-21.6 / R-1.3）
   | 'DB_CONNECTION_FAILED'
   | 'DB_UNIQUE_VIOLATION'
@@ -186,10 +189,21 @@ export interface RateLimitStatus {
 export interface SyncSummary {
   symbols: number;
   countsByStatus: Record<SyncStatus, number>;
+  /** 1m 表的行数（既有语义不变，R-8.2） */
   totalRows: number;
+  /** 1m 表的体积（既有语义不变，R-8.2） */
   totalBytes: number;
   pendingGaps: number;
   rateLimit: RateLimitStatus;
+  /**
+   * 四张派生表的行数与**实测**体积（v0.2.0 R-8.2 / AC-16）。
+   *
+   * 体积直接读 `pg_total_relation_size`，不沿用附录 B.2 的单行估算——那条估算至今
+   * 未实测，而 `sync_state.bytes` 一直按它推进，谁都没量过真表。
+   * `aggregateIntervals: []`（未启用派生）时是空数组：显示「0 个桶」会让人误以为
+   * 「还没聚合」，必须与「启用了但确实为空」区分开（R-8.4 / AC-22）。
+   */
+  derived: DerivedTableStat[];
 }
 
 /** 首次全量的规模预估（R-8.3），执行前必须先算给人看。 */
@@ -229,6 +243,26 @@ export interface SyncRunSummary {
   metadataStale: boolean;
   /** 规模预估；仅首次全量返回 */
   estimate?: SyncPlanEstimate;
+  /**
+   * 本轮派生聚合的每周期统计（v0.2.0 R-8.3）。
+   *
+   * 与 `SyncRunSummary` **同提交**更新（跨语言契约，AGENTS.md 硬性约定 2）：
+   * Python 侧 `run_sync` 产出、TS 侧消费，两边字段名必须一致。
+   *
+   * `aggregateIntervals: []`（显式关闭派生）时是 `null`——**不是**空对象：
+   * 「未启用派生」与「启用了但一个桶都没写」是两种完全不同的状态，页面必须能分开说
+   * （R-8.4 / AC-22）。空对象会让人以为「还没聚合」。
+   */
+  aggregated: Record<string, AggregateIntervalStats> | null;
+}
+
+/** 全局汇总里的派生表实测体积（v0.2.0 R-8.2 / AC-16）。 */
+export interface DerivedTableStat {
+  interval: string;
+  table: string;
+  rows: number;
+  /** `pg_total_relation_size` 实测值（含索引摊销），不是估算 */
+  bytes: number;
 }
 
 /** 库内最后一根 bar 的自愈校验结果（R-10.3）。 */
@@ -237,4 +271,51 @@ export interface ClosedBarCheck {
   closeTime: number;
   /** closeTime <= now_ms */
   closed: boolean;
+}
+
+/**
+ * 单个派生周期的聚合统计（v0.2.0 R-5.6）。
+ *
+ * 数字**必须由 SQL 从 1m 推导**，不落「扣留表」（R-3.5）：被扣留的桶如果只表现为
+ * 「图上少一根」，用户就得自己猜原因。
+ *
+ * 两种扣留原因互斥且必须分开报：
+ *   * `withheldNotClosed`  —— 桶尚未走完（1m 还没到齐），等下一批自然出现；
+ *   * `withheldIncomplete` —— 桶已收盘但桶内有 1m 缺口，写进去就是一根半截蜡烛（R-3.5）。
+ */
+export interface AggregateIntervalStats {
+  /** 本轮写入 / 更新的桶数（`--rebuild` 与重复执行时可能为 0） */
+  upserted: number;
+  /** 尚未收盘被扣留的桶数 */
+  withheldNotClosed: number;
+  /** 已收盘但 1m 未全覆盖而被扣留的桶数 */
+  withheldIncomplete: number;
+  /** 扣留桶内合计缺失的 1m 分钟数（= 缺口在派生层的投影） */
+  missingMinutes: number;
+}
+
+/** `data aggregate` 的结果摘要。**不许只报「成功」**（R-5.6）。 */
+export interface AggregateSummary {
+  symbol: string;
+  /** 区间起点（bucket 起点，epoch ms） */
+  from: number | null;
+  /** 区间终点（含，epoch ms） */
+  to: number | null;
+  /** 显式为 false 时表示本轮是只读校验（`--check`） */
+  rebuild: boolean;
+  check: boolean;
+  /** 每周期统计；`aggregateIntervals` 为空时是空对象（未启用派生，R-8.4） */
+  intervals: Record<string, AggregateIntervalStats>;
+  durationMs: number;
+}
+
+/** `--check` 发现的不一致明细（任一非空即抛 AGGREGATION_MISMATCH，R-5.1）。 */
+export interface AggregateMismatch {
+  interval: string;
+  /** `stale` = 派生表有但按当前 1m 已不合格；`missing` = 合格但缺失；`mismatch` = 值不一致 */
+  kind: 'stale' | 'missing' | 'mismatch';
+  /** 桶起点（epoch ms） */
+  time: number;
+  /** `mismatch` 时指出不一致的列名 */
+  column?: string;
 }

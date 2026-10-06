@@ -25,6 +25,7 @@ type Pending =
   /** 守护进程不在线：意图会记录但不会拉数据，必须说清楚再让用户决定 */
   | { kind: 'startOffline'; symbol: string }
   | { kind: 'verify'; symbol: string }
+  | { kind: 'aggregate'; symbol: string; target: number }
   | { kind: 'remove'; symbol: string; policy: RemovePolicy };
 
 export function App() {
@@ -135,6 +136,11 @@ export function App() {
     () => jobs.find((j) => j.kind === 'verify' && j.status === 'running')?.symbol ?? null,
     [jobs],
   );
+  /** 重建派生表同理：同样只从作业列表推，避免两处状态不同步。 */
+  const aggregatingSymbol = useMemo(
+    () => jobs.find((j) => j.kind === 'aggregate' && j.status === 'running')?.symbol ?? null,
+    [jobs],
+  );
   const daemonOnline = overview?.daemon.state === 'running';
 
   const runLifecycle = useCallback(
@@ -236,6 +242,9 @@ export function App() {
       } else if (pending.kind === 'verify') {
         const job = await api.startVerify(pending.symbol);
         notify(`已登记数据体检作业 ${job.id}`);
+      } else if (pending.kind === 'aggregate') {
+        const job = await api.startAggregate(pending.symbol, pending.target);
+        notify(`已登记派生重建作业 ${job.id}（只重算派生表，不拉数据）`);
       } else {
         await api.removeSymbol(pending.symbol, pending.policy);
         notify(`${pending.symbol} 已移除（已入库数据按 ${pending.policy} 处置）`);
@@ -354,7 +363,13 @@ export function App() {
                   return (
                     <tr key={job.id}>
                       <td className="mono">{job.symbol}</td>
-                      <td>{job.kind === 'full' ? '全量/增量' : '全表校验'}</td>
+                      <td>
+                        {job.kind === 'full'
+                          ? '全量/增量'
+                          : job.kind === 'verify'
+                            ? '全表校验'
+                            : '派生重建'}
+                      </td>
                       <td>
                         <span
                           className={`tag ${
@@ -451,6 +466,16 @@ export function App() {
               now={now}
               verifying={verifyingSymbol === selected}
               onVerify={() => setPending({ kind: 'verify', symbol: selected })}
+              aggregating={aggregatingSymbol === selected}
+              onAggregate={() =>
+                setPending({
+                  kind: 'aggregate',
+                  symbol: selected,
+                  // 进度分母沿用 1m 行数：页面已有的分母就是它，换成桶数会让
+                  // 同一条进度条在两个作业之间跳变。
+                  target: detail?.state?.rows ?? 0,
+                })
+              }
               tick={tick}
             />
           )}
@@ -535,6 +560,25 @@ export function App() {
             例行同步只看最近 7 天，<b>更早的漏行只有它能发现</b>
             。只读本地库，不出网、不消耗交易所配额。
             缺口语义：只由真实数据填充，不插值、不跳过（R-11）。
+          </p>
+        </ConfirmDialog>
+      ) : null}
+
+      {pending?.kind === 'aggregate' ? (
+        <ConfirmDialog
+          title={`重建派生 K 线 ${pending.symbol}`}
+          confirmLabel="开始重建"
+          busy={busy === pending.symbol}
+          onCancel={() => setPending(null)}
+          onConfirm={() => void confirmPending()}
+        >
+          <p>
+            从库内已入库的 <b>1m K 线</b>重算 15m / 1h / 4h / 1d 全部桶（先删后算）。
+            <b>不出网、不消耗交易所配额</b>，也不改动 1m 与水位。
+          </p>
+          <p className="muted" style={{ fontSize: 12 }}>
+            通常<strong>不需要</strong>手动重建：缺口在下一轮同步被补上时，受影响的桶会自动出现。
+            重建用于「1m 被外部改动 / 派生表被篡改」这两种情况。
           </p>
         </ConfirmDialog>
       ) : null}

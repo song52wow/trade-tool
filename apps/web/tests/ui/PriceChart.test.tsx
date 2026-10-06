@@ -19,8 +19,18 @@ function bar(time: number, close: number): BarDto {
   return { time, open: close, high: close + 1, low: close - 1, close, volume: 10 };
 }
 
-function series(n: number): BarDto[] {
-  return Array.from({ length: n }, (_, i) => bar(BASE + i * MINUTE, 100 + i));
+function series(n: number, step = MINUTE): BarDto[] {
+  return Array.from({ length: n }, (_, i) => bar(BASE + i * step, 100 + i));
+}
+
+/**
+ * 构造 `/bars` 的回包。
+ *
+ * `interval` / `intervalMs` 是 v0.2.0 新增的**实际生效值**（R-7.3）：页面靠它把缺口
+ * 换算成「几根 / 几段 / 最长连续」，写死 1m 会在 4h 图上把 4 小时说成 1 分钟。
+ */
+function barsPayload(limit: number, items: BarDto[], interval = '1m', intervalMs = MINUTE) {
+  return { symbol: 'AAAUSDT', interval, intervalMs, limit, items };
 }
 
 /** 记录调用路径的假 fetch；`fail` 时返回服务端错误体。 */
@@ -44,13 +54,52 @@ function stubFetch(payload: unknown, opts: { fail?: boolean } = {}) {
   return { calls, fetchMock };
 }
 
+/**
+ * 按请求里的 `interval` 分发不同回包。
+ *
+ * 周期切换类用例**必须**用这个：固定回包的 stub 会在切到 4h 之后仍然返回 1m 的数据，
+ * 于是「空状态原因」「缺口按周期量化」这些断言根本走不到对应分支——测的是渲染分支，
+ * 不是周期行为。
+ */
+function stubFetchByInterval(byInterval: Record<string, { items: BarDto[]; limit?: number }>) {
+  const calls: string[] = [];
+  const widths: Record<string, number> = {
+    '1m': MINUTE,
+    '15m': 15 * MINUTE,
+    '1h': 60 * MINUTE,
+    '4h': FOUR_HOURS,
+    '1d': 24 * 60 * MINUTE,
+  };
+  vi.stubGlobal(
+    'fetch',
+    vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      calls.push(url);
+      const interval = new URL(url, 'http://localhost').searchParams.get('interval') ?? '1m';
+      const spec = byInterval[interval];
+      const body = {
+        symbol: 'AAAUSDT',
+        interval,
+        intervalMs: widths[interval] ?? MINUTE,
+        limit: spec?.limit ?? 300,
+        items: spec?.items ?? [],
+      };
+      return new Response(JSON.stringify(body), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      });
+    }),
+  );
+  return { calls };
+}
+
 function renderChart(props: Partial<Parameters<typeof PriceChart>[0]> = {}) {
   return render(<PriceChart symbol="AAAUSDT" totalRows={123_456} hasHistory tick={0} {...props} />);
 }
 
 describe('PriceChart 取数', () => {
   it('库里没数据时不发请求，直接给可执行的下一步', async () => {
-    const { calls } = stubFetch({});
+    const { calls } = stubFetch(barsPayload(300, []));
     renderChart({ hasHistory: false, totalRows: 0 });
 
     expect(calls).toHaveLength(0);
@@ -59,15 +108,17 @@ describe('PriceChart 取数', () => {
   });
 
   it('有数据时取最近 N 根并画出蜡烛', async () => {
-    const { calls } = stubFetch({ symbol: 'AAAUSDT', limit: 300, items: series(5) });
+    const { calls } = stubFetch(barsPayload(300, series(5)));
     const { container } = renderChart();
 
     await waitFor(() => expect(container.querySelectorAll('rect[data-bar-time]')).toHaveLength(5));
     expect(calls[0]).toContain('/api/symbols/AAAUSDT/bars?limit=300');
+    // 缺省请求必须显式带上 interval=1m（向后兼容，服务端据此分派表）
+    expect(calls[0]).toContain('interval=1m');
   });
 
   it('图注说清「图上这点 vs 库里那堆」，不让人误以为看全了', async () => {
-    stubFetch({ symbol: 'AAAUSDT', limit: 300, items: series(5) });
+    stubFetch(barsPayload(300, series(5)));
     renderChart({ totalRows: 123_456 });
 
     await waitFor(() => expect(screen.getByText(/库内共/)).toBeTruthy());
@@ -75,12 +126,12 @@ describe('PriceChart 取数', () => {
   });
 
   it('切区间按新根数重新取数', async () => {
-    const { calls } = stubFetch({ symbol: 'AAAUSDT', limit: 300, items: series(5) });
+    const { calls } = stubFetch(barsPayload(300, series(5)));
     renderChart();
 
     await waitFor(() => expect(calls).toHaveLength(1));
     await act(async () => {
-      fireEvent.click(screen.getByTitle(/最近 60 分钟/));
+      fireEvent.click(screen.getByTitle(/最近 60 根/));
     });
 
     await waitFor(() => expect(calls).toHaveLength(2));
@@ -88,7 +139,7 @@ describe('PriceChart 取数', () => {
   });
 
   it('跟全局刷新走：tick 变化才重新取数（不自己另开轮询）', async () => {
-    const { calls } = stubFetch({ symbol: 'AAAUSDT', limit: 300, items: series(5) });
+    const { calls } = stubFetch(barsPayload(300, series(5)));
     const { rerender } = renderChart();
 
     await waitFor(() => expect(calls).toHaveLength(1));
@@ -103,7 +154,7 @@ describe('PriceChart 取数', () => {
   });
 
   it('服务端给的生效上限小于请求量时如实标注，不把截断后的图当成完整数据', async () => {
-    stubFetch({ symbol: 'AAAUSDT', limit: 900, items: series(3) });
+    stubFetch(barsPayload(900, series(3)));
     renderChart();
 
     // 缺省区间 300 < 900，不算截断
@@ -112,13 +163,13 @@ describe('PriceChart 取数', () => {
 
     // 切到 1440 根：900 < 1440，图只覆盖了一部分，必须说出来
     await act(async () => {
-      fireEvent.click(screen.getByTitle(/最近 1,440 分钟/));
+      fireEvent.click(screen.getByTitle(/最近 1,440 根/));
     });
     await waitFor(() => expect(screen.getByText(/请求被截断到/)).toBeTruthy());
   });
 
   it('读取失败必须**常驻可见**，并说明下面的是旧数据', async () => {
-    const { fetchMock } = stubFetch({ symbol: 'AAAUSDT', limit: 300, items: series(5) });
+    const { fetchMock } = stubFetch(barsPayload(300, series(5)));
     const { container } = renderChart();
     await waitFor(() => expect(container.querySelectorAll('rect[data-bar-time]').length).toBe(5));
 
@@ -131,7 +182,7 @@ describe('PriceChart 取数', () => {
         }),
     );
     await act(async () => {
-      fireEvent.click(screen.getByTitle(/最近 60 分钟/));
+      fireEvent.click(screen.getByTitle(/最近 60 根/));
     });
 
     await waitFor(() => expect(screen.getByText(/读取 K 线失败/)).toBeTruthy());
@@ -141,10 +192,12 @@ describe('PriceChart 取数', () => {
   });
 
   it('库里没有该标的的数据时显示空状态，不是报错', async () => {
-    stubFetch({ symbol: 'AAAUSDT', limit: 300, items: [] });
+    stubFetch(barsPayload(300, []));
     renderChart();
 
-    await waitFor(() => expect(screen.getByText(/这个区间内库里没有数据/)).toBeTruthy());
+    // 1m 周期下的空状态文案：说明原因而不是笼统说「没有数据」
+    // 要等 loading 结束：读数中显示的是「正在读取 K 线…」
+    await waitFor(() => expect(document.body.textContent).toContain('这个区间内库里没有 1m 数据'));
   });
 
   /**
@@ -168,5 +221,148 @@ describe('PriceChart 取数', () => {
     renderChart();
 
     await waitFor(() => expect(screen.getByText(/\[PG_ERROR\] 库读不出来/)).toBeTruthy());
+  });
+});
+
+const FOUR_HOURS = 4 * 60 * MINUTE;
+
+/**
+ * 周期切换与缺口量化（v0.2.0 R-7.3 / R-7.4 / AC-14）。
+ *
+ * 重点是「不骗人」：切到 4h 后，缺口必须按**根**报（4h 图上少一根 = 4 小时），
+ * 并说明根因在上游 1m；把分钟数原样贴到 4h 图上是需求明令禁止的。
+ */
+describe('PriceChart 周期切换', () => {
+  /** 4h 桶：0,1,3,4 —— 第 2 根缺失（跳过一根） */
+  function fourHourBars(): BarDto[] {
+    return [0, 1, 3, 4].map((i) => bar(BASE + i * FOUR_HOURS, 100 + i));
+  }
+
+  it('切到 4h 后请求带 interval=4h，且当前周期一直可见', async () => {
+    const { calls } = stubFetchByInterval({
+      '1m': { items: series(5) },
+      '4h': { items: fourHourBars() },
+    });
+    renderChart();
+
+    await waitFor(() => expect(calls).toHaveLength(1));
+    expect(calls[0]).toContain('interval=1m');
+
+    await act(async () => {
+      fireEvent.click(screen.getByTitle('切换到 4h'));
+    });
+
+    await waitFor(() => expect(calls).toHaveLength(2));
+    expect(calls[1]).toContain('interval=4h');
+    // 当前周期必须常驻可见，否则用户不知道自己在看哪一档
+    await waitFor(() => expect(document.body.textContent).toContain('4h K 线'));
+  });
+
+  it('五个周期都有显式控件，缺省停在 1m', async () => {
+    stubFetchByInterval({ '1m': { items: series(5) } });
+    renderChart();
+    for (const interval of ['1m', '15m', '1h', '4h', '1d']) {
+      expect(screen.getByTitle(`切换到 ${interval}`), `缺少 ${interval} 控件`).toBeTruthy();
+    }
+    expect(document.body.textContent).toContain('1m K 线');
+  });
+
+  it('缺口按所选周期报「根」而不是「分钟」（R-7.3）', async () => {
+    stubFetchByInterval({ '1m': { items: series(5) }, '4h': { items: fourHourBars() } });
+    renderChart();
+
+    await act(async () => {
+      fireEvent.click(screen.getByTitle('切换到 4h'));
+    });
+
+    // 同一句里既有「缺 1 根」也有「4 小时」，用容器文本断言避免多重匹配
+    await waitFor(() => expect(document.body.textContent).toContain('缺 1 根'));
+    expect(document.body.textContent).toContain('4 小时');
+    // 4h 下一根 = 4 小时：说成「缺 1 分钟」就是把 1m 的口径贴到了 4h 图上
+    expect(document.body.textContent).not.toContain('缺 1 分钟');
+  });
+
+  it('同时说明根因在上游 1m，并换算成当前周期下的根数', async () => {
+    stubFetchByInterval({ '1m': { items: series(5) }, '4h': { items: fourHourBars() } });
+    renderChart({
+      derived: {
+        '4h': { buckets: 4, withheldNotClosed: 0, withheldIncomplete: 1, missingMinutes: 240 },
+      },
+    });
+
+    await act(async () => {
+      fireEvent.click(screen.getByTitle('切换到 4h'));
+    });
+
+    await waitFor(() => expect(document.body.textContent).toContain('根因在上游 1m'));
+    expect(document.body.textContent).toContain('240');
+  });
+
+  it('上游 1m 有缺口导致该周期一个桶都没有时，说明原因而不是空白图', async () => {
+    stubFetchByInterval({ '1m': { items: series(5) }, '4h': { items: [] } });
+    renderChart({
+      derived: {
+        '4h': { buckets: 0, withheldNotClosed: 0, withheldIncomplete: 2, missingMinutes: 480 },
+      },
+    });
+
+    await act(async () => {
+      fireEvent.click(screen.getByTitle('切换到 4h'));
+    });
+
+    await waitFor(() => expect(document.body.textContent).toContain('上游 1m 缺'));
+    // 并说明补上缺口后会自动出现，不需要人工重建
+    expect(document.body.textContent).toContain('自动出现');
+  });
+
+  it('桶尚未收盘导致空状态时说明「等下一批」', async () => {
+    stubFetchByInterval({ '1m': { items: series(5) }, '1h': { items: [] } });
+    renderChart({
+      derived: {
+        '1h': { buckets: 0, withheldNotClosed: 1, withheldIncomplete: 0, missingMinutes: 0 },
+      },
+    });
+
+    await act(async () => {
+      fireEvent.click(screen.getByTitle('切换到 1h'));
+    });
+
+    await waitFor(() => expect(document.body.textContent).toContain('还没走完'));
+    expect(document.body.textContent).toContain('下一批');
+  });
+
+  it('未启用派生时明说，而不是显示 0 个桶（AC-22）', async () => {
+    stubFetchByInterval({ '1m': { items: series(5) }, '4h': { items: [] } });
+    renderChart({
+      derived: { '4h': { withheldReason: 'disabled' } },
+      onAggregate: () => undefined,
+    });
+
+    await act(async () => {
+      fireEvent.click(screen.getByTitle('切换到 4h'));
+    });
+
+    await waitFor(() => expect(document.body.textContent).toContain('未启用派生'));
+    // 空状态必须给出可执行的下一步
+    expect(document.body.textContent).toContain('重建派生 K 线');
+  });
+
+  it('重建按钮触发确认而不是直接开跑（长活儿要显式确认）', async () => {
+    const onAggregate = vi.fn();
+    const { calls } = stubFetchByInterval({ '1m': { items: series(5) }, '4h': { items: [] } });
+    renderChart({ derived: { '4h': { withheldReason: 'disabled' } }, onAggregate });
+
+    await act(async () => {
+      fireEvent.click(screen.getByTitle('切换到 4h'));
+    });
+    await waitFor(() => expect(document.body.textContent).toContain('重建派生 K 线'));
+
+    // 按钮只负责**请求**重建（App 层会弹确认），不发任何网络请求
+    await act(async () => {
+      fireEvent.click(screen.getByText(/重建派生 K 线/));
+    });
+    expect(onAggregate).toHaveBeenCalledTimes(1);
+
+    expect(calls.some((c) => c.startsWith('/api/symbols/AAAUSDT/aggregate'))).toBe(false);
   });
 });

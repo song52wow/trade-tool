@@ -1,4 +1,4 @@
-import type { GapRecord, RemovePolicy } from '@trade-tool/core';
+import type { GapRecord, RemovePolicy, StoredInterval } from '@trade-tool/core';
 
 import type {
   BarsDto,
@@ -84,18 +84,18 @@ export const api = {
    * 这与「库里没数据」（200 + 空数组）完全相反：前者要重启，后者要去同步。报一句
    * 笼统的 `404 Not Found`，用户根本判断不出该做哪件事。
    */
-  bars: (s: string, limit: number) =>
-    request<BarsDto>(`/api/symbols/${encodeURIComponent(s)}/bars?limit=${String(limit)}`).catch(
-      (error: unknown) => {
-        if (error instanceof ApiError && error.status === 404) {
-          throw new ApiError(
-            'CONTROL_PLANE_STALE',
-            `控制面没有 /bars 路由：它还是改动前启动的旧进程。重启 trade-tool 控制面后刷新页面即可（页面本身已是新的）。`,
-          );
-        }
-        throw error;
-      },
-    ),
+  bars: (s: string, limit: number, interval: StoredInterval = '1m') =>
+    request<BarsDto>(
+      `/api/symbols/${encodeURIComponent(s)}/bars?limit=${String(limit)}&interval=${interval}`,
+    ).catch((error: unknown) => {
+      if (error instanceof ApiError && error.status === 404) {
+        throw new ApiError(
+          'CONTROL_PLANE_STALE',
+          `控制面没有 /bars 路由：它还是改动前启动的旧进程。重启 trade-tool 控制面后刷新页面即可（页面本身已是新的）。`,
+        );
+      }
+      throw error;
+    }),
   exchange: (refresh = false) =>
     request<ExchangeListDto>(`/api/exchange${refresh ? '?refresh=true' : ''}`),
   addSymbol: (symbol: string) => post<SymbolRowDto>('/api/symbols', { symbol }),
@@ -119,5 +119,14 @@ export const api = {
     post<JobDto>(`/api/symbols/${encodeURIComponent(symbol)}/full`, { target }),
   startVerify: (symbol: string) =>
     post<JobDto>(`/api/symbols/${encodeURIComponent(symbol)}/verify`, { target: null }),
+  /**
+   * 重建派生 K 线（v0.2.0 R-7.6）。
+   *
+   * 走的是长任务通道：重建是几十分钟量级，HTTP 绝不能挂在原地等（202 + job id）。
+   * 目标行数是**1m 行数**而不是桶数——页面已经有的进度分母就是 1m 行数，
+   * 换成桶数会让同一条进度条在两个作业之间跳变。
+   */
+  startAggregate: (symbol: string, target: number) =>
+    post<JobDto>(`/api/symbols/${encodeURIComponent(symbol)}/aggregate`, { target }),
   jobs: () => request<{ items: JobDto[] }>('/api/jobs').then((r) => r.items),
 };

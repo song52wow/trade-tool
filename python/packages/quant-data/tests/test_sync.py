@@ -1110,6 +1110,8 @@ def test_migrations_are_idempotent(conn: DbConn, pg_dsn: str) -> None:
         "001_init",
         "002_sync_plan",
         "003_daemon_heartbeat",
+        # v0.2.0：四张派生周期表
+        "004_klines_agg",
     ]
     pg.ensure_schema(conn)
 

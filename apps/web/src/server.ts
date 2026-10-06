@@ -1,13 +1,20 @@
 import { Hono } from 'hono';
-import { SyncError, type GapRecord, type RemovePolicy } from '@trade-tool/core';
+import {
+  INTERVAL_MS,
+  SyncError,
+  type GapRecord,
+  type RemovePolicy,
+  type StoredInterval,
+} from '@trade-tool/core';
 
-import { parseBarLimit } from './bars.js';
+import { parseBarLimit, parseIntervalParam } from './bars.js';
 import { toErrorBody } from './errors.js';
 import type {
   AddSymbolBody,
   BarDto,
   ExchangeListDto,
   JobDto,
+  JobKind,
   LifecycleAction,
   OverviewDto,
   RemoveSymbolBody,
@@ -31,19 +38,21 @@ export interface WebDeps {
   removeSymbol(symbol: string, policy: RemovePolicy): Promise<void>;
   lifecycle(symbol: string, action: LifecycleAction): Promise<SymbolRowDto>;
   listGaps(symbol: string): Promise<GapRecord[]>;
-  /** 最近 N 根 1m K 线，升序。limit 已由路由夹到上限内，这里拿到的就是生效值。 */
-  listBars(symbol: string, options: { limit: number }): Promise<BarDto[]>;
+  /**
+   * 最近 N 根 K 线，升序。`limit` 已由路由夹到上限内，这里拿到的就是生效值。
+   * `interval` 同样已过白名单（未实现的周期在路由层就 400 了），这里不再重复校验。
+   */
+  listBars(symbol: string, options: { limit: number; interval: StoredInterval }): Promise<BarDto[]>;
   estimate(symbol: string): Promise<SymbolDetailDto['estimate']>;
-  startJob(input: {
-    kind: 'full' | 'verify';
-    symbol: string;
-    target?: number | undefined;
-  }): Promise<JobDto>;
+  startJob(input: { kind: JobKind; symbol: string; target?: number | undefined }): Promise<JobDto>;
   listJobs(): Promise<JobDto[]>;
   getJob(id: string): Promise<JobDto | null>;
 }
 
 const LIFECYCLE: readonly LifecycleAction[] = ['start', 'pause', 'resume'];
+
+/** 会登记为长任务（202 + job id）的动作。 */
+const JOB_ACTIONS: readonly JobKind[] = ['full', 'verify', 'aggregate'];
 
 async function bodyOf<T>(c: { req: { json(): Promise<unknown> } }): Promise<T> {
   try {
@@ -116,12 +125,12 @@ export function buildApp(deps: WebDeps): Hono {
     if (LIFECYCLE.includes(action as LifecycleAction)) {
       return c.json(await deps.lifecycle(symbol, action as LifecycleAction));
     }
-    if (action === 'full' || action === 'verify') {
+    if (JOB_ACTIONS.includes(action as JobKind)) {
       const body = await bodyOf<Partial<StartJobBody>>(c).catch(
         () => ({}) as Partial<StartJobBody>,
       );
       const job = await deps.startJob({
-        kind: action,
+        kind: action as JobKind,
         symbol,
         target: typeof body?.target === 'number' ? body.target : undefined,
       });
@@ -129,7 +138,7 @@ export function buildApp(deps: WebDeps): Hono {
     }
     throw new SyncError('CONFIG_INVALID', `未知操作：${action}`, {
       action,
-      allowed: [...LIFECYCLE, 'full', 'verify'],
+      allowed: [...LIFECYCLE, ...JOB_ACTIONS],
     });
   });
 
@@ -139,16 +148,27 @@ export function buildApp(deps: WebDeps): Hono {
   });
 
   /**
-   * K 线图取数（R-23）：最近 N 根，**只读本地库**。
+   * K 线图取数（R-23 / R-7.1）：最近 N 根，**只读本地库**。
    *
    * 不出网、不写库，也不占用交易所配额——它是纯读，因此可以挂在页面的刷新节奏上。
    * 库里没有该标的数据时返回 `items: []`（200），不是 404：这个标的确实可能存在于
    * 页面之外的库里而只是没同步过，「没数据」是正常答案，页面要如实显示空状态。
+   *
+   * `?interval=` 缺省 `1m`（向后兼容）；非法或未实现的周期 → 400 `CONFIG_INVALID`，
+   * **一次查询都不发**。回包带上**实际生效**的 `interval` 与 `intervalMs`，页面据此
+   * 把缺口换算成「几根 / 几段 / 最长连续」（R-7.3）。
    */
   app.get('/api/symbols/:symbol/bars', async (c) => {
     const symbol = normalizeSymbol(c.req.param('symbol'));
     const limit = parseBarLimit(c.req.query('limit'));
-    return c.json({ symbol, limit, items: await deps.listBars(symbol, { limit }) });
+    const interval = parseIntervalParam(c.req.query('interval'));
+    return c.json({
+      symbol,
+      interval,
+      intervalMs: INTERVAL_MS[interval],
+      limit,
+      items: await deps.listBars(symbol, { limit, interval }),
+    });
   });
 
   /** 规模预估（R-8.3）：首次全量前必须先算给人看，确认弹窗的数据就来自这里。 */

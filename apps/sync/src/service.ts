@@ -16,6 +16,13 @@ export interface SyncServiceOptions {
   exchange?: string;
   now?: () => number;
   sleep?: (ms: number) => Promise<void>;
+  /**
+   * 心跳刷新间隔（毫秒）。`SyncDaemon` 支持注入，但此前 service 层**没往下传**，
+   * 于是 `apps/sync/tests/heartbeat.test.ts` 里传它会直接编译不过——那条测试
+   * 恰好是靠「心跳停了但行还在」来证明语义的，注入不了间隔就等于没在测。
+   * 生产用 `HEARTBEAT_INTERVAL_MS`（10s），不传即缺省。
+   */
+  heartbeatIntervalMs?: number;
 }
 
 export interface SyncService {
@@ -36,6 +43,9 @@ export function createSyncService(ctx: MarketContext, options: SyncServiceOption
     control: primitives,
     ...(options.now ? { now: options.now } : {}),
     ...(options.sleep ? { sleep: options.sleep } : {}),
+    ...(options.heartbeatIntervalMs !== undefined
+      ? { heartbeatIntervalMs: options.heartbeatIntervalMs }
+      : {}),
   });
   return {
     primitives,

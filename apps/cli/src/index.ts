@@ -6,6 +6,7 @@ import { runBacktestCommand } from './commands/backtest.js';
 import { initConfig, showConfig } from './commands/config.js';
 import {
   fetchBars,
+  runAggregate,
   runBackfill,
   runGaps,
   runSync,
@@ -212,6 +213,33 @@ dataCmd
       return 1;
     });
   });
+
+dataCmd
+  .command('aggregate')
+  .description('由库内 1m 派生 / 重建 / 校验 15m / 1h / 4h / 1d')
+  .requiredOption('-s, --symbol <symbol>')
+  .option('--intervals <list>', '逗号分隔；缺省取 data.aggregateIntervals')
+  .option('--from <ms>', '区间起点，缺省 min(time)')
+  .option('--to <ms>', '区间终点，缺省 max(time)')
+  .option('--rebuild', '先删后算（修复 1m 被改动 / 派生被篡改）')
+  .option('--check', '只读校验：报出 stale / missing / mismatch')
+  .option('--json', '输出 JSON')
+  .action(
+    async (options: {
+      symbol: string;
+      intervals?: string;
+      from?: string;
+      to?: string;
+      rebuild?: boolean;
+      check?: boolean;
+      json?: boolean;
+    }) => {
+      process.exitCode = await runAggregate(options).catch((error: unknown) => {
+        fail(error);
+        return 1;
+      });
+    },
+  );
 
 dataCmd
   .command('symbols')

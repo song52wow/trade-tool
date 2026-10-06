@@ -27,6 +27,9 @@ ErrorCode = Literal[
     "WATERMARK_MISMATCH",
     # 缺口（R-11.9）
     "GAP_ATTEMPTS_EXHAUSTED",
+    # 派生周期（v0.2.0 R-9.3）
+    "AGGREGATION_FAILED",
+    "AGGREGATION_MISMATCH",
     # 数据库（R-21.6 / R-1.3）
     "DB_CONNECTION_FAILED",
     "DB_UNIQUE_VIOLATION",

@@ -9,6 +9,7 @@
 - ``generate``：确定性合成源（既有行为保持不变，``packages/data/src/provider.ts`` 依赖它）
 - ``symbols`` / ``resolve`` / ``estimate``：元数据与规模预估
 - ``sync`` / ``backfill`` / ``verify``：落库的一轮同步、区间回补、全表缺口校验
+- ``aggregate``：由库内 1m 派生 15m / 1h / 4h / 1d（补齐 / ``--rebuild`` / ``--check``）
 """
 
 from __future__ import annotations
@@ -16,6 +17,7 @@ from __future__ import annotations
 import argparse
 import sys
 from collections.abc import Sequence
+from dataclasses import replace
 from pathlib import Path
 
 from quant_core import INTERVALS, interval_to_ms, series_to_dicts
@@ -135,6 +137,7 @@ def _build_parser() -> argparse.ArgumentParser:
     _add_clock_option(one_shot)
     _add_metadata_options(one_shot)
     _add_weight_option(one_shot)
+    _add_intervals_option(one_shot)
 
     backfill = sub.add_parser("backfill", help="显式区间回补（恒为 ON CONFLICT DO NOTHING）")
     _add_exchange(backfill)
@@ -164,11 +167,46 @@ def _build_parser() -> argparse.ArgumentParser:
     _add_clock_option(backfill)
     _add_metadata_options(backfill)
     _add_weight_option(backfill)
+    _add_intervals_option(backfill)
 
     verify = sub.add_parser("verify", help="全表缺口扫描并重建 verified_upto 基线")
     _add_exchange(verify)
     verify.add_argument("--symbol", required=True)
     _add_clock_option(verify)
+
+    aggregate = sub.add_parser(
+        "aggregate", help="由库内 1m 派生高周期 K 线（补齐 / --rebuild / --check）"
+    )
+    _add_exchange(aggregate)
+    aggregate.add_argument("--symbol", required=True)
+    aggregate.add_argument(
+        "--intervals",
+        default=None,
+        help="逗号分隔的派生周期（15m,1h,4h,1d），缺省取全部已实现周期",
+    )
+    aggregate.add_argument(
+        "--from",
+        dest="from_ms",
+        type=int,
+        default=None,
+        help="区间起点（epoch ms），缺省 min(time)",
+    )
+    aggregate.add_argument(
+        "--to", dest="to_ms", type=int, default=None, help="区间终点（epoch ms），缺省 max(time)"
+    )
+    aggregate.add_argument(
+        "--aggregate-batch-bars",
+        type=int,
+        default=sync.DEFAULT_AGGREGATE_BATCH_BARS,
+        help="每批聚合的 1m 根数（每批一个事务）",
+    )
+    aggregate.add_argument(
+        "--rebuild", action="store_true", help="先删后算（修复 1m 被改动 / 派生被篡改）"
+    )
+    aggregate.add_argument(
+        "--check", action="store_true", help="只读校验：报出 stale / missing / mismatch"
+    )
+    _add_clock_option(aggregate)
 
     return parser
 
@@ -196,6 +234,31 @@ def _meta_dir(args: argparse.Namespace) -> Path | None:
     return Path(args.meta_dir) if getattr(args, "meta_dir", None) else None
 
 
+def _parse_intervals(raw: str | None) -> tuple[str, ...] | None:
+    """``--intervals 15m,1h`` → ``("15m", "1h")``；缺省返回 None 交给配置决定。
+
+    空串等价于「显式关闭」→ ``()``，这与配置里写 ``aggregateIntervals: []`` 语义一致
+    （R-9.2）。而 ``run_aggregate`` 会对「未启用派生」报错，而不是静默成功。
+    """
+    if raw is None:
+        return None
+    return tuple(part.strip() for part in raw.split(",") if part.strip() != "")
+
+
+def _add_intervals_option(parser: argparse.ArgumentParser) -> None:
+    """所有会写 1m 的子命令都提供 ``--intervals``。
+
+    派生挂在 1m 的唯一写入出口上，因此关掉它只有两条路：改配置，或在命令行显式给
+    ``--intervals ''``。**没有**运行时静默跳过的开关（R-9.2）：任何一次因配置而未聚合，
+    都必须能从 ``SyncRunSummary.aggregated is None`` 与状态里看出来（AC-22）。
+    """
+    parser.add_argument(
+        "--intervals",
+        default=None,
+        help="逗号分隔的派生周期（15m,1h,4h,1d）；空串 = 显式关闭派生",
+    )
+
+
 def _options(args: argparse.Namespace) -> sync.SyncOptions:
     """把 argparse 结果转成 :class:`SyncOptions`。
 
@@ -218,6 +281,7 @@ def _options(args: argparse.Namespace) -> sync.SyncOptions:
         ttl_ms=getattr(args, "ttl_ms", DEFAULT_TTL_MS),
         allow_stale=getattr(args, "allow_stale", False),
         refresh=getattr(args, "refresh", False),
+        aggregate_intervals=_parse_intervals(getattr(args, "intervals", None)),
     )
 
 
@@ -251,6 +315,25 @@ def _cmd_verify(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_aggregate(args: argparse.Namespace) -> int:
+    options = _options(args)
+    options = replace(
+        options,
+        aggregate_intervals=_parse_intervals(getattr(args, "intervals", None)),
+        aggregate_batch_bars=getattr(
+            args, "aggregate_batch_bars", sync.DEFAULT_AGGREGATE_BATCH_BARS
+        ),
+    )
+    dump_json(
+        sync.run_aggregate(
+            options,
+            rebuild=bool(getattr(args, "rebuild", False)),
+            check=bool(getattr(args, "check", False)),
+        )
+    )
+    return 0
+
+
 _COMMANDS = {
     "symbols": _cmd_symbols,
     "resolve": _cmd_resolve,
@@ -258,6 +341,7 @@ _COMMANDS = {
     "sync": _cmd_sync,
     "backfill": _cmd_backfill,
     "verify": _cmd_verify,
+    "aggregate": _cmd_aggregate,
 }
 
 
