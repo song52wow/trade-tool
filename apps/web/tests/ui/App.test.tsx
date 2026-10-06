@@ -548,6 +548,32 @@ describe('详情页 K 线', () => {
     expect(screen.getByTitle(/最近 60 根/)).toBeTruthy();
   });
 
+  /**
+   * 真实踩过的坑：控制面是**改动前启动的旧进程**，响应里没有 `derived` 字段。
+   * 派生周期表当时裸读 `derived[interval]`，于是一个附加统计面板直接把**整个详情页**
+   * 打挂（`Cannot read properties of undefined`）——连 K 线图都看不到。
+   *
+   * 这里是防线：字段缺失时该表格显示「读取中…」，主内容照常渲染。
+   */
+  it('响应缺少 derived 字段时，详情页照常渲染（附加面板不得弄垮主内容）', async () => {
+    const stub = detailStub(bars);
+    // 刻意删掉 derived，模拟旧进程 / 未迁移 schema
+    const detail = { ...(stub['/api/symbols/BTCUSDC'] as Record<string, unknown>) };
+    delete detail['derived'];
+    stub['/api/symbols/BTCUSDC'] = detail;
+
+    stubFetch(stub);
+    render(<App />);
+    await waitFor(() => expect(screen.getByText('BTCUSDC')).toBeTruthy());
+    fireEvent.click(screen.getAllByText('BTCUSDC')[0]!);
+
+    // 主内容仍在：K 线图与周期切换都要渲染出来
+    await waitFor(() => expect(screen.getByTitle('切换到 4h')).toBeTruthy());
+    expect(screen.getByText(/读自本地库/)).toBeTruthy();
+    // 派生表退化为「读取中…」而不是抛错
+    expect(screen.getAllByText(/读取中/).length).toBeGreaterThan(0);
+  });
+
   it('库里没有历史的标的：K 线区给可执行的下一步，而不是空图', async () => {
     const bare = row('BTCUSDC', { hasHistory: false, state: null });
     stubFetch(detailStub([], bare));

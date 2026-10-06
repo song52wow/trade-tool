@@ -193,7 +193,10 @@ function DerivedTable(props: {
           </thead>
           <tbody>
             {ALL_INTERVALS.filter((i) => i !== '1m').map((interval) => {
-              const stats = props.derived[interval];
+              // 必须用 `props.derived?.[...]`：后端字段缺失时（旧进程 / schema 未迁移）
+              // 裸读会让整张表抛 `Cannot read properties of undefined`，把**整个详情页**
+              // 一起打挂——一个附加的统计面板不该有能力弄垮主内容。
+              const stats = props.derived?.[interval];
               if (stats === undefined) {
                 return (
                   <tr key={interval}>
