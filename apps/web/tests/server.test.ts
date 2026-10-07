@@ -21,13 +21,6 @@ function row(symbol: string, overrides: Partial<SymbolRowDto> = {}): SymbolRowDt
     onboardDate: NOW - 86_400_000,
     addedAt: NOW,
     state: null,
-    coverage: {
-      onboardDate: NOW - 86_400_000,
-      earliest: null,
-      watermark: null,
-      verifiedUpTo: null,
-      now: NOW,
-    },
     hasHistory: false,
     ...overrides,
   };

@@ -4,7 +4,6 @@ import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } fr
 import { ApiError, api } from './api.js';
 import { fmtAgo, fmtDuration, fmtNumber, fmtPercent } from './format.js';
 import { ConfirmDialog } from './components/ConfirmDialog.js';
-import { CoverageChart } from './components/CoverageChart.js';
 import { OverviewCards } from './components/OverviewCards.js';
 import { SymbolDetail } from './components/SymbolDetail.js';
 import { SymbolPicker } from './components/SymbolPicker.js';

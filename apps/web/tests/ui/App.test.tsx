@@ -74,13 +74,6 @@ function row(symbol: string, overrides: Partial<SymbolRowDto> = {}): SymbolRowDt
       metadataStale: false,
       plan: null,
     },
-    coverage: {
-      onboardDate: NOW - 86_400_000,
-      earliest: NOW - 86_000_000,
-      watermark: NOW - 60_000,
-      verifiedUpTo: NOW - 3_600_000,
-      now: NOW,
-    },
     hasHistory: true,
     ...overrides,
   };

@@ -50,15 +50,6 @@ export interface JobDto {
   error: JobError | null;
 }
 
-/** 单个标的的数据覆盖时间线：用于一眼看出「历史起点 / 已验证到哪里 / 水位在哪」。 */
-export interface CoverageDto {
-  onboardDate: number | null;
-  earliest: number | null;
-  watermark: number | null;
-  verifiedUpTo: number | null;
-  now: number;
-}
-
 /** 标的列表的一行。
  *
  * 关键：列表取的是 **`symbols` 集合与 `sync_state` 的并集**，与 `readGlobalSummary`
@@ -75,7 +66,6 @@ export interface SymbolRowDto {
   onboardDate: number | null;
   addedAt: number | null;
   state: SymbolSyncState | null;
-  coverage: CoverageDto;
   /** 库里有行即视为已完成过首次全量（R-8.1 的「已存在历史」判据）。 */
   hasHistory: boolean;
 }

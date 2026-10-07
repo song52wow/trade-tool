@@ -1,7 +1,6 @@
 import { fmtAgo, fmtDate, fmtNumber, fmtTime } from '../format.js';
 import type { DerivedIntervalDto } from '../../../src/types';
 import type { SymbolDetailDto } from '../../../src/types';
-import { CoverageChart } from './CoverageChart.js';
 import { ALL_INTERVALS } from './gaps.js';
 import { PriceChart } from './PriceChart.js';
 
@@ -19,7 +18,6 @@ export function SymbolDetail(props: {
 }) {
   const {
     state,
-    coverage,
     contract,
     gaps,
     exchange,
@@ -31,7 +29,7 @@ export function SymbolDetail(props: {
   return (
     <div>
       {/* K 线放在最上面：这个面板回答的第一个问题是「同步下来的数据长什么样」，
-          覆盖时间线与合约规格是它的补充说明。 */}
+          合约规格是它的补充说明。 */}
       <div>
         <h2 style={{ fontSize: 13, color: 'var(--muted)', fontWeight: 500 }}>K 线</h2>
         <PriceChart
@@ -53,52 +51,42 @@ export function SymbolDetail(props: {
         onAggregate={props.onAggregate}
       />
 
-      <div className="grid2" style={{ marginTop: 18 }}>
-        <div>
-          <h2 style={{ fontSize: 13, color: 'var(--muted)', fontWeight: 500 }}>覆盖时间线</h2>
-          <CoverageChart coverage={coverage} />
-          <p className="muted mono" style={{ fontSize: 11 }}>
-            起点 {fmtDate(coverage.onboardDate)} · 最早入库 {fmtDate(coverage.earliest)} · 水位{' '}
-            {fmtTime(coverage.watermark)} · 已验证 {fmtTime(coverage.verifiedUpTo)}
-          </p>
-        </div>
-        <div>
-          <h2 style={{ fontSize: 13, color: 'var(--muted)', fontWeight: 500 }}>合约与状态</h2>
-          <dl className="kv">
-            <dt>交易所</dt>
-            <dd className="mono">{exchange}</dd>
-            <dt>合约类型</dt>
-            <dd className="mono">{contract?.contractType ?? '未知'}</dd>
-            <dt>交易状态</dt>
-            <dd className="mono">{contract?.status ?? '未知'}</dd>
-            <dt>上市时间</dt>
-            <dd className="mono">{fmtDate(coverage.onboardDate)}</dd>
-            <dt>期望状态</dt>
-            <dd className="mono">{desiredState ?? '未加入集合'}</dd>
-            <dt>实际状态</dt>
-            <dd className="mono">{state?.status ?? '未开始'}</dd>
-            <dt>已入库行数</dt>
-            <dd className="mono">{fmtNumber(state?.rows)}</dd>
-            <dt>最近一次运行</dt>
-            <dd className="mono">{fmtAgo(state?.lastRunAt, props.now)}</dd>
-            <dt>最近一次成功</dt>
-            <dd className="mono">{fmtAgo(state?.lastSuccessAt, props.now)}</dd>
-            {state?.lastError ? (
-              <>
-                <dt style={{ color: 'var(--err)' }}>最近错误</dt>
-                <dd className="mono" style={{ whiteSpace: 'pre-wrap' }}>
-                  {state.lastError}
-                </dd>
-              </>
-            ) : null}
-            {state && state.errorCount > 0 ? (
-              <>
-                <dt>连续失败</dt>
-                <dd className="mono">{state.errorCount}</dd>
-              </>
-            ) : null}
-          </dl>
-        </div>
+      <div style={{ marginTop: 18 }}>
+        <h2 style={{ fontSize: 13, color: 'var(--muted)', fontWeight: 500 }}>合约与状态</h2>
+        <dl className="kv">
+          <dt>交易所</dt>
+          <dd className="mono">{exchange}</dd>
+          <dt>合约类型</dt>
+          <dd className="mono">{contract?.contractType ?? '未知'}</dd>
+          <dt>交易状态</dt>
+          <dd className="mono">{contract?.status ?? '未知'}</dd>
+          <dt>上市时间</dt>
+          <dd className="mono">{fmtDate(props.detail.onboardDate)}</dd>
+          <dt>期望状态</dt>
+          <dd className="mono">{desiredState ?? '未加入集合'}</dd>
+          <dt>实际状态</dt>
+          <dd className="mono">{state?.status ?? '未开始'}</dd>
+          <dt>已入库行数</dt>
+          <dd className="mono">{fmtNumber(state?.rows)}</dd>
+          <dt>最近一次运行</dt>
+          <dd className="mono">{fmtAgo(state?.lastRunAt, props.now)}</dd>
+          <dt>最近一次成功</dt>
+          <dd className="mono">{fmtAgo(state?.lastSuccessAt, props.now)}</dd>
+          {state?.lastError ? (
+            <>
+              <dt style={{ color: 'var(--err)' }}>最近错误</dt>
+              <dd className="mono" style={{ whiteSpace: 'pre-wrap' }}>
+                {state.lastError}
+              </dd>
+            </>
+          ) : null}
+          {state && state.errorCount > 0 ? (
+            <>
+              <dt>连续失败</dt>
+              <dd className="mono">{state.errorCount}</dd>
+            </>
+          ) : null}
+        </dl>
       </div>
 
       {/* 数据体检放在详情里而不是行内：它是低频的重操作（全表扫描，成本随数据量增长），

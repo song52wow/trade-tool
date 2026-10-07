@@ -17,7 +17,6 @@ import {
   getGaps,
   getState,
   listExchangeSymbols,
-  readBars,
   readDaemonHeartbeat,
   readDerivedIntervals,
   readLatestBars,
@@ -68,19 +67,11 @@ export function createWebRuntime(config: TradeToolConfig): WebRuntime {
 
   const entries = (): Promise<SymbolEntry[]> => service.primitives.listSymbols();
 
-  /** 升序返回，limit 1 即最早一根；空表返回 0 行（无历史），不是错误。 */
-  async function earliestBar(symbol: string): Promise<number | null> {
-    const rows = await readBars(pool, symbol, { limit: 1 });
-    return rows[0]?.time ?? null;
-  }
-
-  const allRows = async (now: number) =>
+  const allRows = async () =>
     mergeSymbolRows({
       entries: await entries(),
       states: await states(),
-      earliestOf: earliestBar,
       fallbackExchange: ctx.exchange,
-      now,
     });
 
   const jobs = new JobRegistry({
@@ -147,11 +138,11 @@ export function createWebRuntime(config: TradeToolConfig): WebRuntime {
     },
 
     async listSymbols(): Promise<SymbolRowDto[]> {
-      return allRows(Date.now());
+      return allRows();
     },
 
     async getSymbol(symbol): Promise<SymbolDetailDto | null> {
-      const row = (await allRows(Date.now())).find((r) => r.symbol === symbol) ?? null;
+      const row = (await allRows()).find((r) => r.symbol === symbol) ?? null;
       if (row === null) return null;
       // 合约规格是快照：拿不到（缓存过期且出网失败）不该让整个详情页打不开，
       // 但必须显式是 null 让页面显示「未知」，不拿旧值假装有。
@@ -170,7 +161,7 @@ export function createWebRuntime(config: TradeToolConfig): WebRuntime {
 
     async addSymbol(symbol): Promise<SymbolRowDto> {
       await service.primitives.addSymbol(symbol);
-      const row = (await allRows(Date.now())).find((r) => r.symbol === symbol);
+      const row = (await allRows()).find((r) => r.symbol === symbol);
       if (row === undefined) throw new Error(`添加 ${symbol} 后仍读不到该标的，状态无法确定`);
       return row;
     },
@@ -183,7 +174,7 @@ export function createWebRuntime(config: TradeToolConfig): WebRuntime {
       if (action === 'start') await service.primitives.start(symbol);
       else if (action === 'pause') await service.primitives.pause(symbol);
       else await service.primitives.resume(symbol);
-      const row = (await allRows(Date.now())).find((r) => r.symbol === symbol);
+      const row = (await allRows()).find((r) => r.symbol === symbol);
       if (row === undefined) {
         throw new Error(`生命周期变更后 ${symbol} 读不到，状态无法确定`);
       }
