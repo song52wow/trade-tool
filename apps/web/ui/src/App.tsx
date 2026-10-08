@@ -24,7 +24,7 @@ type Pending =
   /** 守护进程不在线：意图会记录但不会拉数据，必须说清楚再让用户决定 */
   | { kind: 'startOffline'; symbol: string }
   | { kind: 'verify'; symbol: string }
-  | { kind: 'aggregate'; symbol: string; target: number }
+  | { kind: 'aggregate'; symbol: string }
   | { kind: 'remove'; symbol: string; policy: RemovePolicy };
 
 export function App() {
@@ -242,7 +242,7 @@ export function App() {
         const job = await api.startVerify(pending.symbol);
         notify(`已登记数据体检作业 ${job.id}`);
       } else if (pending.kind === 'aggregate') {
-        const job = await api.startAggregate(pending.symbol, pending.target);
+        const job = await api.startAggregate(pending.symbol);
         notify(`已登记派生重建作业 ${job.id}（只重算派生表，不拉数据）`);
       } else {
         await api.removeSymbol(pending.symbol, pending.policy);
@@ -466,15 +466,7 @@ export function App() {
               verifying={verifyingSymbol === selected}
               onVerify={() => setPending({ kind: 'verify', symbol: selected })}
               aggregating={aggregatingSymbol === selected}
-              onAggregate={() =>
-                setPending({
-                  kind: 'aggregate',
-                  symbol: selected,
-                  // 进度分母沿用 1m 行数：页面已有的分母就是它，换成桶数会让
-                  // 同一条进度条在两个作业之间跳变。
-                  target: detail?.state?.rows ?? 0,
-                })
-              }
+              onAggregate={() => setPending({ kind: 'aggregate', symbol: selected })}
               tick={tick}
             />
           )}

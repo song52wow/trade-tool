@@ -123,10 +123,13 @@ export const api = {
    * 重建派生 K 线（v0.2.0 R-7.6）。
    *
    * 走的是长任务通道：重建是几十分钟量级，HTTP 绝不能挂在原地等（202 + job id）。
-   * 目标行数是**1m 行数**而不是桶数——页面已经有的进度分母就是 1m 行数，
-   * 换成桶数会让同一条进度条在两个作业之间跳变。
+   *
+   * **刻意不传 target**（与 `verify` 一致）。作业进度读的是 `sync_state.rows`，
+   * 而重建**不改 sync_state**（R-5.4）——把它同时当分子和分母，进度条会全程钉在
+   * 100%：一边显示「已完成」一边还在跑，正是 R-7.6 禁止的假进度。读不到真实进度
+   * 就如实不显示（页面显示「—」），而不是编一个百分比。
    */
-  startAggregate: (symbol: string, target: number) =>
-    post<JobDto>(`/api/symbols/${encodeURIComponent(symbol)}/aggregate`, { target }),
+  startAggregate: (symbol: string) =>
+    post<JobDto>(`/api/symbols/${encodeURIComponent(symbol)}/aggregate`, { target: null }),
   jobs: () => request<{ items: JobDto[] }>('/api/jobs').then((r) => r.items),
 };
