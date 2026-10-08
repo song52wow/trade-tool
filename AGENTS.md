@@ -46,7 +46,7 @@ pnpm check      # = build + TS 测试 + Python 测试
 | **数据库表结构 / 迁移**                  | **`packages/data/sql/`**（唯一来源）              |
 | PG 客户端、schema 闸门、查询层           | `packages/data/src/db`                            |
 | **派生周期（桶对齐 / 覆盖判据 / 聚合）** | **`python/packages/quant-data/src/aggregate.py`** |
-| 回测循环、绩效指标、新策略               | `packages/backtest/src/strategies/`               |
+| 新策略                                   | `packages/backtest/src/strategies/`               |
 | 命令行命令                               | `apps/cli/src/commands/`                          |
 | 常驻同步、生命周期、控制原语             | `apps/sync/src`                                   |
 | 控制面 HTTP 路由与前端页面               | `apps/web/src` + `apps/web/ui`                    |
@@ -71,15 +71,13 @@ pnpm check      # = build + TS 测试 + Python 测试
 
 ## 硬性约定
 
-1. **依赖方向单向**：`core` 不依赖任何 workspace 包；其它包只依赖 `core`；
+1. **依赖方向单向**：`core` 不依赖任何 workspace 包；
    跨语言调用只从 `packages/data` 发起。出现反向依赖说明分层错了。
-2. **跨语言契约 = 数据库 schema**：K 线**只经 PostgreSQL 传输**，不经 stdout；
-   `packages/data` → `python -m quant_data` 的桥接**只传控制信息**（命令、参数、结果摘要）。
-   因此改 schema 必须**同提交**更新迁移文件与两侧读写代码，且两侧对同一列的
+2. **跨语言契约 = 数据库 schema**：改 schema 必须**同提交**更新迁移文件与两侧读写代码，且两侧对同一列的
    类型 / 单位 / NULL 语义必须一致。时间统一毫秒时间戳，数据库列用 `bigint` 而非 `timestamptz`。
    PG 连接串经 `TRADE_TOOL_PG_DSN` 环境变量注入，不进 argv。
 3. **schema 唯一来源是 `packages/data/sql/*.sql`**：不得在 TS 或 Python 侧另持影子定义。
-4. **策略无状态**：`Strategy.onBar()` 必须是纯函数，无 IO、无随机数，回测与实盘共用同一实现。
+4. **策略无状态**：`Strategy.onBar()` 必须是纯函数，无 IO、无随机数。
 5. **对外导出走 barrel**：包内模块互相 import 用显式 `.js` 后缀，对外只从 `src/index.ts` 导出。
 6. **tsconfig 不复制**：一律 `extends` `@trade-tool/tsconfig/*`。
 7. **Python 类型**：`mypy --strict` 必须过，公开函数全标注类型；不要用 `# type: ignore` 掩盖。
@@ -150,7 +148,7 @@ stdout 是命令结果（日志走 stderr），`--json` 时输出纯 JSON，便�
    路由在启动时注册，这一句比 `404 Not Found` 有用得多。
    改这张图时别把它换成「按序号排的通用图表」——那会把空洞压成连续走势。
 
-   周期本身也受第 10 条约束：桶宽来自**服务端回传的 `intervalMs`**，不在前端写死。
+   桶宽来自**服务端回传的 `intervalMs`**，不在前端写死。
    写死 60_000 会把「4h 图上缺一根」说成「缺一分钟」。
 
 标的口径是 `symbols` 集合 ∪ `sync_state`，与 `readGlobalSummary` 的计数保持一致；
