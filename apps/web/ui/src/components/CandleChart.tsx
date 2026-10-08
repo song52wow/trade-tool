@@ -1,7 +1,7 @@
 import { useLayoutEffect, useRef, useState } from 'react';
 
 import type { BarDto } from '../../../src/types';
-import { describeSpan, gapStats, minutesToBars } from './gaps.js';
+import { describeSpan, gapStats } from './gaps.js';
 
 // 缺口统计住在 gaps.ts（纯计算，1m 与派生周期共用），这里转出以保持
 // `CandleChart` 作为「图表相关」的单一入口——既有测试与调用方都从这里取。
@@ -475,12 +475,16 @@ export function CandleChart(props: {
  * 量化**按所选周期报**（v0.2.0 R-7.3）：4h 图上写「缺 30 分钟」是错的——那 30 分钟是
  * 上游 1m 的根因，在 4h 尺度上表现为「少了 1 根（约 4 小时）」。两句都要说，用户才
  * 分得清「4h 数据本身没写进来」与「1m 有洞导致 4h 被扣留」。
+ *
+ * 上游那个分钟数是**全历史累计**（`readDerivedIntervals` 对整张 1m 表聚合），
+ * 不是本窗口的数字。因此文案必须写成「累计…含本区间」：把它说成「该区间缺 X 分钟」
+ * 会把三年前一个老洞的分钟数算到今天的空白头上，那是另一种形式的骗人界面。
  */
 export function GapNotice(props: {
   bars: readonly BarDto[];
   barMs?: number;
   interval?: string;
-  /** 上游 1m 缺口的分钟数（服务端按同一区间算好）；给了就一并说明根因 */
+  /** 上游 1m 缺口的分钟数（服务端按**全历史**算好）；给了就一并说明根因 */
   upstreamMissingMinutes?: number | null;
 }) {
   const barMs = props.barMs ?? DEFAULT_BAR_MS;
@@ -502,9 +506,10 @@ export function GapNotice(props: {
       {props.upstreamMissingMinutes ? (
         <>
           {' '}
-          · 根因在上游 1m：该区间缺 {props.upstreamMissingMinutes.toLocaleString('zh-CN')} 分钟（ 约{' '}
-          {minutesToBars(props.upstreamMissingMinutes, barMs).toLocaleString('zh-CN')} 根{' '}
-          {props.interval ?? '1m'}）
+          · 根因在上游 1m：该标的 1m 累计缺 {props.upstreamMissingMinutes.toLocaleString(
+            'zh-CN',
+          )}{' '}
+          分钟（全历史口径，含本区间）
         </>
       ) : null}
     </p>

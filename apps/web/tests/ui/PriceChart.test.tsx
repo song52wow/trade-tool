@@ -282,7 +282,7 @@ describe('PriceChart 周期切换', () => {
     expect(document.body.textContent).not.toContain('缺 1 分钟');
   });
 
-  it('同时说明根因在上游 1m，并换算成当前周期下的根数', async () => {
+  it('说明根因在上游 1m，并标明那是全历史累计口径', async () => {
     stubFetchByInterval({ '1m': { items: series(5) }, '4h': { items: fourHourBars() } });
     renderChart({
       derived: {
@@ -296,6 +296,10 @@ describe('PriceChart 周期切换', () => {
 
     await waitFor(() => expect(document.body.textContent).toContain('根因在上游 1m'));
     expect(document.body.textContent).toContain('240');
+    // 服务端给的是**全历史累计**的缺失分钟数，不是本窗口的。文案必须写清口径——
+    // 说成「该区间缺 240 分钟」会把别处老洞的分钟数算到这张图的空白头上。
+    expect(document.body.textContent).toContain('累计');
+    expect(document.body.textContent).toContain('含本区间');
   });
 
   it('上游 1m 有缺口导致该周期一个桶都没有时，说明原因而不是空白图', async () => {
@@ -343,14 +347,23 @@ describe('PriceChart 周期切换', () => {
     });
 
     await waitFor(() => expect(document.body.textContent).toContain('未启用派生'));
-    // 空状态必须给出可执行的下一步
-    expect(document.body.textContent).toContain('重建派生 K 线');
+    // 未启用的周期**没有可执行的重建**：作业读的是同一个配置（`data.aggregateIntervals`），
+    // 点了也只会重算启用的那几个周期，当前周期照样一根都不出现。
+    // 所以这里只说明原因（下一步是改配置），不给一个按了也不会好的按钮。
+    expect(document.body.textContent).toContain('data.aggregateIntervals');
+    expect(screen.queryByText(/重建派生 K 线/)).toBeNull();
   });
 
   it('重建按钮触发确认而不是直接开跑（长活儿要显式确认）', async () => {
     const onAggregate = vi.fn();
     const { calls } = stubFetchByInterval({ '1m': { items: series(5) }, '4h': { items: [] } });
-    renderChart({ derived: { '4h': { withheldReason: 'disabled' } }, onAggregate });
+    // 启用但暂时没有桶（末尾那个还没收盘）——这种空状态才是重建按钮的用武之地
+    renderChart({
+      derived: {
+        '4h': { buckets: 0, withheldNotClosed: 1, withheldIncomplete: 0, missingMinutes: 0 },
+      },
+      onAggregate,
+    });
 
     await act(async () => {
       fireEvent.click(screen.getByTitle('切换到 4h'));

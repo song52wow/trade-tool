@@ -124,7 +124,9 @@ export function PriceChart(props: {
   const onRange = useCallback((next: number) => setRange(next), []);
   const onInterval = useCallback((next: StoredInterval) => setInterval(next), []);
 
-  // 派生周期的缺口根因：同一区间在上游 1m 缺了多少分钟。
+  // 派生周期的缺口根因：该标的在上游 1m 上**累计**缺了多少分钟（全历史口径）。
+  // 它不是本窗口的数字——窗口自己的缺口已经由 GapNotice 按所选周期报过；
+  // 这里只回答「为什么会有这些空白」，所以文案必须带上「累计 / 含本区间」。
   const upstreamMissing =
     interval === '1m'
       ? null
@@ -133,6 +135,15 @@ export function PriceChart(props: {
           if (stats === undefined || 'withheldReason' in stats) return null;
           return stats.missingMinutes > 0 ? stats.missingMinutes : null;
         })();
+
+  // 该周期**未启用**（不在 `data.aggregateIntervals` 里）。
+  // 未启用的周期不能给「重建派生 K 线」按钮：作业读的是同一个配置，
+  // 点下去只会重算启用的那几个周期，当前周期照样一根都不会出现——
+  // 那是一个按了也不会好的按钮。这里的下一步是改配置，所以只说明原因。
+  const intervalDisabled = (() => {
+    const stats = derived?.[interval];
+    return stats !== undefined && 'withheldReason' in stats;
+  })();
 
   return (
     <div className="price-chart">
@@ -179,8 +190,10 @@ export function PriceChart(props: {
           <p className="muted" style={{ fontSize: 12, margin: '8px 0 0' }}>
             {loading ? '正在读取 K 线…' : emptyReason(symbol, interval, hasHistory, derived)}
           </p>
-          {/* 空状态要给出可执行的下一步，而不是让用户对着空白图猜（R-7.4） */}
-          {interval !== '1m' && props.onAggregate ? (
+          {/* 空状态要给出可执行的下一步，而不是让用户对着空白图猜（R-7.4）。
+              但**未启用**的周期没有可执行的重建：作业读的是同一个配置，点了也不会
+              写这张表。那种情况下的下一步是改配置，所以只说明原因、不给按钮。 */}
+          {interval !== '1m' && !intervalDisabled && props.onAggregate ? (
             <button
               onClick={props.onAggregate}
               disabled={props.aggregating ?? false}
