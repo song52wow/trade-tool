@@ -148,9 +148,10 @@ export function createWebRuntime(config: TradeToolConfig): WebRuntime {
       // 但必须显式是 null 让页面显示「未知」，不拿旧值假装有。
       const contract = await resolveContract(ctx, symbol).catch(() => null);
       // 派生统计（R-7.5 / AC-15）：让用户能回答「为什么没有 4h 蜡烛」。
-      // 未启用派生时如实返回 withheldReason='disabled'，而不是全 0（AC-22）。
+      // 传**实际启用的周期集合**而不是布尔：R-9.1 允许只启用一个子集，没启用的周期
+      // 必须如实返回 withheldReason='disabled'，而不是报 0 个桶（AC-22）。
       const derived = await readDerivedIntervals(pool, symbol, STORED_INTERVALS, {
-        enabled: config.data.aggregateIntervals.length > 0,
+        enabled: config.data.aggregateIntervals,
       });
       return { ...row, contract, gaps: await getGaps(ctx, symbol), estimate: null, derived };
     },

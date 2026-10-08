@@ -364,7 +364,10 @@ export async function getRateLimitStatus(ctx: MarketContext): Promise<RateLimitS
 
 export async function getSummary(ctx: MarketContext): Promise<SyncSummary> {
   const [global, rateLimit] = await Promise.all([
-    repo.readGlobalSummary(ctx.pool, ctx.exchange),
+    // 传**实际启用的派生周期**：`aggregateIntervals: []` 时 `derived` 必须是空数组，
+    // 否则 `sync status` 会打印四行「0 行 / 0.00 MB」——那是「未启用派生」被显示成
+    // 「启用了但还没聚合」（R-8.4 / AC-22）。只启用子集时同理，不能把没启用的报成 0。
+    repo.readGlobalSummary(ctx.pool, ctx.exchange, ctx.config.data.aggregateIntervals),
     getRateLimitStatus(ctx),
   ]);
   return { ...global, rateLimit };

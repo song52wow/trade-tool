@@ -317,15 +317,46 @@ describe('全局汇总含实测体积（AC-16 / R-8.2）', () => {
     const derivedBytes = summary.derived.reduce((sum, item) => sum + item.bytes, 0);
     expect(derivedBytes).toBeGreaterThan(0);
   });
+
+  it('未启用派生时汇总的 derived 是空数组，而不是四行 0（R-8.4 / AC-22）', async () => {
+    // `sync status` 的文案分支就是靠 `derived.length === 0` 判断「未启用派生」的。
+    // 汇总不认配置的话这个分支永远不可达，页面/CLI 会把「未启用」显示成
+    // 「启用了但还没聚合」——用户据此会一直点重建。
+    // 数据由本 describe 的 beforeEach 铺好（30 根 1m + 每张派生表 1 行），不重复 seed。
+    const off = await readGlobalSummary(ctx.pool, 'binance', []);
+    expect(off.derived).toEqual([]);
+    // 只启用子集时只报启用那张表，不得把没启用的报成 0
+    const onlyHour = await readGlobalSummary(ctx.pool, 'binance', ['1h']);
+    expect(onlyHour.derived.map((item) => item.interval)).toEqual(['1h']);
+    expect(onlyHour.derived[0]?.rows).toBe(1);
+    // 不传（既有调用）仍按四个全启用算，行为不变
+    const all = await readGlobalSummary(ctx.pool, 'binance');
+    expect(all.derived.map((item) => item.interval)).toEqual([...DERIVED_INTERVALS]);
+  });
 });
 
 describe('扣留统计可见（AC-15 / R-7.5）', () => {
   it('未启用派生时如实标记 disabled，而不是报 0（AC-22）', async () => {
     await seed(ctx.pool, 60);
     const derived = await readDerivedIntervals(ctx.pool, SYMBOL, STORED_INTERVALS, {
-      enabled: false,
+      enabled: [],
     });
     for (const interval of DERIVED_INTERVALS) {
+      expect(derived[interval]).toEqual({ withheldReason: 'disabled' });
+    }
+  });
+
+  it('只启用子集时，未启用的周期同样标记 disabled（R-9.1 / R-8.4）', async () => {
+    // `aggregateIntervals: ['1h']` 是合法配置。没启用的三张表**不会**被写入，
+    // 页面若把它们按启用态统计，就会显示成「0 个桶 + 全 0 扣留」——
+    // 看起来像「已启用但还没聚合」，用户会一直点重建，而重建读的是同一个配置，
+    // 根本不会写这三张表。
+    await seed(ctx.pool, 60);
+    const derived = await readDerivedIntervals(ctx.pool, SYMBOL, STORED_INTERVALS, {
+      enabled: ['1h'],
+    });
+    expect(derived['1h']).not.toEqual({ withheldReason: 'disabled' });
+    for (const interval of ['15m', '4h', '1d'] as const) {
       expect(derived[interval]).toEqual({ withheldReason: 'disabled' });
     }
   });
@@ -335,7 +366,7 @@ describe('扣留统计可见（AC-15 / R-7.5）', () => {
     await seed(ctx.pool, 60);
     await seedDerived(ctx.pool, '1h', [T0], 10);
     const derived = await readDerivedIntervals(ctx.pool, SYMBOL, STORED_INTERVALS, {
-      enabled: true,
+      enabled: [...DERIVED_INTERVALS],
     });
     const oneHour = derived['1h'];
     expect(oneHour).toBeDefined();
@@ -358,7 +389,7 @@ describe('扣留统计可见（AC-15 / R-7.5）', () => {
       );
     }
     const derived = await readDerivedIntervals(ctx.pool, SYMBOL, STORED_INTERVALS, {
-      enabled: true,
+      enabled: [...DERIVED_INTERVALS],
     });
     const fourHour = derived['4h'];
     expect(fourHour).toBeDefined();
@@ -371,7 +402,7 @@ describe('扣留统计可见（AC-15 / R-7.5）', () => {
 
   it('库里没有 1m 时不编造桶数', async () => {
     const derived = await readDerivedIntervals(ctx.pool, 'NOBODYUSDC', STORED_INTERVALS, {
-      enabled: true,
+      enabled: [...DERIVED_INTERVALS],
     });
     expect(derived['4h']).toEqual({
       buckets: 0,

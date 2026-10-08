@@ -41,7 +41,7 @@ function emptyReason(
   const stats = derived?.[interval];
   if (stats === undefined) return `${interval} 暂无已收盘桶。`;
   if ('withheldReason' in stats && stats.withheldReason === 'disabled') {
-    return `未启用派生（aggregateIntervals 为空），${interval} 不会写入任何桶。`;
+    return `未启用派生（${interval} 不在 data.aggregateIntervals 里），不会写入任何桶。`;
   }
   if ('withheldReason' in stats) return `${interval} 暂无已收盘桶。`;
   if (stats.buckets === 0 && stats.withheldIncomplete > 0) {

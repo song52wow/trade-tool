@@ -815,7 +815,7 @@ export interface GlobalSummary {
   /** 1m 表的体积（既有语义不变，R-8.2） */
   totalBytes: number;
   pendingGaps: number;
-  /** 四张派生表的行数与**实测**体积（v0.2.0 R-8.2 / AC-16） */
+  /** **启用的**派生表行数与**实测**体积（v0.2.0 R-8.2 / AC-16）；未启用派生时为空数组 */
   derived: DerivedTableStat[];
 }
 
@@ -832,8 +832,16 @@ export interface GlobalSummary {
  *
  * `pendingGaps` 统计**库里全部**缺口，不按集合过滤：「缺口不得静默存在」（R-11.11），
  * 把集合外的缺口从汇总里藏起来正是静默。
+ *
+ * `derivedIntervals` 是**实际启用的派生周期**（`data.aggregateIntervals`，R-9.1）。
+ * 未启用派生时返回 `derived: []`，调用方据此说「未启用派生」；不传则按四个全启用算，
+ * 既有调用行为不变。
  */
-export async function readGlobalSummary(pool: Pool, exchange: string): Promise<GlobalSummary> {
+export async function readGlobalSummary(
+  pool: Pool,
+  exchange: string,
+  derivedIntervals: readonly DerivedInterval[] = DERIVED_INTERVALS,
+): Promise<GlobalSummary> {
   try {
     const rows = await pool.query<QueryResultRow>(
       `WITH universe AS (
@@ -867,7 +875,7 @@ export async function readGlobalSummary(pool: Pool, exchange: string): Promise<G
       totalRows,
       totalBytes,
       pendingGaps: ms(gaps.rows[0]?.n) ?? 0,
-      derived: await readDerivedTableStats(pool),
+      derived: await readDerivedTableStats(pool, derivedIntervals),
     };
   } catch (error) {
     throw toSyncError(error, '读取全局汇总失败');
@@ -875,17 +883,21 @@ export async function readGlobalSummary(pool: Pool, exchange: string): Promise<G
 }
 
 /**
- * 四张派生表的行数与**实测**体积（v0.2.0 R-8.2 / AC-16）。
+ * 派生表的行数与**实测**体积（v0.2.0 R-8.2 / AC-16）。
  *
  * 体积走 `pg_total_relation_size`（含索引摊销与 TOAST），**不沿用**附录 B.2 的
  * 单行估算：那条估算至今未实测，而 `sync_state.bytes` 一直按它推进，谁都没量过真表。
  * 本次要求就是把估算换成实测。
  *
- * 用 `unnest` 在一条语句里查四张表：四次 `pg_total_relation_size` 调用可以合并，
- * 避免为了「多几个数字」把汇总查询翻四倍。
+ * `intervals` 是**实际启用的周期**（`data.aggregateIntervals`）：未启用派生时返回空数组，
+ * 调用方据此显示「未启用派生」而不是「0 个桶」——后者会让人以为「还没聚合」（R-8.4 /
+ * AC-22）。只启用一个子集时同理：只报启用那几张表，不把没启用的报成 0。
  */
-export async function readDerivedTableStats(pool: Pool): Promise<DerivedTableStat[]> {
-  const tables = DERIVED_INTERVALS.map((interval) => ({
+export async function readDerivedTableStats(
+  pool: Pool,
+  intervals: readonly DerivedInterval[] = DERIVED_INTERVALS,
+): Promise<DerivedTableStat[]> {
+  const tables = intervals.map((interval) => ({
     interval,
     table: INTERVAL_TABLES[interval],
   }));
@@ -923,22 +935,28 @@ export async function readDerivedTableStats(pool: Pool): Promise<DerivedTableSta
  * 有效窗口取桶与该标的 1m 区间的交集。两处各写一套判据的风险是「页面说少一根、
  * 写库时其实写进去了」，而那种不一致排查起来要跨两个语言。
  *
- * `enabled=false`（`aggregateIntervals: []`）时返回 `withheldReason: 'disabled'` 而不是
- * 全 0：显示「0 个桶」会让人以为「还没聚合」，于是反复去点重建（AC-22 / R-8.4）。
+ * `options.enabled` 是**实际启用的派生周期集合**（`data.aggregateIntervals`），不是
+ * 布尔开关：R-9.1 允许只启用四个周期的一个子集，此时**没启用的周期必须显示成
+ * 「未启用派生」**。把它们按启用态统计会得到一份「0 个桶 + 全 0 扣留」——
+ * 看起来像「已启用但还没聚合」，用户会一直点重建，而重建（读的是同一个配置）
+ * 根本不会写这几张表（AC-22 / R-8.4）。
  */
 export async function readDerivedIntervals(
   pool: Pool,
   symbol: string,
   intervals: readonly StoredInterval[],
-  options: { enabled: boolean },
+  options: { enabled: readonly DerivedInterval[] },
 ): Promise<Record<string, DerivedIntervalSummary>> {
-  if (!options.enabled) {
-    return Object.fromEntries(
-      intervals.map((interval) => [interval, { withheldReason: 'disabled' as const }]),
-    );
-  }
   const derived = intervals.filter((interval): interval is DerivedInterval => interval !== '1m');
   if (derived.length === 0) return {};
+  const enabled = new Set<DerivedInterval>(options.enabled);
+  const active = derived.filter((interval) => enabled.has(interval));
+  const disabled: Record<string, DerivedIntervalSummary> = Object.fromEntries(
+    derived
+      .filter((interval) => !enabled.has(interval))
+      .map((interval) => [interval, { withheldReason: 'disabled' as const }]),
+  );
+  if (active.length === 0) return disabled;
 
   try {
     const bounds = await pool.query<{ first_ms: string | null; last_ms: string | null }>(
@@ -949,7 +967,12 @@ export async function readDerivedIntervals(
     const lastMs = ms(bounds.rows[0]?.last_ms);
     if (firstMs === null || lastMs === null) {
       // 库里没有 1m：派生表也不该有行，「无数据」本身就是答案。
-      return Object.fromEntries(derived.map((interval) => [interval, emptySummary()]));
+      return Object.fromEntries(
+        derived.map((interval) => [
+          interval,
+          enabled.has(interval) ? emptySummary() : { withheldReason: 'disabled' as const },
+        ]),
+      );
     }
 
     // 一次查询覆盖全部周期：按宽度分别算，桶起点用取模而不是 date_trunc（R-2.1）。
@@ -1009,7 +1032,7 @@ export async function readDerivedIntervals(
         ORDER BY w.width_ms`,
       // $1 symbol、$2 该标的 1m 的 max(time)、$3 min(time)、$4 本次要统计的周期、
       // $5 与 $4 一一对应的桶宽（毫秒）
-      [symbol, lastMs, firstMs, derived, derived.map((interval) => INTERVAL_MS[interval])],
+      [symbol, lastMs, firstMs, active, active.map((interval) => INTERVAL_MS[interval])],
     );
     const withheld = new Map(
       result.rows.map((row) => [
@@ -1022,8 +1045,8 @@ export async function readDerivedIntervals(
       ]),
     );
 
-    const out: Record<string, DerivedIntervalSummary> = {};
-    for (const interval of derived) {
+    const out: Record<string, DerivedIntervalSummary> = { ...disabled };
+    for (const interval of active) {
       const counts = withheld.get(interval) ?? { notClosed: 0, incomplete: 0, missingMinutes: 0 };
       const stored = await pool.query<{ n: string }>(
         `SELECT count(*)::bigint AS n FROM ${INTERVAL_TABLES[interval]} WHERE symbol = $1`,

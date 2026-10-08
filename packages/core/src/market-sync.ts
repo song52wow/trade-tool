@@ -196,12 +196,16 @@ export interface SyncSummary {
   pendingGaps: number;
   rateLimit: RateLimitStatus;
   /**
-   * 四张派生表的行数与**实测**体积（v0.2.0 R-8.2 / AC-16）。
+   * **启用的**派生表的行数与**实测**体积（v0.2.0 R-8.2 / AC-16）。
    *
    * 体积直接读 `pg_total_relation_size`，不沿用附录 B.2 的单行估算——那条估算至今
    * 未实测，而 `sync_state.bytes` 一直按它推进，谁都没量过真表。
-   * `aggregateIntervals: []`（未启用派生）时是空数组：显示「0 个桶」会让人误以为
-   * 「还没聚合」，必须与「启用了但确实为空」区分开（R-8.4 / AC-22）。
+   *
+   * 只列 `aggregateIntervals` 里启用的周期：
+   *   * `[]`（未启用派生）→ 空数组，显示「0 个桶」会让人误以为「还没聚合」；
+   *   * 只启用子集 → 只报启用那几张表，没启用的**不得**报成 0（否则 `sync status`
+   *     与控制面都会显示成「已启用但还没聚合」，用户会一直点重建）。
+   * 两种情形都必须与「启用了但确实为空」区分开（R-8.4 / R-9.1 / AC-22）。
    */
   derived: DerivedTableStat[];
 }
@@ -310,7 +314,10 @@ export interface AggregateSummary {
   /** 显式为 false 时表示本轮是只读校验（`--check`） */
   rebuild: boolean;
   check: boolean;
-  /** 每周期统计；`aggregateIntervals` 为空时是空对象（未启用派生，R-8.4） */
+  /**
+   * 每周期统计。`aggregateIntervals: []`（未启用派生）时命令直接报 `CONFIG_INVALID`
+   * 而不是返回空对象——「成功但什么都没做」正是 R-14 禁止的静默兜底（R-9.2 / AC-22）。
+   */
   intervals: Record<string, AggregateIntervalStats>;
   durationMs: number;
 }

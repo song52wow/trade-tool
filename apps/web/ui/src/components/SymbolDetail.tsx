@@ -16,16 +16,8 @@ export function SymbolDetail(props: {
   /** 随全局刷新递增，K 线图跟着它更新 */
   tick: number;
 }) {
-  const {
-    state,
-    contract,
-    gaps,
-    exchange,
-    desiredState,
-    inCollection,
-    hasHistory,
-    derived,
-  } = props.detail;
+  const { state, contract, gaps, exchange, desiredState, inCollection, hasHistory, derived } =
+    props.detail;
   return (
     <div>
       {/* K 线放在最上面：这个面板回答的第一个问题是「同步下来的数据长什么样」，
@@ -200,7 +192,7 @@ function DerivedTable(props: {
                   <tr key={interval}>
                     <td className="mono">{interval}</td>
                     <td colSpan={4} className="muted">
-                      未启用派生（aggregateIntervals 为空）
+                      未启用派生（{interval} 不在 data.aggregateIntervals 里）
                     </td>
                   </tr>
                 );
