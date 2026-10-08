@@ -282,13 +282,19 @@ export interface ClosedBarCheck {
  * 两种扣留原因互斥且必须分开报：
  *   * `withheldNotClosed`  —— 桶尚未走完（1m 还没到齐），等下一批自然出现；
  *   * `withheldIncomplete` —— 桶已收盘但桶内有 1m 缺口，写进去就是一根半截蜡烛（R-3.5）。
+ *
+ * **口径是「桶次」，不是「此刻库里的桶数」**：同步一轮分多批写入，每批各自判定一次，
+ * 这里的数字是各批之和。首次全量下一个 400 根的标的（8 批）会报 `withheldNotClosed: 8`，
+ * 而轮末真正还没收盘的只有 1 个桶——前 7 个在下一批里已经被写入。上游刻意不做成
+ * 「轮末重算一遍」：那要在每轮收尾再对整段做一次全区间判定，正是 §6.3 里最贵的那次查询。
+ * 要「此刻有几桶被扣留」请看 `readDerivedIntervals`（`/api/symbols/:symbol` 的 `derived`）。
  */
 export interface AggregateIntervalStats {
-  /** 本轮写入 / 更新的桶数（`--rebuild` 与重复执行时可能为 0） */
+  /** 本轮**新写入**的桶数（实际落库 − 写前已存在；`--rebuild` 与重复执行时可能为 0） */
   upserted: number;
-  /** 尚未收盘被扣留的桶数 */
+  /** 本次判定中因**尚未收盘**而被扣留的桶次（各批之和，见上） */
   withheldNotClosed: number;
-  /** 已收盘但 1m 未全覆盖而被扣留的桶数 */
+  /** 本次判定中因**已收盘但 1m 未全覆盖**而被扣留的桶次（各批之和，见上） */
   withheldIncomplete: number;
   /** 扣留桶内合计缺失的 1m 分钟数（= 缺口在派生层的投影） */
   missingMinutes: number;

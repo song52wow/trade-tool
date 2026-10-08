@@ -337,8 +337,8 @@ class TestWithholding:
             )
         last_ms = T0 + 240 * 3 * ONE_MINUTE_MS - 1
         counts = agg.withheld_counts(conn, "RANGEUSDC", "4h", T0, last_ms)
-        assert counts["incomplete"] == 1
-        assert counts["notClosed"] == 1
+        assert counts["withheldIncomplete"] == 1
+        assert counts["withheldNotClosed"] == 1
         assert counts["missingMinutes"] == 10
         # 只有第一个桶合格且已写入
         with conn.transaction():
@@ -597,8 +597,8 @@ class TestEmptyStore:
 
     def test_withheld_counts无数据全零(self, conn: DbConn) -> None:
         assert agg.withheld_counts(conn, "GHOSTUSDC", "4h", T0, T0 + W4H) == {
-            "notClosed": 0,
-            "incomplete": 0,
+            "withheldNotClosed": 0,
+            "withheldIncomplete": 0,
             "missingMinutes": 0,
         }
 

@@ -143,6 +143,40 @@ class TestAggregateUnlocksNothing:
         assert excinfo.value.code == "SYMBOL_NOT_FOUND"
 
 
+class TestAggregateCheckShape:
+    def test_check的每周期键名与补齐一致(self, conn: DbConn, symbol_case: SymbolCase) -> None:
+        """R-5.6 / R-8.3：``--check`` 与补齐必须返回**同一个形状**。
+
+        回归用例：check 分支一度直接返回 ``withheld_counts`` 的内部简称键
+        （``notClosed`` / ``incomplete``），与跨语言契约 ``AggregateIntervalStats``
+        （``withheldNotClosed`` / ``withheldIncomplete``）对不上。后果不是「显示不准」
+        而是**命令直接崩**：CLI 打印 ``stats.withheldNotClosed.toLocaleString()`` 抛
+        TypeError，于是一份完全一致的库上 ``data aggregate --check`` 永远无法成功退出 0。
+        """
+        opts = _options(symbol_case, aggregate_intervals=("4h",))
+        bucket = 1_735_689_600_000 - (1_735_689_600_000 % 14_400_000)
+        with conn.transaction():
+            for i in range(240):  # 一个完整的 4h 桶
+                conn.execute(
+                    "INSERT INTO klines_1m (symbol, time, open, high, low, close, volume)"
+                    " VALUES (%s, %s, 1, 2, 0.5, 1.5, 10)",
+                    (symbol_case.symbol, bucket + i * ONE_MINUTE),
+                )
+        fill = sync_mod.run_aggregate(opts)
+        check = sync_mod.run_aggregate(opts, check=True)
+        fill_intervals = fill["intervals"]
+        check_intervals = check["intervals"]
+        assert isinstance(fill_intervals, dict) and isinstance(check_intervals, dict)
+        expected = {"upserted", "withheldNotClosed", "withheldIncomplete", "missingMinutes"}
+        fill_four = fill_intervals["4h"]
+        check_four = check_intervals["4h"]
+        assert isinstance(fill_four, dict) and isinstance(check_four, dict)
+        assert set(fill_four) == expected
+        assert set(check_four) == expected
+        assert check_four["withheldNotClosed"] == 0
+        assert check_four["withheldIncomplete"] == 0
+
+
 # ------------------------------------------------------------- 测试辅助
 
 

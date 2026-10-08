@@ -1279,6 +1279,9 @@ def run_aggregate(
                     "to": end_ms,
                     "rebuild": False,
                     "check": True,
+                    # `withheld_counts` 的键名就是契约（withheldNotClosed / …），
+                    # 与补齐路径**同一个形状**——否则 `data aggregate --check` 的
+                    # 打印会在 undefined 上崩掉（R-5.6 / R-8.3）。
                     "intervals": {
                         interval: agg.withheld_counts(
                             writer, opts.symbol, interval, start_ms, end_ms

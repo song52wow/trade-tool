@@ -627,11 +627,17 @@ def withheld_counts(
 
     逐桶复用 :func:`judge_bucket`，与写入路径同源；桶数被区间长度框住，详情页一次调用
     的代价可接受。
+
+    **键名就是跨语言契约**：``AggregateIntervalStats`` 用
+    ``withheldNotClosed`` / ``withheldIncomplete`` / ``missingMinutes``。这里若用简称
+    （``notClosed`` / ``incomplete``），``data aggregate --check`` 的返回就与
+    ``SyncRunSummary.aggregated`` / ``data aggregate``（补齐）不是同一个形状——
+    两侧类型对不上，CLI 打印会在 ``undefined.toLocaleString`` 上崩掉（R-5.6 / R-8.3）。
     """
     width = interval_width(interval)
     bounds = read_bounds(conn, symbol)
     if bounds is None:
-        return {"notClosed": 0, "incomplete": 0, "missingMinutes": 0}
+        return {"withheldNotClosed": 0, "withheldIncomplete": 0, "missingMinutes": 0}
     not_closed = incomplete = missing = 0
     bucket_list = bucket_starts(start_ms, end_ms, width)
     whole = (
@@ -660,7 +666,11 @@ def withheld_counts(
         else:
             not_closed += 1
         missing += verdict.missing
-    return {"notClosed": not_closed, "incomplete": incomplete, "missingMinutes": missing}
+    return {
+        "withheldNotClosed": not_closed,
+        "withheldIncomplete": incomplete,
+        "missingMinutes": missing,
+    }
 
 
 def interval_summary(
@@ -683,8 +693,8 @@ def interval_summary(
         "interval": interval,
         "table": DERIVED_TABLES[interval],
         "buckets": int(stored_row["n"]) if stored_row is not None else 0,
-        "withheldNotClosed": counts["notClosed"],
-        "withheldIncomplete": counts["incomplete"],
+        "withheldNotClosed": counts["withheldNotClosed"],
+        "withheldIncomplete": counts["withheldIncomplete"],
         "missingMinutes": counts["missingMinutes"],
         "firstBar": bounds.first_ms if bounds is not None else None,
         "lastBar": bounds.last_ms if bounds is not None else None,
