@@ -73,8 +73,9 @@ beforeEach(async () => {
     'UPDATE weight_budget SET window_from = 0, used = 0, pause_until = NULL WHERE id = 1',
   );
   exchange.setSymbols(makeMockSymbols(NOW));
-  exchange.clearFailures();
-  exchange.setRateLimit(null, 0);
+  // 同 sync-integration：注入态必须**整体**清掉，只清 failures 会让一个中途失败的
+  // 用例把时间偏移 / 人为缺口漏给下一个用例（表现成指向同步逻辑的假失败）。
+  exchange.resetOverrides();
   await rm(metaDir, { recursive: true, force: true });
 });
 

@@ -84,8 +84,10 @@ async function resetExchange(): Promise<void> {
     'UPDATE weight_budget SET window_from = 0, used = 0, pause_until = NULL WHERE id = 1',
   );
   exchange.setSymbols(makeMockSymbols(NOW));
-  exchange.clearFailures();
-  exchange.setRateLimit(null, 0);
+  // 故障 / 时间偏移 / 人为缺口 / 限速**全部**清掉，而不是逐项清：
+  // AC-31 中途失败或超时就走不到它自己的 `shiftAllTimes(sym, 0)`，偏移会漏进下一个用例，
+  // 表现为后者抛 BACKFILL_BOUNDARY_VIOLATION——一个指向「同步逻辑」的假线索。
+  exchange.resetOverrides();
   await rm(metaDir, { recursive: true, force: true });
 }
 

@@ -44,6 +44,17 @@ export interface MockExchange {
   failKlines(symbol: string, error: MockKlineFailure | null): void;
   /** 清空**所有**已注入的故障——只传 `failKlines('', null)` 是清不掉的 */
   clearFailures(): void;
+  /**
+   * 清空**全部注入态**：故障、时间偏移、人为制造的缺口、限速。
+   *
+   * 用例之间必须调用它（`resetExchange()`）。只重置标的集合（`setSymbols`）是不够的：
+   * 时间偏移与 dropRange 独立于 `specs` / `bars` 存活，一旦某个用例**中途失败或超时**
+   * 没走到自己的复原语句（AC-31 末尾的 `shiftAllTimes(sym, 0)`、AC-7 的 dropRange），
+   * 状态就会漏进后面的用例——实测见过它表现为另一个用例抛
+   * `BACKFILL_BOUNDARY_VIOLATION`：一个看似「同步逻辑坏了」的错误，真实原因却是
+   * 上一个用例超时留下的偏移。那种失败信息比失败本身更难查。
+   */
+  resetOverrides(): void;
   /** 人为删掉某段时间的 bar，制造缺口（AC-7） */
   dropRange(symbol: string, from: number, to: number): void;
   /** 人为篡改最后一根的 close（AC-30 最后一根自愈） */
@@ -236,6 +247,15 @@ export async function startMockExchange(options: MockServerOptions): Promise<Moc
       else failures.set(symbol, error);
     },
     clearFailures: () => failures.clear(),
+    resetOverrides: () => {
+      failures.clear();
+      shifts.clear();
+      dropRanges.clear();
+      rateLimit = null;
+      klineRequests.length = 0;
+      requests.exchangeInfo = 0;
+      requests.klines = 0;
+    },
     dropRange: (symbol, from, to) => {
       const list = dropRanges.get(symbol) ?? [];
       list.push({ from, to });
