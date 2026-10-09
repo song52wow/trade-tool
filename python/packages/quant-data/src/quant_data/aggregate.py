@@ -443,12 +443,7 @@ def _judge_with_whole(
     # onboard 前缀桶（桶内首根就是 F）同样不在 `whole` 里，而它完全正确。
     # 必须放过它，否则每轮同步都会把新标的第一个桶报成「未全覆盖扣留」——
     # 而它既没缺数据、也不该被扣留。
-    if (
-        preexisting
-        and verdict.write
-        and bucket not in whole
-        and rows[0].time != bounds.first_ms
-    ):
+    if preexisting and verdict.write and bucket not in whole and rows[0].time != bounds.first_ms:
         return BucketJudgement(
             time=verdict.time,
             write=False,
@@ -766,9 +761,7 @@ def check_intervals(
             if row is None:
                 problems.append({"interval": interval, "kind": "missing", "time": bucket})
                 continue
-            is_prefix = prefix_of.get(bucket) == (
-                bounds.first_ms if bounds is not None else None
-            )
+            is_prefix = prefix_of.get(bucket) == (bounds.first_ms if bounds is not None else None)
             if not is_prefix and actual_of.get(bucket, 0) < capacity:
                 # 桶内 1m 不齐（根数不足一个满桶），它不该以「合格」的身份留在派生表。
                 # 必须在比对值**之前**报 stale：值当然对不上，但根因是「这个桶不该在」，

@@ -252,8 +252,12 @@ describe('PriceChart 周期切换', () => {
       fireEvent.click(screen.getByTitle('切换到 4h'));
     });
 
-    await waitFor(() => expect(calls).toHaveLength(2));
-    expect(calls[1]).toContain('interval=4h');
+    // 派生周期下会**额外**发一次 `/indicators`（R-10.1）：图上的指标只能来自物化表，
+    // 而 1m 没有指标物化，因此 1m 下不���这个请求。
+    await waitFor(() =>
+      expect(calls.some((c) => c.includes('/indicators') && c.includes('interval=4h'))).toBe(true),
+    );
+    expect(calls.some((c) => c.includes('/bars') && c.includes('interval=4h'))).toBe(true);
     // 当前周期必须常驻可见，否则用户不知道自己在看哪一档
     await waitFor(() => expect(document.body.textContent).toContain('4h K 线'));
   });

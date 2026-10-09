@@ -9,6 +9,7 @@ import {
   runAggregate,
   runBackfill,
   runGaps,
+  runIndicators,
   runSync,
   runSymbols,
   runVerify,
@@ -228,6 +229,7 @@ dataCmd
     async (options: {
       symbol: string;
       intervals?: string;
+      specs?: string;
       from?: string;
       to?: string;
       rebuild?: boolean;
@@ -235,6 +237,38 @@ dataCmd
       json?: boolean;
     }) => {
       process.exitCode = await runAggregate(options).catch((error: unknown) => {
+        fail(error);
+        return 1;
+      });
+    },
+  );
+
+dataCmd
+  .command('indicators')
+  .description('由库内已收盘的派生 K 线物化技术指标（补齐 / --rebuild / --check）')
+  .requiredOption('-s, --symbol <symbol>')
+  .option('--intervals <list>', '逗号分隔；缺省取 data.indicatorIntervals（不含 1m）')
+  .option(
+    '--indicator-specs <specs>',
+    '要物化的参数集 JSON，缺省取 data.indicatorSpecs。例：\'{"rsi":[{"period":7}]}\'',
+  )
+  .option('--from <ms>', '区间起点，缺省 min(time)')
+  .option('--to <ms>', '区间终点，缺省 max(time)')
+  .option('--rebuild', '先删后算（修复 K 线被改动 / 指标被篡改 / impl_version 已递增）')
+  .option('--check', '只读校验：报出 stale / missing / mismatch / 混版')
+  .option('--json', '输出 JSON')
+  .action(
+    async (options: {
+      symbol: string;
+      intervals?: string;
+      specs?: string;
+      from?: string;
+      to?: string;
+      rebuild?: boolean;
+      check?: boolean;
+      json?: boolean;
+    }) => {
+      process.exitCode = await runIndicators(options).catch((error: unknown) => {
         fail(error);
         return 1;
       });

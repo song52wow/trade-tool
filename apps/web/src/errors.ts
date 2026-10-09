@@ -27,6 +27,13 @@ const STATUS_BY_CODE = {
   // 处置方式是 --rebuild，而不是重试同一个请求。
   AGGREGATION_FAILED: 500,
   AGGREGATION_MISMATCH: 409,
+  // 技术指标（v0.3.0 R-12.3）——与派生周期同构，因为它们的成因与处置方式完全一样：
+  //   * INDICATOR_FAILED 物化失败是服务端数据层的问题（500），用户改请求没用；
+  //   * INDICATOR_MISMATCH `--check` 发现库里与当前 K 线对不上（409），处置是 --rebuild；
+  //   * INDICATOR_IMPL_STALE 实现版本不一致、已拒绝写入（409），同样要人工介入。
+  INDICATOR_FAILED: 500,
+  INDICATOR_MISMATCH: 409,
+  INDICATOR_IMPL_STALE: 409,
   // 数据库
   DB_CONNECTION_FAILED: 503,
   DB_DEADLOCK: 503,

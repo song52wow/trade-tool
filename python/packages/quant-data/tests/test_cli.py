@@ -76,14 +76,34 @@ def test_end_to_end_sync_then_idempotent_repeat(conn: DbConn, tmp_path: Path) ->
         "estimate",
         # v0.2.0 R-8.3：每周期聚合统计进 SyncRunSummary（跨语言契约，AC-25）
         "aggregated",
+        # v0.3.0 R-11.3：指标物化统计与**实际使用的实现版本**进 SyncRunSummary。
+        # 与 TS 侧 `SyncRunSummary` 同提交更新——两侧字段名必须一致（AGENTS.md 硬性约定 2）。
+        "indicators",
+        "implVersion",
     }
+    # 指标统计按**周期 × 参数集**逐项给出（不许只报「成功」，R-6.6）。
+    # 必须是按周期分组的：只按「指标:参数」做键会让四个周期互相覆盖，
+    # 摘要里只剩最后一个周期的数字，而那看起来完全正常。
+    indicators = summary["indicators"]
+    assert indicators is not None
+    assert set(indicators) == {"15m", "1h", "4h", "1d"}
+    for interval, specs in indicators.items():
+        assert specs, f"{interval} 一个参数集都没有"
+        for label, stat in specs.items():
+            assert {"indicator", "params", "upserted", "withheldWarmup"} <= set(stat), label
+            assert isinstance(stat["upserted"], int) and stat["upserted"] >= 0
+            assert isinstance(stat["withheldWarmup"], int)
+    assert summary["implVersion"] >= 1
     assert summary["from"] == CASE.onboard_date
     assert summary["writeStrategy"] == "upsert"
     assert summary["added"] == CASE.bars - 1
     # summary 里只有计数与时间范围，没有任何一根 bar 的价格数据（AC-8）。
     assert "close" not in first.stdout and "open" not in first.stdout
     assert "volume" not in first.stdout
-    assert len(first.stdout) < 1024
+    # 摘要是 O(周期 × 参数集) 的**计数**，不是 O(bar 数)。这里的上界按「每根 bar 至少
+    # 几十字节」反推：只要 stdout 还远小于 bar 数的量级，就证明 K 线没有经 stdout 传输
+    # （R-2.1 / AC-8）。硬写 1024 会把「摘要多了一个指标段」误报成「K 线泄漏」。
+    assert len(first.stdout) < 16 * 1024, f"stdout 过大，疑似混入了 K 线：{len(first.stdout)} 字节"
 
     stored = [
         int(row["time"])

@@ -41,6 +41,14 @@ export type SyncErrorCode =
   // 派生周期（v0.2.0 R-9.3）
   | 'AGGREGATION_FAILED'
   | 'AGGREGATION_MISMATCH'
+  // 技术指标（v0.3.0 R-12.3）
+  | 'INDICATOR_FAILED'
+  | 'INDICATOR_MISMATCH'
+  | 'INDICATOR_IMPL_STALE'
+  // 风控（v0.4.0）：ATR 取不到——本地库里没有足够的已收盘连续 K 线。
+  // 单列而不复用 CONFIG_INVALID：这是「数据还没同步上来」，不是「参数写错了」，
+  // 两者的处置完全不同（前者去 start 标的，后者改配置）。
+  | 'RISK_ATR_UNAVAILABLE'
   // 数据库（R-21.6 / R-1.3）
   | 'DB_CONNECTION_FAILED'
   | 'DB_UNIQUE_VIOLATION'
@@ -77,6 +85,47 @@ export class SyncError extends Error {
 
 export function isSyncError(error: unknown): error is SyncError {
   return error instanceof SyncError;
+}
+
+/**
+ * **需人工介入**的错误码（v0.2.0 R-4.6；v0.3.0 R-12.3）。
+ *
+ * 语义：这些错误说明「再自动重试一次也不会变好」。常驻同步必须据此把标的钉成
+ * `error` 并停止自动重试（R-21.3），而不是在同一个确定性的失败上反复烧交易所配额。
+ *
+ * 指标层的三个码都在这里：
+ *   * `INDICATOR_FAILED` 物化失败 → 整批回滚（连 1m 与派生桶一起）；
+ *   * `INDICATOR_MISMATCH` `--check` 发现不一致；
+ *   * `INDICATOR_IMPL_STALE` `impl_version` 不一致 → **拒绝混版写入**。
+ *
+ * 要恢复 K 线同步有两条**显式**出路：修好问题，或把 `data.indicatorSpecs` 清空
+ * 关掉指标层——关闭状态在 `sync status` 与控制面上都可见（R-11.4 / AC-23），
+ * 不存在「悄悄跳过」这种状态。
+ */
+export const MANUAL_INTERVENTION_CODES: ReadonlySet<SyncErrorCode> = new Set<SyncErrorCode>([
+  'GAP_ATTEMPTS_EXHAUSTED',
+  'UNCLOSED_BAR_IN_STORE',
+  'BACKFILL_BOUNDARY_VIOLATION',
+  'WATERMARK_MISMATCH',
+  'NULL_NOT_ALLOWED',
+  'SYMBOL_NOT_FOUND',
+  'NOT_PERPETUAL',
+  'NOT_TRADING',
+  'SCHEMA_VERSION_MISMATCH',
+  // v0.2.0 R-9.3：聚合失败需人工介入。AGGREGATION_FAILED 意味着**该批 1m 已整批回滚**
+  // （连水位都没推进）——自动重试只会让标的反复失败而没人知道是派生层坏了。
+  'AGGREGATION_FAILED',
+  'AGGREGATION_MISMATCH',
+  // v0.3.0 R-12.3：指标层同理。恢复 1m 同步的显式出路是把
+  // `data.indicatorSpecs` 清空（关闭状态在状态里**可见**，R-11.4 / AC-23）。
+  'INDICATOR_FAILED',
+  'INDICATOR_MISMATCH',
+  'INDICATOR_IMPL_STALE',
+]);
+
+/** 该错误码是否需要人工介入（不进自动重试队列）。 */
+export function needsManualIntervention(code: SyncErrorCode): boolean {
+  return MANUAL_INTERVENTION_CODES.has(code);
 }
 
 /** 合约元数据快照。本需求只依赖这三个字段（R-7.3），其余仅作快照留存。 */
@@ -258,6 +307,46 @@ export interface SyncRunSummary {
    * （R-8.4 / AC-22）。空对象会让人以为「还没聚合」。
    */
   aggregated: Record<string, AggregateIntervalStats> | null;
+  /**
+   * 本轮指标物化的统计（v0.3.0 R-11.3），**按周期分组**：
+   * ``{ "15m": { "SMA(bars=20)": {...} }, "1h": {...} }``。
+   *
+   * 分组不是美观问题：只按「指标:参数」做键时，四个周期的同名参数集会**互相覆盖**，
+   * 摘要里只剩最后一个周期的数字——而那看起来完全正常（AC-25 的同一条教训）。
+   *
+   * 与 `SyncRunSummary` **同提交**更新（跨语言契约，AGENTS.md 硬性约定 2）：
+   * Python 侧 `run_sync` 产出、TS 侧消费，两边字段名必须一致。
+   *
+   * `indicatorSpecs: {}`（**显式关闭指标层**）时是 `null`——**不是**空对象：
+   * 「未启用指标」与「启用了但一行没写」是两种完全不同的状态，控制面必须能分开说
+   * （R-11.4 / AC-23）。空对象会让人以为「还没算」，于是反复点重建。
+   */
+  indicators: Record<string, Record<string, IndicatorMaterializeStats>> | null;
+  /**
+   * 本轮**实际使用**的指标实现版本（R-11.3）。
+   *
+   * 回传给调用方而不是让 TS 侧自己持有常量：`INDICATOR_IMPL_VERSION` 只存在于
+   * Python 侧，复制一份就会在实现递增后静默停在旧版本号上（R-3.4）。
+   */
+  implVersion: number;
+}
+
+/**
+ * 一个「周期 × 参数集」的指标物化统计（v0.3.0 R-6.6 / R-11.3）。
+ *
+ * 数字**逐周期逐参数集**报出，不许只报「成功」——一个 10 行集的物化跑完只回一句
+ * 「成功」，用户无从判断哪些周期真的算了、哪些被预热期扣光了。
+ */
+export interface IndicatorMaterializeStats {
+  indicator: string;
+  /** 参数列（键名与数据库列一致，因此控制面可直接回显成「哪几组参数」） */
+  params: Record<string, number | string>;
+  /** 真正**改动**的行数；重复执行同一区间必然为 0（幂等断言的依据） */
+  upserted: number;
+  /** 因**预热期**不落库的行数——「算不出来」而不是「没触及」 */
+  withheldWarmup: number;
+  /** `'noChange'` = 本批该周期没有任何桶变化，未重算 */
+  skipped?: string;
 }
 
 /** 全局汇总里的派生表实测体积（v0.2.0 R-8.2 / AC-16）。 */

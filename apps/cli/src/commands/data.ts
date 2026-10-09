@@ -15,12 +15,14 @@ import {
   backfillRange,
   estimateFirstPull,
   getGaps,
+  indicatorSymbol,
   listExchangeSymbols,
   readBars,
   requireContract,
   syncSymbol,
   verifySymbol,
   watermark,
+  type IndicatorSummary,
 } from '@trade-tool/data';
 
 import { withContext } from '../context.js';
@@ -449,6 +451,87 @@ export async function runAggregate(flags: {
     }
     if (Object.keys(result.intervals).length === 0) {
       console.log('  未启用派生（data.aggregateIntervals 为空）');
+    }
+    return 0;
+  });
+}
+
+/**
+ * `data indicators` —— 技术指标补齐 / 重建 / 校验（v0.3.0 R-6）。
+ *
+ * 三种模式与 `data aggregate` 同形，便于记忆：
+ *   * 缺省（补齐）：区间内全部合格行 UPSERT，不删任何已有行；
+ *   * `--rebuild`：先删后算，修复「K 线被改动 / 指标被篡改 / impl_version 已递增」；
+ *   * `--check`：只读校验，报出 stale / missing / mismatch / 混版。
+ *
+ * 显式 `--intervals` / `--indicator-specs` 优先于配置；出现未实现周期（1m / 5m / 其它）
+ * 由 Python 侧报 CONFIG_INVALID，不静默忽略（1m 之所以不做指标物化是**容量结论**：
+ * 单标的约 4.3 GB/标的，附录 B.3）。
+ */
+export async function runIndicators(flags: {
+  symbol?: string | undefined;
+  intervals?: string | undefined;
+  specs?: string | undefined;
+  from?: string | undefined;
+  to?: string | undefined;
+  rebuild?: boolean | undefined;
+  check?: boolean | undefined;
+  json?: boolean | undefined;
+}): Promise<number> {
+  const symbol = requireSymbol(flags.symbol);
+  const from = parseMs(flags.from, '--from');
+  const to = parseMs(flags.to, '--to');
+
+  let specs: unknown;
+  if (flags.specs !== undefined) {
+    // 命令行给的是**紧凑形态**或与配置同形的 JSON；解析失败必须当场报错，
+    // 绝不允许「解析不出来就当没给」——那会让用户以为换了参数集而其实没换。
+    try {
+      specs = JSON.parse(flags.specs) as unknown;
+    } catch {
+      specs = flags.specs;
+    }
+  }
+
+  return withContext(async (ctx) => {
+    await assertSchema(ctx.pool);
+    const result: IndicatorSummary = await indicatorSymbol(
+      ctx,
+      symbol,
+      {
+        ...(flags.intervals === undefined
+          ? {}
+          : {
+              intervals: flags.intervals
+                .split(',')
+                .map((s) => s.trim())
+                .filter(Boolean),
+            }),
+        ...(specs === undefined ? {} : { specs }),
+        ...(from === undefined ? {} : { from }),
+        ...(to === undefined ? {} : { to }),
+      },
+      { rebuild: flags.rebuild === true, check: flags.check === true },
+    );
+    if (flags.json) {
+      console.log(JSON.stringify(result, null, 2));
+      return 0;
+    }
+    console.log(
+      `${symbol}  ${new Date(result.from ?? 0).toISOString()} → ${new Date(result.to ?? 0).toISOString()}` +
+        `  ${result.check ? '只读校验' : result.rebuild ? '重建（先删后算）' : '补齐'}` +
+        `  implVersion=${result.implVersion}  耗时 ${result.durationMs}ms`,
+    );
+    // 不许只报「成功」（R-6.6）：每周期每参数集都要报出写入数与预热扣留数。
+    for (const [interval, specsBlock] of Object.entries(result.indicators)) {
+      for (const [label, stats] of Object.entries(specsBlock)) {
+        const skipped = stats.skipped ? `  跳过：${stats.skipped}` : '';
+        console.log(
+          `  ${interval.padEnd(4)} ${label.padEnd(20)}` +
+            ` 写入 ${stats.upserted.toLocaleString('en-US')} 行` +
+            `  预热不落库 ${stats.withheldWarmup.toLocaleString('en-US')} 根${skipped}`,
+        );
+      }
     }
     return 0;
   });

@@ -15,6 +15,7 @@ import type {
   SymbolSyncState,
 } from '@trade-tool/core';
 import type { SchemaStatus } from '@trade-tool/data';
+import type { IndicatorInterval } from '@trade-tool/data';
 
 export type LifecycleAction = 'start' | 'pause' | 'resume';
 /**
@@ -129,6 +130,62 @@ export type DerivedIntervalDto =
       missingMinutes: number;
     }
   | { withheldReason: 'disabled' };
+
+// ---------------------------------------------------------------- 技术指标（v0.3.0）
+
+/**
+ * 一个「已物化的参数集」（R-10.1）。
+ *
+ * `params` 的键是**数据库列名**（`window` 记作 `bars`，因为 `window` 是 PG 保留字），
+ * 因此页面可以直接把它渲染成图例，不需要前端再维护一张「指标 → 参数名」的映射表——
+ * 多一份映射就多一处会漂移的地方。
+ */
+export interface IndicatorSpecDto {
+  indicator: string;
+  params: Record<string, number | string>;
+  /** 该参数集实际生效的实现版本（R-9.3「回传生效值」） */
+  implVersion: number;
+  /** 该参数集已物化的行数 */
+  rows: number;
+}
+
+/** 一行指标。`values` 的键与该指标的值列一致（`value` / `dif,dea,hist` / …）。 */
+export interface IndicatorRowDto {
+  time: number;
+  values: Record<string, number>;
+}
+
+/** 一条指标线。缺口处**行缺失**，因此线在图上必须断开（R-10.4）。 */
+export interface IndicatorSeriesDto {
+  spec: IndicatorSpecDto;
+  /** 服务端给的稳定标签，如 `MA(window=20)`、`MACD(fast=12, slow=26, signal=9)` */
+  label: string;
+  rows: IndicatorRowDto[];
+}
+
+/** `/indicators` 的回包。 */
+export interface IndicatorsDto {
+  symbol: string;
+  interval: IndicatorInterval;
+  /** 桶宽（毫秒）。页面用它把「指标比 K 线短」换算成根数——**不能写死 60_000**。 */
+  intervalMs: number;
+  limit: number;
+  /** **实际生效**的实现版本；库里一个参数集都没物化时为 null */
+  implVersion: number | null;
+  specs: IndicatorSeriesDto[];
+  /**
+   * 指标序列比 K 线短是**正常**的（R-2.4）：少的正是预热期与未收盘的最后一根。
+   * `shortBy` 把它量化写明，否则用户会以为哪里丢了数据。
+   */
+  shortBy: {
+    bars: number;
+    reason: 'warmup' | 'not-closed' | 'mixed' | null;
+  };
+  /** 未物化 / 未启用时的说明与物化命令（R-10.4：空状态要给原因与下一步） */
+  state: 'ok' | 'not-materialized' | 'disabled';
+  message: string | null;
+  materializeCommand: string | null;
+}
 
 /** exchangeInfo 概览；不返回全量列表，避免每次轮询都传几百个标的。 */
 export interface ExchangeOverviewDto {

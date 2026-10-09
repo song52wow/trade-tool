@@ -1,8 +1,10 @@
 import type { GapRecord, RemovePolicy, StoredInterval } from '@trade-tool/core';
+import type { IndicatorInterval } from '@trade-tool/data';
 
 import type {
   BarsDto,
   ExchangeListDto,
+  IndicatorsDto,
   JobDto,
   OverviewDto,
   SymbolDetailDto,
@@ -92,6 +94,25 @@ export const api = {
         throw new ApiError(
           'CONTROL_PLANE_STALE',
           `控制面没有 /bars 路由：它还是改动前启动的旧进程。重启 trade-tool 控制面后刷新页面即可（页面本身已是新的）。`,
+        );
+      }
+      throw error;
+    }),
+  /**
+   * 指标序列（R-10）。纯读本地库，可挂在刷新节奏上。
+   *
+   * 404 在这里**同样单列**：路由在进程启动时注册，404 几乎总是「控制面还是改动前的
+   * 旧进程」，而前端已经是新的——报一句笼统的 `404 Not Found`，用户根本判断不出
+   * 该重启还是该去物化指标（v0.1.0 R-23.9 的延续）。
+   */
+  indicators: (s: string, limit: number, interval: IndicatorInterval = '1h') =>
+    request<IndicatorsDto>(
+      `/api/symbols/${encodeURIComponent(s)}/indicators?limit=${String(limit)}&interval=${interval}`,
+    ).catch((error: unknown) => {
+      if (error instanceof ApiError && error.status === 404) {
+        throw new ApiError(
+          'CONTROL_PLANE_STALE',
+          '控制面没有 /indicators 路由：它还是改动前启动的旧进程。重启 trade-tool 控制面后刷新页面即可。',
         );
       }
       throw error;

@@ -1,4 +1,5 @@
 import {
+  INTERVAL_MS,
   loadConfigOrDefault,
   STORED_INTERVALS,
   type GapRecord,
@@ -17,13 +18,19 @@ import {
   getGaps,
   getState,
   listExchangeSymbols,
+  listMaterializedSpecs,
+  materializeHint,
   readDaemonHeartbeat,
   readDerivedIntervals,
+  readIndicatorSpec,
   readLatestBars,
   resolveContract,
   schemaStatus,
+  specLabel,
   syncSymbol,
   verifySymbol,
+  type IndicatorInterval,
+  type IndicatorSpec,
   type MarketContext,
   type Pool,
 } from '@trade-tool/data';
@@ -36,6 +43,7 @@ import type { WebDeps } from './server.js';
 import type {
   BarDto,
   DaemonStatusDto,
+  IndicatorsDto,
   ExchangeListDto,
   OverviewDto,
   SymbolDetailDto,
@@ -206,6 +214,91 @@ export function createWebRuntime(config: TradeToolConfig): WebRuntime {
         close,
         volume,
       }));
+    },
+
+    /**
+     * 指标序列（R-10.1）：返回该 `(symbol, interval)` 下**全部已物化**的参数集。
+     *
+     * 取的是「库里实际有什么」而不是「配置里写了什么」——配置可以随时改，而库里是改动
+     * 之前物化的那一版；用配置去猜会让页面画出一条库里根本没有的线（R-10.1 / R-9.3）。
+     *
+     * **一个参数集都��物化时返回 200 + `state: 'not-materialized'`**，而不是 404 也不是
+     * 空数组：`not-materialized` 是完全正常的状态（刚建好标的还没物化指标），页面要能
+     * 显示空状态 + 物化命令，而不是报错。
+     */
+    async listIndicators(symbol, options): Promise<IndicatorsDto> {
+      const interval = options.interval;
+      const limit = clampBarLimit(options?.limit);
+      const intervalMs = INTERVAL_MS[interval];
+      const specs = await listMaterializedSpecs(pool, symbol, interval);
+      if (specs.length === 0) {
+        return {
+          symbol,
+          interval,
+          intervalMs,
+          limit,
+          implVersion: null,
+          specs: [],
+          shortBy: { bars: 0, reason: null },
+          state: config.data.indicatorIntervals.includes(interval) ? 'not-materialized' : 'disabled',
+          message:
+            config.data.indicatorIntervals.includes(interval)
+              ? `${interval} 的指标尚未物化。图上还没有指标线，不代表数据有问题。`
+              : `未启用 ${interval} 的指标（不在 data.indicatorIntervals 里）。`,
+          materializeCommand: config.data.indicatorIntervals.includes(interval)
+            ? materializeHint(symbol, interval)
+            : null,
+        };
+      }
+
+      // 每个参数集一条查询：不同指标在不同表里，而 `interval` / `implVersion` 各不相同，
+      // 合成一条动态 SQL 需要把表名与列名拼进语句——那正是 R-9.2 禁止的。
+      const series = await Promise.all(
+        specs.map(async (entry) => {
+          const spec: IndicatorSpec = { indicator: entry.indicator, params: entry.params };
+          const result = await readIndicatorSpec(pool, symbol, interval, spec, { limit });
+          return {
+            spec: {
+              indicator: entry.indicator,
+              params: entry.params,
+              implVersion: result.implVersion ?? entry.implVersion,
+              rows: result.rows.length,
+            },
+            label: specLabel(spec),
+            rows: result.rows,
+          };
+        }),
+      );
+
+      // 「指标比 K 线短多少根」必须量化写明（R-10.4）：少的是预热期与未收盘的最后一根，
+      // 不是数据缺失。桶宽来自服务端回传的 intervalMs，**不在前端写死**。
+      const barCount = await readLatestBars(pool, symbol, { limit, interval });
+      const latestBar = barCount[barCount.length - 1]?.time ?? null;
+      const firstBar = barCount[0]?.time ?? null;
+      const coverage = series.map((s) => s.rows[0]?.time).filter((t): t is number => t !== undefined);
+      const coverageStart = coverage.length > 0 ? Math.max(...coverage) : null;
+      const shortByBars =
+        firstBar !== null && coverageStart !== null ? Math.round((coverageStart - firstBar) / intervalMs) : 0;
+      const shortByLast =
+        latestBar !== null && series.every((s) => (s.rows[s.rows.length - 1]?.time ?? null) !== latestBar)
+          ? 1
+          : 0;
+
+      return {
+        symbol,
+        interval,
+        intervalMs,
+        limit,
+        implVersion: series[0]?.spec.implVersion ?? null,
+        specs: series,
+        shortBy: {
+          bars: shortByBars + shortByLast,
+          reason: shortByBars > 0 && shortByLast > 0 ? 'mixed' : shortByBars > 0 ? 'warmup' : shortByLast > 0 ? 'not-closed' : null,
+        },
+        state: 'ok',
+        message: null,
+        materializeCommand: null,
+      };
     },
 
     // 预估要出网读元数据但**不写库**（R-8.3），所以由确认弹窗按需单独触发。

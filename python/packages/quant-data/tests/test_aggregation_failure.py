@@ -66,7 +66,7 @@ class TestAggregationFailureRollsBack:
             _patched_batch(base_url),
             pytest.raises(SyncError),
         ):
-                sync_mod.run_sync(_options(symbol_case, aggregate_intervals=("4h",), batch_size=50))
+            sync_mod.run_sync(_options(symbol_case, aggregate_intervals=("4h",), batch_size=50))
         assert _bar_rows_in_store(conn, symbol_case.symbol) == 0
 
     def test_水位不推进(self, conn: DbConn, symbol_case: SymbolCase) -> None:
@@ -77,7 +77,7 @@ class TestAggregationFailureRollsBack:
             _patched_batch(base_url),
             pytest.raises(SyncError),
         ):
-                sync_mod.run_sync(_options(symbol_case, aggregate_intervals=("4h",), batch_size=50))
+            sync_mod.run_sync(_options(symbol_case, aggregate_intervals=("4h",), batch_size=50))
         assert pg.max_time(conn, symbol_case.symbol) is None
         state = pg.read_state(conn, "binance", symbol_case.symbol)
         if state is not None:
@@ -91,7 +91,7 @@ class TestAggregationFailureRollsBack:
             _patched_batch(base_url),
             pytest.raises(SyncError) as excinfo,
         ):
-                sync_mod.run_sync(_options(symbol_case, aggregate_intervals=("4h",), batch_size=50))
+            sync_mod.run_sync(_options(symbol_case, aggregate_intervals=("4h",), batch_size=50))
         details = excinfo.value.details
         assert details["symbol"] == symbol_case.symbol
         assert "4h" in str(details.get("intervals"))

@@ -1,5 +1,6 @@
 import {
   createLogger,
+  MANUAL_INTERVENTION_CODES as coreManualInterventionCodes,
   SyncError,
   type GapRecord,
   type RemovePolicy,
@@ -88,25 +89,10 @@ export interface ControlPrimitives {
  * 把它当人工介入会因一次正常竞争就把该标的钉死成 error，而 `resume()` 之后
  * 只要竞争仍在就会再次钉死——那是把可恢复的并发误报成故障（R-21.3 / R-21.5）。
  */
-const MANUAL_INTERVENTION_CODES = new Set([
-  'GAP_ATTEMPTS_EXHAUSTED',
-  'UNCLOSED_BAR_IN_STORE',
-  'BACKFILL_BOUNDARY_VIOLATION',
-  'WATERMARK_MISMATCH',
-  'NULL_NOT_ALLOWED',
-  'SYMBOL_NOT_FOUND',
-  'NOT_PERPETUAL',
-  'NOT_TRADING',
-  'SCHEMA_VERSION_MISMATCH',
-  // v0.2.0 R-9.3：聚合失败需人工介入。
-  //
-  // AGGREGATION_FAILED 意味着**该批 1m 已整批回滚**（连水位都没推进）——自动重试
-  // 掩盖它，只会让标的反复失败而没人知道是派生层坏了；正确处置是把
-  // `data.aggregateIntervals` 显式设成 `[]` 恢复 1m 同步，再排查派生。
-  // AGGREGATION_MISMATCH 来自 `data aggregate --check`，是人工校验的产物。
-  'AGGREGATION_FAILED',
-  'AGGREGATION_MISMATCH',
-]);
+// 「需人工介入」的码表是 `@trade-tool/core` 的**唯一一份**（v0.3.0 起）。
+// 这里曾有一份私有副本，与 core 的那份会静默漂移——新增一个「需人工介入」的错误码时，
+// 只改一边就会让某个错误既不被钉死成 error、又被无限重试。
+const MANUAL_INTERVENTION_CODES = coreManualInterventionCodes;
 
 const log = createLogger('sync:control');
 

@@ -7,12 +7,15 @@ import {
   type StoredInterval,
 } from '@trade-tool/core';
 
-import { parseBarLimit, parseIntervalParam } from './bars.js';
+import { parseBarLimit, parseIndicatorIntervalParam, parseIntervalParam } from './bars.js';
 import { toErrorBody } from './errors.js';
+import { type IndicatorInterval } from '@trade-tool/data';
+
 import type {
   AddSymbolBody,
   BarDto,
   ExchangeListDto,
+  IndicatorsDto,
   JobDto,
   JobKind,
   LifecycleAction,
@@ -43,6 +46,16 @@ export interface WebDeps {
    * `interval` 同样已过白名单（未实现的周期在路由层就 400 了），这里不再重复校验。
    */
   listBars(symbol: string, options: { limit: number; interval: StoredInterval }): Promise<BarDto[]>;
+  /**
+   * 某周期下**全部已物化**的指标序列（R-10.1）。
+   *
+   * 仍是**纯读**：只打 PG，不出网、不写库、不消耗配额，因此可以挂在页面的刷新节奏上。
+   * `interval` 已在路由层过白名单（1m / 5m / 其它 → 400），这里拿到的就是生效值。
+   */
+  listIndicators(
+    symbol: string,
+    options: { limit: number; interval: IndicatorInterval },
+  ): Promise<IndicatorsDto>;
   estimate(symbol: string): Promise<SymbolDetailDto['estimate']>;
   startJob(input: { kind: JobKind; symbol: string; target?: number | undefined }): Promise<JobDto>;
   listJobs(): Promise<JobDto[]>;
@@ -169,6 +182,24 @@ export function buildApp(deps: WebDeps): Hono {
       limit,
       items: await deps.listBars(symbol, { limit, interval }),
     });
+  });
+
+  /**
+   * 指标取数（R-10）：最近 N 根，按所选周期，**纯读本地库**。
+   *
+   * `?interval=` 只接受 `15m / 1h / 4h / 1d`；`1m` / `5m` / `foo` → 400
+   * `CONFIG_INVALID`，**一次查询都不发**。绝不静默回落到某个周期：用户以为在看 4h、
+   * 实际拿到 1h，正是最典型的静默兜底（AC-12）。
+   *
+   * 回包带上**实际生效**的 `interval` / `intervalMs` / `implVersion` / `specs`，
+   * 以及「指标比 K 线短多少根、为什么短」——预热期与未收盘的最后一根会让指标序列
+   * 天然短一截，不说清楚就会被当成数据缺失（R-10.4 / R-2.4）。
+   */
+  app.get('/api/symbols/:symbol/indicators', async (c) => {
+    const symbol = normalizeSymbol(c.req.param('symbol'));
+    const limit = parseBarLimit(c.req.query('limit'));
+    const interval = parseIndicatorIntervalParam(c.req.query('interval'));
+    return c.json(await deps.listIndicators(symbol, { limit, interval }));
   });
 
   /** 规模预估（R-8.3）：首次全量前必须先算给人看，确认弹窗的数据就来自这里。 */

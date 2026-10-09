@@ -103,6 +103,177 @@ function metadataArgs(ctx: MarketContext): string[] {
   ];
 }
 
+// -------------------------------------------------------------- 技术指标（v0.3.0）
+
+/**
+ * 把配置里的指标设置编成 argv。
+ *
+ * 参数集**始终**显式下发（不是「缺省由 Python 决定」）：CLI 与 Python 两侧各有一份
+ * 缺省值时，改了一边就会出现「配置里没写的那个参数集在两边跑出不同的行集」。
+ * 显式下发让 Python 侧成为纯粹的执行者，配置的唯一真相在 TS 侧的配置 schema。
+ *
+ * `{}` 下发成**空串**：那是「显式关闭指标层」（R-12.2），与「没配置」不同。
+ */
+function indicatorArgs(ctx: MarketContext): string[] {
+  const data = ctx.config.data;
+  return [
+    '--indicator-intervals',
+    data.indicatorIntervals.join(','),
+    '--indicator-specs',
+    JSON.stringify(data.indicatorSpecs),
+  ];
+}
+
+export interface IndicatorOptions {
+  /** 显式给出时以命令行为准；缺省取 `data.indicatorIntervals` */
+  intervals?: readonly string[] | undefined;
+  /** 显式给出时以命令行为准；缺省取 `data.indicatorSpecs` */
+  specs?: unknown;
+  from?: number | undefined;
+  to?: number | undefined;
+}
+
+/** 单个「周期 × 参数集」的物化统计（跨语言契约：与 Python 侧 `IndicatorStat.to_dict` 逐字段一致）。 */
+export interface IndicatorIntervalStats {
+  indicator: string;
+  params: Record<string, number | string>;
+  /** 真正**改动**的行数；重复执行必然为 0 */
+  upserted: number;
+  /** 因**预热期**不落库的行数 */
+  withheldWarmup: number;
+  skipped?: string;
+}
+
+/** `data indicators` 的结果摘要。**不许只报「成功」**（R-6.6）。 */
+export interface IndicatorSummary {
+  symbol: string;
+  from: number | null;
+  to: number | null;
+  rebuild: boolean;
+  check: boolean;
+  /** `{ interval: { 'MA(window=20)': {...} } }`，键序固定 */
+  indicators: Record<string, Record<string, IndicatorIntervalStats>>;
+  implVersion: number;
+  durationMs: number;
+}
+
+/**
+ * 指标补齐 / `--rebuild` / `--check`（v0.3.0 R-6）。
+ *
+ * **不进交易所、不改 `sync_state`**：只读派生 K 线、只写指标表。单写者锁与
+ * `SymbolLock` 同键（Python 侧抢），因此这里不需要额外加锁。
+ */
+export async function indicatorSymbol(
+  ctx: MarketContext,
+  symbol: string,
+  options: IndicatorOptions = {},
+  mode: { rebuild?: boolean; check?: boolean } = {},
+): Promise<IndicatorSummary> {
+  const { assertSchemaVersion } = await import('./db/migrate.js');
+  await assertSchemaVersion(ctx.pool);
+  const data = ctx.config.data;
+  return invoke<IndicatorSummary>(ctx, {
+    args: [
+      'indicators',
+      ...baseArgs(ctx),
+      '--symbol',
+      symbol,
+      '--intervals',
+      (options.intervals ?? data.indicatorIntervals).join(','),
+      // 命令行没显式给 specs 时下发**配置里的缺省**，因此两边永远看到同一份。
+      '--indicator-specs',
+      JSON.stringify(options.specs ?? data.indicatorSpecs),
+      '--indicator-batch-bars',
+      String(data.indicatorBatchBars),
+      ...(options.from === undefined ? [] : ['--from', String(options.from)]),
+      ...(options.to === undefined ? [] : ['--to', String(options.to)]),
+      ...(mode.rebuild ? ['--rebuild'] : []),
+      ...(mode.check ? ['--check'] : []),
+    ],
+    withDsn: true,
+  });
+}
+
+// ------------------------------------------------------------------ 回测（v0.3.0）
+
+export interface BacktestResult {
+  symbol: string;
+  interval: string;
+  intervalMs: number;
+  bars: number;
+  strategy: string;
+  params: Record<string, number>;
+  /** 成交模型标识：``signal-at-close-t-fill-at-open-t+1``（R-2.3） */
+  fills: { model: string };
+  equity: Array<{ time: number; equity: number; drawdown: number }>;
+  trades: Array<{
+    entryTime: number;
+    exitTime: number;
+    entryPrice: number;
+    exitPrice: number;
+    quantity: number;
+    pnl: number;
+    reason: string;
+  }>;
+  metrics: {
+    total_return: number;
+    cagr: number;
+    volatility: number;
+    sharpe: number;
+    max_drawdown: number;
+    trade_count: number;
+    win_rate: number;
+  };
+}
+
+export interface BacktestRequest {
+  symbol: string;
+  interval: string;
+  bars: number;
+  fast: number;
+  slow: number;
+  initialCapital: number;
+  feeRate: number;
+  slippageRate: number;
+}
+
+/**
+ * 跑一次回测并返回结果（v0.3.0 R-7.4）。
+ *
+ * 回测实现整体迁到 Python，**TS 侧不再有任何指标与引擎代码**——两侧各有一份 `sma`
+ * 就会在浮点舍入上分叉，而症状是「回测赚钱、实盘不赚」且几乎无法定位（R-1）。
+ *
+ * 合成数据路径在 Python 进程内生成并消费，K 线不经 stdout（R-7.2）。
+ */
+export async function runBacktest(
+  ctx: MarketContext,
+  request: BacktestRequest,
+): Promise<BacktestResult> {
+  return invoke<BacktestResult>(ctx, {
+    // 回测不需要 PG：不注入 DSN，进一步缩小凭证暴露面。
+    withDsn: false,
+    args: [
+      'backtest',
+      '--symbol',
+      request.symbol,
+      '--interval',
+      request.interval,
+      '--bars',
+      String(request.bars),
+      '--fast',
+      String(request.fast),
+      '--slow',
+      String(request.slow),
+      '--initial-capital',
+      String(request.initialCapital),
+      '--fee-rate',
+      String(request.feeRate),
+      '--slippage-rate',
+      String(request.slippageRate),
+    ],
+  });
+}
+
 // ------------------------------------------------------------------ 元数据
 
 export interface ExchangeSymbol extends ContractSpec {
@@ -211,6 +382,7 @@ function syncArgs(ctx: MarketContext, symbol: string, options: SyncOptions): str
     ...metadataArgs(ctx),
     '--intervals',
     (options.aggregateIntervals ?? data.aggregateIntervals).join(','),
+    ...indicatorArgs(ctx),
     ...(options.from === undefined ? [] : ['--from', String(options.from)]),
     ...(options.to === undefined ? [] : ['--to', String(options.to)]),
     ...(options.nowMs === undefined ? [] : ['--now-ms', String(options.nowMs)]),
@@ -262,6 +434,7 @@ export async function backfillRange(
       ...metadataArgs(ctx),
       '--intervals',
       (options.aggregateIntervals ?? ctx.config.data.aggregateIntervals).join(','),
+      ...indicatorArgs(ctx),
       ...(options.nowMs === undefined ? [] : ['--now-ms', String(options.nowMs)]),
     ],
     withDsn: true,

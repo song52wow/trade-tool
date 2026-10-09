@@ -1,4 +1,0 @@
-{
-  "extends": "@trade-tool/tsconfig/node-library.json",
-  "include": ["src", "tests"]
-}

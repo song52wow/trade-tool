@@ -118,6 +118,21 @@ function fakeDeps(overrides: Partial<WebDeps> = {}): WebDeps & { calls: string[]
         { time: NOW, open: 1.5, high: 2.5, low: 1, close: 2, volume: 12 },
       ];
     },
+    listIndicators: async (symbol, options) => {
+      calls.push(`indicators:${symbol}:${String(options.limit)}:${options.interval}`);
+      return {
+        symbol,
+        interval: options.interval,
+        intervalMs: options.interval === '1h' ? 3_600_000 : 900_000,
+        limit: options.limit,
+        implVersion: 1,
+        specs: [],
+        shortBy: { bars: 0, reason: null },
+        state: 'ok',
+        message: null,
+        materializeCommand: null,
+      };
+    },
     estimate: async (symbol) => {
       calls.push(`estimate:${symbol}`);
       return {

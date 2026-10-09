@@ -23,9 +23,6 @@ importers:
 
   apps/cli:
     dependencies:
-      '@trade-tool/backtest':
-        specifier: workspace:*
-        version: link:../../packages/backtest
       '@trade-tool/core':
         specifier: workspace:*
         version: link:../../packages/core
@@ -48,6 +45,31 @@ importers:
       typescript:
         specifier: ^5.7.0
         version: 5.9.3
+
+  apps/executor:
+    dependencies:
+      '@trade-tool/core':
+        specifier: workspace:*
+        version: link:../../packages/core
+      '@trade-tool/data':
+        specifier: workspace:*
+        version: link:../../packages/data
+    devDependencies:
+      '@trade-tool/tsconfig':
+        specifier: workspace:*
+        version: link:../../packages/tsconfig
+      tsup:
+        specifier: ^8.3.0
+        version: 8.5.1(postcss@8.5.28)(tsx@4.23.15)(typescript@5.9.3)
+      tsx:
+        specifier: ^4.19.0
+        version: 4.23.15
+      typescript:
+        specifier: ^5.7.0
+        version: 5.9.3
+      vitest:
+        specifier: ^2.1.0
+        version: 2.1.9(@types/node@24.19.0)(jsdom@30.1.1)
 
   apps/sync:
     dependencies:
@@ -131,25 +153,6 @@ importers:
       vite:
         specifier: ^5.4.21
         version: 5.4.21(@types/node@24.19.0)
-      vitest:
-        specifier: ^2.1.0
-        version: 2.1.9(@types/node@24.19.0)(jsdom@30.1.1)
-
-  packages/backtest:
-    dependencies:
-      '@trade-tool/core':
-        specifier: workspace:*
-        version: link:../core
-    devDependencies:
-      '@trade-tool/tsconfig':
-        specifier: workspace:*
-        version: link:../tsconfig
-      tsup:
-        specifier: ^8.3.0
-        version: 8.5.1(postcss@8.5.28)(tsx@4.23.15)(typescript@5.9.3)
-      typescript:
-        specifier: ^5.7.0
-        version: 5.9.3
       vitest:
         specifier: ^2.1.0
         version: 2.1.9(@types/node@24.19.0)(jsdom@30.1.1)

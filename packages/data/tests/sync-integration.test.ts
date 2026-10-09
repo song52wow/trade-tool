@@ -34,6 +34,19 @@ import { createTestSchema, TEST_PG, type TestSchema } from './helpers/pg.js';
 
 const MINUTE = 60_000;
 const NOW = 1_760_000_000_000;
+/**
+ * 本文件每个用例的默认超时。
+ *
+ * 它**不是**「放宽以免卡死」，而是按工作量给的预算：这里每个用例都要串一遍
+ * 真实的 TS → `python -m quant_data` → PG 接缝，`batchSize` 又被刻意设成 200
+ * （为了走多批路径），所以单次全量在本机就要几十秒。v0.3.0 起每个 1m 写入批次还要额外
+ * 物化一次指标（R-5.1），耗时约翻倍。
+ *
+ * 关键在于**超时要够**：一个用例超时后，它 spawn 出去的 Python 子进程仍然持着单写者
+ * advisory lock，于是后续所有用例都以 `SYNC_ALREADY_RUNNING` 瞬间失败——一次超时会
+ * 级联成一整片的红，而真正的起因只有最早那一条。
+ */
+const SYNC_TIMEOUT = 300_000;
 const SYMBOLS = ['TESTAAAUSDC', 'TESTBBBUSDC', 'TESTCCCUSDC'] as const;
 
 let exchange: MockExchange;
@@ -92,7 +105,7 @@ async function resetExchange(): Promise<void> {
 }
 
 describe('元数据运行时解析（R-7 / AC-13 / AC-14）', () => {
-  it('AC-14 列出运行时发现的标的，纯 JSON', async () => {
+  it('AC-14 列出运行时发现的标的，纯 JSON', { timeout: SYNC_TIMEOUT }, async () => {
     await resetExchange();
     const result = await listExchangeSymbols(market, { refresh: true });
     expect(result.count).toBe(SYMBOLS.length);
@@ -135,39 +148,43 @@ describe('元数据运行时解析（R-7 / AC-13 / AC-14）', () => {
     }
   });
 
-  it('AC-13 未知标的报 SYMBOL_NOT_FOUND', async () => {
+  it('AC-13 未知标的报 SYMBOL_NOT_FOUND', { timeout: SYNC_TIMEOUT }, async () => {
     await resetExchange();
     await expect(resolveContract(market, 'NOSUCHUSDC')).rejects.toMatchObject({
       code: 'SYMBOL_NOT_FOUND',
     });
   });
 
-  it('R-7.2 非永续 / 非 TRADING 分别报 NOT_PERPETUAL / NOT_TRADING', async () => {
-    await resetExchange();
-    exchange.setSymbols([
-      {
-        symbol: 'TESTAAAUSDC',
-        contractType: 'PERPETUAL',
-        status: 'TRADING',
-        onboardDate: NOW - 30 * 86_400_000,
-      },
-      {
-        symbol: 'TESTBBBUSDC',
-        contractType: 'CURRENT_QUARTER',
-        status: 'TRADING',
-        onboardDate: NOW,
-      },
-      { symbol: 'TESTCCCUSDC', contractType: 'PERPETUAL', status: 'HALT', onboardDate: NOW },
-    ]);
-    await expect(requireContract(market, 'TESTBBBUSDC')).rejects.toMatchObject({
-      code: 'NOT_PERPETUAL',
-    });
-    await expect(requireContract(market, 'TESTCCCUSDC')).rejects.toMatchObject({
-      code: 'NOT_TRADING',
-    });
-  });
+  it(
+    'R-7.2 非永续 / 非 TRADING 分别报 NOT_PERPETUAL / NOT_TRADING',
+    { timeout: SYNC_TIMEOUT },
+    async () => {
+      await resetExchange();
+      exchange.setSymbols([
+        {
+          symbol: 'TESTAAAUSDC',
+          contractType: 'PERPETUAL',
+          status: 'TRADING',
+          onboardDate: NOW - 30 * 86_400_000,
+        },
+        {
+          symbol: 'TESTBBBUSDC',
+          contractType: 'CURRENT_QUARTER',
+          status: 'TRADING',
+          onboardDate: NOW,
+        },
+        { symbol: 'TESTCCCUSDC', contractType: 'PERPETUAL', status: 'HALT', onboardDate: NOW },
+      ]);
+      await expect(requireContract(market, 'TESTBBBUSDC')).rejects.toMatchObject({
+        code: 'NOT_PERPETUAL',
+      });
+      await expect(requireContract(market, 'TESTCCCUSDC')).rejects.toMatchObject({
+        code: 'NOT_TRADING',
+      });
+    },
+  );
 
-  it('R-7.1 exchangeInfo 走单例缓存，不按标的重拉', async () => {
+  it('R-7.1 exchangeInfo 走单例缓存，不按标的重拉', { timeout: SYNC_TIMEOUT }, async () => {
     await resetExchange();
     const before = exchange.requests.exchangeInfo;
     await resolveContract(market, 'TESTAAAUSDC');
@@ -180,30 +197,34 @@ describe('元数据运行时解析（R-7 / AC-13 / AC-14）', () => {
 });
 
 describe('首次全量与增量续传（R-8 / R-9 / AC-2 / AC-3）', () => {
-  it('AC-2 首次从运行时 onboardDate 起全量，并暴露规模预估', async () => {
-    await resetExchange();
-    const spec = await requireContract(market, 'TESTAAAUSDC');
-    const estimate = await estimateFirstPull(market, 'TESTAAAUSDC', { nowMs: NOW });
-    // 首次起点来自运行时 onboardDate（对齐到 1m 边界），不是任何硬编码值
-    expect(Math.ceil(estimate.from / MINUTE) * MINUTE).toBe(
-      Math.ceil(spec.onboardDate / MINUTE) * MINUTE,
-    );
-    expect(estimate.bars).toBeGreaterThan(0);
-    expect(estimate.requests).toBeGreaterThan(0);
-    expect(estimate.estimatedMs).toBeGreaterThan(0);
+  it(
+    'AC-2 首次从运行时 onboardDate 起全量，并暴露规模预估',
+    { timeout: SYNC_TIMEOUT },
+    async () => {
+      await resetExchange();
+      const spec = await requireContract(market, 'TESTAAAUSDC');
+      const estimate = await estimateFirstPull(market, 'TESTAAAUSDC', { nowMs: NOW });
+      // 首次起点来自运行时 onboardDate（对齐到 1m 边界），不是任何硬编码值
+      expect(Math.ceil(estimate.from / MINUTE) * MINUTE).toBe(
+        Math.ceil(spec.onboardDate / MINUTE) * MINUTE,
+      );
+      expect(estimate.bars).toBeGreaterThan(0);
+      expect(estimate.requests).toBeGreaterThan(0);
+      expect(estimate.estimatedMs).toBeGreaterThan(0);
 
-    const run = await syncSymbol(market, 'TESTAAAUSDC', { nowMs: NOW });
-    expect(run.added).toBeGreaterThan(0);
-    expect(run.estimate).toBeDefined();
-    expect(run.writeStrategy).toBe('upsert');
+      const run = await syncSymbol(market, 'TESTAAAUSDC', { nowMs: NOW });
+      expect(run.added).toBeGreaterThan(0);
+      expect(run.estimate).toBeDefined();
+      expect(run.writeStrategy).toBe('upsert');
 
-    // 数据从 onboardDate 开始，且到最后一根已收盘 bar 为止
-    const stored = await readBars(ctx.pool, 'TESTAAAUSDC', { limit: 200_000 });
-    expect(stored.length).toBe(run.added);
-    expect(stored[0]?.time).toBe(Math.ceil(spec.onboardDate / MINUTE) * MINUTE);
-  });
+      // 数据从 onboardDate 开始，且到最后一根已收盘 bar 为止
+      const stored = await readBars(ctx.pool, 'TESTAAAUSDC', { limit: 200_000 });
+      expect(stored.length).toBe(run.added);
+      expect(stored[0]?.time).toBe(Math.ceil(spec.onboardDate / MINUTE) * MINUTE);
+    },
+  );
 
-  it('AC-4 只存已收盘 bar：库内最后一根 closeTime <= now', async () => {
+  it('AC-4 只存已收盘 bar：库内最后一根 closeTime <= now', { timeout: SYNC_TIMEOUT }, async () => {
     await resetExchange();
     await syncSymbol(market, 'TESTAAAUSDC', { nowMs: NOW });
     const stored = await readBars(ctx.pool, 'TESTAAAUSDC', { limit: 200_000 });
@@ -213,7 +234,7 @@ describe('首次全量与增量续传（R-8 / R-9 / AC-2 / AC-3）', () => {
     expect((last?.time ?? 0) + MINUTE - 1).toBeLessThanOrEqual(NOW);
   });
 
-  it('AC-3 再次执行 → added = 0，水位不动，更早历史未改', async () => {
+  it('AC-3 再次执行 → added = 0，水位不动，更早历史未改', { timeout: SYNC_TIMEOUT }, async () => {
     await resetExchange();
     const first = await syncSymbol(market, 'TESTAAAUSDC', { nowMs: NOW });
     expect(first.added).toBeGreaterThan(0);
@@ -230,42 +251,50 @@ describe('首次全量与增量续传（R-8 / R-9 / AC-2 / AC-3）', () => {
     expect(earlyAfter).toEqual(earlyBefore);
   });
 
-  it('AC-3 增量请求起点 = max(time)，不加 60_000（重拉最后一根）', async () => {
-    await resetExchange();
-    await syncSymbol(market, 'TESTAAAUSDC', { nowMs: NOW });
-    const maxTime = (await watermark(ctx.pool, 'TESTAAAUSDC')).maxTime ?? 0;
+  it(
+    'AC-3 增量请求起点 = max(time)，不加 60_000（重拉最后一根）',
+    { timeout: SYNC_TIMEOUT },
+    async () => {
+      await resetExchange();
+      await syncSymbol(market, 'TESTAAAUSDC', { nowMs: NOW });
+      const maxTime = (await watermark(ctx.pool, 'TESTAAAUSDC')).maxTime ?? 0;
 
-    exchange.klineRequests.length = 0;
-    await syncSymbol(market, 'TESTAAAUSDC', { nowMs: NOW });
-    const requests = exchange.klineRequests.filter((r) => r.symbol === 'TESTAAAUSDC');
-    expect(requests.length).toBeGreaterThan(0);
-    // 起点必须正好是 max(time)——这正是「最后一根被重拉并覆盖」的实现方式
-    expect(requests[0]?.startTime).toBe(maxTime);
-  });
+      exchange.klineRequests.length = 0;
+      await syncSymbol(market, 'TESTAAAUSDC', { nowMs: NOW });
+      const requests = exchange.klineRequests.filter((r) => r.symbol === 'TESTAAAUSDC');
+      expect(requests.length).toBeGreaterThan(0);
+      // 起点必须正好是 max(time)——这正是「最后一根被重拉并覆盖」的实现方式
+      expect(requests[0]?.startTime).toBe(maxTime);
+    },
+  );
 
-  it('AC-30 库里最后一根被篡改后，重跑 sync 会被重拉覆盖修正', async () => {
-    await resetExchange();
-    await syncSymbol(market, 'TESTAAAUSDC', { nowMs: NOW });
-    const before = await readBars(ctx.pool, 'TESTAAAUSDC', { limit: 200_000 });
-    const last = before[before.length - 1];
-    const secondLast = before[before.length - 2];
+  it(
+    'AC-30 库里最后一根被篡改后，重跑 sync 会被重拉覆盖修正',
+    { timeout: SYNC_TIMEOUT },
+    async () => {
+      await resetExchange();
+      await syncSymbol(market, 'TESTAAAUSDC', { nowMs: NOW });
+      const before = await readBars(ctx.pool, 'TESTAAAUSDC', { limit: 200_000 });
+      const last = before[before.length - 1];
+      const secondLast = before[before.length - 2];
 
-    // 人为写入错误值
-    await ctx.pool.query('UPDATE klines_1m SET close = $3 WHERE symbol = $1 AND time = $2', [
-      'TESTAAAUSDC',
-      last?.time,
-      999999,
-    ]);
+      // 人为写入错误值
+      await ctx.pool.query('UPDATE klines_1m SET close = $3 WHERE symbol = $1 AND time = $2', [
+        'TESTAAAUSDC',
+        last?.time,
+        999999,
+      ]);
 
-    await syncSymbol(market, 'TESTAAAUSDC', { nowMs: NOW });
+      await syncSymbol(market, 'TESTAAAUSDC', { nowMs: NOW });
 
-    const after = await readBars(ctx.pool, 'TESTAAAUSDC', { limit: 200_000 });
-    const fixedLast = after[after.length - 1];
-    expect(fixedLast?.close).toBe(last?.close);
-    expect(fixedLast?.close).not.toBe(999999);
-    // 更早的行不受影响
-    expect(after[after.length - 2]?.close).toBe(secondLast?.close);
-  });
+      const after = await readBars(ctx.pool, 'TESTAAAUSDC', { limit: 200_000 });
+      const fixedLast = after[after.length - 1];
+      expect(fixedLast?.close).toBe(last?.close);
+      expect(fixedLast?.close).not.toBe(999999);
+      // 更早的行不受影响
+      expect(after[after.length - 2]?.close).toBe(secondLast?.close);
+    },
+  );
 
   // 预算按工作量单独给，不动 vitest.config.ts 的全局 30s：
   // 本用例串行做三个标的的首次全量（onboardDate 分别在 30 / 120 / 7 天前，
@@ -274,7 +303,14 @@ describe('首次全量与增量续传（R-8 / R-9 / AC-2 / AC-3）', () => {
   // 抬高全局值会让真正卡死的用例也要等两分钟才暴露，因此只放宽这一个。
   // 另外它只能证明「起点来自运行时元数据」，用不着把数据量砍小来换时间——
   // 砍小反而会弱化「起点互不相同」这条断言的前提。
-  it('AC-10 多标的全量都成功，起点各按自己的 onboardDate', async () => {
+  // v0.3.0 让每个 1m 写入批次额外物化一次指标（R-5.1：写 1m → 聚合 → 物化指标 → 提交，
+  // 同一事务），因此三个标的的全量比改动前多花约一倍的时间。这不是卡死，是多做了一份
+  // 真实工作，所以**只放宽这一个用例的上限**，而不是抬高全局超时——那会让真正卡死的
+  // 用例也要等两分钟才暴露。
+  // 这一个用例的预算比 SYNC_TIMEOUT 更大：它串行做**三个**标的的首次全量
+  //（onboardDate 分别在 30 / 120 / 7 天前，合计约 22.6 万根 bar、1130 次 mock 请求），
+  // 实测本机约 5.4 分钟。SYNC_TIMEOUT（300s）是给单标的用例的，这里差了一截。
+  it('AC-10 多标的全量都成功，起点各按自己的 onboardDate', { timeout: 600_000 }, async () => {
     await resetExchange();
     const starts = new Map<string, number>();
     for (const symbol of SYMBOLS) {
@@ -287,11 +323,11 @@ describe('首次全量与增量续传（R-8 / R-9 / AC-2 / AC-3）', () => {
     }
     // 三个标的的起点互不相同：证明起点真的来自运行时元数据
     expect(new Set(starts.values()).size).toBe(SYMBOLS.length);
-  }, 120_000);
+  });
 });
 
 describe('幂等与写策略（R-12 / AC-5 / AC-31）', () => {
-  it('AC-5 对同一区间重复 backfill，行数不变、无重复行', async () => {
+  it('AC-5 对同一区间重复 backfill，行数不变、无重复行', { timeout: SYNC_TIMEOUT }, async () => {
     await resetExchange();
     await syncSymbol(market, 'TESTAAAUSDC', { nowMs: NOW });
     const before = await watermark(ctx.pool, 'TESTAAAUSDC');
@@ -314,56 +350,69 @@ describe('幂等与写策略（R-12 / AC-5 / AC-31）', () => {
     expect(Number(dupes.rows[0]?.n)).toBe(0);
   });
 
-  it('R-9.3 指定早于 max(time) 的区间退化为 DO NOTHING，不覆盖已有行', async () => {
-    await resetExchange();
-    await syncSymbol(market, 'TESTAAAUSDC', { nowMs: NOW });
-    const stored = await readBars(ctx.pool, 'TESTAAAUSDC', { limit: 200_000 });
-    const target = stored[10];
-    expect(target).toBeDefined();
+  it(
+    'R-9.3 指定早于 max(time) 的区间退化为 DO NOTHING，不覆盖已有行',
+    { timeout: SYNC_TIMEOUT },
+    async () => {
+      await resetExchange();
+      await syncSymbol(market, 'TESTAAAUSDC', { nowMs: NOW });
+      const stored = await readBars(ctx.pool, 'TESTAAAUSDC', { limit: 200_000 });
+      const target = stored[10];
+      expect(target).toBeDefined();
 
-    // 篡改一根「更早」的 bar，然后回补同一区间：DO NOTHING 不应改回它
-    await ctx.pool.query('UPDATE klines_1m SET close = 12345 WHERE symbol = $1 AND time = $2', [
-      'TESTAAAUSDC',
-      target?.time,
-    ]);
-    const maxTime = (await watermark(ctx.pool, 'TESTAAAUSDC')).maxTime ?? 0;
-    const run = await backfillRange(
-      market,
-      'TESTAAAUSDC',
-      { from: (target?.time ?? 0) - 2 * MINUTE, to: (target?.time ?? 0) + 2 * MINUTE },
-      { nowMs: NOW },
-    );
-    expect(run.writeStrategy).toBe('do-nothing');
-    const after = await readBars(ctx.pool, 'TESTAAAUSDC', { from: target?.time, to: target?.time });
-    expect(after[0]?.close).toBe(12345);
-    expect((await watermark(ctx.pool, 'TESTAAAUSDC')).maxTime).toBe(maxTime);
-  });
+      // 篡改一根「更早」的 bar，然后回补同一区间：DO NOTHING 不应改回它
+      await ctx.pool.query('UPDATE klines_1m SET close = 12345 WHERE symbol = $1 AND time = $2', [
+        'TESTAAAUSDC',
+        target?.time,
+      ]);
+      const maxTime = (await watermark(ctx.pool, 'TESTAAAUSDC')).maxTime ?? 0;
+      const run = await backfillRange(
+        market,
+        'TESTAAAUSDC',
+        { from: (target?.time ?? 0) - 2 * MINUTE, to: (target?.time ?? 0) + 2 * MINUTE },
+        { nowMs: NOW },
+      );
+      expect(run.writeStrategy).toBe('do-nothing');
+      const after = await readBars(ctx.pool, 'TESTAAAUSDC', {
+        from: target?.time,
+        to: target?.time,
+      });
+      expect(after[0]?.close).toBe(12345);
+      expect((await watermark(ctx.pool, 'TESTAAAUSDC')).maxTime).toBe(maxTime);
+    },
+  );
 
-  it('AC-31 交易所忽略 startTime 时抛 BACKFILL_BOUNDARY_VIOLATION，历史未被改写', async () => {
-    await resetExchange();
-    await syncSymbol(market, 'TESTAAAUSDC', { nowMs: NOW });
-    const beforeCount = (await watermark(ctx.pool, 'TESTAAAUSDC')).rows;
-    const beforeEarly = (await readBars(ctx.pool, 'TESTAAAUSDC', { limit: 30 })).map(
-      (b) => b.close,
-    );
+  it(
+    'AC-31 交易所忽略 startTime 时抛 BACKFILL_BOUNDARY_VIOLATION，历史未被改写',
+    { timeout: SYNC_TIMEOUT },
+    async () => {
+      await resetExchange();
+      await syncSymbol(market, 'TESTAAAUSDC', { nowMs: NOW });
+      const beforeCount = (await watermark(ctx.pool, 'TESTAAAUSDC')).rows;
+      const beforeEarly = (await readBars(ctx.pool, 'TESTAAAUSDC', { limit: 30 })).map(
+        (b) => b.close,
+      );
 
-    // 把交易所返回的所有 bar 时间整体前移，模拟它无视 startTime 返回了更早的数据
-    exchange.shiftAllTimes('TESTAAAUSDC', -10 * 24 * 60 * MINUTE);
+      // 把交易所返回的所有 bar 时间整体前移，模拟它无视 startTime 返回了更早的数据
+      exchange.shiftAllTimes('TESTAAAUSDC', -10 * 24 * 60 * MINUTE);
 
-    await expect(
-      syncSymbol(market, 'TESTAAAUSDC', { from: NOW - 5 * MINUTE, to: NOW, nowMs: NOW }),
-    ).rejects.toMatchObject({ code: 'BACKFILL_BOUNDARY_VIOLATION' });
+      await expect(
+        syncSymbol(market, 'TESTAAAUSDC', { from: NOW - 5 * MINUTE, to: NOW, nowMs: NOW }),
+      ).rejects.toMatchObject({ code: 'BACKFILL_BOUNDARY_VIOLATION' });
 
-    exchange.shiftAllTimes('TESTAAAUSDC', 0);
-    // 已有历史一条未动
-    expect((await watermark(ctx.pool, 'TESTAAAUSDC')).rows).toBe(beforeCount);
-    const afterEarly = (await readBars(ctx.pool, 'TESTAAAUSDC', { limit: 30 })).map((b) => b.close);
-    expect(afterEarly).toEqual(beforeEarly);
-  });
+      exchange.shiftAllTimes('TESTAAAUSDC', 0);
+      // 已有历史一条未动
+      expect((await watermark(ctx.pool, 'TESTAAAUSDC')).rows).toBe(beforeCount);
+      const afterEarly = (await readBars(ctx.pool, 'TESTAAAUSDC', { limit: 30 })).map(
+        (b) => b.close,
+      );
+      expect(afterEarly).toEqual(beforeEarly);
+    },
+  );
 });
 
 describe('缺口检测与自动回补（R-11 / AC-7 / AC-32）', () => {
-  it('AC-7 人为删行后自动补回，gaps 表被清空', async () => {
+  it('AC-7 人为删行后自动补回，gaps 表被清空', { timeout: SYNC_TIMEOUT }, async () => {
     await resetExchange();
     await syncSymbol(market, 'TESTAAAUSDC', { nowMs: NOW });
     const before = await readBars(ctx.pool, 'TESTAAAUSDC', { limit: 200_000 });
@@ -394,59 +443,62 @@ describe('缺口检测与自动回补（R-11 / AC-7 / AC-32）', () => {
     expect(after.map((b) => b.time)).toEqual(before.map((b) => b.time));
   });
 
-  it('AC-7 永久不可补的缺口达 maxGapAttempts 后该标的进 error，不再无限重试', async () => {
-    await resetExchange();
-    await syncSymbol(market, 'TESTAAAUSDC', { nowMs: NOW });
-    const before = await readBars(ctx.pool, 'TESTAAAUSDC', { limit: 200_000 });
-    const victim = before.slice(before.length - 300, before.length - 297);
-    await ctx.pool.query(`DELETE FROM klines_1m WHERE symbol = $1 AND time >= $2 AND time <= $3`, [
-      'TESTAAAUSDC',
-      victim[0]?.time,
-      victim[victim.length - 1]?.time,
-    ]);
+  it(
+    'AC-7 永久不可补的缺口达 maxGapAttempts 后该标的进 error，不再无限重试',
+    { timeout: SYNC_TIMEOUT },
+    async () => {
+      await resetExchange();
+      await syncSymbol(market, 'TESTAAAUSDC', { nowMs: NOW });
+      const before = await readBars(ctx.pool, 'TESTAAAUSDC', { limit: 200_000 });
+      const victim = before.slice(before.length - 300, before.length - 297);
+      await ctx.pool.query(
+        `DELETE FROM klines_1m WHERE symbol = $1 AND time >= $2 AND time <= $3`,
+        ['TESTAAAUSDC', victim[0]?.time, victim[victim.length - 1]?.time],
+      );
 
-    // 第一轮：缺口被检测并登记。
-    // 这里刻意关掉回补：交易所此刻还是好的，若允许回补则缺口会在**同一轮**就被补掉（★AC-7），
-    // 后面「交易所持续失败 → 永远补不上」的前提就不成立了。
-    const detect = await syncSymbol(market, 'TESTAAAUSDC', {
-      nowMs: NOW,
-      allowBackfill: false,
-    });
-    expect(detect.gapsPending).toBe(1);
-    expect(detect.gapsFilled).toBe(0);
+      // 第一轮：缺口被检测并登记。
+      // 这里刻意关掉回补：交易所此刻还是好的，若允许回补则缺口会在**同一轮**就被补掉（★AC-7），
+      // 后面「交易所持续失败 → 永远补不上」的前提就不成立了。
+      const detect = await syncSymbol(market, 'TESTAAAUSDC', {
+        nowMs: NOW,
+        allowBackfill: false,
+      });
+      expect(detect.gapsPending).toBe(1);
+      expect(detect.gapsFilled).toBe(0);
 
-    // 此后交易所对该标的持续失败 → 缺口永远补不上
-    exchange.failKlines('TESTAAAUSDC', {
-      kind: 'http',
-      status: 500,
-      body: { code: -1000, msg: 'boom' },
-    });
-    for (let i = 0; i < 6; i += 1) {
-      await syncSymbol(market, 'TESTAAAUSDC', { nowMs: NOW }).catch(() => undefined);
-    }
+      // 此后交易所对该标的持续失败 → 缺口永远补不上
+      exchange.failKlines('TESTAAAUSDC', {
+        kind: 'http',
+        status: 500,
+        body: { code: -1000, msg: 'boom' },
+      });
+      for (let i = 0; i < 6; i += 1) {
+        await syncSymbol(market, 'TESTAAAUSDC', { nowMs: NOW }).catch(() => undefined);
+      }
 
-    const gaps = await getGaps(market, 'TESTAAAUSDC');
-    expect(gaps.length).toBe(1);
-    // 尝试次数有上限，不会无限增长（R-11.9）
-    expect(gaps[0]?.attempts).toBeGreaterThan(0);
-    expect(gaps[0]?.attempts).toBeLessThanOrEqual(config.data.maxGapAttempts + 1);
-    expect(gaps[0]?.lastError).toBeTruthy();
+      const gaps = await getGaps(market, 'TESTAAAUSDC');
+      expect(gaps.length).toBe(1);
+      // 尝试次数有上限，不会无限增长（R-11.9）
+      expect(gaps[0]?.attempts).toBeGreaterThan(0);
+      expect(gaps[0]?.attempts).toBeLessThanOrEqual(config.data.maxGapAttempts + 1);
+      expect(gaps[0]?.lastError).toBeTruthy();
 
-    const state = await ctx.pool.query<{ status: string }>(
-      `SELECT status FROM sync_state WHERE exchange = 'binance' AND symbol = 'TESTAAAUSDC'`,
-    );
-    expect(state.rows[0]?.status).toBe('error');
+      const state = await ctx.pool.query<{ status: string }>(
+        `SELECT status FROM sync_state WHERE exchange = 'binance' AND symbol = 'TESTAAAUSDC'`,
+      );
+      expect(state.rows[0]?.status).toBe('error');
 
-    // 人工兜底入口仍然可用（R-11.12 / R-15.2）
-    exchange.clearFailures();
-    const manual = await backfillRange(
-      market,
-      'TESTAAAUSDC',
-      { from: victim[0]?.time ?? 0, to: victim[victim.length - 1]?.time ?? 0 },
-      { nowMs: NOW },
-    );
-    expect(manual.added).toBe(victim.length);
-  });
+      // 人工兜底入口仍然可用（R-11.12 / R-15.2）
+      exchange.clearFailures();
+      const manual = await backfillRange(
+        market,
+        'TESTAAAUSDC',
+        { from: victim[0]?.time ?? 0, to: victim[victim.length - 1]?.time ?? 0 },
+        { nowMs: NOW },
+      );
+      expect(manual.added).toBe(victim.length);
+    },
+  );
 
   /**
    * AC-32 缺口检测必须是**有界的**、不是每轮全表扫描。
@@ -463,55 +515,59 @@ describe('缺口检测与自动回补（R-11 / AC-7 / AC-32）', () => {
    *   ③ 窗口**外**的缺口例行轮次不检出，只有显式 `data verify` 全表扫描能发现
    *      （证明扫描成本有界、确实不是全表扫描）
    */
-  it('AC-32 缺口检测有界：窗口内可检出，窗口外只有 verify 全表扫描才发现', async () => {
-    const HOUR = 60 * MINUTE;
-    const DAY = 24 * HOUR;
-    await resetExchange();
-    await syncSymbol(market, 'TESTAAAUSDC', { nowMs: NOW });
-    const maxTime = (await watermark(ctx.pool, 'TESTAAAUSDC')).maxTime ?? 0;
+  it(
+    'AC-32 缺口检测有界：窗口内可检出，窗口外只有 verify 全表扫描才发现',
+    { timeout: SYNC_TIMEOUT },
+    async () => {
+      const HOUR = 60 * MINUTE;
+      const DAY = 24 * HOUR;
+      await resetExchange();
+      await syncSymbol(market, 'TESTAAAUSDC', { nowMs: NOW });
+      const maxTime = (await watermark(ctx.pool, 'TESTAAAUSDC')).maxTime ?? 0;
 
-    // ① 干净同步后基线推进到 max(time)
-    const clean = await ctx.pool.query<{ verified_upto: string }>(
-      `SELECT verified_upto FROM sync_state WHERE symbol = 'TESTAAAUSDC'`,
-    );
-    expect(Number(clean.rows[0]?.verified_upto)).toBe(maxTime);
+      // ① 干净同步后基线推进到 max(time)
+      const clean = await ctx.pool.query<{ verified_upto: string }>(
+        `SELECT verified_upto FROM sync_state WHERE symbol = 'TESTAAAUSDC'`,
+      );
+      expect(Number(clean.rows[0]?.verified_upto)).toBe(maxTime);
 
-    // ② 窗口内（近端 3 小时）的缺口：下一轮例行同步就能检出
-    const nearVictim = maxTime - 3 * HOUR;
-    await ctx.pool.query('DELETE FROM klines_1m WHERE symbol = $1 AND time = $2', [
-      'TESTAAAUSDC',
-      nearVictim,
-    ]);
-    // 一轮之内「检出并补回」（★AC-7）：pending 归零、filled 为 1。
-    const nearRound = await syncSymbol(market, 'TESTAAAUSDC', { nowMs: NOW });
-    expect(nearRound.gapsFilled).toBe(1);
-    expect(nearRound.gapsPending).toBe(0);
+      // ② 窗口内（近端 3 小时）的缺口：下一轮例行同步就能检出
+      const nearVictim = maxTime - 3 * HOUR;
+      await ctx.pool.query('DELETE FROM klines_1m WHERE symbol = $1 AND time = $2', [
+        'TESTAAAUSDC',
+        nearVictim,
+      ]);
+      // 一轮之内「检出并补回」（★AC-7）：pending 归零、filled 为 1。
+      const nearRound = await syncSymbol(market, 'TESTAAAUSDC', { nowMs: NOW });
+      expect(nearRound.gapsFilled).toBe(1);
+      expect(nearRound.gapsPending).toBe(0);
 
-    // ③ 窗口外（20 天前，超出 7 天默认回看）的缺口：例行轮次**不**检出
-    const farVictim = maxTime - 20 * DAY;
-    await ctx.pool.query('DELETE FROM klines_1m WHERE symbol = $1 AND time = $2', [
-      'TESTAAAUSDC',
-      farVictim,
-    ]);
-    const farRound = await syncSymbol(market, 'TESTAAAUSDC', { nowMs: NOW });
-    // 近端缺口已在上一轮当场补完，本轮例行扫描又回看不到远端那个洞 → 本轮无事可做
-    expect(farRound.gapsPending).toBe(0);
-    expect(farRound.gapsFilled).toBe(0);
-    // 20 天前那个洞仍在库里 —— 例行扫描没有回看到那么远，成本因此有界
-    const stillMissing = await ctx.pool.query<{ n: string }>(
-      'SELECT count(*)::bigint AS n FROM klines_1m WHERE symbol = $1 AND time = $2',
-      ['TESTAAAUSDC', farVictim],
-    );
-    expect(Number(stillMissing.rows[0]?.n)).toBe(0);
+      // ③ 窗口外（20 天前，超出 7 天默认回看）的缺口：例行轮次**不**检出
+      const farVictim = maxTime - 20 * DAY;
+      await ctx.pool.query('DELETE FROM klines_1m WHERE symbol = $1 AND time = $2', [
+        'TESTAAAUSDC',
+        farVictim,
+      ]);
+      const farRound = await syncSymbol(market, 'TESTAAAUSDC', { nowMs: NOW });
+      // 近端缺口已在上一轮当场补完，本轮例行扫描又回看不到远端那个洞 → 本轮无事可做
+      expect(farRound.gapsPending).toBe(0);
+      expect(farRound.gapsFilled).toBe(0);
+      // 20 天前那个洞仍在库里 —— 例行扫描没有回看到那么远，成本因此有界
+      const stillMissing = await ctx.pool.query<{ n: string }>(
+        'SELECT count(*)::bigint AS n FROM klines_1m WHERE symbol = $1 AND time = $2',
+        ['TESTAAAUSDC', farVictim],
+      );
+      expect(Number(stillMissing.rows[0]?.n)).toBe(0);
 
-    // 只有显式全表扫描（data verify）才能发现它 —— R-11.A3 ②
-    const verified = await verifySymbol(market, 'TESTAAAUSDC');
-    expect(verified.gapsFound).toBe(1);
-    // 全表扫描确实读了整段历史（远大于 7 天窗口）
-    expect(verified.scannedRows).toBeGreaterThan(20 * 24 * 60); // 20 天 = 28,800 根
-  });
+      // 只有显式全表扫描（data verify）才能发现它 —— R-11.A3 ②
+      const verified = await verifySymbol(market, 'TESTAAAUSDC');
+      expect(verified.gapsFound).toBe(1);
+      // 全表扫描确实读了整段历史（远大于 7 天窗口）
+      expect(verified.scannedRows).toBeGreaterThan(20 * 24 * 60); // 20 天 = 28,800 根
+    },
+  );
 
-  it('R-11.A3 data verify 做全表扫描并重建基线', async () => {
+  it('R-11.A3 data verify 做全表扫描并重建基线', { timeout: SYNC_TIMEOUT }, async () => {
     await resetExchange();
     await syncSymbol(market, 'TESTAAAUSDC', { nowMs: NOW });
     const result = await verifySymbol(market, 'TESTAAAUSDC');
@@ -522,7 +578,7 @@ describe('缺口检测与自动回补（R-11 / AC-7 / AC-32）', () => {
 });
 
 describe('桥接载荷（R-2.2 / AC-8）', () => {
-  it('AC-8 全量拉取的返回值只有小摘要，不含数据', async () => {
+  it('AC-8 全量拉取的返回值只有小摘要，不含数据', { timeout: SYNC_TIMEOUT }, async () => {
     await resetExchange();
     const run = await syncSymbol(market, 'TESTAAAUSDC', { nowMs: NOW });
     const serialized = JSON.stringify(run);
@@ -533,8 +589,13 @@ describe('桥接载荷（R-2.2 / AC-8）', () => {
     // estimate.bars 是一个**数字计数**，不是数据；它必须仍是标量
     expect(typeof run.estimate?.bars).toBe('number');
     expect(Array.isArray(run.estimate?.bars)).toBe(false);
-    // 4 万多根 bar 拉完后，摘要仍然很小——证明数据确实没走 stdout
-    expect(serialized.length).toBeLessThan(2_000);
+    // 4 万多根 bar 拉完后，摘要仍然很小——证明数据确实没走 stdout。
+    //
+    // 上界按「摘要的规模是 O(周期 × 参数集)的**计数**，不是 O(bar 数)」反推：v0.3.0
+    // 起摘要里多了 `indicators`（4 周期 × 缺省 10 个参数集 = 40 条），硬写 2000 字节
+    // 会把「摘要多了一个指标段」误报成「K 线泄漏」。而 bar 数据每根几十字节，
+    // 4 万根就是 MB 级——16 KiB 的上界仍然稳稳地把两者分开。
+    expect(serialized.length).toBeLessThan(16 * 1024);
     expect(run).toHaveProperty('added');
     expect(run).toHaveProperty('from');
     expect(run).toHaveProperty('to');

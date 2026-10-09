@@ -74,6 +74,89 @@ export const dataSchema = z.object({
    * 单事务会把 WAL 与锁持有时间推到不可接受。
    */
   aggregateBatchBars: z.number().int().positive().max(1_000_000).default(20_000),
+  /**
+   * 启用哪些**指标周期**（v0.3.0 R-9.5）。
+   *
+   * 只接受 `15m / 1h / 4h / 1d` 的任意子集；**出现 `1m` / `5m` / 其它一律 CONFIG_INVALID**。
+   * `1m` 不做指标物化是**容量结论**不是疏漏：单标的 1m 约 320 万行 × 缺省 10 个行集
+   * 约 4.3 GB/标的，而四个高周期合计约 386 MB/标的（N-2 / 附录 B.3）。
+   * `[]` = **显式关闭指标周期**，状态里会如实显示「未启用指标」。
+   *
+   * **不提供**「放宽」的开关：想看别的周期请先在派生层加表。
+   */
+  indicatorIntervals: z.array(z.enum(['15m', '1h', '4h', '1d'])).default(['15m', '1h', '4h', '1d']),
+  /**
+   * 要物化的「指标 × 参数集」集合（v0.3.0 R-12.1）。
+   *
+   * **参数是数据不是 schema**：把 `ma` 的窗口 5 改成 30、或加一组 `MACD(8,17,9)`，
+   * 都是「插新行、零 DDL」。因此这里刻意允许任意正整数窗口，不做枚举、不做 schema 校验。
+   *
+   * `kMilli` 是 BOLL 的 k 的**千分之一整数**（`2000` 表示 `k = 2.0`）：浮点参数不得进
+   * 主键，否则会有浮点相等性问题（R-3.2）。它是唯一允许 `0` 的参数（`k = 0` 时三轨重合）。
+   *
+   * **`{}`（全部为空对象）= 显式关闭指标层**——那是合法配置，用于「指标层故障、
+   * 但 1m 同步还要继续」。关闭状态必须从 `sync status` 与控制面**看得见**
+   * （R-11.4 / AC-23），而不是显示 0 行让人以为「还没算」。
+   *
+   * 缺省值必须与 `sql/005_indicators.sql` 的表集合一致，由 AC-2 的测试守住。
+   */
+  indicatorSpecs: z
+    .object({
+      ma: z
+        .array(
+          z.object({
+            kind: z.enum(['sma', 'ema']).default('sma'),
+            window: z.number().int().positive(),
+          }),
+        )
+        .default([]),
+      macd: z
+        .array(
+          z.object({
+            fast: z.number().int().positive(),
+            slow: z.number().int().positive(),
+            signal: z.number().int().positive(),
+          }),
+        )
+        .default([]),
+      rsi: z.array(z.object({ period: z.number().int().positive() })).default([]),
+      boll: z
+        .array(
+          z.object({ period: z.number().int().positive(), kMilli: z.number().int().nonnegative() }),
+        )
+        .default([]),
+      kdj: z
+        .array(
+          z.object({
+            n: z.number().int().positive(),
+            kPeriod: z.number().int().positive(),
+            dPeriod: z.number().int().positive(),
+          }),
+        )
+        .default([]),
+      atr: z.array(z.object({ period: z.number().int().positive() })).default([]),
+      obv: z.array(z.object({})).default([]),
+    })
+    .default({
+      ma: [
+        { kind: 'sma', window: 5 },
+        { kind: 'sma', window: 10 },
+        { kind: 'sma', window: 20 },
+        { kind: 'sma', window: 60 },
+      ],
+      macd: [{ fast: 12, slow: 26, signal: 9 }],
+      rsi: [{ period: 14 }],
+      boll: [{ period: 20, kMilli: 2000 }],
+      kdj: [{ n: 9, kPeriod: 3, dPeriod: 3 }],
+      atr: [{ period: 14 }],
+      obv: [{}],
+    }),
+  /**
+   * 指标补齐 / `--rebuild` 的分批大小（v0.3.0 R-6.3），每批一个事务。
+   * 单位是**派生 bar 数**而不是时间：按时间推进会让数据稀疏的标的（大量缺口 → 大量
+   * 短段）永远达不到批大小而**死循环**。
+   */
+  indicatorBatchBars: z.number().int().positive().max(1_000_000).default(20_000),
 });
 
 /**
@@ -147,6 +230,47 @@ export const syncSchema = z.object({
   onRemove: removePolicySchema.default('keep'),
 });
 
+/**
+ * 止盈止损执行服务配置（v0.4.0 `executor` 段）。
+ *
+ * 每一项都会变成**真实的平仓指令**，因此默认值取保守的一侧：
+ *   * `enabled` 缺省 **false**——服务会真实下单，不该因为「装了包」就在跑；
+ *   * `workingType` 缺省 `MARK_PRICE`（标记价触发，抗插针）；最新成交价一根针就能
+ *     把止损扫掉；
+ *   * `onPartialFill` 缺省 `ignore`：部分成交就按均价重算一次，等于让止损位在
+ *     建仓过程中被改写两次——要在部分成交上也保护，必须显式打开。
+ */
+export const executorSchema = z.object({
+  enabled: z.boolean().default(false),
+  /** ATR 周期长度。 */
+  atrPeriod: z.number().int().positive().max(200).default(14),
+  /** 算 ATR 的周期。`5m` / `2h` 等未实现周期由解析层报错，**不回落**到 1m。 */
+  atrInterval: z.enum(['1m', '15m', '1h', '4h', '1d']).default('1m'),
+  /** 参与计算的连续 K 根数上限。 */
+  atrWindowBars: z.number().int().positive().max(5_000).default(240),
+  /** 止损 = 入场价 ∓ 该倍数 × ATR。 */
+  stopAtrMult: z.number().positive().max(20).default(2),
+  /** 止盈 = 入场价 ± 该倍数 × ATR。 */
+  takeProfitAtrMult: z.number().positive().max(50).default(3),
+  /** 只服务这些标的；空数组 = 全部（**含库里出现但集合外的标的**）。 */
+  symbols: z.array(z.string().min(1)).default([]),
+  /** 买入成交只部分成交时怎么办。`ignore` = 等它全成交再设一次止盈止损。 */
+  onPartialFill: z.enum(['ignore', 'accumulate']).default('ignore'),
+  workingType: z.enum(['MARK_PRICE', 'CONTRACT_PRICE']).default('MARK_PRICE'),
+  /** 触发保护：标记价与最新价偏离过大时暂停触发。 */
+  priceProtect: z.boolean().default(true),
+  /** 单笔买入成交的成交金额上限（quote 计），超过则跳过并报错。0 = 不限。 */
+  maxEntryNotional: z.number().min(0).default(0),
+  /** 私钥的**环境变量名**。配置文件里不写密钥本身。 */
+  apiKeyEnv: z.string().min(1).default('TRADE_TOOL_BINANCE_API_KEY'),
+  apiSecretEnv: z.string().min(1).default('TRADE_TOOL_BINANCE_API_SECRET'),
+  /** 请求时间戳容忍窗口（毫秒）。太小会因本机时钟漂移而 -1021。 */
+  recvWindowMs: z.number().int().positive().max(60_000).default(5_000),
+  /** 重连退避：初始 / 上限。断线必须重连，否则服务会「看起来在跑」而实际不再设单。 */
+  reconnectBaseMs: z.number().int().positive().default(2_000),
+  reconnectMaxMs: z.number().int().positive().default(60_000),
+});
+
 export const configSchema = z.object({
   version: z.literal(1).default(1),
   market: marketSchema,
@@ -155,6 +279,7 @@ export const configSchema = z.object({
   data: dataSchema.default({}),
   database: databaseSchema.default({}),
   sync: syncSchema.default({}),
+  executor: executorSchema.default({}),
 });
 
 export type MarketConfig = z.infer<typeof marketSchema>;
@@ -162,6 +287,7 @@ export type BacktestConfig = z.infer<typeof backtestSchema>;
 export type DataConfig = z.infer<typeof dataSchema>;
 export type DatabaseConfig = z.infer<typeof databaseSchema>;
 export type SyncConfig = z.infer<typeof syncSchema>;
+export type ExecutorConfig = z.infer<typeof executorSchema>;
 // 注意：`RemovePolicy` 这个类型名归 market-sync.ts 所有，config 只导出 zod schema，
 // 避免同一概念在两个模块各有一个类型名。
 export type RemovePolicySchema = z.infer<typeof removePolicySchema>;

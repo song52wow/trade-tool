@@ -38,7 +38,14 @@ DSN_ENV = "TRADE_TOOL_PG_DSN"
 #: 而库超前时又会被完全放行——两种都属于 R-1.3 禁止的「按不匹配的 schema 继续运行」。
 #: 因此**新增迁移必须同步在这里登记**（这就是 AC-25 的「同提交更新两侧」）。
 KNOWN_MIGRATION_VERSIONS: frozenset[str] = frozenset(
-    {"001_init", "002_sync_plan", "003_daemon_heartbeat", "004_klines_agg"}
+    {
+        "001_init",
+        "002_sync_plan",
+        "003_daemon_heartbeat",
+        "004_klines_agg",
+        "005_indicators",
+        "006_risk_bracket",
+    }
 )
 
 REQUIRED_MIGRATION_VERSIONS: frozenset[str] = KNOWN_MIGRATION_VERSIONS
@@ -59,6 +66,15 @@ REQUIRED_TABLES: frozenset[str] = frozenset(
         "gaps",
         "symbols",
         "weight_budget",
+        # 指标表也在其中：它们是「指标 → 表」映射的一部分，缺表意味着物化与读侧
+        # 白名单都指向一张不存在的表（v0.3.0 R-3.1）。
+        "indicator_ma",
+        "indicator_macd",
+        "indicator_rsi",
+        "indicator_boll",
+        "indicator_kdj",
+        "indicator_atr",
+        "indicator_obv",
     }
 )
 

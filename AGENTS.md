@@ -39,18 +39,21 @@ pnpm check      # = build + TS 测试 + Python 测试
 
 ## 放置代码的位置
 
-| 新东西                                   | 放哪                                              |
-| ---------------------------------------- | ------------------------------------------------- |
-| 领域类型、配置 schema、策略接口          | `packages/core/src`                               |
-| 行情接入、缓存、Python 调用              | `packages/data/src`                               |
-| **数据库表结构 / 迁移**                  | **`packages/data/sql/`**（唯一来源）              |
-| PG 客户端、schema 闸门、查询层           | `packages/data/src/db`                            |
-| **派生周期（桶对齐 / 覆盖判据 / 聚合）** | **`python/packages/quant-data/src/aggregate.py`** |
-| 新策略                                   | `packages/backtest/src/strategies/`               |
-| 命令行命令                               | `apps/cli/src/commands/`                          |
-| 常驻同步、生命周期、控制原语             | `apps/sync/src`                                   |
-| 控制面 HTTP 路由与前端页面               | `apps/web/src` + `apps/web/ui`                    |
-| 计算密集逻辑、指标、真实行情源           | `python/packages/*/src`                           |
+| 新东西                                       | 放哪                                                 |
+| -------------------------------------------- | ---------------------------------------------------- |
+| 领域类型、配置 schema、策略接口              | `packages/core/src`                                  |
+| 行情接入、缓存、Python 调用                  | `packages/data/src`                                  |
+| **数据库表结构 / 迁移**                      | **`packages/data/sql/`**（唯一来源）                 |
+| PG 客户端、schema 闸门、查询层               | `packages/data/src/db`                               |
+| **派生周期（桶对齐 / 覆盖判据 / 聚合）**     | **`python/packages/quant-data/src/aggregate.py`**    |
+| **带时间锚的取数（如「按成交时刻算 ATR」）** | **`python/packages/quant-data/src/risk.py`**         |
+| **私有交易接口（下单 / 用户数据流）**        | **`packages/data/src/binance-private.ts`**           |
+| 止盈止损编排、幂等、执行记录                 | `apps/executor/src` + `packages/data/src/db/risk.ts` |
+| **新策略**                                   | **`python/packages/quant-backtest/src/`**            |
+| 命令行命令                                   | `apps/cli/src/commands/`                             |
+| 常驻同步、生命周期、控制原语                 | `apps/sync/src`                                      |
+| 控制面 HTTP 路由与前端页面                   | `apps/web/src` + `apps/web/ui`                       |
+| 计算密集逻辑、指标、真实行情源               | `python/packages/*/src`                              |
 
 ## 派生周期层（v0.2.0）
 
@@ -77,7 +80,8 @@ pnpm check      # = build + TS 测试 + Python 测试
    类型 / 单位 / NULL 语义必须一致。时间统一毫秒时间戳，数据库列用 `bigint` 而非 `timestamptz`。
    PG 连接串经 `TRADE_TOOL_PG_DSN` 环境变量注入，不进 argv。
 3. **schema 唯一来源是 `packages/data/sql/*.sql`**：不得在 TS 或 Python 侧另持影子定义。
-4. **策略无状态**：`Strategy.onBar()` 必须是纯函数，无 IO、无随机数。
+4. **策略与指标都是纯函数**：输入等长序列、输出等长数组；不读时钟、不做 IO、不用随机数。
+   指标公式**只允许**出现在 `quant_core`（v0.3.0）。
 5. **对外导出走 barrel**：包内模块互相 import 用显式 `.js` 后缀，对外只从 `src/index.ts` 导出。
 6. **tsconfig 不复制**：一律 `extends` `@trade-tool/tsconfig/*`。
 7. **Python 类型**：`mypy --strict` 必须过，公开函数全标注类型；不要用 `# type: ignore` 掩盖。
@@ -97,13 +101,60 @@ pnpm check      # = build + TS 测试 + Python 测试
 并把 `TRADE_TOOL_BINANCE_BASE_URL` 指向它，让**真实的 Python 引擎**跑完整接缝。
 **测试过程中不得访问真实网络。**
 
+## 止盈止损层（v0.4.0）
+
+买入成交 → ATR → 止盈止损。五条**不可协商**的规则：
+
+1. **只用已收盘的 bar**：bar 起点 `t`、桶宽 `W`，则窗口上界是 `time <= asOf − W`。
+   把未收盘的 bar 喂进 Wilder ATR，止损位会随价格实时漂移。
+2. **不跨缺口**：窗口必须是**极大连续段**的尾部。回补久远的缺口不得改写此后成交对应的 ATR。
+3. **取不到就拒绝下单**：`RISK_ATR_UNAVAILABLE`，并说清缺多少根。**绝不**换更小的周期、
+   也**绝不**用 0 顶替——ATR=0 会让止损正好落在入场价上。
+4. **先占坑再动手**：`(exchange, symbol, entry_order_id)` 是幂等锚点。用户数据流在续期与
+   重连后会重放事件，而止盈止损是真的会下单。占坑后失败留 `failed` 行 + `last_error`，
+   好过「下单成功但没记下来，重连后再挂一次」。
+5. **两张单要么都挂上要么都不挂**：先止盈后止损；第二张失败就撤掉第一张。留一张有止盈
+   没止损的单，比什么都不挂更危险。
+
+Binance U 本位**没有单请求 OCO**（`/fapi/v1/order/oco` 已下架）：用
+`TAKE_PROFIT_MARKET` + `STOP_MARKET`（`closePosition=true`），仓位平掉后另一张
+**由交易所自动撤销**。因此本地**不轮询、不盯市**——不要在控制面或守护进程里再实现一套
+「触发后撤另一张」的逻辑。
+
+新增口径时：策略放 `packages/core/src/risk-policy.ts`（纯函数），
+ATR 取数放 `quant_data.risk`，交易所差异放 `packages/data/src/binance-private.ts`，
+执行记录放 `sql/006_risk_bracket.sql` + `packages/data/src/db/risk.ts`。
+
+## 技术指标层（v0.3.0）
+
+指标实现在 **`python/packages/quant-core/src/quant_core/indicators.py`**，
+全仓库**唯一一份**；TS 侧（`packages/*`、`apps/*`）**不得出现任何指标实现**。
+两侧各有 `sma` 就意味着同一根 K 线上的同一个指标会因浮点舍入而分叉，
+症状是「回测赚钱、实盘不赚」且几乎无法定位。
+
+四条不可协商的规则：
+
+1. **参数是数据不是表结构**：`indicator_*` 的参数列直接进主键，改窗口 / 加参数集是
+   **插新行、零 DDL**。不得出现 `ma_20` 这类把参数写进列名的形态，也不得用
+   `params_hash` 代替可查的参数列。
+2. **`impl_version` 进主键**（`quant_core.INDICATOR_IMPL_VERSION`）：口径变更 / 修 bug
+   **必须**递增，纯重构不递增。写侧发现混版即抛 `INDICATOR_IMPL_STALE` 拒绝写入。
+3. **连续段各自独立重算，段间不递推**：回补一个久远的缺口**不得**静默改写此后的指标值。
+   缺口就是噪声，不得跨越。
+4. **预热期不落库**：不写 NaN、不写 NULL、更不写 0 冒充缺失。库里每一行都是有效值。
+
+`window` 是 PostgreSQL 的**完全保留字**，因此指标表里那一列叫 `bars`；配置侧仍叫
+`window`（JSON 不受 SQL 关键字约束），两者只经 `quant_data.indicators._CONFIG_KEYS` 映射。
+
 ## 加一个新策略的完整步骤
 
-1. 在 `packages/backtest/src/strategies/<name>.ts` 实现 `Strategy` 接口。
-2. 从 `packages/backtest/src/index.ts` 导出。
-3. 在 `apps/cli/src/commands/backtest.ts` 注册到 `backtest.strategy` 的分派处。
+1. 在 `python/packages/quant-backtest/src/` 实现策略：**只消费 `quant_core` 的指标序列**，
+   引擎内不得写任何指标公式（`Strategy` 侧的旧 TS 接口已随 `packages/backtest` 一并退场）。
+2. 从 `quant_backtest/__init__.py` 导出。
+3. 在 `quant_backtest/__main__.py` 注册到策略分派处，经 argv 接收控制信息。
 4. 在 `packages/core/src/config.ts` 的 `backtestSchema` 里登记可配置参数。
-5. 补 `packages/backtest/tests/` 用例；纯函数指标逻辑同样要覆盖。
+5. 补 `python/packages/quant-backtest/tests/` 用例；**必须**覆盖「无未来函数」
+   （构造只有未来数据才成立的信号，断言不产生交易）与 O(n) 复杂度。
 
 ## 命令行入口
 

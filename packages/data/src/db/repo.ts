@@ -15,6 +15,13 @@ import {
 } from '@trade-tool/core';
 
 import { toSyncError } from './errors.js';
+import {
+  INDICATOR_INTERVALS,
+  INDICATOR_TABLES,
+  readIndicatorTableStats,
+  type IndicatorInterval,
+  type IndicatorTableStat,
+} from './indicators.js';
 import type { Pool, QueryResultRow } from './pool.js';
 
 /**
@@ -290,6 +297,29 @@ export async function hasRange(
 }
 
 // -------------------------------------------------------------- contract_spec
+
+/**
+ * 读 exchangeInfo 的**原始条目**（`contract_spec.raw`）。
+ *
+ * 止盈止损要把价格对齐到最小价格变动（`PRICE_FILTER.tickSize`），而 tickSize 只存在于
+ * 原始 JSON 里——`readContractSpec` 那几个解析后的列不包含它。这里读的是库里**同一份
+ * 快照**，不重新出网拉 exchangeInfo：对齐依据必须与其它规格自洽。
+ *
+ * 没有快照返回 `null`（调用方据此报错，而不是拿默认 tickSize 猜一个）。
+ */
+export async function readContractSpecRaw(
+  pool: Pool,
+  exchange: string,
+  symbol: string,
+): Promise<unknown | null> {
+  const result = await pool.query<QueryResultRow>(
+    'SELECT raw FROM contract_spec WHERE exchange = $1 AND symbol = $2',
+    [exchange, symbol],
+  );
+  const row = result.rows[0];
+  if (!row || row['raw'] === null || row['raw'] === undefined) return null;
+  return row['raw'];
+}
 
 export async function readContractSpec(
   pool: Pool,
@@ -626,6 +656,12 @@ export async function removeSymbolEntry(
             symbol,
           ]);
         }
+        // v0.3.0 R-11.1：指标表同样必须**同事务**一并删除。「1m 已删、4h 还画得出」
+        // 已经自相矛盾；「K 线已删、指标还叠在图上」是同一个矛盾的下一层——
+        // 那条指标线的数据源已经不存在了，用户会以为它在描述某个还在的行情。
+        for (const table of Object.values(INDICATOR_TABLES)) {
+          await client.query(`DELETE FROM ${table} WHERE symbol = $1`, [symbol]);
+        }
         const count = deleted.rowCount ?? 0;
         // 数据已删，**所有由数据推导出来的缓存列必须一起清掉**。
         // 只把 status 改成 paused 是不够的：残留的 watermark 会在该标的下一次同步时
@@ -817,6 +853,16 @@ export interface GlobalSummary {
   pendingGaps: number;
   /** **启用的**派生表行数与**实测**体积（v0.2.0 R-8.2 / AC-16）；未启用派生时为空数组 */
   derived: DerivedTableStat[];
+  /**
+   * **已启用的**指标表行数与**实测**体积（v0.3.0 R-11.2）。
+   *
+   * `totalRows` / `totalBytes` 的含义**保持为 1m 不变**（R-11.2）——把它们改成
+   * 「全部表」会让既有页面上的 1m 口径数字无声地变大，而没有任何一行代码说它变了。
+   *
+   * 未启用指标层（`indicatorSpecs: {}`）时是 `null`，与「启用了但一行没写」（`[]`）
+   * 分开说：显示 0 行会让人以为「还没算」（R-11.4 / AC-23）。
+   */
+  indicators: IndicatorTableStat[] | null;
 }
 
 /**
@@ -841,6 +887,13 @@ export async function readGlobalSummary(
   pool: Pool,
   exchange: string,
   derivedIntervals: readonly DerivedInterval[] = DERIVED_INTERVALS,
+  /**
+   * **实际启用的**指标周期。`null` = 未启用指标层（显式配置，状态里必须如实显示）。
+   *
+   * 不传时按四个全启用算，既有调用行为不变；未启用时返回 `null` 而不是空数组——
+   * 空数组会被读成「启用了但一行都没写」，于是用户反复点重建（R-11.4 / AC-23）。
+   */
+  indicatorIntervals: readonly IndicatorInterval[] | null = INDICATOR_INTERVALS,
 ): Promise<GlobalSummary> {
   try {
     const rows = await pool.query<QueryResultRow>(
@@ -876,6 +929,7 @@ export async function readGlobalSummary(
       totalBytes,
       pendingGaps: ms(gaps.rows[0]?.n) ?? 0,
       derived: await readDerivedTableStats(pool, derivedIntervals),
+      indicators: indicatorIntervals ? await readIndicatorTableStats(pool) : null,
     };
   } catch (error) {
     throw toSyncError(error, '读取全局汇总失败');

@@ -1,7 +1,8 @@
 import { useLayoutEffect, useRef, useState } from 'react';
 
-import type { BarDto } from '../../../src/types';
+import type { BarDto, IndicatorsDto } from '../../../src/types';
 import { describeSpan, gapStats } from './gaps.js';
+import { OVERLAY_COLUMNS, columnSeries, isSubpanel, splitSeries } from './indicators.js';
 
 // 缺口统计住在 gaps.ts（纯计算，1m 与派生周期共用），这里转出以保持
 // `CandleChart` 作为「图表相关」的单一入口——既有测试与调用方都从这里取。
@@ -251,12 +252,55 @@ function Tooltip(props: { bar: BarDto; x: number; y: number; plotRight: number }
   );
 }
 
+export interface OverlayLine {
+  key: string;
+  color: string;
+  segments: Array<Array<{ time: number; value: number }>>;
+}
+
+const OVERLAY_COLORS = ['#f0b72f', '#58a6ff', '#f0883e', '#a371f7', '#3fb950', '#8b949e'];
+
+/**
+ * 构造主图叠加的折线段。**纯计算**：可脱离 DOM 断言「缺口处确实断了」。
+ *
+ * 断线是硬要求：指标行在缺口处**缺失**，连过去会把空白画成斜线，用户会读成
+ * 「这段指标在平滑变化」，而真相是那段没有数据（R-10.4）。
+ */
+export function buildOverlayLines(
+  indicators: IndicatorsDto | undefined,
+  barMs: number,
+  hidden: ReadonlySet<string> | undefined,
+): OverlayLine[] {
+  if (indicators === undefined || indicators.state !== 'ok') return [];
+  const out: OverlayLine[] = [];
+  let colorIndex = 0;
+  for (const series of indicators.specs) {
+    if (isSubpanel(series.label)) continue;
+    if (hidden?.has(series.label)) continue;
+    for (const column of OVERLAY_COLUMNS[series.spec.indicator] ?? []) {
+      const points = columnSeries(series.rows, column);
+      if (points.length === 0) continue;
+      out.push({
+        key: `${series.label}:${column}`,
+        color: OVERLAY_COLORS[colorIndex % OVERLAY_COLORS.length] ?? '#f0b72f',
+        segments: splitSeries(points, barMs),
+      });
+      colorIndex += 1;
+    }
+  }
+  return out;
+}
+
 export function CandleChart(props: {
   bars: readonly BarDto[];
   height?: number;
   /** 桶宽（毫秒）。缺省 1m；派生周期必须显式传入，否则缺口会被按分钟误算。 */
   barMs?: number;
   interval?: string;
+  /** 已物化的指标；主图叠加均线与 BOLL（R-10.4） */
+  indicators?: IndicatorsDto | undefined;
+  /** 被图例关掉的参数集标签 */
+  hidden?: ReadonlySet<string> | undefined;
 }) {
   const bars = props.bars;
   const [ref, width] = useMeasuredWidth();
@@ -270,6 +314,10 @@ export function CandleChart(props: {
   const plotRight = layout.plotLeft + layout.plotWidth;
   const hovered = hover === null ? null : (bars[hover] ?? null);
   const last = bars[bars.length - 1];
+
+  // 主图叠加的线：均线与布林带。**缺口处断开**——`splitSeries` 按时间差判连续性，
+  // 与写侧的连续段判据同源（R-10.4）。绝不跨越缺口连线。
+  const overlays = buildOverlayLines(props.indicators, barMs, props.hidden);
 
   const pick = (clientX: number, rect: DOMRect) => {
     // jsdom 的 getBoundingClientRect 全 0；此时按布局宽度推算，逻辑仍然可测。
@@ -394,6 +442,32 @@ export function CandleChart(props: {
           );
         })}
 
+        {/* 指标叠加层（R-10.4）：与蜡烛共用同一个 `xOf`，因此**横轴按时间**严格对齐。
+            画在蜡烛之上、价格之下——指标是「读数」，蜡烛才是本体。 */}
+        {overlays.length > 0 ? (
+          <g>
+            {overlays.map((line) => (
+              <g key={line.key}>
+                {line.segments.map((seg, idx) =>
+                  seg.length < 2 ? null : (
+                    <polyline
+                      key={`${line.key}-${String(idx)}`}
+                      data-indicator-line={line.key}
+                      points={seg
+                        .map((p) => `${String(xOf(layout, p.time))},${String(yOf(layout, p.value))}`)
+                        .join(' ')}
+                      fill="none"
+                      stroke={line.color}
+                      strokeWidth={1.2}
+                      opacity={0.9}
+                    />
+                  ),
+                )}
+              </g>
+            ))}
+          </g>
+        ) : null}
+
         {last && layout.maxVolume > 0 ? (
           <text
             x={plotRight + 4}
@@ -464,6 +538,7 @@ export function CandleChart(props: {
         <span style={{ color: UP }}>▲ 收 ≥ 开</span>
         <span style={{ color: DOWN }}>▼ 收 &lt; 开</span>
         <span>横轴按时间排布，空白即缺口</span>
+        {overlays.length > 0 ? <span>指标线在缺口处同样断开</span> : null}
       </div>
     </div>
   );

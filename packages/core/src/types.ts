@@ -64,6 +64,36 @@ export interface Bar {
 
 export type Side = 'long' | 'short';
 
+// ------------------------------------------------------------ 交易所原语（v0.4.0）
+//
+// 这几个类型是**跨语言 / 跨包同义词的唯一一份定义**：`packages/data` 的 Binance
+// 私有客户端、`packages/core` 的止盈止损策略都从这里取。之前它们各写各的
+// （`'BUY' | 'SELL'` 在两个包里各有一遍），一旦一边加上 `BOTH` 之类的取值，
+// 编译期不会报错，只会在某个分支上悄悄失配。
+
+/** 交易所的买卖方向。 */
+export type OrderSide = 'BUY' | 'SELL';
+
+/** 持仓方向。`BOTH` = 单向持仓模式（one-way），`LONG`/`SHORT` = 双向（hedge）。 */
+export type PositionSide = 'BOTH' | 'LONG' | 'SHORT';
+
+/** 订单的成交类型：`TRADE` = 真的撮合了，`NON_TRADE` = 只是状态变更。 */
+export type ExecutionType = 'TRADE' | 'NON_TRADE';
+
+/** 订单生命周期状态。 */
+export type OrderStatus = 'NEW' | 'PARTIALLY_FILLED' | 'FILLED' | 'CANCELED' | 'REJECTED';
+
+/**
+ * 交易所私有接口的凭据。
+ *
+ * **只允许从环境变量注入**（同 `database.passwordEnv` 的理由）：配置文件与日志里
+ * 一旦出现密钥，它就会跟着 git、备份与报错信息一路走。
+ */
+export interface Credentials {
+  apiKey: string;
+  apiSecret: string;
+}
+
 /** 订单意图，回测与实盘共用。 */
 export interface OrderIntent {
   symbol: string;

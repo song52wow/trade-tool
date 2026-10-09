@@ -10,6 +10,8 @@
 - ``symbols`` / ``resolve`` / ``estimate``：元数据与规模预估
 - ``sync`` / ``backfill`` / ``verify``：落库的一轮同步、区间回补、全表缺口校验
 - ``aggregate``：由库内 1m 派生 15m / 1h / 4h / 1d（补齐 / ``--rebuild`` / ``--check``）
+- ``indicators``：由库内**已收盘的派生 K 线**物化技术指标（补齐 / ``--rebuild`` / ``--check``）
+- ``risk-atr``：按成交时刻从库里算 Wilder ATR（``apps/executor`` 止盈止损的唯一输入）
 """
 
 from __future__ import annotations
@@ -23,7 +25,8 @@ from pathlib import Path
 from quant_core import INTERVALS, interval_to_ms, series_to_dicts
 from quant_core.io import dump_json, log
 
-from . import sync
+from . import indicators, sync
+from . import risk as risk_mod
 from .errors import SyncError
 from .metadata import DEFAULT_TTL_MS
 from .ratelimit import DEFAULT_BUDGET_PER_MINUTE
@@ -138,6 +141,7 @@ def _build_parser() -> argparse.ArgumentParser:
     _add_metadata_options(one_shot)
     _add_weight_option(one_shot)
     _add_intervals_option(one_shot)
+    _add_indicator_options(one_shot)
 
     backfill = sub.add_parser("backfill", help="显式区间回补（恒为 ON CONFLICT DO NOTHING）")
     _add_exchange(backfill)
@@ -168,6 +172,7 @@ def _build_parser() -> argparse.ArgumentParser:
     _add_metadata_options(backfill)
     _add_weight_option(backfill)
     _add_intervals_option(backfill)
+    _add_indicator_options(backfill)
 
     verify = sub.add_parser("verify", help="全表缺口扫描并重建 verified_upto 基线")
     _add_exchange(verify)
@@ -208,6 +213,83 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     _add_clock_option(aggregate)
 
+    ind = sub.add_parser(
+        "indicators",
+        help="由库内派生 K 线物化技术指标（补齐 / --rebuild / --check）",
+    )
+    _add_exchange(ind)
+    ind.add_argument("--symbol", required=True)
+    ind.add_argument(
+        "--intervals",
+        default=None,
+        help="逗号分隔的指标周期（15m,1h,4h,1d）；**不含 1m**。缺省取 data.indicatorIntervals",
+    )
+    ind.add_argument(
+        "--from",
+        dest="from_ms",
+        type=int,
+        default=None,
+        help="区间起点（epoch ms），缺省 min(time)",
+    )
+    ind.add_argument(
+        "--to", dest="to_ms", type=int, default=None, help="区间终点（epoch ms），缺省 max(time)"
+    )
+    ind.add_argument(
+        "--indicator-specs",
+        default=None,
+        help=(
+            "要物化的参数集，缺省取 data.indicatorSpecs。紧凑形态 "
+            "sma:5,macd:12:26:9,rsi:14,boll:20:2000,kdj:9:3:3,atr:14,obv；"
+            "也接受与配置同形的 JSON。空串 = 显式关闭指标层"
+        ),
+    )
+    ind.add_argument(
+        "--indicator-batch-bars",
+        type=int,
+        default=sync.DEFAULT_INDICATOR_BATCH_BARS,
+        help="每批物化的派生 bar 数（每批一个事务）",
+    )
+    ind.add_argument(
+        "--rebuild", action="store_true", help="先删后算（修复 K 线被改动 / 指标被篡改）"
+    )
+    ind.add_argument(
+        "--check",
+        action="store_true",
+        help="只读校验：报出 stale / missing / mismatch / 混版",
+    )
+    _add_clock_option(ind)
+
+    risk = sub.add_parser(
+        "risk-atr",
+        help="按成交时刻从库里算 Wilder ATR（止盈止损的唯一输入）",
+    )
+    risk.add_argument("--symbol", required=True)
+    risk.add_argument(
+        "--interval",
+        default=None,
+        help=(
+            "算 ATR 的周期（1m/15m/1h/4h/1d），缺省 1m。"
+            "未实现的周期（5m 等）直接报错，不回落"
+        ),
+    )
+    risk.add_argument(
+        "--period", type=int, default=risk_mod.DEFAULT_ATR_PERIOD, help="ATR 周期长度，缺省 14"
+    )
+    risk.add_argument(
+        "--as-of-ms",
+        dest="as_of_ms",
+        type=int,
+        required=True,
+        help="成交时刻（epoch ms）。只用该时刻**已收盘**的 bar",
+    )
+    risk.add_argument(
+        "--window-bars",
+        dest="window_bars",
+        type=int,
+        default=risk_mod.DEFAULT_WINDOW_BARS,
+        help="参与计算的连续 bar 数上限，缺省 240",
+    )
+
     return parser
 
 
@@ -243,6 +325,25 @@ def _parse_intervals(raw: str | None) -> tuple[str, ...] | None:
     if raw is None:
         return None
     return tuple(part.strip() for part in raw.split(",") if part.strip() != "")
+
+
+def _add_indicator_options(parser: argparse.ArgumentParser) -> None:
+    """所有会写 1m 的子命令都提供 ``--indicator-intervals`` / ``--indicator-specs``。
+
+    指标挂在 1m 的唯一写入出口上（v0.3.0 R-5.1），因此关掉它同样只有两条路：改配置，
+    或命令行显式给空串。**没有**运行时静默跳过的开关——任何一次因配置而未物化，
+    都必须能从 ``SyncRunSummary.indicators is None`` 与状态里看出来（R-11.4 / AC-23）。
+    """
+    parser.add_argument(
+        "--indicator-intervals",
+        default=None,
+        help="逗号分隔的指标周期（15m,1h,4h,1d）；**不含 1m**。空串 = 显式关闭指标层",
+    )
+    parser.add_argument(
+        "--indicator-specs",
+        default=None,
+        help=("要物化的参数集，缺省取配置。紧凑形态 sma:5,macd:12:26:9,obv；空串 = 显式关闭指标层"),
+    )
 
 
 def _add_intervals_option(parser: argparse.ArgumentParser) -> None:
@@ -282,6 +383,11 @@ def _options(args: argparse.Namespace) -> sync.SyncOptions:
         allow_stale=getattr(args, "allow_stale", False),
         refresh=getattr(args, "refresh", False),
         aggregate_intervals=_parse_intervals(getattr(args, "intervals", None)),
+        indicator_intervals=_parse_intervals(getattr(args, "indicator_intervals", None)),
+        indicator_specs=indicators.parse_specs_arg(getattr(args, "indicator_specs", None)),
+        indicator_batch_bars=getattr(
+            args, "indicator_batch_bars", sync.DEFAULT_INDICATOR_BATCH_BARS
+        ),
     )
 
 
@@ -334,6 +440,41 @@ def _cmd_aggregate(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_indicators(args: argparse.Namespace) -> int:
+    options = _options(args)
+    specs = indicators.parse_specs_arg(getattr(args, "indicator_specs", None))
+    options = replace(
+        options,
+        indicator_intervals=_parse_intervals(getattr(args, "intervals", None)),
+        indicator_specs=specs,
+        indicator_batch_bars=getattr(
+            args, "indicator_batch_bars", sync.DEFAULT_INDICATOR_BATCH_BARS
+        ),
+    )
+    dump_json(
+        sync.run_indicators(
+            options,
+            rebuild=bool(getattr(args, "rebuild", False)),
+            check=bool(getattr(args, "check", False)),
+        )
+    )
+    return 0
+
+
+def _cmd_risk_atr(args: argparse.Namespace) -> int:
+    dump_json(
+        risk_mod.run_atr(
+            symbol=args.symbol,
+            interval=args.interval,
+            period=args.period,
+            as_of_ms=args.as_of_ms,
+            window_bars=args.window_bars,
+            dsn=None,
+        )
+    )
+    return 0
+
+
 _COMMANDS = {
     "symbols": _cmd_symbols,
     "resolve": _cmd_resolve,
@@ -342,7 +483,11 @@ _COMMANDS = {
     "backfill": _cmd_backfill,
     "verify": _cmd_verify,
     "aggregate": _cmd_aggregate,
+    "indicators": _cmd_indicators,
+    "risk-atr": _cmd_risk_atr,
 }
+
+
 
 
 def _emit_error(error: SyncError) -> None:

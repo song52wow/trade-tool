@@ -27,7 +27,6 @@
     "clean": "rm -rf dist"
   },
   "dependencies": {
-    "@trade-tool/backtest": "workspace:*",
     "@trade-tool/core": "workspace:*",
     "@trade-tool/data": "workspace:*",
     "commander": "^12.1.0"

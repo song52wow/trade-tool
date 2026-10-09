@@ -4,8 +4,14 @@ import { useCallback, useLayoutEffect, useState } from 'react';
 import { ApiError, api } from '../api.js';
 import { fmtDuration, fmtNumber, fmtTime } from '../format.js';
 import { CandleChart, GapNotice } from './CandleChart.js';
+import { IndicatorPanels } from './IndicatorPanels.js';
 import { ALL_INTERVALS, EMPTY_BARS, intervalMs, minutesToBars } from './gaps.js';
-import type { BarDto, BarsDto, DerivedIntervalDto } from '../../../src/types';
+import type {
+  BarDto,
+  BarsDto,
+  DerivedIntervalDto,
+  IndicatorsDto,
+} from '../../../src/types';
 
 /**
  * 区间选项是**根数**，不是时间。
@@ -81,6 +87,11 @@ export function PriceChart(props: {
   const [loadedAt, setLoadedAt] = useState<number | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // 指标：与 K 线同一个 tick 上刷新，同样是**纯读**（不出网、不消耗配额），因此
+  // 可以挂在刷新节奏上（R-10.2）。`1m` 没有指标物化，1m 下不发这个请求。
+  const [indicators, setIndicators] = useState<IndicatorsDto | undefined>(undefined);
+  const [indicatorError, setIndicatorError] = useState<string | null>(null);
+  const [hidden, setHidden] = useState<ReadonlySet<string>>(() => new Set<string>());
 
   const { symbol, hasHistory, tick, derived } = props;
 
@@ -117,6 +128,38 @@ export function PriceChart(props: {
       cancelled = true;
     };
   }, [symbol, range, tick, hasHistory, interval]);
+
+  useLayoutEffect(() => {
+    if (!hasHistory || interval === '1m') {
+      setIndicators(undefined);
+      setIndicatorError(null);
+      return;
+    }
+    let cancelled = false;
+    void api
+      .indicators(symbol, range, interval)
+      .then((result) => {
+        if (cancelled) return;
+        setIndicators(result);
+        setIndicatorError(null);
+      })
+      .catch((e: unknown) => {
+        if (cancelled) return;
+        setIndicatorError(reason(e));
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [symbol, range, tick, hasHistory, interval]);
+
+  const onToggle = useCallback((label: string) => {
+    setHidden((prev) => {
+      const next = new Set(prev);
+      if (next.has(label)) next.delete(label);
+      else next.add(label);
+      return next;
+    });
+  }, []);
 
   const bars: BarDto[] = data.items;
   const barMs = data.intervalMs > 0 ? data.intervalMs : intervalMs(interval);
@@ -206,7 +249,13 @@ export function PriceChart(props: {
         </div>
       ) : (
         <>
-          <CandleChart bars={bars} barMs={barMs} interval={interval} />
+          <CandleChart
+            bars={bars}
+            barMs={barMs}
+            interval={interval}
+            {...(indicators !== undefined ? { indicators } : {})}
+            hidden={hidden}
+          />
           <p className="muted mono" style={{ fontSize: 11, margin: '4px 0 0' }}>
             {loading ? '读取中 · ' : ''}
             {bars.length.toLocaleString('zh-CN')} 根 {interval} · {fmtTime(bars[0]?.time)} →{' '}
@@ -223,6 +272,16 @@ export function PriceChart(props: {
             interval={interval}
             upstreamMissingMinutes={upstreamMissing}
           />
+          {interval !== '1m' ? (
+            <IndicatorPanels
+              indicators={indicators}
+              bars={bars}
+              interval={interval}
+              hidden={hidden}
+              onToggle={onToggle}
+              error={indicatorError}
+            />
+          ) : null}
         </>
       )}
     </div>

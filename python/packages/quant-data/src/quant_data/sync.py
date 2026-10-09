@@ -10,6 +10,7 @@ a. 单写者锁（``pg.SymbolLock``）→ b. 元数据解析与校验 → c. **�
 
 from __future__ import annotations
 
+import json
 import math
 import os
 import time
@@ -18,9 +19,11 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
+from quant_core import INDICATOR_IMPL_VERSION
 from quant_core.io import log
 
 from . import aggregate as agg
+from . import indicators as ind
 from . import pg
 from .aggregate import validate_intervals
 from .binance import (
@@ -51,6 +54,10 @@ DEFAULT_BATCH_SIZE = 5_000
 #: 补齐 / ``--rebuild`` 的默认分批大小（v0.2.0 R-5.3）。**必须分批**：
 #: 整段历史一次聚合会让单个事务持有锁的时间与 WAL 体积都不可接受。
 DEFAULT_AGGREGATE_BATCH_BARS = 20_000
+
+#: 指标补齐 / ``--rebuild`` 的默认分批大小（v0.3.0 R-6.3）。**必须分批**，理由同派生：
+#: 整段历史一次物化会让单个事务的锁持有时间与 WAL 体积不可接受。
+DEFAULT_INDICATOR_BATCH_BARS = 20_000
 
 #: 缺口自动回补的默认尝试上限（R-11.B9）。
 DEFAULT_MAX_GAP_ATTEMPTS = 5
@@ -113,11 +120,23 @@ class SyncOptions:
     aggregate_intervals: tuple[str, ...] | None = None
     #: 补齐 / ``--rebuild`` 的分批大小（仅 ``aggregate`` 子命令用，R-5.3）
     aggregate_batch_bars: int = DEFAULT_AGGREGATE_BATCH_BARS
+    #: 启用哪些**指标周期**（v0.3.0 R-9.5）。``None`` = 走缺省；``[]`` = 显式关闭指标层。
+    indicator_intervals: tuple[str, ...] | None = None
+    #: 要物化的「指标 × 参数集」集合（v0.3.0 R-12.1）。**``[]`` = 显式关闭指标层**
+    #: ——那是合法配置，状态里会如实显示「未启用指标」（R-11.4 / AC-23），而不是
+    #: 显示 0 行让人以为「还没算」。
+    indicator_specs: tuple[ind.ParamSet, ...] | None = None
+    #: 补齐 / ``--rebuild`` 的分批大小（仅 ``indicators`` 子命令用，R-6.3）
+    indicator_batch_bars: int = DEFAULT_INDICATOR_BATCH_BARS
 
 
 #: 派生周期的默认集合。**必须**与 ``packages/data/sql/004_klines_agg.sql`` 的表集合一致，
 #: 由 AC-1 的测试守住（R-9.4）。
 DEFAULT_AGGREGATE_INTERVALS: tuple[str, ...] = ("15m", "1h", "4h", "1d")
+
+#: 指标周期的缺省集合。**必须**与 ``indicatorIntervals`` 的缺省、以及
+#: ``005_indicators.sql`` 里 ``interval`` 的 CHECK 允许集合三方一致（AC-2）。
+DEFAULT_INDICATOR_INTERVALS: tuple[str, ...] = ind.ALLOWED_INDICATOR_INTERVALS
 
 
 def resolve_aggregate_intervals(opts: SyncOptions) -> tuple[str, ...]:
@@ -132,6 +151,27 @@ def resolve_aggregate_intervals(opts: SyncOptions) -> tuple[str, ...]:
         else (DEFAULT_AGGREGATE_INTERVALS)
     )
     return validate_intervals(list(raw))
+
+
+def resolve_indicator_intervals(opts: SyncOptions) -> tuple[str, ...]:
+    """归一 ``indicator_intervals``，对未实现周期报 ``CONFIG_INVALID``（R-9.5）。
+
+    与 :func:`resolve_aggregate_intervals` 分开而不是复用：指标**不做 1m**，而派生做。
+    共用一个函数就会在某处不小心把 1m 也放行，而那意味着 4.3 GB/标的（N-2）。
+    """
+    raw = (
+        opts.indicator_intervals
+        if opts.indicator_intervals is not None
+        else DEFAULT_INDICATOR_INTERVALS
+    )
+    return ind.validate_indicator_intervals(list(raw))
+
+
+def resolve_indicator_specs(opts: SyncOptions) -> tuple[ind.ParamSet, ...]:
+    """归一 ``indicator_specs``；``None`` = 走缺省，``[]`` = **显式关闭指标层**（R-12.2）。"""
+    if opts.indicator_specs is None:
+        return ind.DEFAULT_SPECS
+    return tuple(opts.indicator_specs)
 
 
 def _validate_options(
@@ -466,6 +506,40 @@ def _pull_range(
     return [collected[key] for key in sorted(collected)]
 
 
+def _by_interval(
+    stats: Mapping[str, ind.IndicatorStat], intervals: Sequence[str]
+) -> list[tuple[str, dict[str, ind.IndicatorStat]]]:
+    """按 :attr:`IndicatorStat.interval` 把一批统计重新分组。"""
+    out: dict[str, dict[str, ind.IndicatorStat]] = {}
+    for item in stats.values():
+        out.setdefault(item.interval, {})[ind.stat_key_from_stat(item)] = item
+    return [(iv, out[iv]) for iv in intervals if iv in out]
+
+
+def _merge_by_interval(
+    target: dict[str, dict[str, ind.IndicatorStat]],
+    source: Mapping[str, dict[str, ind.IndicatorStat]],
+) -> None:
+    for interval, batch in source.items():
+        ind.merge_stats(target.setdefault(interval, {}), batch)
+
+
+def _assert_indicator_versions_once(
+    writer: DbConn,
+    symbol: str,
+    intervals: Sequence[str],
+    specs: Sequence[ind.ParamSet],
+) -> None:
+    """一轮同步开始时校验一次 ``impl_version``（R-4.6）。
+
+    混版是「库里已有旧版本行而代码已递增」的静态状态，不会在一轮之内变化。因此
+    **每轮查一次**与每批查一次等价，但省掉 ``批数 × 周期数 × 参数集数`` 条往返——
+    一轮首次全量可以有上千批，那条固定开销会被放大几千倍。
+    """
+    for interval in intervals:
+        ind.assert_no_mixed_versions(writer, symbol, interval, specs)
+
+
 def _merge_aggregated(
     target: dict[str, agg.IntervalAggregate], source: Mapping[str, agg.IntervalAggregate]
 ) -> None:
@@ -498,32 +572,39 @@ def write_bars_and_aggregate(
     rows: Sequence[Kline],
     strategy: str,
     intervals: Sequence[str],
-) -> tuple[int, dict[str, agg.IntervalAggregate]]:
-    """**1m 的唯一写入出口**（v0.2.0 R-4.1 / R-4.2）。
+    specs: Sequence[ind.ParamSet] = (),
+) -> tuple[int, dict[str, agg.IntervalAggregate], dict[str, ind.IndicatorStat]]:
+    """**1m 的唯一写入出口**（v0.2.0 R-4.1 / R-4.2；v0.3.0 R-5.1）。
 
-    返回 ``(新增行数, 每周期聚合统计)``。调用方负责包事务——本函数不自己开事务，
-    因为它必须与 1m 写入、水位推进**同事务**（R-4.2）。
+    返回 ``(新增行数, 每周期聚合统计, 每「周期 × 参数集」指标统计)``。调用方负责包
+    事务——本函数不自己开事务，因为它必须与 1m 写入、水位推进**同事务**（R-4.2）。
 
     为什么必须收敛成一个函数：当前写 1m 的路径有三条（``_stream_pull_and_write`` 的每批提交、
     缺口回补的内联写入、``run_backfill`` 的流式写入）。若聚合只挂在其中一条上，另外两条
     写进去的 1m 就永远派生不出高周期——而且是**静默**的：图上少一根 4h，没人会知道
     原因。R-4.1 的原话是「任何新的 1m 写入路径都必须经过它，否则聚合会变成看运气」。
 
-    聚合失败 → 异常向上冒，**整批回滚**（连 1m 一起），由调用方包着的 `with writer.transaction()`
-    保证「不存在 1m 已提交、派生没跟上且无人察觉」的窗口（R-4.2）。错误码是
-    ``AGGREGATION_FAILED``，属「需人工介入」，不自动重试（R-4.6 / R-9.3）。
+    **指标物化挂在聚合之后、同一事务内**（v0.3.0 R-5.1）：顺序固定为
+    ``写 1m → 聚合派生桶 → 物化指标 → 提交``。指标依赖刚写入的派生桶，因此必须在聚合
+    之后；同事务的理由与派生聚合完全一致——不允许存在「K 线已提交、指标没跟上且无人
+    察觉」的窗口。
+
+    聚合 / 指标任一失败 → 异常向上冒，**整批回滚**（连 1m 一起），由调用方包着的
+    `with writer.transaction()` 保证。错误码分别是 ``AGGREGATION_FAILED`` 与
+    ``INDICATOR_FAILED``，均属「需人工介入」，不自动重试（R-4.6 / R-9.3 / R-5.4）。
     """
     added = pg.write_bars(writer, symbol, rows, strategy)
     stats: dict[str, agg.IntervalAggregate] = {}
+    ind_stats: dict[str, ind.IndicatorStat] = {}
     if not intervals or not rows:
-        return added, stats
+        return added, stats, ind_stats
     # 按**桶**对齐而不是按批边界：跨批的桶必须被完整重算，否则「上一批写了半根、
     # 这一批写了另一半」的桶永远不完整，而那正是 R-3.5 要扣留的情形。
     first_ms = min(row.time for row in rows)
     last_ms = max(row.time for row in rows)
     try:
         # 四个周期共用一次 1m 读取（见 aggregate.aggregate_batches）
-        return added, agg.aggregate_batches(
+        stats = agg.aggregate_batches(
             writer, symbol, list(intervals), first_ms, last_ms + ONE_MINUTE_MS - 1
         )
     except SyncError:
@@ -543,6 +624,23 @@ def write_bars_and_aggregate(
                 "cause": str(exc),
             },
         ) from exc
+
+    # 指标物化：紧接聚合之后、同一事务内（v0.3.0 R-5.1）。区间取**派生桶**范围，
+    # 即本批 1m 触及的桶的起点区间——不是 1m 区间，否则每个周期都要在几百万根里
+    # 扫一遍根本不属于它的下标。
+    if specs:
+        for interval in intervals:
+            width = agg.interval_width(interval)
+            ind.materialize_touched(
+                writer,
+                symbol,
+                interval,
+                specs,
+                agg.bucket_start(first_ms, width),
+                agg.bucket_start(last_ms, width) + width - ONE_MINUTE_MS,
+                ind_stats,
+            )
+    return added, stats, ind_stats
 
 
 def _advance_progress(
@@ -585,7 +683,12 @@ def _stream_pull_and_write(
     end_ms: int | None,
     strategy: str,
     now: int,
-) -> tuple[int, PullObservation, dict[str, agg.IntervalAggregate]]:
+) -> tuple[
+    int,
+    PullObservation,
+    dict[str, agg.IntervalAggregate],
+    dict[str, dict[str, ind.IndicatorStat]],
+]:
     """边拉边写：攒够 ``batch_size`` 就 ``COPY`` + 提交 + 推进水位，再继续拉下一页。
 
     这是 R-3.2 / R-8.5 / AC-6 的落点，也是与「先拉完再写」的本质区别：
@@ -595,9 +698,10 @@ def _stream_pull_and_write(
     - 边界校验（R-9.4）按批执行，与「全量校验后再写」等价：任何一根
       ``time < startTime`` 都会在它所在的那一批抛错，此前已提交的批次保持有效。
 
-    返回 ``(新增行数, 拉取过程中观察到的交易所当前 bar, 每周期聚合统计)``。第二个返回值目前
-    只有 ``run_sync`` 用得着（R-10.3 的收尾校验），而那个判定必须在写完——可能已过很久——
-    之后才做。第三个是跨批累加后的聚合统计，进 ``SyncRunSummary.aggregated``（R-8.3）。
+    返回 ``(新增行数, 拉取过程中观察到的交易所当前 bar, 每周期聚合统计, 指标统计)``。
+    第二个返回值目前只有 ``run_sync`` 用得着（R-10.3 的收尾校验），而那个判定必须在写完
+    ——可能已过很久——之后才做。第三个是跨批累加后的聚合统计，进 ``SyncRunSummary.aggregated``
+    （R-8.3）。第四个是指标物化统计，进 ``SyncRunSummary.indicators``（v0.3.0 R-11.3）。
     """
     added = 0
     known_rows: int | None = None
@@ -605,19 +709,29 @@ def _stream_pull_and_write(
     observation = PullObservation()
     clock = _round_clock(opts, now)
     intervals = resolve_aggregate_intervals(opts)
+    specs = resolve_indicator_specs(opts)
+    # 混版检查**每轮一次**（R-4.6）：一轮内只有本进程写指标，且只写一个版本，
+    # 因此每批重查不会提高安全性，只会把固定开销乘以批数。查出不一致立刻拒绝，
+    # 用户不会看到「前几批写进去了、从这一批开始才停」。
+    if specs:
+        _assert_indicator_versions_once(writer, opts.symbol, intervals, specs)
     aggregated: dict[str, agg.IntervalAggregate] = {
         interval: agg.IntervalAggregate(interval=interval) for interval in intervals
     }
+    # **按周期分组**（与 `aggregated` 同形）：内部键只有「指标:参数」，四个周期会互相覆盖，
+    # 摘要里就只剩最后一个周期的数字——而那看起来完全正常。
+    indicators: dict[str, dict[str, ind.IndicatorStat]] = {i: {} for i in intervals}
 
     def commit(chunk: Sequence[Kline]) -> None:
-        """写入一批并在**同一事务内**推进可观测状态（R-19.5）与派生桶（R-4.2）。"""
+        """写入一批并在**同一事务内**推进可观测状态（R-19.5）、派生桶（R-4.2）与指标（R-5.1）。"""
         nonlocal added, known_rows
         _assert_within_boundary(chunk, start_ms, opts.symbol)
         with writer.transaction():
-            # 1m 写入 + 派生聚合在**同一个事务**里：不允许出现「1m 已提交、派生没跟上
-            # 且无人察觉」的窗口（R-4.2）。聚合抛错 → 整批回滚，连 1m 一起。
-            batch_added, stats = write_bars_and_aggregate(
-                writer, opts.symbol, chunk, strategy, intervals
+            # 1m 写入 + 派生聚合 + 指标物化在**同一个事务**里：不允许出现「1m 已提交、
+            # 派生或指标没跟上且无人察觉」的窗口（R-4.2 / R-5.1）。任一环节抛错 →
+            # 整批回滚，连 1m 一起。
+            batch_added, stats, ind_stats = write_bars_and_aggregate(
+                writer, opts.symbol, chunk, strategy, intervals, specs
             )
             for interval, item in stats.items():
                 current = aggregated[interval]
@@ -625,6 +739,8 @@ def _stream_pull_and_write(
                 current.withheld_not_closed += item.withheld_not_closed
                 current.withheld_incomplete += item.withheld_incomplete
                 current.missing_minutes += item.missing_minutes
+            for interval, batch in _by_interval(ind_stats, intervals):
+                ind.merge_stats(indicators[interval], batch)
             # 首批用一次精确 count 打底（状态可能来自旧版本或别的进程），之后按新增累加，
             # 避免每批都做一次 count(*)（首次全量 144 万行时代价不可接受）。
             if known_rows is None:
@@ -639,7 +755,7 @@ def _stream_pull_and_write(
             del buffer[: opts.batch_size]
     if buffer:
         commit(buffer)
-    return added, observation, aggregated
+    return added, observation, aggregated, indicators
 
 
 def _assert_last_bar_closed(
@@ -691,7 +807,13 @@ def _backfill_registered_gaps(
     now: int,
     *,
     skip: frozenset[int] | None = None,
-) -> tuple[int, int, set[int], dict[str, agg.IntervalAggregate]]:
+) -> tuple[
+    int,
+    int,
+    set[int],
+    dict[str, agg.IntervalAggregate],
+    dict[str, dict[str, ind.IndicatorStat]],
+]:
     """优先回补已登记的缺口（R-11.B6）：成功则删除并推进 ``verified_upto``；失败计次。
 
     返回 ``(已补回数, 已放弃数, 本次尝试过的 gap_start, 每周期聚合统计)``。第三个返回值让
@@ -705,9 +827,18 @@ def _backfill_registered_gaps(
     abandoned = 0
     attempted: set[int] = set()
     intervals = resolve_aggregate_intervals(opts)
+    specs = resolve_indicator_specs(opts)
+    if specs:
+        _assert_indicator_versions_once(writer, opts.symbol, intervals, specs)
+    # 混版检查**每轮一次**（R-4.6）：一轮内只有本进程写指标，且只写一个版本，
+    # 因此每批重查不会提高安全性，只会把固定开销乘以批数。查出不一致立刻拒绝，
+    # 用户不会看到「前几批写进去了、从这一批开始才停」。
+    if specs:
+        _assert_indicator_versions_once(writer, opts.symbol, intervals, specs)
     aggregated: dict[str, agg.IntervalAggregate] = {
         interval: agg.IntervalAggregate(interval=interval) for interval in intervals
     }
+    indicators: dict[str, dict[str, ind.IndicatorStat]] = {i: {} for i in intervals}
     state = pg.read_state(writer, opts.exchange, opts.symbol)
     verified = state.get("verified_upto") if state is not None else None
     verified_ms = int(verified) if verified is not None else None
@@ -732,9 +863,11 @@ def _backfill_registered_gaps(
             _assert_within_boundary(rows, gap_start, opts.symbol)
             with writer.transaction():
                 # 缺口回补一律 DO NOTHING：绝不误改已存在的正确数据（R-11.B7）。
-                added, stats = write_bars_and_aggregate(
-                    writer, opts.symbol, rows, "do-nothing", intervals
+                added, stats, ind_stats = write_bars_and_aggregate(
+                    writer, opts.symbol, rows, "do-nothing", intervals, specs
                 )
+                for interval, batch in _by_interval(ind_stats, intervals):
+                    ind.merge_stats(indicators[interval], batch)
                 for interval, item in stats.items():
                     current = aggregated[interval]
                     current.upserted += item.upserted
@@ -773,7 +906,7 @@ def _backfill_registered_gaps(
             _record_gap_failure(
                 writer, opts, gap_start, attempts, f"{exc.code}: {exc.message}", now
             )
-    return filled, abandoned, attempted, aggregated
+    return filled, abandoned, attempted, aggregated, indicators
 
 
 def _record_gap_failure(
@@ -1004,12 +1137,27 @@ def run_sync(opts: SyncOptions) -> dict[str, object]:
         aggregated: dict[str, agg.IntervalAggregate] = {
             interval: agg.IntervalAggregate(interval=interval) for interval in intervals
         }
+        # 指标统计（v0.3.0 R-11.3）。`None` 表示**未启用指标**（indicatorSpecs = {}），
+        # 与「启用了但一行没写」（空数组）必须能分开说（R-11.4 / AC-23）——
+        # 显示 0 行会让人以为「还没算」，于是反复点重建。
+        specs = resolve_indicator_specs(opts)
+        indicators: dict[str, dict[str, ind.IndicatorStat]] | None = (
+            {i: ind.all_stats(specs, i) for i in resolve_indicator_intervals(opts)}
+            if specs
+            else None
+        )
         if opts.allow_backfill:
-            gaps_filled, gaps_abandoned, attempted_set, gap_stats = _backfill_registered_gaps(
-                client, writer, opts, now
-            )
+            (
+                gaps_filled,
+                gaps_abandoned,
+                attempted_set,
+                gap_stats,
+                gap_indicators,
+            ) = _backfill_registered_gaps(client, writer, opts, now)
             attempted = frozenset(attempted_set)
             _merge_aggregated(aggregated, gap_stats)
+            if indicators is not None:
+                _merge_by_interval(indicators, gap_indicators)
 
         # d. 由起点决定写入策略（R-9.3）——本需求最关键的一条规则。
         stored_max = pg.max_time(writer, item.symbol)
@@ -1042,10 +1190,12 @@ def run_sync(opts: SyncOptions) -> dict[str, object]:
         # e–h. 边拉边写：每批一个事务，提交后才推进水位（R-3.2 / AC-6）。
         # 边界校验在每批内执行，与「全量校验后再写」等价（R-9.4）。
         # 派生聚合与每批 1m 同事务（R-4.2）。
-        added, pull_observation, stream_stats = _stream_pull_and_write(
+        added, pull_observation, stream_stats, stream_indicators = _stream_pull_and_write(
             writer, opts, client, start_ms, opts.to_ms, strategy, now
         )
         _merge_aggregated(aggregated, stream_stats)
+        if indicators is not None:
+            _merge_by_interval(indicators, stream_indicators)
 
         # i. 最后一根自愈校验（R-10.3）。判据优先用「本轮拉取看到的交易所当前那根 bar」，
         # 与本地时钟无关；退回本地时钟时也必须现读——用轮首的 now 会把本轮刚写入的、
@@ -1061,12 +1211,18 @@ def run_sync(opts: SyncOptions) -> dict[str, object]:
         # 操作者要跑两轮才看得到修复，且中间那轮 gaps 表一直挂着记录。
         # skip=attempted 保证同一个缺口一轮只计一次 attempts，maxGapAttempts 语义不变（R-11.B9）。
         if opts.allow_backfill and gaps_pending > 0:
-            filled_now, abandoned_now, _, round_stats = _backfill_registered_gaps(
-                client, writer, opts, now, skip=attempted
-            )
+            (
+                filled_now,
+                abandoned_now,
+                _attempted,
+                round_stats,
+                round_indicators,
+            ) = _backfill_registered_gaps(client, writer, opts, now, skip=attempted)
             gaps_filled += filled_now
             gaps_abandoned += abandoned_now
             _merge_aggregated(aggregated, round_stats)
+            if indicators is not None:
+                _merge_by_interval(indicators, round_indicators)
             # 补完重新检测：让 gapsPending / verified_upto 反映真实终态。
             gaps_pending, _verified = _detect_and_register_gaps(writer, opts, now)
 
@@ -1111,6 +1267,13 @@ def run_sync(opts: SyncOptions) -> dict[str, object]:
             # v0.2.0 R-8.3：`None` 表示**未启用派生**（`aggregateIntervals: []`），
             # 与「启用了但一个桶都没写」（`{}`）是两种状态，控制面必须能分开说（AC-22）。
             "aggregated": ({k: v.to_dict() for k, v in aggregated.items()} if intervals else None),
+            # v0.3.0 R-11.3：指标物化统计。`None` = 未启用指标层（显式配置，不是静默跳过）。
+            "indicators": (
+                {iv: ind.stats_payload(st, specs) for iv, st in indicators.items()}
+                if indicators is not None
+                else None
+            ),
+            "implVersion": INDICATOR_IMPL_VERSION,
         }
         if estimate is not None:
             summary["estimate"] = estimate
@@ -1169,7 +1332,8 @@ def run_backfill(opts: SyncOptions) -> dict[str, object]:
         # 限区间请求的收盘判据在拉取时就按现读时钟执行了（`_keep_closed`），
         # R-10.3 的收尾校验只属于 `run_sync`，这里不需要那个观测。
         # backfill 也是 1m 写入路径，因此**必须**触发聚合（R-4.1 / AC-6）。
-        added, _observation, aggregated = _stream_pull_and_write(
+        specs = resolve_indicator_specs(opts)
+        added, _observation, aggregated, indicators = _stream_pull_and_write(
             writer, opts, client, opts.from_ms, opts.to_ms, "do-nothing", now
         )
         # 分母必须按**对齐到 1m 开盘时刻**的行数算，否则未对齐入参会高估（R-11.B12）。
@@ -1206,6 +1370,14 @@ def run_backfill(opts: SyncOptions) -> dict[str, object]:
             "requests": client.requests,
             "weight": client.weight,
             "aggregated": ({k: v.to_dict() for k, v in aggregated.items()} if aggregated else None),
+            # backfill 也是 1m 写入路径，因此**必须**触发指标物化（R-5.2 / AC-6）。
+            # 与 sync 同一个形状：`{周期: {参数集标签: {...}}}`。
+            "indicators": (
+                {iv: ind.stats_payload(st, specs) for iv, st in indicators.items()}
+                if indicators
+                else None
+            ),
+            "implVersion": INDICATOR_IMPL_VERSION,
         }
 
 
@@ -1369,6 +1541,285 @@ def _aggregate_batched(
             )
         cursor = next_cursor
     return totals
+
+
+def run_indicators(
+    opts: SyncOptions, *, rebuild: bool = False, check: bool = False
+) -> dict[str, object]:
+    """``indicators`` 命令（v0.3.0 R-6）：补齐 / ``--rebuild`` / ``--check``。
+
+    语义与 ``aggregate`` 同形（R-6.1），便于记忆：
+      * **补齐（缺省）**：区间内全部合格行 UPSERT，**不删**任何已有行；区间缺省该标的全量；
+      * ``--rebuild``：同一区间**先删后算**，修复「K 线被改动 / 指标被篡改 /
+        ``impl_version`` 已递增」；
+      * ``--check``：**只读**校验，报 stale / missing / mismatch / 混版，任一不一致即抛
+        ``INDICATOR_MISMATCH``（退出码非 0 由 CLI 决定）。
+
+    **不进交易所、不改 ``sync_state`` 的水位与 rows**（R-6.4）：只读派生 K 线、只写指标表。
+    单写者锁与 :class:`pg.SymbolLock` 同键（R-6.5），但**不建** ``sync_state`` 行——
+    否则「库里已有数据、只是没进集合」的标的会因跑一次重建就多出一行幽灵状态。
+    """
+    now = _validate_options(opts)
+    if rebuild and check:
+        raise SyncError("CONFIG_INVALID", "--rebuild 与 --check 不能同时使用", {})
+
+    intervals = resolve_indicator_intervals(opts)
+    specs = resolve_indicator_specs(opts)
+    if not specs:
+        # 显式关闭指标层时，`data indicators` 不该假装成功而什么都不说（R-12.2 / AC-23）。
+        raise SyncError(
+            "CONFIG_INVALID",
+            "未启用指标（indicatorSpecs 为空），无可物化的参数集",
+            {"indicatorSpecs": []},
+        )
+    if not intervals:
+        raise SyncError(
+            "CONFIG_INVALID",
+            "未启用指标周期（indicatorIntervals 为空）",
+            {"indicatorIntervals": []},
+        )
+    if opts.indicator_batch_bars <= 0:
+        raise SyncError(
+            "CONFIG_INVALID",
+            "--indicator-batch-bars 必须为正整数",
+            {"indicatorBatchBars": opts.indicator_batch_bars},
+        )
+
+    dsn = opts.dsn
+    writer = pg.connect(dsn)
+    started = time.monotonic()
+    try:
+        pg.ensure_schema(writer)
+        bounds = agg.read_bounds(writer, opts.symbol)
+        if bounds is None:
+            # 与 verify / aggregate 同口径：库里没有该标的的任何数据 → SYMBOL_NOT_FOUND，
+            # 而不是「成功但写了 0 行」（R-14 禁止只报成功）。
+            raise SyncError(
+                "SYMBOL_NOT_FOUND",
+                f"库内没有该标的的任何数据: {opts.symbol}",
+                {"symbol": opts.symbol},
+            )
+        start_ms = opts.from_ms if opts.from_ms is not None else bounds.first_ms
+        end_ms = opts.to_ms if opts.to_ms is not None else bounds.last_ms
+        if end_ms < start_ms:
+            raise SyncError(
+                "CONFIG_INVALID", "--to 不能早于 --from", {"from": start_ms, "to": end_ms}
+            )
+
+        lock = pg.SymbolLock.acquire(dsn, opts.exchange, opts.symbol, now, create_state_row=False)
+        try:
+            if check:
+                problems: list[ind.IndicatorProblem] = []
+                for interval in intervals:
+                    problems.extend(
+                        ind.check_interval(writer, opts.symbol, interval, specs, start_ms, end_ms)
+                    )
+                ind.raise_on_mismatch(opts.symbol, problems)
+                # 与补齐路径**同一个形状**：键名与 `IndicatorStat.to_dict()` 逐字段一致，
+                # 否则 `data indicators --check` 的打印会在 undefined 上崩掉（R-6.6）。
+                return {
+                    "symbol": opts.symbol,
+                    "from": start_ms,
+                    "to": end_ms,
+                    "rebuild": False,
+                    "check": True,
+                    "indicators": _indicators_payload(specs, _zero_stats(specs), intervals),
+                    "implVersion": INDICATOR_IMPL_VERSION,
+                    "durationMs": int((time.monotonic() - started) * 1000),
+                }
+
+            totals = _indicators_batched(
+                writer,
+                opts.symbol,
+                intervals,
+                specs,
+                start_ms,
+                end_ms,
+                opts.indicator_batch_bars,
+                rebuild=rebuild,
+            )
+            return {
+                "symbol": opts.symbol,
+                "from": start_ms,
+                "to": end_ms,
+                "rebuild": rebuild,
+                "check": False,
+                # 键序固定 → 连续两次补齐的 JSON 逐字节相同（R-6.7）
+                "indicators": _indicators_payload(specs, totals, intervals),
+                "implVersion": INDICATOR_IMPL_VERSION,
+                "durationMs": int((time.monotonic() - started) * 1000),
+            }
+        finally:
+            lock.release()
+    finally:
+        writer.close()
+
+
+def _zero_stats(specs: Sequence[ind.ParamSet]) -> dict[str, ind.IndicatorStat]:
+    return ind.all_stats(specs, ind.ALLOWED_INDICATOR_INTERVALS[0])
+
+
+def _indicators_payload(
+    specs: Sequence[ind.ParamSet],
+    stats: Mapping[str, ind.IndicatorStat],
+    intervals: Sequence[str],
+) -> dict[str, object]:
+    """按 ``specs`` 的固定次序铺开 ``{interval: {spec: {...}}}``，缺项补零。
+
+    铺开而不是直接吐 ``stats`` 的键：键里混了周期名，直接吐会让「某参数集本轮完全没触及」
+    变成「从摘要里消失」，看起来像没启用（R-6.6：不许只报成功）。
+    """
+    payload: dict[str, object] = {}
+    for interval in intervals:
+        block: dict[str, object] = {}
+        for spec in specs:
+            key = f"{spec.indicator}:{json.dumps(spec.params_dict(), sort_keys=True)}"
+            stat = stats.get(key)
+            block[spec.label()] = (
+                stat.to_dict()
+                if stat is not None
+                else {
+                    "indicator": spec.indicator,
+                    "params": spec.params_dict(),
+                    "upserted": 0,
+                    "withheldWarmup": 0,
+                }
+            )
+        payload[interval] = block
+    return payload
+
+
+def _indicators_batched(
+    writer: DbConn,
+    symbol: str,
+    intervals: Sequence[str],
+    specs: Sequence[ind.ParamSet],
+    start_ms: int,
+    end_ms: int,
+    batch_bars: int,
+    *,
+    rebuild: bool,
+) -> dict[str, ind.IndicatorStat]:
+    """按**派生 bar 数**分批、每批一个事务地物化区间（R-6.3）。
+
+    绝不把整段历史一次物化：15m 全历史可达数十万行，单事务的锁持有时间与 WAL 体积
+    都不可接受（与 ``_aggregate_batched`` 同理）。
+
+    **批边界必须落在连续段的边界上**——这一点与派生聚合**不一样**，不能照抄它的做法。
+    派生聚合按「最宽的周期」对齐批边界是安全的，因为一个桶的值只取决于它自己那几根
+    1m；指标则不同：**一个连续段被从中间切成两半后，两半各自的「段首」不同**，
+    于是预热期起点、递推种子、乃至浮点累加的原点全都变了——同��根 bar 的指标值
+    会与整段重算差最后几位（实测 15m 全库出现 156 万处 ``mismatch``）。
+
+    因此这里每批先读一个探测窗口，切段后**只写完整的段**；末尾那一段若延伸出窗口，
+    就把它整体推迟到下一批（下一批从它的**段首**重新读）。代价是每批多读一段，
+    换来的是「分批结果与整段重算逐值相同」——而这正是 ``--check`` 的判据。
+    """
+    if not intervals or not specs:
+        return {}
+    totals: dict[str, ind.IndicatorStat] = {}
+    for interval in intervals:
+        width = agg.interval_width(interval)
+        cursor = start_ms
+        while cursor <= end_ms:
+            probe_end = min(cursor + batch_bars * width - 1, end_ms)
+            with writer.transaction():
+                batch_stats, next_cursor = _materialize_one_batch(
+                    writer,
+                    symbol,
+                    interval,
+                    specs,
+                    cursor,
+                    probe_end,
+                    rebuild=rebuild and cursor == start_ms,
+                )
+            ind.merge_stats(totals, batch_stats)
+            if next_cursor <= cursor:  # pragma: no cover - 防御 batch_bars 过小导致不推进
+                raise SyncError(
+                    "CONFIG_INVALID",
+                    "indicatorBatchBars 过小，无法按 bar 推进",
+                    {"indicatorBatchBars": batch_bars, "intervals": list(intervals)},
+                )
+            cursor = next_cursor
+    return totals
+
+
+def _materialize_one_batch(
+    writer: DbConn,
+    symbol: str,
+    interval: str,
+    specs: Sequence[ind.ParamSet],
+    cursor: int,
+    probe_end: int,
+    *,
+    rebuild: bool,
+) -> tuple[dict[str, ind.IndicatorStat], int]:
+    """一批 = 若干**完整**的连续段。返回 ``(统计, 下一批起点)``。
+
+    段没有被切断的做法是「把探测窗口延长到该段结束」，**不是**「留到下一批再算」——
+    后者会把游标退回全局段首，于是同一段被反复重读重算，永远推不动。
+
+    窗口按倍数外扩直到末段不再顶在窗口末尾（或已经读到数据末尾）。段通常远小于
+    窗口，因此实际只多读一次；跨段的罕见数据才会多扩几轮。
+    """
+    stats: dict[str, ind.IndicatorStat] = {}
+    width = agg.interval_width(interval)
+    data_end = _derived_end(writer, symbol, interval)
+    probe = probe_end
+    times: list[int] = []
+    series = ind.empty_series()
+    segments: list[ind.Segment] = []
+    while True:
+        times, series = ind.read_derived_bars(writer, symbol, interval, cursor, probe)
+        if not times:
+            return stats, probe + 1
+        segments = ind.split_segments(times, width)
+        last = segments[-1]
+        # 末段顶在窗口最后一根桶上、且窗口还没到数据末尾 → 它可能还没走完
+        if last.end_ms < probe - width + 1 or probe >= data_end:
+            next_cursor = times[-1] + width
+            break
+        probe = min(cursor + (probe - cursor) * 2 + width, max(data_end, probe))
+
+    if not segments:
+        return stats, next_cursor
+    if rebuild:
+        ind.delete_range(writer, symbol, interval, specs, segments[0].start_ms, segments[-1].end_ms)
+    ind.write_specs(writer, symbol, interval, specs, times, series, segments, stats)
+    return stats, next_cursor
+
+
+def _derived_end(writer: DbConn, symbol: str, interval: str) -> int:
+    """该标的该周期派生表的最后一根 bar 起点（没有则返回 0）。"""
+    table = agg.DERIVED_TABLES[interval]
+    row = writer.execute(
+        f"SELECT max(time) AS t FROM {table} WHERE symbol = %s", (symbol,)
+    ).fetchone()
+    value = row["t"] if row is not None else None
+    return int(value) if value is not None else 0
+
+
+def _next_indicator_cursor(
+    writer: DbConn,
+    symbol: str,
+    interval: str,
+    cursor: int,
+    probe_end: int,
+    end_ms: int,
+    width: int,
+) -> int:
+    """下一批的起点：落在**段边界**上，因此绝不从一段中间接着算。"""
+    if probe_end >= end_ms:
+        return end_ms + 1
+    times, _series = ind.read_derived_bars(writer, symbol, interval, cursor, probe_end)
+    if not times:
+        return probe_end + 1
+    segments = ind.split_segments(times, width)
+    last = segments[-1]
+    # 末段走完了整个窗口且窗口不是数据末尾 → 它可能还没结束，从**它的段首**重来
+    if last.end_ms == times[-1] and last.end_ms >= probe_end - width + 1:
+        return last.start_ms + width
+    return times[-1] + width
 
 
 def run_verify(opts: SyncOptions) -> dict[str, object]:

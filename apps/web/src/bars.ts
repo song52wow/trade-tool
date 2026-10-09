@@ -1,4 +1,4 @@
-import { parseStoredInterval } from '@trade-tool/data';
+import { parseIndicatorInterval, parseStoredInterval, type IndicatorInterval } from '@trade-tool/data';
 import { SyncError } from '@trade-tool/core';
 
 /**
@@ -55,4 +55,17 @@ export function parseBarLimit(raw: string | undefined): number {
  */
 export function parseIntervalParam(raw: string | undefined) {
   return parseStoredInterval(raw);
+}
+
+/**
+ * 解析 `?interval=`（**指标**取数用，v0.3.0 R-10.3）。
+ *
+ * 与 K 线的 `parseIntervalParam` **刻意分开**：K 线允许 `1m`（它是基础数据），
+ * 指标**不做 1m 物化**（N-2：单标的约 4.3 GB/标的）。合成一条「指标周期」白名单会让
+ * 两者在某个周期上分叉，而分叉的后果是「图上画着 1h、其实取的是 1m」。
+ *
+ * 缺省 `1h`；`1m` / `5m` / `foo` 一律 `CONFIG_INVALID` → 400，**绝不静默回落**（AC-12）。
+ */
+export function parseIndicatorIntervalParam(raw: string | undefined): IndicatorInterval {
+  return parseIndicatorInterval(raw);
 }

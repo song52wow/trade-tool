@@ -1,10 +1,10 @@
 {
-  "name": "@trade-tool/backtest",
+  "name": "@trade-tool/executor",
   "version": "0.0.0",
   "private": true,
   "type": "module",
   "license": "MIT",
-  "description": "回测编排与绩效指标",
+  "description": "买入成交 → ATR → 止盈止损（常驻执行服务）",
   "main": "./dist/index.js",
   "module": "./dist/index.js",
   "types": "./dist/index.d.ts",
@@ -17,19 +17,25 @@
   "files": [
     "dist"
   ],
+  "bin": {
+    "trade-tool-executor": "./dist/main.js"
+  },
   "scripts": {
     "build": "tsup",
-    "dev": "tsup --watch",
+    "dev": "tsx watch src/main.ts",
+    "start": "tsx src/main.ts",
     "typecheck": "tsc -p tsconfig.json",
     "test": "vitest run",
     "clean": "rm -rf dist"
   },
   "dependencies": {
-    "@trade-tool/core": "workspace:*"
+    "@trade-tool/core": "workspace:*",
+    "@trade-tool/data": "workspace:*"
   },
   "devDependencies": {
     "@trade-tool/tsconfig": "workspace:*",
     "tsup": "^8.3.0",
+    "tsx": "^4.19.0",
     "typescript": "^5.7.0",
     "vitest": "^2.1.0"
   }
