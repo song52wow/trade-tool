@@ -45,6 +45,8 @@ KNOWN_MIGRATION_VERSIONS: frozenset[str] = frozenset(
         "004_klines_agg",
         "005_indicators",
         "006_risk_bracket",
+        # v0.5.0：控制面可写的运行期设置（加密凭据 + 止盈止损策略）
+        "007_executor_settings",
     }
 )
 
@@ -75,6 +77,10 @@ REQUIRED_TABLES: frozenset[str] = frozenset(
         "indicator_kdj",
         "indicator_atr",
         "indicator_obv",
+        # v0.5.0 的两张设置表同样在必需之列：缺表等价于「控制面能写的配置无处可落」，
+        # 而写侧会在一个没有约束的表上悄悄接受脏数据。
+        "executor_credentials",
+        "risk_policy",
     }
 )
 

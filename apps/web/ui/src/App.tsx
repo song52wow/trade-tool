@@ -5,10 +5,13 @@ import { ApiError, api } from './api.js';
 import { fmtAgo, fmtDuration, fmtNumber, fmtPercent } from './format.js';
 import { ConfirmDialog } from './components/ConfirmDialog.js';
 import { OverviewCards } from './components/OverviewCards.js';
-import { SymbolDetail } from './components/SymbolDetail.js';
+import { SettingsPage } from './components/SettingsPage.js';
+import { SymbolPage } from './components/SymbolPage.js';
 import { SymbolPicker } from './components/SymbolPicker.js';
 import { SymbolTable } from './components/SymbolTable.js';
-import type { JobDto, OverviewDto, SymbolDetailDto, SymbolRowDto } from '../../src/types';
+import { ThemeToggle } from './components/ThemeToggle.js';
+import { HOME_PATH, SETTINGS_PATH, navigate, symbolPath, useRoute } from './router.js';
+import type { JobDto, OverviewDto, SymbolRowDto } from '../../src/types';
 
 const REFRESH_MS = 5_000;
 
@@ -31,8 +34,6 @@ export function App() {
   const [overview, setOverview] = useState<OverviewDto | null>(null);
   const [symbols, setSymbols] = useState<SymbolRowDto[]>([]);
   const [jobs, setJobs] = useState<JobDto[]>([]);
-  const [selected, setSelected] = useState<string | null>(null);
-  const [detail, setDetail] = useState<SymbolDetailDto | null>(null);
   const [pending, setPending] = useState<Pending | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
   const [toasts, setToasts] = useState<Toast[]>([]);
@@ -40,6 +41,13 @@ export function App() {
   const [knownSymbols, setKnownSymbols] = useState<string[]>([]);
   const [autoRefresh, setAutoRefresh] = useState(true);
   const [loadError, setLoadError] = useState<string | null>(null);
+  /**
+   * 路由（`#/` / `#/symbol/X` / `#/settings`）。**选中标的不再是组件状态**：
+   * 它就是地址栏里的 hash，刷新后要停在同一个标的、能复制给别人，
+   * 因此它只能是路由，不能是 `useState`。
+   */
+  const route = useRoute();
+  const selected = route.kind === 'symbol' ? route.symbol : null;
   /**
    * 全局刷新计数。每成功刷新一次 +1，详情里的 K 线图拿它当刷新信号。
    *
@@ -105,22 +113,8 @@ export function App() {
     return () => clearInterval(id);
   }, [autoRefresh, refresh]);
 
-  useEffect(() => {
-    if (selected === null) {
-      setDetail(null);
-      return;
-    }
-    let cancelled = false;
-    void api
-      .symbol(selected)
-      .then((d) => {
-        if (!cancelled) setDetail(d);
-      })
-      .catch(report);
-    return () => {
-      cancelled = true;
-    };
-  }, [selected, refresh, report]);
+  // 详情取数已经搬进 SymbolPage：那边可能是首屏（直接粘地址栏进来），
+  // 必须用自己的 layout effect，父组件替它取数会让它在图表挂载失败时被一起带下水。
 
   useEffect(() => {
     void api
@@ -247,7 +241,8 @@ export function App() {
       } else {
         await api.removeSymbol(pending.symbol, pending.policy);
         notify(`${pending.symbol} 已移除（已入库数据按 ${pending.policy} 处置）`);
-        if (selected === pending.symbol) setSelected(null);
+        // 正在看的正是被移除的那个标的：路由回首页，而不是停在一个 404 的详情页上
+        if (selected === pending.symbol) navigate(HOME_PATH);
       }
       setPending(null);
       await refresh();
@@ -264,7 +259,32 @@ export function App() {
   return (
     <div className="app">
       <header className="top">
-        <h1>trade-tool 控制面</h1>
+        {/* 面包屑三态：它就是导航本身。点「首页」改 hash，不整页刷新。 */}
+        <nav className="crumbs" aria-label="面包屑">
+          <button
+            className={`link${route.kind === 'home' ? ' current' : ''}`}
+            onClick={() => navigate(HOME_PATH)}
+          >
+            首页
+          </button>
+          {route.kind === 'symbol' ? (
+            <>
+              <span className="sep" aria-hidden="true">
+                /
+              </span>
+              <span className="mono current">{route.symbol}</span>
+            </>
+          ) : null}
+          {route.kind === 'settings' ? (
+            <>
+              <span className="sep" aria-hidden="true">
+                /
+              </span>
+              <span className="current">设置</span>
+            </>
+          ) : null}
+        </nav>
+        <h1 className="brand">trade-tool 控制面</h1>
         <span className={`tag ${schemaOk ? 'ok' : 'error'}`}>
           schema {overview ? `${overview.schema.current} / ${overview.schema.latest}` : '读取中'}
         </span>
@@ -277,6 +297,13 @@ export function App() {
           />
           <span className="muted">每 {REFRESH_MS / 1000}s 自动刷新</span>
         </label>
+        <button
+          onClick={() => navigate(SETTINGS_PATH)}
+          className={route.kind === 'settings' ? 'primary' : ''}
+        >
+          设置
+        </button>
+        <ThemeToggle />
         <button onClick={() => void refresh()}>立即刷新</button>
       </header>
 
@@ -316,162 +343,163 @@ export function App() {
         </div>
       ) : null}
 
-      {overview ? (
-        <OverviewCards
-          summary={overview.summary}
-          exchangeCount={overview.exchange.count}
-          exchangeStale={overview.exchange.stale}
-          exchangeAgeMs={overview.exchange.ageMs}
-          daemon={overview.daemon}
-          now={now}
-          activeJobs={overview.jobs.active}
-        />
-      ) : (
-        <p className="muted">正在读取状态…</p>
-      )}
-
-      <div className="panel">
-        <h2>
-          进行中与最近作业
-          {activeJobs.length > 0 ? (
-            <span className="tag running">{activeJobs.length} 进行中</span>
-          ) : null}
-        </h2>
-        {jobs.length === 0 ? (
-          <p className="muted">还没有作业。数据体检会在详情面板里发起。</p>
-        ) : (
-          <div className="table-scroll">
-            <table>
-              <thead>
-                <tr>
-                  <th>标的</th>
-                  <th>类型</th>
-                  <th>状态</th>
-                  <th>进度</th>
-                  <th>开始</th>
-                  <th>耗时</th>
-                  <th>结果 / 错误</th>
-                </tr>
-              </thead>
-              <tbody>
-                {jobs.slice(0, 8).map((job) => {
-                  const pct =
-                    job.progress.target && job.progress.target > 0 && job.progress.rows !== null
-                      ? Math.min(1, job.progress.rows / job.progress.target)
-                      : null;
-                  return (
-                    <tr key={job.id}>
-                      <td className="mono">{job.symbol}</td>
-                      <td>
-                        {job.kind === 'full'
-                          ? '全量/增量'
-                          : job.kind === 'verify'
-                            ? '全表校验'
-                            : '派生重建'}
-                      </td>
-                      <td>
-                        <span
-                          className={`tag ${
-                            job.status === 'running'
-                              ? 'running'
-                              : job.status === 'failed'
-                                ? 'error'
-                                : 'ok'
-                          }`}
-                        >
-                          {job.status}
-                        </span>
-                      </td>
-                      <td style={{ minWidth: 180 }}>
-                        {pct === null ? (
-                          <span className="muted">—</span>
-                        ) : (
-                          <>
-                            <div className="bar thin">
-                              <i style={{ width: `${pct * 100}%` }} />
-                            </div>
-                            <span className="mono muted" style={{ fontSize: 11 }}>
-                              {fmtNumber(job.progress.rows)} / {fmtNumber(job.progress.target)} ·{' '}
-                              {fmtPercent(pct)}
-                            </span>
-                          </>
-                        )}
-                      </td>
-                      <td className="muted mono">
-                        {new Date(job.startedAt).toLocaleTimeString('zh-CN', { hour12: false })}
-                      </td>
-                      <td className="muted">
-                        {job.finishedAt === null
-                          ? '进行中'
-                          : fmtDuration(job.finishedAt - job.startedAt)}
-                      </td>
-                      <td className="mono muted" style={{ whiteSpace: 'pre-wrap' }}>
-                        {job.error ? `[${job.error.code}] ${job.error.message}` : '—'}
-                      </td>
-                    </tr>
-                  );
-                })}
-              </tbody>
-            </table>
-          </div>
-        )}
-      </div>
-
-      <div className="panel">
-        <h2>标的集合</h2>
-        <div className="row" style={{ marginBottom: 12 }}>
-          <SymbolPicker
-            options={knownSymbols}
-            value={newSymbol}
-            onChange={setNewSymbol}
-            onSubmit={(s) => void addSymbolNamed(s)}
-          />
-          <button
-            className="primary"
-            onClick={() => void addSymbol()}
-            disabled={newSymbol.trim() === ''}
-          >
-            添加（默认 paused）
-          </button>
-          <span className="muted" style={{ fontSize: 12 }}>
-            新标的默认 paused —— 加进来不会自动拉数据，避免一次加多个引发回补风暴。
-          </span>
-        </div>
-        <SymbolTable
-          items={symbols}
-          now={now}
-          selected={selected}
-          busy={busy}
-          daemonOnline={daemonOnline}
-          onSelect={setSelected}
-          onLifecycle={(s, a) => void runLifecycle(s, a)}
-          onStart={(s) => void askStart(s)}
-          onRemove={askRemove}
-          onAdopt={(s) => void addSymbolNamed(s)}
-        />
-      </div>
-
-      {selected !== null ? (
-        <div className="panel">
-          <h2>
-            {selected} 详情
-            <button onClick={() => setSelected(null)}>收起</button>
-          </h2>
-          {detail === null ? (
-            <p className="muted">读取中…</p>
-          ) : (
-            <SymbolDetail
-              detail={detail}
+      {/*
+        三条路由各自只渲染自己那部分内容：详情页不重复概览卡片，设置页也不。
+        概览卡片回答的是「全局现在怎么样」，详情页回答的是「这个标的怎么样」，
+        两者堆在一起只会让后者被前者压掉。
+      */}
+      {route.kind === 'home' ? (
+        <>
+          {overview ? (
+            <OverviewCards
+              summary={overview.summary}
+              exchangeCount={overview.exchange.count}
+              exchangeStale={overview.exchange.stale}
+              exchangeAgeMs={overview.exchange.ageMs}
+              daemon={overview.daemon}
               now={now}
-              verifying={verifyingSymbol === selected}
-              onVerify={() => setPending({ kind: 'verify', symbol: selected })}
-              aggregating={aggregatingSymbol === selected}
-              onAggregate={() => setPending({ kind: 'aggregate', symbol: selected })}
-              tick={tick}
+              activeJobs={overview.jobs.active}
             />
+          ) : (
+            <p className="muted">正在读取状态…</p>
           )}
-        </div>
+          <div className="panel">
+            <h2>
+              进行中与最近作业
+              {activeJobs.length > 0 ? (
+                <span className="tag running">{activeJobs.length} 进行中</span>
+              ) : null}
+            </h2>
+            {jobs.length === 0 ? (
+              <p className="muted">还没有作业。数据体检会在详情面板里发起。</p>
+            ) : (
+              <div className="table-scroll">
+                <table>
+                  <thead>
+                    <tr>
+                      <th>标的</th>
+                      <th>类型</th>
+                      <th>状态</th>
+                      <th>进度</th>
+                      <th>开始</th>
+                      <th>耗时</th>
+                      <th>结果 / 错误</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {jobs.slice(0, 8).map((job) => {
+                      const pct =
+                        job.progress.target && job.progress.target > 0 && job.progress.rows !== null
+                          ? Math.min(1, job.progress.rows / job.progress.target)
+                          : null;
+                      return (
+                        <tr key={job.id}>
+                          <td className="mono">{job.symbol}</td>
+                          <td>
+                            {job.kind === 'full'
+                              ? '全量/增量'
+                              : job.kind === 'verify'
+                                ? '全表校验'
+                                : '派生重建'}
+                          </td>
+                          <td>
+                            <span
+                              className={`tag ${
+                                job.status === 'running'
+                                  ? 'running'
+                                  : job.status === 'failed'
+                                    ? 'error'
+                                    : 'ok'
+                              }`}
+                            >
+                              {job.status}
+                            </span>
+                          </td>
+                          <td style={{ minWidth: 180 }}>
+                            {pct === null ? (
+                              <span className="muted">—</span>
+                            ) : (
+                              <>
+                                <div className="bar thin">
+                                  <i style={{ width: `${pct * 100}%` }} />
+                                </div>
+                                <span className="mono muted" style={{ fontSize: 11 }}>
+                                  {fmtNumber(job.progress.rows)} / {fmtNumber(job.progress.target)}{' '}
+                                  · {fmtPercent(pct)}
+                                </span>
+                              </>
+                            )}
+                          </td>
+                          <td className="muted mono">
+                            {new Date(job.startedAt).toLocaleTimeString('zh-CN', { hour12: false })}
+                          </td>
+                          <td className="muted">
+                            {job.finishedAt === null
+                              ? '进行中'
+                              : fmtDuration(job.finishedAt - job.startedAt)}
+                          </td>
+                          <td className="mono muted" style={{ whiteSpace: 'pre-wrap' }}>
+                            {job.error ? `[${job.error.code}] ${job.error.message}` : '—'}
+                          </td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+            )}
+          </div>
+
+          <div className="panel">
+            <h2>标的集合</h2>
+            <div className="row" style={{ marginBottom: 12 }}>
+              <SymbolPicker
+                options={knownSymbols}
+                value={newSymbol}
+                onChange={setNewSymbol}
+                onSubmit={(s) => void addSymbolNamed(s)}
+              />
+              <button
+                className="primary"
+                onClick={() => void addSymbol()}
+                disabled={newSymbol.trim() === ''}
+              >
+                添加（默认 paused）
+              </button>
+              <span className="muted" style={{ fontSize: 12 }}>
+                新标的默认 paused —— 加进来不会自动拉数据，避免一次加多个引发回补风暴。
+              </span>
+            </div>
+            <SymbolTable
+              items={symbols}
+              now={now}
+              selected={selected}
+              busy={busy}
+              daemonOnline={daemonOnline}
+              onSelect={(s) => navigate(symbolPath(s))}
+              onLifecycle={(s, a) => void runLifecycle(s, a)}
+              onStart={(s) => void askStart(s)}
+              onRemove={askRemove}
+              onAdopt={(s) => void addSymbolNamed(s)}
+            />
+          </div>
+        </>
       ) : null}
+
+      {route.kind === 'symbol' ? (
+        <SymbolPage
+          symbol={route.symbol}
+          symbols={symbols}
+          now={now}
+          verifying={verifyingSymbol === route.symbol}
+          onVerify={() => setPending({ kind: 'verify', symbol: route.symbol })}
+          aggregating={aggregatingSymbol === route.symbol}
+          onAggregate={() => setPending({ kind: 'aggregate', symbol: route.symbol })}
+          tick={tick}
+        />
+      ) : null}
+
+      {route.kind === 'settings' ? <SettingsPage symbols={symbols} notify={notify} /> : null}
 
       {pending?.kind === 'startOffline' ? (
         <ConfirmDialog

@@ -1,4 +1,8 @@
-import { parseIndicatorInterval, parseStoredInterval, type IndicatorInterval } from '@trade-tool/data';
+import {
+  parseIndicatorInterval,
+  parseStoredInterval,
+  type IndicatorInterval,
+} from '@trade-tool/data';
 import { SyncError } from '@trade-tool/core';
 
 /**
@@ -34,15 +38,25 @@ export function clampBarLimit(limit: number | undefined): number {
  *
  * 非法值（0、负数、小数、非数字）直接报错而不是默默用缺省：页面自己拼的参数出错时，
  * 静默换成另一个值只会让人以为「数据就这么多」。超出上限则截断到上限。
+ *
+ * `fallback` 只换**缺省值**，校验规则仍是这一份。止盈止损记录也用同一个 `?limit=`
+ * 约定，但它的合理缺省根数与 K 线不同——允许覆盖缺省正是为了不再写第二套校验规则，
+ * 而两套规则漂移的后果是「页面以为截断了，其实没有」。
  */
-export function parseBarLimit(raw: string | undefined): number {
-  if (raw === undefined) return DEFAULT_BAR_LIMIT;
+export function parseBarLimit(raw: string | undefined, fallback = DEFAULT_BAR_LIMIT): number {
+  if (raw === undefined) return fallback;
   const parsed = Number(raw);
   if (!Number.isInteger(parsed) || parsed < 1) {
     throw new SyncError('CONFIG_INVALID', `limit 必须是正整数，收到：${raw}`, { limit: raw });
   }
   return Math.min(parsed, MAX_BAR_LIMIT);
 }
+
+/** 止盈止损记录的单次取数硬上限：20 条成交足够排查，且是纯读、挂在刷新节奏上。 */
+export const MAX_BRACKET_LIMIT = 20;
+
+/** 止盈止损的缺省条数。仓位级的记录不会高频变动，默认给最近 20 条。 */
+export const DEFAULT_BRACKET_LIMIT = 20;
 
 /**
  * 解析 `?interval=`（v0.2.0 R-7.1）。

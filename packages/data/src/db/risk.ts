@@ -293,3 +293,47 @@ export async function listBrackets(
     throw toSyncError(error, `读取 ${symbol} 止盈止损记录失败`);
   }
 }
+
+/** 五态计数，**五项永远都在**，没有的态是 0。
+ *
+ * 为什么要一份独立的统计而不是从 `listBrackets` 的结果里数：控制面只回最近 N 条，
+ * 而 `failed` 恰恰是最老、最容易被挤出这个窗口的状态——库里有一条「占坑成功但保护单
+ * 没挂上」的记录，页面上却因为它不在前 20 条而显示一切正常。用截断过的列表反推完整
+ * 状态，正是 v0.4.0 要防的那种「看上去没事」。
+ *
+ * `state` 在 DDL 里是 CHECK 约束列，这里仍按已知五态建桶：真出现未知值说明约束被绕过
+ * 了，那属于要暴露的问题，因此直接抛错而不是悄悄归到某个态里（AGENTS.md 约定 9）。
+ */
+export async function countBracketsByState(
+  pool: Pool,
+  exchange: string,
+  symbol: string,
+): Promise<Record<BracketState, number>> {
+  try {
+    const result = await pool.query<{ state: string; n: string }>(
+      `SELECT state, COUNT(*)::text AS n FROM ${TABLE}
+       WHERE exchange = $1 AND symbol = $2 GROUP BY state`,
+      [exchange, symbol],
+    );
+    const counts: Record<BracketState, number> = {
+      armed: 0,
+      take_profit: 0,
+      stop_loss: 0,
+      cancelled: 0,
+      failed: 0,
+    };
+    for (const row of result.rows) {
+      const key = row.state as BracketState;
+      if (!(key in counts)) {
+        throw new SyncError('CONFIG_INVALID', `risk_bracket 出现未知状态：${row.state}`, {
+          state: row.state,
+        });
+      }
+      counts[key] = Number(row.n);
+    }
+    return counts;
+  } catch (error) {
+    if (error instanceof SyncError) throw error;
+    throw toSyncError(error, `统计 ${symbol} 止盈止损状态失败`);
+  }
+}

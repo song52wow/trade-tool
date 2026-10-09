@@ -20,6 +20,45 @@ if (typeof scope.ResizeObserver === 'undefined') {
 }
 
 /**
+ * jsdom 里的 `localStorage`。
+ *
+ * 实测这套环境（Node 26 + jsdom 30）**不给** `window.localStorage`：Node 自己的
+ * 实验性 localStorage 需要 `--localstorage-file`，而 jsdom 的那份没有被挂到 window 上。
+ * 于是 `window.localStorage.getItem` 直接是「读 undefined 的属性」。
+ *
+ * 主题选择要记在 localStorage 里，因此这里补一个内存版。用例要断言「记住了什么」时
+ * 读的是同一个对象，行为与浏览器一致；生产代码对「读不到」的兜底路径另有用例覆盖。
+ */
+type StorageLike = {
+  getItem(key: string): string | null;
+  setItem(key: string, value: string): void;
+  removeItem(key: string): void;
+  clear(): void;
+  key(index: number): string | null;
+  readonly length: number;
+};
+
+const windowScope = globalThis as unknown as { localStorage?: StorageLike };
+if (typeof windowScope.localStorage === 'undefined') {
+  const map = new Map<string, string>();
+  const storage: StorageLike = {
+    getItem: (key) => (map.has(key) ? (map.get(key) as string) : null),
+    setItem: (key, value) => {
+      map.set(key, String(value));
+    },
+    removeItem: (key) => {
+      map.delete(key);
+    },
+    clear: () => map.clear(),
+    key: (index) => [...map.keys()][index] ?? null,
+    get length() {
+      return map.size;
+    },
+  };
+  windowScope.localStorage = storage;
+}
+
+/**
  * jsdom 没有实现 `<dialog>` 的模态方法（`showModal` / `close` / `show`）。
  *
  * `ConfirmDialog` 用的是原生 `<dialog>`（AGENTS.md 允许的浏览器原生控件），所以

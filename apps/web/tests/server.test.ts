@@ -6,9 +6,16 @@ import {
 } from '@trade-tool/core';
 import { describe, expect, it } from 'vitest';
 
-import { MAX_BAR_LIMIT } from '../src/bars.js';
+import { DEFAULT_BRACKET_LIMIT, MAX_BAR_LIMIT, MAX_BRACKET_LIMIT } from '../src/bars.js';
 import { buildApp, type WebDeps } from '../src/server.js';
-import type { JobDto, OverviewDto, SymbolDetailDto, SymbolRowDto } from '../src/types.js';
+import type {
+  BracketsDto,
+  RiskPolicyViewDto,
+  JobDto,
+  OverviewDto,
+  SymbolDetailDto,
+  SymbolRowDto,
+} from '../src/types.js';
 
 const NOW = 1_760_000_000_000;
 
@@ -133,6 +140,59 @@ function fakeDeps(overrides: Partial<WebDeps> = {}): WebDeps & { calls: string[]
         materializeCommand: null,
       };
     },
+    listBrackets: async (symbol, options) => {
+      calls.push(`brackets:${symbol}:${String(options.limit)}`);
+      return {
+        symbol,
+        limit: options.limit,
+        items: [],
+        countsByState: { armed: 0, take_profit: 0, stop_loss: 0, cancelled: 0, failed: 0 },
+      };
+    },
+    getCredentialStatus: async () => ({
+      exchange: 'binance',
+      configured: false,
+      hint: null,
+      updatedAt: null,
+      masterKeyReady: true,
+    }),
+    writeCredentials: async () => ({
+      exchange: 'binance',
+      configured: true,
+      hint: '0000',
+      updatedAt: NOW,
+      masterKeyReady: true,
+    }),
+    clearCredentials: async () => ({
+      exchange: 'binance',
+      configured: false,
+      hint: null,
+      updatedAt: NOW,
+      masterKeyReady: true,
+    }),
+    getRiskPolicy: async () => ({
+      exchange: 'binance',
+      global: null,
+      overrides: [],
+      resolved: {
+        atrPeriod: 14,
+        atrInterval: '1h',
+        stopAtrMult: 2,
+        takeProfitAtrMult: 3,
+        source: 'config' as const,
+      },
+    }),
+    writeRiskPolicy: async (body) => ({
+      scope: body.scope,
+      exchange: 'binance',
+      symbol: body.symbol ?? '',
+      atrPeriod: body.atrPeriod,
+      atrInterval: body.atrInterval,
+      stopAtrMult: body.stopAtrMult,
+      takeProfitAtrMult: body.takeProfitAtrMult,
+      updatedAt: NOW,
+    }),
+    deleteRiskPolicy: async () => ({ ok: true as const }),
     estimate: async (symbol) => {
       calls.push(`estimate:${symbol}`);
       return {
@@ -602,5 +662,218 @@ describe('POST /api/symbols/:symbol/aggregate', () => {
     const res = await app.request('/api/symbols/AAAUSDT/destroy', { method: 'POST' });
     const body = (await res.json()) as { error: { details: { allowed: string[] } } };
     expect(body.error.details.allowed).toContain('aggregate');
+  });
+
+  // ------------------------------------------------------------ 止盈止损（v0.4.0）
+
+  it('GET /brackets 透传生效 limit，并回传全量五态计数', async () => {
+    const deps = fakeDeps();
+    const app = buildApp(deps);
+    const res = await app.request('/api/symbols/AAAUSDT/brackets?limit=5');
+    const body = (await res.json()) as BracketsDto;
+
+    expect(res.status).toBe(200);
+    expect(body.symbol).toBe('AAAUSDT');
+    expect(body.limit).toBe(5);
+    expect(deps.calls).toContain('brackets:AAAUSDT:5');
+    // 五态必须**全部**在，哪怕计数是 0：页面按固定顺序渲染，缺一个键就会打出 undefined。
+    expect(Object.keys(body.countsByState).sort()).toEqual([
+      'armed',
+      'cancelled',
+      'failed',
+      'stop_loss',
+      'take_profit',
+    ]);
+  });
+
+  it('limit 缺省用止盈止损自己的缺省值，而不是 K 线的根数', async () => {
+    const deps = fakeDeps();
+    const app = buildApp(deps);
+    await app.request('/api/symbols/AAAUSDT/brackets');
+
+    expect(deps.calls).toContain(`brackets:AAAUSDT:${String(DEFAULT_BRACKET_LIMIT)}`);
+  });
+
+  it('超上限的 limit 被夹住，且回传生效值', async () => {
+    const deps = fakeDeps();
+    const app = buildApp(deps);
+    const body = (await (
+      await app.request('/api/symbols/AAAUSDT/brackets?limit=99999')
+    ).json()) as BracketsDto;
+
+    expect(body.limit).toBe(MAX_BRACKET_LIMIT);
+    expect(deps.calls).toContain(`brackets:AAAUSDT:${String(MAX_BRACKET_LIMIT)}`);
+  });
+
+  it('非法 limit 报 400，且一次查询都不发（不静默换值）', async () => {
+    const deps = fakeDeps();
+    const app = buildApp(deps);
+    const res = await app.request('/api/symbols/AAAUSDT/brackets?limit=0');
+
+    expect(res.status).toBe(400);
+    expect(deps.calls.some((c) => c.startsWith('brackets:'))).toBe(false);
+  });
+
+  it('没有止盈止损记录时 200 + 空数组，不是 404', async () => {
+    const app = buildApp(fakeDeps());
+    const res = await app.request('/api/symbols/NEVERFILLED/brackets');
+    const body = (await res.json()) as BracketsDto;
+
+    // 「这个标的还没成交过」是完全正常的状态，页面要能显示空状态而不是报错。
+    expect(res.status).toBe(200);
+    expect(body.items).toEqual([]);
+  });
+
+  it('failed 记录被 limit 截掉时，计数仍然能暴露它', async () => {
+    const app = buildApp(
+      fakeDeps({
+        listBrackets: async (symbol, options) => ({
+          symbol,
+          limit: options.limit,
+          items: [
+            {
+              entryOrderId: 'order-1',
+              exchange: 'binance',
+              symbol,
+              entryPrice: 100,
+              entryTime: NOW - 3_600_000,
+              filledQty: 1,
+              positionSide: 'LONG',
+              atr: 2,
+              atrPeriod: 14,
+              atrInterval: '1h',
+              atrWindowFrom: NOW - 7_200_000,
+              atrWindowTo: NOW - 3_600_000,
+              stopPrice: 96,
+              takeProfit: 108,
+              tpOrderId: 1,
+              slOrderId: 2,
+              state: 'armed' as const,
+              lastError: null,
+              createdAt: NOW - 3_600_000,
+              updatedAt: NOW - 3_600_000,
+            },
+          ],
+          // 有 2 笔 failed，但当前 items 里一条都没有——这正是 countsByState 存在的理由。
+          countsByState: {
+            armed: 1,
+            take_profit: 0,
+            stop_loss: 0,
+            cancelled: 0,
+            failed: 2,
+          },
+        }),
+      }),
+    );
+    const body = (await (await app.request('/api/symbols/AAAUSDT/brackets')).json()) as BracketsDto;
+
+    expect(body.items).toHaveLength(1);
+    expect(body.countsByState.failed).toBe(2);
+  });
+
+  // ------------------------------------------------- 运行期设置（v0.5.0）
+
+  it('凭据读取接口的回包里没有任何 secret 字段', async () => {
+    const app = buildApp(fakeDeps());
+    const body = (await (await app.request('/api/settings/credentials')).json()) as Record<
+      string,
+      unknown
+    >;
+
+    // 整个接口的存在前提就是「控制面没有能力显示密钥」，所以断言字段形状而不只是断言内容。
+    expect(Object.keys(body).sort()).toEqual([
+      'configured',
+      'exchange',
+      'hint',
+      'masterKeyReady',
+      'updatedAt',
+    ]);
+    expect(JSON.stringify(body)).not.toMatch(/secret/i);
+  });
+
+  it('写入凭据后回包仍是状态，不是明文', async () => {
+    const app = buildApp(fakeDeps());
+    const res = await app.request('/api/settings/credentials', {
+      method: 'PUT',
+      body: JSON.stringify({ apiKey: 'abcdef123456', apiSecret: 'super-secret' }),
+      headers: { 'content-type': 'application/json' },
+    });
+    const text = await res.text();
+
+    expect(res.status).toBe(200);
+    expect(text).not.toContain('super-secret');
+    expect(text).not.toContain('abcdef123456');
+  });
+
+  it('空 apiKey / apiSecret 被拒', async () => {
+    const app = buildApp(fakeDeps());
+    const res = await app.request('/api/settings/credentials', {
+      method: 'PUT',
+      body: JSON.stringify({ apiKey: '  ', apiSecret: 'x' }),
+      headers: { 'content-type': 'application/json' },
+    });
+    expect(res.status).toBe(400);
+  });
+
+  it('缺字段报 400', async () => {
+    const app = buildApp(fakeDeps());
+    const res = await app.request('/api/settings/credentials', {
+      method: 'PUT',
+      body: JSON.stringify({ apiKey: 'k' }),
+      headers: { 'content-type': 'application/json' },
+    });
+    expect(res.status).toBe(400);
+  });
+
+  it('跨站写请求被拒（控制面无鉴权，这是唯一一道闸）', async () => {
+    const app = buildApp(fakeDeps());
+    const res = await app.request('http://127.0.0.1:8787/api/settings/credentials', {
+      method: 'PUT',
+      body: JSON.stringify({ apiKey: 'k', apiSecret: 's' }),
+      headers: { 'content-type': 'application/json', origin: 'http://evil.example' },
+    });
+    expect(res.status).toBe(400);
+  });
+
+  it('同源写请求放行', async () => {
+    const app = buildApp(fakeDeps());
+    const res = await app.request('http://127.0.0.1:8787/api/settings/credentials', {
+      method: 'PUT',
+      body: JSON.stringify({ apiKey: 'k', apiSecret: 's' }),
+      headers: { 'content-type': 'application/json', origin: 'http://127.0.0.1:8787' },
+    });
+    expect(res.status).toBe(200);
+  });
+
+  it('策略读取带 symbol 时回传 resolved 与来源', async () => {
+    const app = buildApp(fakeDeps());
+    const body = (await (
+      await app.request('/api/settings/risk-policy?symbol=AAAUSDT')
+    ).json()) as RiskPolicyViewDto;
+
+    expect(body.resolved.source).toBe('config');
+    expect(body.overrides).toEqual([]);
+  });
+
+  it('写入策略必须给合法 scope', async () => {
+    const app = buildApp(fakeDeps());
+    const res = await app.request('/api/settings/risk-policy', {
+      method: 'PUT',
+      body: JSON.stringify({
+        scope: 'nonsense',
+        atrPeriod: 14,
+        atrInterval: '1h',
+        stopAtrMult: 2,
+        takeProfitAtrMult: 3,
+      }),
+      headers: { 'content-type': 'application/json' },
+    });
+    expect(res.status).toBe(400);
+  });
+
+  it('删除策略必须给合法 scope', async () => {
+    const app = buildApp(fakeDeps());
+    const res = await app.request('/api/settings/risk-policy?scope=bogus', { method: 'DELETE' });
+    expect(res.status).toBe(400);
   });
 });

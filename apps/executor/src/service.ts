@@ -104,6 +104,24 @@ export interface ExecutorServiceDeps {
   atr: AtrProvider;
   /** 可注入时钟，测试里固定住。 */
   now?: () => number;
+  /**
+   * 按标的解析止盈止损参数（v0.5.0）。
+   *
+   * 优先级只有一份实现：`resolvePolicy()`（标的覆盖 > 全局默认 > 配置文件）。
+   * **不传就用配置文件**——测试与未接库的场景因此不必改。
+   *
+   * 注意：它决定的是**之后**的成交。已经挂出去的单不会被改写，也不会撤单重挂：
+   * 那会平掉真实仓位，不可逆。
+   */
+  resolvePolicy?: (symbol: string) => Promise<RiskPolicy & { source: string }>;
+}
+
+/** 从库里解析出来的一份策略参数。字段名与 `deriveBracketPlan` 入参一一对应。 */
+export interface RiskPolicy {
+  atrPeriod: number;
+  atrInterval: string;
+  stopAtrMult: number;
+  takeProfitAtrMult: number;
 }
 
 /** 一条成交事件的处理结果。控制面与日志都靠它区分「为什么没设单」。 */
@@ -260,6 +278,27 @@ export function createExecutorService(deps: ExecutorServiceDeps): ExecutorServic
     }
 
     if (!inScope(update.symbol)) return 'ignored';
+
+    /**
+     * 本次成交要用哪一套参数。解析失败**不静默回落**到配置值：那会让用户以为
+     * 页面上的设置生效了，实际挂出去的是另一套倍数。宁可这笔成交被拒并留下
+     * 一条看得见的 failed 行（AGENTS.md 约定 9）。
+     */
+    let policy: RiskPolicy;
+    try {
+      policy = deps.resolvePolicy
+        ? await deps.resolvePolicy(update.symbol)
+        : {
+            atrPeriod: settings.atrPeriod,
+            atrInterval: settings.atrInterval,
+            stopAtrMult: settings.stopAtrMult,
+            takeProfitAtrMult: settings.takeProfitAtrMult,
+          };
+    } catch (error) {
+      const outcome = await recordRejected(`策略解析失败：${reasonOf(error)}`);
+      log.error(`${update.symbol} 策略解析失败：${reasonOf(error)}`);
+      return outcome;
+    }
     if (settings.maxEntryNotional > 0) {
       const notional = update.averagePrice * update.cumulativeQty;
       if (notional > settings.maxEntryNotional) {
@@ -274,7 +313,10 @@ export function createExecutorService(deps: ExecutorServiceDeps): ExecutorServic
     // 绝不换个周期或拿 0 顶替——止损位等于入场价就是当场平仓。
     let snapshot;
     try {
-      snapshot = await atr.atrAt(update.symbol, update.tradeTime);
+      snapshot = await atr.atrAt(update.symbol, update.tradeTime, {
+        interval: policy.atrInterval,
+        period: policy.atrPeriod,
+      });
     } catch (error) {
       const outcome = await recordRejected(`ATR 不可用：${reasonOf(error)}`);
       log.error(`${update.symbol} ATR 不可用：${reasonOf(error)}`);
@@ -289,8 +331,8 @@ export function createExecutorService(deps: ExecutorServiceDeps): ExecutorServic
       entryPrice: update.averagePrice,
       atr: snapshot.atr,
       atrPeriod: snapshot.period,
-      stopAtrMult: settings.stopAtrMult,
-      takeProfitAtrMult: settings.takeProfitAtrMult,
+      stopAtrMult: policy.stopAtrMult,
+      takeProfitAtrMult: policy.takeProfitAtrMult,
       tickSize,
     });
     lastPlan = plan;

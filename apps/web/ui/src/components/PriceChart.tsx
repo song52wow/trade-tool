@@ -6,12 +6,7 @@ import { fmtDuration, fmtNumber, fmtTime } from '../format.js';
 import { CandleChart, GapNotice } from './CandleChart.js';
 import { IndicatorPanels } from './IndicatorPanels.js';
 import { ALL_INTERVALS, EMPTY_BARS, intervalMs, minutesToBars } from './gaps.js';
-import type {
-  BarDto,
-  BarsDto,
-  DerivedIntervalDto,
-  IndicatorsDto,
-} from '../../../src/types';
+import type { BarDto, BarsDto, DerivedIntervalDto, IndicatorsDto } from '../../../src/types';
 
 /**
  * 区间选项是**根数**，不是时间。

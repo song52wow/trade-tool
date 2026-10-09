@@ -56,11 +56,7 @@ function indicators(overrides: Partial<IndicatorsDto> = {}): IndicatorsDto {
 
 describe('指标序列按时间切段（缺口处断线的前提）', () => {
   it('连续的时间差等于桶宽时不切段', () => {
-    const rows = [
-      { time: BASE },
-      { time: BASE + HOUR },
-      { time: BASE + 2 * HOUR },
-    ];
+    const rows = [{ time: BASE }, { time: BASE + HOUR }, { time: BASE + 2 * HOUR }];
     expect(splitSeries(rows, HOUR)).toHaveLength(1);
   });
 
@@ -121,7 +117,12 @@ describe('主图叠加线', () => {
     const macd = indicators({
       specs: [
         {
-          spec: { indicator: 'macd', params: { fast: 12, slow: 26, signal: 9 }, implVersion: 1, rows: 2 },
+          spec: {
+            indicator: 'macd',
+            params: { fast: 12, slow: 26, signal: 9 },
+            implVersion: 1,
+            rows: 2,
+          },
           label: 'MACD(fast=12, slow=26, signal=9)',
           rows: [
             { time: BASE, values: { dif: 1, dea: 0.5, hist: 0.5 } },
@@ -134,7 +135,9 @@ describe('主图叠加线', () => {
   });
 
   it('未物化时不画任何线', () => {
-    expect(buildOverlayLines(indicators({ state: 'not-materialized' }), HOUR, undefined)).toHaveLength(0);
+    expect(
+      buildOverlayLines(indicators({ state: 'not-materialized' }), HOUR, undefined),
+    ).toHaveLength(0);
     expect(buildOverlayLines(undefined, HOUR, undefined)).toHaveLength(0);
   });
 
@@ -169,7 +172,9 @@ describe('副图量程', () => {
 describe('副图渲染', () => {
   it('画出指标线并标注「收盘后可用」', async () => {
     render(<IndicatorPanels indicators={indicators()} bars={bars(20)} interval="1h" />);
-    await waitFor(() => expect(document.querySelector('[data-indicator-panel="RSI(period=14)"]')).toBeTruthy());
+    await waitFor(() =>
+      expect(document.querySelector('[data-indicator-panel="RSI(period=14)"]')).toBeTruthy(),
+    );
     expect(document.body.textContent).toContain('收盘后可用');
   });
 
@@ -238,7 +243,14 @@ describe('副图渲染', () => {
   });
 
   it('读取失败常驻可见，并保留上一次读到的指标', () => {
-    render(<IndicatorPanels indicators={indicators()} bars={bars(20)} interval="1h" error="[PG] 读不出来" />);
+    render(
+      <IndicatorPanels
+        indicators={indicators()}
+        bars={bars(20)}
+        interval="1h"
+        error="[PG] 读不出来"
+      />,
+    );
     expect(document.body.textContent).toContain('读取指标失败');
     expect(document.body.textContent).toContain('读不出来');
   });

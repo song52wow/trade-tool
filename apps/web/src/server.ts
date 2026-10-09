@@ -7,13 +7,22 @@ import {
   type StoredInterval,
 } from '@trade-tool/core';
 
-import { parseBarLimit, parseIndicatorIntervalParam, parseIntervalParam } from './bars.js';
+import {
+  DEFAULT_BRACKET_LIMIT,
+  MAX_BRACKET_LIMIT,
+  parseBarLimit,
+  parseIndicatorIntervalParam,
+  parseIntervalParam,
+} from './bars.js';
 import { toErrorBody } from './errors.js';
 import { type IndicatorInterval } from '@trade-tool/data';
 
 import type {
   AddSymbolBody,
   BarDto,
+  BracketsDto,
+  CredentialStatusDto,
+  CredentialWriteBody,
   ExchangeListDto,
   IndicatorsDto,
   JobDto,
@@ -21,10 +30,15 @@ import type {
   LifecycleAction,
   OverviewDto,
   RemoveSymbolBody,
+  RiskPolicyEntryDto,
+  RiskPolicyScopeDto,
+  RiskPolicyViewDto,
+  RiskPolicyWriteBody,
   StartJobBody,
   SymbolDetailDto,
   SymbolRowDto,
 } from './types.js';
+import { checkOrigin } from './csrf.js';
 
 /**
  * 控制面所需的全部能力。
@@ -56,6 +70,26 @@ export interface WebDeps {
     symbol: string,
     options: { limit: number; interval: IndicatorInterval },
   ): Promise<IndicatorsDto>;
+  /**
+   * 某标的最近的止盈止损记录（v0.4.0），倒序。
+   *
+   * 仍是**纯读**：只打 PG，不下单、不改状态、不出网，因此可以挂在页面的刷新节奏上。
+   * 库里没有记录时返回 200 + `items: []`——「还没成交过」是完全正常的状态。
+   */
+  listBrackets(symbol: string, options: { limit: number }): Promise<BracketsDto>;
+  /**
+   * 凭据状态（v0.5.0）。**只回「配没配」与末 4 位**。
+   *
+   * WebDeps 里刻意**没有**任何能返回明文密钥的方法：控制面在类型层面就没有这个能力。
+   */
+  getCredentialStatus(): Promise<CredentialStatusDto>;
+  /** 写入加密后的凭据。返回状态而非明文。 */
+  writeCredentials(input: { apiKey: string; apiSecret: string }): Promise<CredentialStatusDto>;
+  clearCredentials(): Promise<CredentialStatusDto>;
+  /** 策略总览。`symbol` 为 null 时 `resolved` 用全局默认推算。 */
+  getRiskPolicy(symbol: string | null): Promise<RiskPolicyViewDto>;
+  writeRiskPolicy(body: RiskPolicyWriteBody): Promise<RiskPolicyEntryDto>;
+  deleteRiskPolicy(input: { scope: RiskPolicyScopeDto; symbol: string }): Promise<{ ok: true }>;
   estimate(symbol: string): Promise<SymbolDetailDto['estimate']>;
   startJob(input: { kind: JobKind; symbol: string; target?: number | undefined }): Promise<JobDto>;
   listJobs(): Promise<JobDto[]>;
@@ -63,6 +97,23 @@ export interface WebDeps {
 }
 
 const LIFECYCLE: readonly LifecycleAction[] = ['start', 'pause', 'resume'];
+
+/**
+ * 写操作的来源校验（v0.5.0）。控制面无鉴权且局域网可达，
+ * 挡掉「别的网页借用户的浏览器改我们的密钥」这条路。
+ */
+function assertSameOrigin(c: {
+  req: { method: string; url: string; header(name: string): string | undefined };
+}): void {
+  // 比对用的是**请求自身的完整 URL**，不是 Host 头：Host 可以被伪造，
+  // 而 URL 是服务端根据真实连接解析出来的。
+  const check = checkOrigin(c.req.method, c.req.header('origin'), c.req.url);
+  if (!check.ok) {
+    throw new SyncError('CONFIG_INVALID', check.reason ?? '拒绝非同源写请求', {
+      code: 'CROSS_SITE',
+    });
+  }
+}
 
 /** 会登记为长任务（202 + job id）的动作。 */
 const JOB_ACTIONS: readonly JobKind[] = ['full', 'verify', 'aggregate'];
@@ -202,6 +253,25 @@ export function buildApp(deps: WebDeps): Hono {
     return c.json(await deps.listIndicators(symbol, { limit, interval }));
   });
 
+  /**
+   * 止盈止损记录（v0.4.0）：最近 N 条，倒序，**纯读本地库**。
+   *
+   * 不下单、不改状态、不出网，因此可以挂在页面的刷新节奏上。库里没有记录时返回
+   * `items: []`（200），不是 404——「这个标的还没成交过」是完全正常的状态，
+   * 页面要如实显示空状态而不是报错。
+   *
+   * 回包带上**实际生效**的 `limit` 与全量 `countsByState`：后者统计的是**全部**记录，
+   * 不受 limit 影响，所以「列表里看不到但确实有 failed」的情况仍能被发现。
+   */
+  app.get('/api/symbols/:symbol/brackets', async (c) => {
+    const symbol = normalizeSymbol(c.req.param('symbol'));
+    const limit = Math.min(
+      parseBarLimit(c.req.query('limit'), DEFAULT_BRACKET_LIMIT),
+      MAX_BRACKET_LIMIT,
+    );
+    return c.json(await deps.listBrackets(symbol, { limit }));
+  });
+
   /** 规模预估（R-8.3）：首次全量前必须先算给人看，确认弹窗的数据就来自这里。 */
   app.get('/api/symbols/:symbol/estimate', async (c) => {
     const symbol = normalizeSymbol(c.req.param('symbol'));
@@ -223,6 +293,65 @@ export function buildApp(deps: WebDeps): Hono {
   app.get('/api/exchange', async (c) => {
     const refresh = c.req.query('refresh') === 'true';
     return c.json(await deps.listExchangeSymbols({ refresh }));
+  });
+
+  // ------------------------------------------------- 运行期设置（v0.5.0）
+  //
+  // 下面这些路由能改**真实下单**用的凭据与倍数，因此每个写操作都先过来源校验，
+  // 并且不接受任何形式的读回明文。见 csrf.ts 与 types.ts 里 CredentialStatusDto 的说明。
+
+  /**
+   * 凭据状态。**只回「配没配」与末 4 位**，没有 secret 也没有密文——
+   * 控制面从设计上就没有把密钥显示出来的能力。
+   */
+  app.get('/api/settings/credentials', async (c) => c.json(await deps.getCredentialStatus()));
+
+  app.put('/api/settings/credentials', async (c) => {
+    assertSameOrigin(c);
+    const body = await bodyOf<CredentialWriteBody>(c);
+    if (typeof body?.apiKey !== 'string' || typeof body?.apiSecret !== 'string') {
+      throw new SyncError('CONFIG_INVALID', '缺少 apiKey 或 apiSecret');
+    }
+    if (body.apiKey.trim() === '' || body.apiSecret.trim() === '') {
+      throw new SyncError('CONFIG_INVALID', 'apiKey 与 apiSecret 都不能为空');
+    }
+    // 提交上来的 secret 只流向这一行；回包走 `getCredentialStatus`，因此不可能回显。
+    return c.json(await deps.writeCredentials({ apiKey: body.apiKey, apiSecret: body.apiSecret }));
+  });
+
+  app.delete('/api/settings/credentials', async (c) => {
+    assertSameOrigin(c);
+    return c.json(await deps.clearCredentials());
+  });
+
+  /** 策略总览：全局默认 + 全部标的覆盖 + 该标的最终生效的那一套。 */
+  app.get('/api/settings/risk-policy', async (c) => {
+    const symbol = c.req.query('symbol');
+    return c.json(await deps.getRiskPolicy(symbol === undefined ? null : symbol));
+  });
+
+  app.put('/api/settings/risk-policy', async (c) => {
+    assertSameOrigin(c);
+    const body = await bodyOf<RiskPolicyWriteBody>(c);
+    if (body?.scope !== 'global' && body?.scope !== 'symbol') {
+      throw new SyncError(
+        'CONFIG_INVALID',
+        `scope 必须是 global 或 symbol，收到：${String(body?.scope)}`,
+      );
+    }
+    return c.json(await deps.writeRiskPolicy(body));
+  });
+
+  app.delete('/api/settings/risk-policy', async (c) => {
+    assertSameOrigin(c);
+    const scope = c.req.query('scope');
+    if (scope !== 'global' && scope !== 'symbol') {
+      throw new SyncError(
+        'CONFIG_INVALID',
+        `scope 必须是 global 或 symbol，收到：${String(scope)}`,
+      );
+    }
+    return c.json(await deps.deleteRiskPolicy({ scope, symbol: c.req.query('symbol') ?? '' }));
   });
 
   return app;

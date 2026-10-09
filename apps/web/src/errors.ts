@@ -34,6 +34,10 @@ const STATUS_BY_CODE = {
   INDICATOR_FAILED: 500,
   INDICATOR_MISMATCH: 409,
   INDICATOR_IMPL_STALE: 409,
+  // 止盈止损（v0.4.0）：ATR 取不到即**拒绝下单**，成因是已收盘 bar 不够或窗口内跨缺口，
+  // 处置方式是先补 K 线而不是重试同一个请求——与上面几个 MISMATCH 同构，因此是 409。
+  // 绝不能降级成 200 兜底出一个 ATR=0：止损会正好落在入场价上（v0.4.0 规则 3）。
+  RISK_ATR_UNAVAILABLE: 409,
   // 数据库
   DB_CONNECTION_FAILED: 503,
   DB_DEADLOCK: 503,

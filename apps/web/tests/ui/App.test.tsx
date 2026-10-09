@@ -104,6 +104,9 @@ function stubFetch(handlers: Record<string, unknown>) {
 
 beforeEach(() => {
   vi.useFakeTimers({ shouldAdvanceTime: true });
+  // 路由现在是 hash 路由（`#/symbol/X`），而 jsdom 的 window 同一个文件里跨用例复用：
+  // 上一个用例停在详情页的话，下一个用例一挂载就是详情页，而不是首页。
+  window.location.hash = '';
 });
 
 afterEach(() => {

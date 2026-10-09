@@ -1,6 +1,8 @@
 import {
   INTERVAL_MS,
   loadConfigOrDefault,
+  parseSecretKey,
+  SECRET_KEY_ENV,
   STORED_INTERVALS,
   type GapRecord,
   type RemovePolicy,
@@ -17,6 +19,15 @@ import {
   getAllStates,
   getGaps,
   getState,
+  countBracketsByState,
+  clearCredential,
+  listBrackets,
+  listRiskPolicies,
+  readCredentialStatus,
+  resolvePolicy,
+  writeCredential,
+  deleteRiskPolicy as deleteRiskPolicyRow,
+  writeRiskPolicy as writeRiskPolicyRow,
   listExchangeSymbols,
   listMaterializedSpecs,
   materializeHint,
@@ -36,12 +47,36 @@ import {
 } from '@trade-tool/data';
 import { createSyncService, HEARTBEAT_INTERVAL_MS, type SyncService } from '@trade-tool/sync';
 
-import { clampBarLimit } from './bars.js';
+import { clampBarLimit, MAX_BRACKET_LIMIT } from './bars.js';
 import { JobRegistry, type JobRunnerOptions } from './jobs.js';
 import { mergeSymbolRows } from './rows.js';
 import type { WebDeps } from './server.js';
+
+/**
+ * 主密钥探测。**两种状态都要能问**，而不是只有「有没有」：
+ *   * `masterKeyStatus()` —— 页面用来提前显示「当前不能保存」，避免填完提交才失败；
+ *   * `requireMasterKey()` —— 真正写入时拿密钥，缺了就抛错而不是拿空密钥硬加。
+ *
+ * 探测**只判断能不能解析**，不缓存密钥本身，也不把它写进任何日志。
+ */
+function masterKeyStatus(): { ok: boolean; reason?: string } {
+  try {
+    parseSecretKey(process.env[SECRET_KEY_ENV]);
+    return { ok: true };
+  } catch (error) {
+    return { ok: false, reason: error instanceof Error ? error.message : String(error) };
+  }
+}
+
+function requireMasterKey(): Buffer {
+  return parseSecretKey(process.env[SECRET_KEY_ENV]);
+}
 import type {
   BarDto,
+  BracketsDto,
+  CredentialStatusDto,
+  RiskPolicyEntryDto,
+  RiskPolicyViewDto,
   DaemonStatusDto,
   IndicatorsDto,
   ExchangeListDto,
@@ -240,11 +275,12 @@ export function createWebRuntime(config: TradeToolConfig): WebRuntime {
           implVersion: null,
           specs: [],
           shortBy: { bars: 0, reason: null },
-          state: config.data.indicatorIntervals.includes(interval) ? 'not-materialized' : 'disabled',
-          message:
-            config.data.indicatorIntervals.includes(interval)
-              ? `${interval} 的指标尚未物化。图上还没有指标线，不代表数据有问题。`
-              : `未启用 ${interval} 的指标（不在 data.indicatorIntervals 里）。`,
+          state: config.data.indicatorIntervals.includes(interval)
+            ? 'not-materialized'
+            : 'disabled',
+          message: config.data.indicatorIntervals.includes(interval)
+            ? `${interval} 的指标尚未物化。图上还没有指标线，不代表数据有问题。`
+            : `未启用 ${interval} 的指标（不在 data.indicatorIntervals 里）。`,
           materializeCommand: config.data.indicatorIntervals.includes(interval)
             ? materializeHint(symbol, interval)
             : null,
@@ -275,12 +311,17 @@ export function createWebRuntime(config: TradeToolConfig): WebRuntime {
       const barCount = await readLatestBars(pool, symbol, { limit, interval });
       const latestBar = barCount[barCount.length - 1]?.time ?? null;
       const firstBar = barCount[0]?.time ?? null;
-      const coverage = series.map((s) => s.rows[0]?.time).filter((t): t is number => t !== undefined);
+      const coverage = series
+        .map((s) => s.rows[0]?.time)
+        .filter((t): t is number => t !== undefined);
       const coverageStart = coverage.length > 0 ? Math.max(...coverage) : null;
       const shortByBars =
-        firstBar !== null && coverageStart !== null ? Math.round((coverageStart - firstBar) / intervalMs) : 0;
+        firstBar !== null && coverageStart !== null
+          ? Math.round((coverageStart - firstBar) / intervalMs)
+          : 0;
       const shortByLast =
-        latestBar !== null && series.every((s) => (s.rows[s.rows.length - 1]?.time ?? null) !== latestBar)
+        latestBar !== null &&
+        series.every((s) => (s.rows[s.rows.length - 1]?.time ?? null) !== latestBar)
           ? 1
           : 0;
 
@@ -293,7 +334,14 @@ export function createWebRuntime(config: TradeToolConfig): WebRuntime {
         specs: series,
         shortBy: {
           bars: shortByBars + shortByLast,
-          reason: shortByBars > 0 && shortByLast > 0 ? 'mixed' : shortByBars > 0 ? 'warmup' : shortByLast > 0 ? 'not-closed' : null,
+          reason:
+            shortByBars > 0 && shortByLast > 0
+              ? 'mixed'
+              : shortByBars > 0
+                ? 'warmup'
+                : shortByLast > 0
+                  ? 'not-closed'
+                  : null,
         },
         state: 'ok',
         message: null,
@@ -301,8 +349,81 @@ export function createWebRuntime(config: TradeToolConfig): WebRuntime {
       };
     },
 
+    /**
+     * 止盈止损记录（v0.4.0）：最近 N 条 + **全量**五态计数。
+     *
+     * 纯读：只打 PG，不下单、不改状态、不出网，因此能挂在页面的 5s 刷新节奏上。
+     *
+     * 计数单独查而不是从截断后的 `items` 里数：控制面只回最近 N 条，而 `failed`
+     * 通常是最老的记录——用截断过的列表反推，会让「有保护单没挂上」显示成一切正常
+     * （v0.4.0 规则 3 / 5）。
+     */
+    async listBrackets(symbol, options): Promise<BracketsDto> {
+      const limit = Math.min(clampBarLimit(options?.limit), MAX_BRACKET_LIMIT);
+      const [items, countsByState] = await Promise.all([
+        listBrackets(pool, ctx.exchange, symbol, limit),
+        countBracketsByState(pool, ctx.exchange, symbol),
+      ]);
+      return { symbol, limit, items, countsByState };
+    },
+
     // 预估要出网读元数据但**不写库**（R-8.3），所以由确认弹窗按需单独触发。
     estimate: (symbol) => estimateFirstPull(ctx, symbol),
+
+    /**
+     * 凭据状态。**主密钥缺失时如实说 `masterKeyReady: false`**：
+     * 页面必须能提前显示「当前不能保存」，而不是让人填完提交才失败。
+     */
+    async getCredentialStatus(): Promise<CredentialStatusDto> {
+      const status = await readCredentialStatus(pool, ctx.exchange);
+      return { ...status, masterKeyReady: masterKeyStatus().ok };
+    },
+
+    async writeCredentials(input): Promise<CredentialStatusDto> {
+      const key = requireMasterKey();
+      const status = await writeCredential(pool, key, {
+        exchange: ctx.exchange,
+        apiKey: input.apiKey,
+        apiSecret: input.apiSecret,
+        now: Date.now(),
+      });
+      // 回包永远走状态形状：写完之后**没有任何字段**能把明文带出去。
+      return { ...status, masterKeyReady: true };
+    },
+
+    async clearCredentials(): Promise<CredentialStatusDto> {
+      await clearCredential(pool, ctx.exchange, Date.now());
+      return this.getCredentialStatus();
+    },
+
+    async getRiskPolicy(symbol): Promise<RiskPolicyViewDto> {
+      const entries = await listRiskPolicies(pool, ctx.exchange);
+      const global = entries.find((e) => e.scope === 'global') ?? null;
+      const overrides = entries.filter((e) => e.scope === 'symbol');
+      const resolved =
+        symbol === null
+          ? await resolvePolicy(pool, ctx.exchange, '', config.executor)
+          : await resolvePolicy(pool, ctx.exchange, symbol, config.executor);
+      return { exchange: ctx.exchange, global, overrides, resolved };
+    },
+
+    async writeRiskPolicy(body): Promise<RiskPolicyEntryDto> {
+      return writeRiskPolicyRow(pool, {
+        scope: body.scope,
+        exchange: ctx.exchange,
+        symbol: body.symbol ?? '',
+        atrPeriod: body.atrPeriod,
+        atrInterval: body.atrInterval,
+        stopAtrMult: body.stopAtrMult,
+        takeProfitAtrMult: body.takeProfitAtrMult,
+        now: Date.now(),
+      });
+    },
+
+    async deleteRiskPolicy(input): Promise<{ ok: true }> {
+      await deleteRiskPolicyRow(pool, input.scope, ctx.exchange, input.symbol);
+      return { ok: true };
+    },
 
     startJob: (input) => jobs.start(input),
     listJobs: async () => jobs.list(),

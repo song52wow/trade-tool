@@ -24,7 +24,17 @@ export interface AtrSnapshot {
 }
 
 export interface AtrProvider {
-  atrAt(symbol: string, asOfMs: number): Promise<AtrSnapshot>;
+  /**
+   * 取某个时刻、某个标的的 ATR。
+   *
+   * `override` 让**每个标的用各自的策略参数**（v0.5.0 起策略可在控制面按标的覆盖）。
+   * 不传就用构造时的配置兜底——测试与「库里没配策略」的情形都走这一档。
+   */
+  atrAt(
+    symbol: string,
+    asOfMs: number,
+    override?: { interval?: string; period?: number },
+  ): Promise<AtrSnapshot>;
 }
 
 export interface CreateAtrProviderOptions {
@@ -81,7 +91,15 @@ function validate(raw: unknown, symbol: string): AtrSnapshot {
 export function createAtrProvider(options: CreateAtrProviderOptions): AtrProvider {
   const { runtime, dsn, config } = options;
   return {
-    async atrAt(symbol: string, asOfMs: number): Promise<AtrSnapshot> {
+    async atrAt(
+      symbol: string,
+      asOfMs: number,
+      override?: { interval?: string; period?: number },
+    ): Promise<AtrSnapshot> {
+      // 参数一律来自「本次解析出的那份策略」，不在这里兜底：调用方已经决定过优先级，
+      // 这一层再兜一次就会出现「页面显示 A、实际按 B 算」的分裂。
+      const interval = override?.interval ?? config.atrInterval;
+      const period = override?.period ?? config.atrPeriod;
       const { value } = await runPython<unknown>({
         runtime,
         module: 'quant_data',
@@ -90,9 +108,9 @@ export function createAtrProvider(options: CreateAtrProviderOptions): AtrProvide
           '--symbol',
           symbol,
           '--interval',
-          config.atrInterval,
+          interval,
           '--period',
-          String(config.atrPeriod),
+          String(period),
           '--as-of-ms',
           String(asOfMs),
           '--window-bars',

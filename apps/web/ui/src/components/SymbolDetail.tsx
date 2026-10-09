@@ -2,6 +2,7 @@ import { fmtAgo, fmtDate, fmtNumber, fmtTime } from '../format.js';
 import type { DerivedIntervalDto } from '../../../src/types';
 import type { SymbolDetailDto } from '../../../src/types';
 import { ALL_INTERVALS } from './gaps.js';
+import { BracketPanel } from './BracketPanel.js';
 import { PriceChart } from './PriceChart.js';
 
 export function SymbolDetail(props: {
@@ -106,6 +107,10 @@ export function SymbolDetail(props: {
           {props.verifying ? '体检中…' : '开始体检'}
         </button>
       </div>
+
+      {/* 止盈止损（v0.4.0）放在合约状态之后、缺口清单之前：它回答的是「我的仓位现在
+          有没有保护」，与「数据全不全」是两件事，各自的处置方式也不同。 */}
+      <BracketPanel symbol={props.detail.symbol} tick={props.tick} />
 
       <h2 style={{ fontSize: 13, color: 'var(--muted)', fontWeight: 500, marginTop: 18 }}>
         缺口清单（{gaps.length}）

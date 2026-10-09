@@ -1,16 +1,51 @@
+/*
+ * 明暗双主题。
+ *
+ * `:root` 是**亮色**（默认），`:root[data-theme='dark']` 覆盖成深色。之所以把亮色放在
+ * 默认位而不是反过来：深色不是「亮色的反相」，两套值各自调过对比度。
+ *
+ * 调色板之外的组件一律只引用 `var(--…)`。新增颜色时**先想清楚它在两个主题里分别是什么**，
+ * 而不是随手写一个 rgba——写死在组件里的颜色在另一个主题下几乎必然读不清。
+ */
 :root {
+  color-scheme: light;
+  --bg: #f4f6f9;
+  --panel: #ffffff;
+  --panel-2: #eef1f6;
+  --line: #d3d9e2;
+  --line-soft: rgba(23, 32, 48, 0.12);
+  --text: #161c26;
+  --muted: #5b6675;
+  --accent: #1f5fd0;
+  --accent-soft: rgba(31, 95, 208, 0.1);
+  --ok: #1a7f37;
+  --warn: #9a6700;
+  --err: #c0341d;
+  --ok-soft: rgba(26, 127, 55, 0.1);
+  --warn-soft: rgba(154, 103, 0, 0.1);
+  --err-soft: rgba(192, 52, 29, 0.08);
+  --shadow: 0 1px 2px rgba(16, 24, 40, 0.06), 0 6px 18px rgba(16, 24, 40, 0.06);
+  --radius: 10px;
+}
+
+:root[data-theme='dark'] {
   color-scheme: dark;
   --bg: #0f1115;
   --panel: #171a21;
   --panel-2: #1d212a;
   --line: #2a2f3a;
+  --line-soft: rgba(42, 47, 58, 0.55);
   --text: #e6e8ec;
   --muted: #9aa3b2;
   --accent: #4c8dff;
+  --accent-soft: rgba(76, 141, 255, 0.12);
   --ok: #3fb950;
   --warn: #d29922;
   --err: #f85149;
-  --radius: 8px;
+  --ok-soft: rgba(63, 185, 80, 0.1);
+  --warn-soft: rgba(210, 153, 34, 0.1);
+  --err-soft: rgba(248, 81, 73, 0.08);
+  --shadow: 0 1px 2px rgba(0, 0, 0, 0.4), 0 8px 24px rgba(0, 0, 0, 0.28);
 }
 
 * {
@@ -67,7 +102,7 @@ header.top h1 {
 .banner {
   border: 1px solid var(--line);
   border-left: 3px solid var(--err);
-  background: rgba(248, 81, 73, 0.08);
+  background: var(--err-soft);
   padding: 10px 14px;
   border-radius: var(--radius);
   margin: 12px 0;
@@ -75,7 +110,7 @@ header.top h1 {
 
 .banner.warn {
   border-left-color: var(--warn);
-  background: rgba(210, 153, 34, 0.08);
+  background: var(--warn-soft);
 }
 
 /* 「同步中 · 暂停」：一个按钮同时表达「正在跑」与「怎么停下来」 */
@@ -84,8 +119,8 @@ button.syncing {
   align-items: center;
   gap: 6px;
   color: var(--ok);
-  border-color: rgba(63, 185, 80, 0.45);
-  background: rgba(63, 185, 80, 0.1);
+  border-color: var(--ok);
+  background: var(--ok-soft);
 }
 
 button.syncing .dot {
@@ -158,8 +193,9 @@ button.syncing .dot {
   background: var(--panel);
   border: 1px solid var(--line);
   border-radius: var(--radius);
-  padding: 16px;
-  margin: 16px 0;
+  box-shadow: var(--shadow);
+  padding: 18px 20px;
+  margin: 18px 0;
 }
 
 .panel > h2 {
@@ -201,7 +237,7 @@ th {
 
 td {
   padding: 7px 8px;
-  border-bottom: 1px solid rgba(42, 47, 58, 0.55);
+  border-bottom: 1px solid var(--line-soft);
   white-space: nowrap;
 }
 
@@ -240,8 +276,9 @@ button.primary {
 }
 
 button.danger {
-  border-color: rgba(248, 81, 73, 0.6);
-  color: #ffb3ae;
+  border-color: var(--err);
+  color: var(--err);
+  background: var(--err-soft);
 }
 
 input,
@@ -265,7 +302,7 @@ select {
 .tag.running,
 .tag.ok {
   color: var(--ok);
-  border-color: rgba(63, 185, 80, 0.5);
+  border-color: var(--ok);
 }
 
 .tag.paused,
@@ -275,12 +312,12 @@ select {
 
 .tag.error {
   color: var(--err);
-  border-color: rgba(248, 81, 73, 0.5);
+  border-color: var(--err);
 }
 
 .tag.warn {
   color: var(--warn);
-  border-color: rgba(210, 153, 34, 0.5);
+  border-color: var(--warn);
 }
 
 .bar {
@@ -345,7 +382,7 @@ dialog {
 }
 
 dialog::backdrop {
-  background: rgba(0, 0, 0, 0.6);
+  background: rgba(10, 12, 16, 0.55);
 }
 
 .est-grid {
@@ -405,7 +442,7 @@ dialog::backdrop {
 .chart-head .chip.active {
   color: var(--text);
   border-color: var(--accent);
-  background: rgba(76, 141, 255, 0.12);
+  background: var(--accent-soft);
 }
 
 .chart-error {
@@ -435,7 +472,7 @@ dialog::backdrop {
   padding: 6px 8px;
   font-size: 11px;
   min-width: 132px;
-  box-shadow: 0 4px 12px rgb(0 0 0 / 35%);
+  box-shadow: var(--shadow);
 }
 
 .candle-tip dl {
@@ -557,7 +594,7 @@ dialog::backdrop {
   background: var(--panel-2);
   border: 1px solid var(--line);
   border-radius: 6px;
-  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.45);
+  box-shadow: var(--shadow);
 }
 
 .picker-list button {
@@ -566,7 +603,7 @@ dialog::backdrop {
   text-align: left;
   border: none;
   border-radius: 0;
-  border-bottom: 1px solid rgba(42, 47, 58, 0.6);
+  border-bottom: 1px solid var(--line-soft);
   background: transparent;
   padding: 8px 10px;
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
@@ -575,11 +612,173 @@ dialog::backdrop {
 
 .picker-list button:hover,
 .picker-list button[aria-selected='true'] {
-  background: rgba(76, 141, 255, 0.16);
+  background: var(--accent-soft);
 }
 
 .picker-empty {
   padding: 10px;
   color: var(--muted);
   font-size: 12px;
+}
+
+/* ---------- 页面骨架 / 主题切换 / 详情页与设置页 ---------- */
+
+/* 品牌名退到次要位置：现在它左边是面包屑，用户真正在找的是「我在哪一页」 */
+header.top .brand {
+  font-size: 14px;
+  font-weight: 500;
+  color: var(--muted);
+  margin: 0;
+}
+
+header.top {
+  align-items: center;
+  gap: 10px;
+  padding-bottom: 12px;
+  border-bottom: 1px solid var(--line);
+  margin-bottom: 8px;
+}
+
+.crumbs {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 15px;
+}
+
+/* 面包屑里的「当前页」不加装饰：它已经是当前位置，标成链接只会诱导多点一次 */
+.crumbs .current {
+  font-weight: 600;
+}
+
+.crumbs .sep {
+  color: var(--muted);
+}
+
+/* 文字型按钮：看起来是导航而不是「执行一个动作」，因此不画按钮底 */
+button.link {
+  background: transparent;
+  border-color: transparent;
+  color: var(--accent);
+  padding: 4px 6px;
+  font-size: inherit;
+}
+
+button.link:hover:not(:disabled) {
+  text-decoration: underline;
+}
+
+button.link.current {
+  color: var(--text);
+  font-weight: 600;
+}
+
+.page {
+  padding-bottom: 24px;
+}
+
+.detail-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin: 8px 0 4px;
+}
+
+.detail-title {
+  font-size: 18px;
+  margin: 0;
+}
+
+.settings-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 0;
+}
+
+@media (min-width: 1180px) {
+  .settings-grid {
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1.15fr);
+    align-items: start;
+  }
+}
+
+.form-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 12px;
+}
+
+.form-grid label {
+  display: grid;
+  gap: 4px;
+}
+
+.form-grid input,
+.form-grid select {
+  width: 100%;
+}
+
+.form-grid .label {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.form-block {
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 12px 14px;
+  background: var(--panel-2);
+}
+
+/* 生效值的展示区：它回答「现在真正用的是哪一套」，是这一页最重要的一块 */
+.resolved {
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--accent);
+  border-radius: var(--radius);
+  background: var(--panel-2);
+  padding: 12px 14px;
+}
+
+h3.sub {
+  font-size: 13px;
+  margin: 0 0 2px;
+  color: var(--text);
+}
+
+/* 生效来源三档：档位不同，视觉也必须不同。
+   symbol 最强（用户自己改的、此刻真正生效），config 最弱（还没在库里设过）。 */
+.source {
+  display: inline-block;
+  border-radius: 999px;
+  padding: 1px 10px;
+  font-size: 11px;
+  border: 1px solid var(--line);
+  color: var(--muted);
+}
+
+.source-symbol {
+  color: var(--accent);
+  border-color: var(--accent);
+  background: var(--accent-soft);
+  font-weight: 600;
+}
+
+.source-global {
+  color: var(--ok);
+  border-color: var(--ok);
+  background: var(--ok-soft);
+}
+
+.source-config {
+  color: var(--warn);
+  border-color: var(--warn);
+  background: var(--warn-soft);
+  border-style: dashed;
+}
+
+@media (max-width: 640px) {
+  .detail-head select {
+    max-width: 140px;
+  }
 }

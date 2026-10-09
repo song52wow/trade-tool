@@ -6,7 +6,12 @@ import {
   createPool,
   openUserDataStream,
   parseOrderTradeUpdate,
+  readCredentials as readStoredCredentials,
+  resolvePolicy,
 } from '@trade-tool/data';
+import { parseSecretKey, SECRET_KEY_ENV } from '@trade-tool/core';
+
+import type { Pool } from '@trade-tool/data';
 
 import { createAtrProvider } from './atr.js';
 import { createExecutorService } from './service.js';
@@ -20,12 +25,32 @@ let stopRequested = false;
 let closeStream: (() => void) | undefined;
 
 /**
- * 凭据只从环境变量读，且**缺一即拒**。
+ * 凭据解析。**先读库里加密存的那份，再回落环境变量**。
  *
- * 不做「读到一半先用空密钥试一下」：Binance 会返回 401，
+ * 两条路径的优先级必须写在这里并且只有一处：控制面 v0.5.0 起可以在页面上录入密钥，
+ * 加密后落库；但部署环境仍然可以用环境变量注入（CI、临时排障、容器编排）。
+ * 谁优先不是偏好问题——两份不一致时，只有明确的那一份算数。
+ *
+ * 选择「库优先」是因为页面是更近的一步操作：改了之后不必再去改 .env 并重启。
+ * 环境变量仍然兜底，是为了不配置控制面的部署方式完全不受影响。
+ *
+ * 环境变量这一档**缺一即拒**，不做「读到一半先用空密钥试一下」：Binance 会返回 401，
  * 而一个带着空密钥反复重连的进程看起来只是「连不上」，很难定位。
  */
-function loadCredentials(config: Awaited<ReturnType<typeof loadConfigOrDefault>>): Credentials {
+async function loadCredentials(
+  config: Awaited<ReturnType<typeof loadConfigOrDefault>>,
+  pool: Pool,
+): Promise<Credentials> {
+  const stored = await readStoredCredentials(
+    pool,
+    parseSecretKey(process.env[SECRET_KEY_ENV]),
+    config.market.exchange,
+  );
+  if (stored !== null) {
+    console.error(`[executor] 使用控制面录入的凭据（${config.market.exchange}）`);
+    return stored;
+  }
+
   const key = process.env[config.executor.apiKeyEnv];
   const secret = process.env[config.executor.apiSecretEnv];
   const missing: string[] = [];
@@ -34,10 +59,12 @@ function loadCredentials(config: Awaited<ReturnType<typeof loadConfigOrDefault>>
   if (missing.length > 0) {
     throw new SyncError(
       'CONFIG_INVALID',
-      `缺少交易所凭据环境变量：${missing.join(', ')}（在仓库根 .env 里设置，或由部署环境注入）`,
+      `库里没有配置过 ${config.market.exchange} 凭据，且环境变量 ${missing.join(', ')} 也没有设置。` +
+        `请在控制面「设置」页录入，或在仓库根 .env 里设置这两个变量。`,
       { missing },
     );
   }
+  console.error(`[executor] 使用环境变量注入的凭据（${config.market.exchange}）`);
   return { apiKey: key as string, apiSecret: secret as string };
 }
 
@@ -54,8 +81,8 @@ async function main(): Promise<void> {
     process.exit(2);
   }
 
-  const credentials = loadCredentials(config);
   const pool = createPool(config.database);
+  const credentials = await loadCredentials(config, pool);
   const ctx = buildContext(pool, config);
   const client = new BinancePrivateClient({
     credentials,
@@ -67,7 +94,15 @@ async function main(): Promise<void> {
     config: config.executor,
     timeoutMs: config.data.timeoutMs,
   });
-  const service = createExecutorService({ pool, config, placer: client, atr });
+  // 策略按标的解析：标的覆盖 > 全局默认 > 配置文件。优先级只有 resolvePolicy 一份实现，
+  // 控制面预览与这里用的是同一个函数，避免「页面显示的」和「实际挂单的」分叉。
+  const service = createExecutorService({
+    pool,
+    config,
+    placer: client,
+    atr,
+    resolvePolicy: async (symbol) => resolvePolicy(pool, ctx.exchange, symbol, config.executor),
+  });
 
   let delay = config.executor.reconnectBaseMs;
 

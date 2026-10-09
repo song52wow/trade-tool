@@ -454,7 +454,9 @@ export function CandleChart(props: {
                       key={`${line.key}-${String(idx)}`}
                       data-indicator-line={line.key}
                       points={seg
-                        .map((p) => `${String(xOf(layout, p.time))},${String(yOf(layout, p.value))}`)
+                        .map(
+                          (p) => `${String(xOf(layout, p.time))},${String(yOf(layout, p.value))}`,
+                        )
                         .join(' ')}
                       fill="none"
                       stroke={line.color}

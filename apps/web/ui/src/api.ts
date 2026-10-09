@@ -3,10 +3,17 @@ import type { IndicatorInterval } from '@trade-tool/data';
 
 import type {
   BarsDto,
+  BracketsDto,
+  CredentialStatusDto,
+  CredentialWriteBody,
   ExchangeListDto,
   IndicatorsDto,
   JobDto,
   OverviewDto,
+  RiskPolicyEntryDto,
+  RiskPolicyScopeDto,
+  RiskPolicyViewDto,
+  RiskPolicyWriteBody,
   SymbolDetailDto,
   SymbolRowDto,
 } from '../../src/types';
@@ -117,6 +124,25 @@ export const api = {
       }
       throw error;
     }),
+  /**
+   * 止盈止损记录（v0.4.0）。纯读本地库，可挂在刷新节奏上。
+   *
+   * 404 在这里**同样单列**：路由在进程启动时注册，404 几乎总是「控制面还是改动前的
+   * 旧进程」，而前端已经是新的——用户看到的是止盈止损区块整个消失，而不是任何错误提示，
+   * 那种静默比报错更难察觉。
+   */
+  brackets: (s: string, limit = 20) =>
+    request<BracketsDto>(
+      `/api/symbols/${encodeURIComponent(s)}/brackets?limit=${String(limit)}`,
+    ).catch((error: unknown) => {
+      if (error instanceof ApiError && error.status === 404) {
+        throw new ApiError(
+          'CONTROL_PLANE_STALE',
+          '控制面没有 /brackets 路由：它还是改动前启动的旧进程。重启 trade-tool 控制面后刷新页面即可。',
+        );
+      }
+      throw error;
+    }),
   exchange: (refresh = false) =>
     request<ExchangeListDto>(`/api/exchange${refresh ? '?refresh=true' : ''}`),
   addSymbol: (symbol: string) => post<SymbolRowDto>('/api/symbols', { symbol }),
@@ -153,4 +179,46 @@ export const api = {
   startAggregate: (symbol: string) =>
     post<JobDto>(`/api/symbols/${encodeURIComponent(symbol)}/aggregate`, { target: null }),
   jobs: () => request<{ items: JobDto[] }>('/api/jobs').then((r) => r.items),
+
+  // ------------------------------------------------- 运行期设置（v0.5.0）
+  //
+  // 凭据这条线**没有读取明文的能力**，前端也不许假装有：`credentialStatus` 的回包里
+  // 只有 configured / hint（末 4 位）/ updatedAt / masterKeyReady。所以页面永远不要
+  // 试图把密钥回填进输入框——它手上根本没有这个值。
+
+  credentialStatus: () => request<CredentialStatusDto>('/api/settings/credentials'),
+  /** 回包仍是状态而非凭据：提交上去的东西不会（也不可能）被回显。 */
+  writeCredentials: (body: CredentialWriteBody) =>
+    request<CredentialStatusDto>('/api/settings/credentials', {
+      method: 'PUT',
+      headers: JSON_HEADERS,
+      body: JSON.stringify(body),
+    }),
+  clearCredentials: () =>
+    request<CredentialStatusDto>('/api/settings/credentials', { method: 'DELETE' }),
+
+  /**
+   * 策略总览。`symbol` 省略时 `resolved` 按全局默认算——设置页在还没选标的时也要能显示
+   * 生效值，而不是「等选了标的才有话说」。
+   */
+  riskPolicy: (symbol?: string) =>
+    request<RiskPolicyViewDto>(
+      symbol === undefined
+        ? '/api/settings/risk-policy'
+        : `/api/settings/risk-policy?symbol=${encodeURIComponent(symbol)}`,
+    ),
+  putRiskPolicy: (body: RiskPolicyWriteBody) =>
+    request<RiskPolicyEntryDto>('/api/settings/risk-policy', {
+      method: 'PUT',
+      headers: JSON_HEADERS,
+      body: JSON.stringify(body),
+    }),
+  /** 作用域与标的都走 query：作用域缺失时服务端会 CONFIG_INVALID，不做默认猜测。 */
+  deleteRiskPolicy: (scope: RiskPolicyScopeDto, symbol?: string) =>
+    request<{ ok: boolean }>(
+      `/api/settings/risk-policy?scope=${scope}${
+        symbol === undefined ? '' : `&symbol=${encodeURIComponent(symbol)}`
+      }`,
+      { method: 'DELETE' },
+    ),
 };

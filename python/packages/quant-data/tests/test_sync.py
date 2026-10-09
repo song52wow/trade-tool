@@ -1114,6 +1114,10 @@ def test_migrations_are_idempotent(conn: DbConn, pg_dsn: str) -> None:
         "004_klines_agg",
         # v0.3.0：七张指标物化表
         "005_indicators",
+        # v0.4.0：止盈止损执行记录
+        "006_risk_bracket",
+        # v0.5.0：控制面可写的运行期设置
+        "007_executor_settings",
     ]
     pg.ensure_schema(conn)
 

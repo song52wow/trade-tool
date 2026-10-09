@@ -8,6 +8,9 @@ export * from './db/pool.js';
 export * from './db/repo.js';
 export * from './db/indicators.js';
 export * from './db/risk.js';
+/** 控制面可写的运行期设置（v0.5.0）：加密凭据 + 止盈止损策略。 */
+export * from './db/credentials.js';
+export * from './db/risk-policy.js';
 export * from './db/sql-files.js';
 /** 私有交易接口（签名 REST + 用户数据流），v0.4.0 `apps/executor` 的交易所侧适配。 */
 export * from './binance-private.js';
