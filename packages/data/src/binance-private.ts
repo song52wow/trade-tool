@@ -77,7 +77,8 @@ export interface ClosePositionOrderRequest {
   side: OrderSide;
   type: 'STOP_MARKET' | 'TAKE_PROFIT_MARKET';
   stopPrice: number;
-  clientOrderId: string;
+  /** 条件单的自定义号。交易所侧叫 `clientAlgoId`（正则同 `newClientOrderId`）。 */
+  clientAlgoId: string;
   /** `MARK_PRICE` 用标记价触发（抗插针），`PRICE` 用最新成交价。缺省 MARK_PRICE。 */
   workingType?: 'MARK_PRICE' | 'CONTRACT_PRICE';
   /** 触发保护：标记价与最新价偏离超过标的 `triggerProtect` 时暂停触发。 */
@@ -85,13 +86,15 @@ export interface ClosePositionOrderRequest {
   recvWindowMs?: number;
 }
 
-export interface PlacedOrder {
-  orderId: number;
-  clientOrderId: string;
+/** 条件单挂成之后的回执。**是 algoId，不是普通 orderId**——两套编号互不通用。 */
+export interface PlacedAlgoOrder {
+  algoId: number;
+  clientAlgoId: string;
   symbol: string;
   side: OrderSide;
   type: string;
-  stopPrice: number;
+  /** 条件单侧叫 triggerPrice。 */
+  triggerPrice: number;
   status: string;
 }
 
@@ -353,40 +356,55 @@ export class BinancePrivateClient {
   /**
    * 挂一张 `closePosition` 条件单（止盈或止损）。
    *
-   * `closePosition=true` 时官方明确**不能**带 `quantity` 与 `reduceOnly`，
-   * 因此这里刻意不发这两个参数——发了就是 -1106。
+   * **必须走 Algo Order API**：`STOP_MARKET` / `TAKE_PROFIT_MARKET` 已从
+   * `POST /fapi/v1/order` 迁走，打老接口会被拒
+   * （`Order type not supported for this endpoint. Please use the Algo Order API endpoints instead.`）。
+   *
+   * `algoType=CONDITIONAL` 是必填；`closePosition=true` 仍然只支持这两种类型，
+   * 且官方明确**不能**带 `quantity` 与 `reduceOnly`——发了就是 -1106。
+   *
+   * 返回的是 **algoId**，不是普通 orderId：条件单走的是另一套编号与撤销接口，
+   * 混用会在撤单时拿到「订单不存在」。
    */
-  async placeClosePositionOrder(request: ClosePositionOrderRequest): Promise<PlacedOrder> {
-    const body = await this.request<Record<string, unknown>>('POST', '/fapi/v1/order', {
+  async placeClosePositionOrder(request: ClosePositionOrderRequest): Promise<PlacedAlgoOrder> {
+    const body = await this.request<Record<string, unknown>>('POST', '/fapi/v1/algoOrder', {
       signed: true,
       params: {
+        algoType: 'CONDITIONAL',
         symbol: request.symbol,
         side: request.side,
         type: request.type,
-        stopPrice: request.stopPrice,
-        closePosition: true,
+        // 条件单侧叫 triggerPrice，不是 stopPrice。
+        triggerPrice: request.stopPrice,
+        closePosition: 'true',
         workingType: request.workingType ?? 'MARK_PRICE',
-        priceProtect: request.priceProtect ?? true,
-        newClientOrderId: request.clientOrderId,
+        priceProtect: String(request.priceProtect ?? true),
+        clientAlgoId: request.clientAlgoId,
         recvWindow: request.recvWindowMs ?? this.recvWindowMs,
       },
     });
     const where = `placeClosePositionOrder ${request.symbol}`;
     return {
-      orderId: requireNumber(body['orderId'], 'orderId', where),
-      clientOrderId: requireString(body['clientOrderId'], 'clientOrderId', where),
+      algoId: requireNumber(body['algoId'], 'algoId', where),
+      clientAlgoId: requireString(body['clientAlgoId'], 'clientAlgoId', where),
       symbol: requireString(body['symbol'], 'symbol', where),
       side: requireString(body['side'], 'side', where) as OrderSide,
-      type: requireString(body['type'], 'type', where),
-      stopPrice: requirePositive(body['stopPrice'], 'stopPrice', where),
-      status: requireString(body['status'], 'status', where),
+      type: requireString(body['orderType'], 'orderType', where),
+      triggerPrice: requirePositive(body['triggerPrice'], 'triggerPrice', where),
+      status: requireString(body['algoStatus'], 'algoStatus', where),
     };
   }
 
-  async cancelOrder(symbol: string, orderId: number): Promise<void> {
-    await this.request('DELETE', '/fapi/v1/order', {
+  /**
+   * 撤条件单。
+   *
+   * 与普通订单不同：条件单**不需要 symbol**，只认 `algoId`（或 `clientAlgoId`）。
+   * 拿普通 orderId 来撤会得到「订单不存在」——因为那是两套独立的编号空间。
+   */
+  async cancelAlgoOrder(algoId: number): Promise<void> {
+    await this.request('DELETE', '/fapi/v1/algoOrder', {
       signed: true,
-      params: { symbol, orderId },
+      params: { algoId },
     });
   }
 }

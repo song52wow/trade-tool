@@ -39,13 +39,13 @@ describe('私有 REST', () => {
       seenUrl = String(url);
       seenHeaders = init.headers as Record<string, string>;
       return jsonResponse({
-        orderId: 1,
-        clientOrderId: 'x',
+        algoId: 1,
+        clientAlgoId: 'x',
         symbol: 'SYM',
         side: 'SELL',
-        type: 'STOP_MARKET',
-        stopPrice: '100',
-        status: 'NEW',
+        orderType: 'STOP_MARKET',
+        triggerPrice: '100',
+        algoStatus: 'NEW',
       });
     }) as unknown as typeof fetch);
 
@@ -54,11 +54,16 @@ describe('私有 REST', () => {
       side: 'SELL',
       type: 'STOP_MARKET',
       stopPrice: 100,
-      clientOrderId: 'rsk-sl-1',
+      clientAlgoId: 'rsk-sl-1',
     });
 
     expect(seenHeaders['X-MBX-APIKEY']).toBe('key-123');
-    expect(seenUrl).toContain('/fapi/v1/order?');
+    // 条件单已迁到 Algo Order API：打老接口会被拒
+    // （Order type not supported for this endpoint）。
+    expect(seenUrl).toContain('/fapi/v1/algoOrder?');
+    expect(seenUrl).toContain('algoType=CONDITIONAL');
+    expect(seenUrl).toContain('triggerPrice=100');
+    expect(seenUrl).toContain('clientAlgoId=rsk-sl-1');
     expect(seenUrl).toMatch(/[?&]timestamp=\d+/);
     expect(seenUrl).toMatch(/[?&]recvWindow=/);
     expect(seenUrl).toMatch(/[?&]signature=[0-9a-f]{64}$/);

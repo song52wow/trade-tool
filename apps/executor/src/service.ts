@@ -83,18 +83,23 @@ export function parseBracketClientOrderId(
   return { tag, entryOrderId };
 }
 
-/** 下单能力。只声明用到的两个方法，测试可整体替身。 */
+/**
+ * 下单能力。只声明用到的两个方法，测试可整体替身。
+ *
+ * 全部走 Algo Order API：`algoId` 与普通 `orderId` 是两套独立编号，撤销也各走各的。
+ * 这里刻意用 `algoId` 命名而不用 `orderId`——混用只会在撤单时才暴露。
+ */
 export interface OrderPlacer {
   placeClosePositionOrder(request: {
     symbol: string;
     side: 'BUY' | 'SELL';
     type: 'STOP_MARKET' | 'TAKE_PROFIT_MARKET';
     stopPrice: number;
-    clientOrderId: string;
+    clientAlgoId: string;
     workingType: 'MARK_PRICE' | 'CONTRACT_PRICE';
     priceProtect: boolean;
-  }): Promise<{ orderId: number; clientOrderId: string; symbol: string; status: string }>;
-  cancelOrder(symbol: string, orderId: number): Promise<void>;
+  }): Promise<{ algoId: number; clientAlgoId: string; symbol: string; status: string }>;
+  cancelAlgoOrder(algoId: number): Promise<void>;
 }
 
 export interface ExecutorServiceDeps {
@@ -183,48 +188,46 @@ export function createExecutorService(deps: ExecutorServiceDeps): ExecutorServic
 
     // 先挂**止盈**、再挂**止损**：反过来的话，止盈挂上后止损失败、
     // 我们连一张可以撤的单都没有，仓位直接裸奔。
-    let tpOrderId: number | undefined;
-    let slOrderId: number | undefined;
+    let tpAlgoId: number | undefined;
+    let slAlgoId: number | undefined;
     try {
       const tp = await placer.placeClosePositionOrder({
         symbol: update.symbol,
         side: plan.exitSide,
         type: 'TAKE_PROFIT_MARKET',
         stopPrice: plan.takeProfitPrice,
-        clientOrderId: bracketClientOrderId('tp', entryOrderId),
+        clientAlgoId: bracketClientOrderId('tp', entryOrderId),
         workingType,
         priceProtect,
       });
-      tpOrderId = tp.orderId;
+      tpAlgoId = tp.algoId;
       const sl = await placer.placeClosePositionOrder({
         symbol: update.symbol,
         side: plan.exitSide,
         type: 'STOP_MARKET',
         stopPrice: plan.stopPrice,
-        clientOrderId: bracketClientOrderId('sl', entryOrderId),
+        clientAlgoId: bracketClientOrderId('sl', entryOrderId),
         workingType,
         priceProtect,
       });
-      slOrderId = sl.orderId;
+      slAlgoId = sl.algoId;
     } catch (error) {
       // 撤掉可能已经挂上的那张：留一张没有对单的止盈/止损，比两张都没有更糟。
       let cancelNote = '';
-      if (tpOrderId !== undefined || slOrderId !== undefined) {
-        const orderId = tpOrderId ?? slOrderId;
-        if (orderId !== undefined) {
-          try {
-            await placer.cancelOrder(update.symbol, orderId);
-            cancelNote = `；已撤掉先挂上的订单 ${orderId}`;
-          } catch (cancelError) {
-            cancelNote = `；**撤单也失败了**（订单 ${orderId} 可能仍在交易所挂着）：${reasonOf(cancelError)}`;
-          }
+      const algoId = tpAlgoId ?? slAlgoId;
+      if (algoId !== undefined) {
+        try {
+          await placer.cancelAlgoOrder(algoId);
+          cancelNote = `；已撤掉先挂上的条件单 ${algoId}`;
+        } catch (cancelError) {
+          cancelNote = `；**撤单也失败了**（条件单 ${algoId} 可能仍在交易所挂着）：${reasonOf(cancelError)}`;
         }
       }
       const reason = `${reasonOf(error)}${cancelNote}`;
       await markBracketFailed(
         pool,
         key,
-        { ...(tpOrderId ? { tpOrderId } : {}), ...(slOrderId ? { slOrderId } : {}) },
+        { ...(tpAlgoId !== undefined ? { tpAlgoId } : {}), ...(slAlgoId !== undefined ? { slAlgoId } : {}) },
         reason,
         now(),
       );
@@ -235,7 +238,7 @@ export function createExecutorService(deps: ExecutorServiceDeps): ExecutorServic
     await markBracketArmed(
       pool,
       key,
-      { tpOrderId: tpOrderId as number, slOrderId: slOrderId as number },
+      { tpAlgoId: tpAlgoId as number, slAlgoId: slAlgoId as number },
       now(),
     );
     log.info(`${update.symbol} 止盈止损已挂上：${describePlan(plan)}`);

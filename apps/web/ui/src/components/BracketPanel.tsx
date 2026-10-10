@@ -210,8 +210,8 @@ export function BracketPanel(props: { symbol: string; tick: number }) {
                         没有止损号」本身就是异常，必须显式说破，不能把 null 渲染成
                         和「已成交后被交易所撤单」同样的「—」。 */}
                     <td className="mono">
-                      {fmtNumber(b.tpOrderId)} / {fmtNumber(b.slOrderId)}
-                      {(b.tpOrderId === null) !== (b.slOrderId === null) ? (
+                      {fmtNumber(b.tpAlgoId)} / {fmtNumber(b.slAlgoId)}
+                      {(b.tpAlgoId === null) !== (b.slAlgoId === null) ? (
                         <div style={{ color: 'var(--err)', fontSize: 11 }}>单号不成对</div>
                       ) : null}
                     </td>

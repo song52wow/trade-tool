@@ -30,7 +30,7 @@ const TABLE = 'risk_bracket';
 
 const COLUMNS = `exchange, symbol, entry_order_id, entry_price, entry_time, filled_qty,
   position_side, atr, atr_period, atr_interval, atr_window_from, atr_window_to,
-  stop_price, take_profit, tp_order_id, sl_order_id, state, last_error, created_at, updated_at`;
+  stop_price, take_profit, tp_algo_id, sl_algo_id, state, last_error, created_at, updated_at`;
 
 export type BracketState = 'armed' | 'take_profit' | 'stop_loss' | 'cancelled' | 'failed';
 
@@ -70,8 +70,8 @@ export interface BracketRecord {
   atrWindowTo: number;
   stopPrice: number;
   takeProfit: number;
-  tpOrderId: number | null;
-  slOrderId: number | null;
+  tpAlgoId: number | null;
+  slAlgoId: number | null;
   state: BracketState;
   lastError: string | null;
   createdAt: number;
@@ -129,8 +129,8 @@ function toRecord(row: Record<string, unknown>): BracketRecord {
     atrWindowTo: bigint(row, 'atr_window_to', where),
     stopPrice: num(row, 'stop_price', where),
     takeProfit: num(row, 'take_profit', where),
-    tpOrderId: optionalBigint(row, 'tp_order_id', where),
-    slOrderId: optionalBigint(row, 'sl_order_id', where),
+    tpAlgoId: optionalBigint(row, 'tp_algo_id', where),
+    slAlgoId: optionalBigint(row, 'sl_algo_id', where),
     state: str(row, 'state', where) as BracketState,
     lastError: optionalStr(row, 'last_error', where),
     createdAt: bigint(row, 'created_at', where),
@@ -183,15 +183,15 @@ export async function claimBracket(pool: Pool, claim: BracketClaim): Promise<Bra
 export async function markBracketArmed(
   pool: Pool,
   key: { exchange: string; symbol: string; entryOrderId: string },
-  orderIds: { tpOrderId: number; slOrderId: number },
+  orderIds: { tpAlgoId: number; slAlgoId: number },
   now: number,
 ): Promise<void> {
   try {
     const result = await pool.query(
-      `UPDATE ${TABLE} SET tp_order_id = $4, sl_order_id = $5, state = 'armed',
+      `UPDATE ${TABLE} SET tp_algo_id = $4, sl_algo_id = $5, state = 'armed',
          last_error = NULL, updated_at = $6
        WHERE exchange = $1 AND symbol = $2 AND entry_order_id = $3`,
-      [key.exchange, key.symbol, key.entryOrderId, orderIds.tpOrderId, orderIds.slOrderId, now],
+      [key.exchange, key.symbol, key.entryOrderId, orderIds.tpAlgoId, orderIds.slAlgoId, now],
     );
     if (result.rowCount !== 1) {
       throw new SyncError(
@@ -213,14 +213,14 @@ export async function markBracketArmed(
 export async function markBracketFailed(
   pool: Pool,
   key: { exchange: string; symbol: string; entryOrderId: string },
-  error: { tpOrderId?: number; slOrderId?: number },
+  error: { tpAlgoId?: number; slAlgoId?: number },
   reason: string,
   now: number,
 ): Promise<void> {
   try {
     await pool.query(
       `UPDATE ${TABLE} SET state = 'failed', last_error = $4,
-         tp_order_id = COALESCE($5, tp_order_id), sl_order_id = COALESCE($6, sl_order_id),
+         tp_algo_id = COALESCE($5, tp_algo_id), sl_algo_id = COALESCE($6, sl_algo_id),
          updated_at = $7
        WHERE exchange = $1 AND symbol = $2 AND entry_order_id = $3`,
       [
@@ -228,8 +228,8 @@ export async function markBracketFailed(
         key.symbol,
         key.entryOrderId,
         reason,
-        error.tpOrderId ?? null,
-        error.slOrderId ?? null,
+        error.tpAlgoId ?? null,
+        error.slAlgoId ?? null,
         now,
       ],
     );

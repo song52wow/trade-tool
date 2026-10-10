@@ -207,7 +207,7 @@ export type BracketStateDto = 'armed' | 'take_profit' | 'stop_loss' | 'cancelled
 /**
  * 一条止盈止损记录（`risk_bracket` 表的一行）。
  *
- * `tpOrderId` / `slOrderId` 可为 null：**两张单要么都挂上要么都不挂**（v0.4.0 规则 5），
+ * `tpAlgoId` / `slAlgoId` 可为 null：**两张单要么都挂上要么都不挂**（v0.4.0 规则 5），
  * 所以出现「有止盈单号、无止损单号」本身就是一条 `failed` 记录，页面要把这种不完整
  * 如实显示成异常，而不是把 null 悄悄渲染成「—」当作正常。
  */
@@ -229,8 +229,8 @@ export interface BracketDto {
   atrWindowTo: number;
   stopPrice: number;
   takeProfit: number;
-  tpOrderId: number | null;
-  slOrderId: number | null;
+  tpAlgoId: number | null;
+  slAlgoId: number | null;
   state: BracketStateDto;
   lastError: string | null;
   createdAt: number;

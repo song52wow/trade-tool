@@ -62,8 +62,8 @@ function fakePool() {
             atr_window_to: windowTo,
             stop_price: stop,
             take_profit: takeProfit,
-            tp_order_id: null,
-            sl_order_id: null,
+            tp_algo_id: null,
+            sl_algo_id: null,
             state: 'failed',
             last_error: null,
             created_at: now,
@@ -73,7 +73,7 @@ function fakePool() {
         rowCount: 1,
       };
     }
-    if (sql.includes('SET tp_order_id')) {
+    if (sql.includes('SET tp_algo_id')) {
       const [exchange, symbol, entryOrderId, tp, sl] = params as (string | number)[];
       const row = state.claims.get(`${exchange}/${symbol}/${entryOrderId}`);
       if (row) Object.assign(row, { tpOrderId: tp, slOrderId: sl, state: 'armed' });
@@ -147,10 +147,10 @@ function fakeAtr(): AtrProvider & { calls: [string, number][] } {
 }
 
 function fakePlacer(overrides: Partial<OrderPlacer> = {}): OrderPlacer & {
-  placed: { type: string; stopPrice: number; clientOrderId: string }[];
+  placed: { type: string; stopPrice: number; clientAlgoId: string }[];
   cancelled: number[];
 } {
-  const placed: { type: string; stopPrice: number; clientOrderId: string }[] = [];
+  const placed: { type: string; stopPrice: number; clientAlgoId: string }[] = [];
   const cancelled: number[] = [];
   let seq = 900;
   return {
@@ -160,18 +160,18 @@ function fakePlacer(overrides: Partial<OrderPlacer> = {}): OrderPlacer & {
       placed.push({
         type: request.type,
         stopPrice: request.stopPrice,
-        clientOrderId: request.clientOrderId,
+        clientAlgoId: request.clientAlgoId,
       });
       seq += 1;
       return {
-        orderId: seq,
-        clientOrderId: request.clientOrderId,
+        algoId: seq,
+        clientAlgoId: request.clientAlgoId,
         symbol: request.symbol,
         status: 'NEW',
       };
     },
-    async cancelOrder(_symbol: string, orderId: number) {
-      cancelled.push(orderId);
+    async cancelAlgoOrder(algoId: number) {
+      cancelled.push(algoId);
     },
     ...overrides,
   };
@@ -304,8 +304,8 @@ describe('下单', () => {
           throw new Error('交易所拒单 -2021 Order would immediately trigger');
         }
         return {
-          orderId: 777,
-          clientOrderId: request.clientOrderId,
+          algoId: 777,
+          clientAlgoId: request.clientAlgoId,
           symbol: request.symbol,
           status: 'NEW',
         };
