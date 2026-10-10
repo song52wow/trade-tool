@@ -334,9 +334,20 @@ export class BinancePrivateClient {
     await this.request('DELETE', '/fapi/v1/listenKey', { params: { listenKey } });
   }
 
-  /** listenKey 的流地址。 */
+  /**
+   * listenKey 的流地址。
+   *
+   * **必须走 `/private` 路由**：Binance 于 2026-03-06 公告拆分 USDⓈ-M 合约的 WS
+   * 架构（public / market / private 三条独立入口），并于 **2026-04-23 永久下线旧地址**。
+   * 官方明确：用户数据走 `wss://fstream.binance.com/private/ws?listenKey=<key>`，
+   * **省略 `/private` 不会投递账户事件**。
+   *
+   * 这一点踩过坑：旧地址**握手仍然成功**（`onopen` 正常触发、连接不报错、不重连），
+   * 但一个事件也收不到——于是买入成交永远不触发挂单，`risk_bracket` 一行不落，
+   * 日志干净得像一切正常，而服务实际上完全失明。这比直接崩掉危险得多。
+   */
   listenKeyUrl(listenKey: string): string {
-    return `${this.streamUrl}/ws/${listenKey}`;
+    return `${this.streamUrl}/private/ws?listenKey=${encodeURIComponent(listenKey)}`;
   }
 
   /**

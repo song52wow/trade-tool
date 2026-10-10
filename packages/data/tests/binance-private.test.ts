@@ -104,6 +104,19 @@ describe('私有 REST', () => {
     const client = clientWith((async () => jsonResponse({})) as unknown as typeof fetch);
     await expect(client.createListenKey()).rejects.toThrow(/listenKey/);
   });
+
+  // 旧地址 `${streamUrl}/ws/<listenKey>` **握手照样成功**（onopen 触发、不报错、
+  // 不重连），但 Binance 2026-04-23 起已下线它，并且省略 `/private` 不投递账户事件。
+  // 后果是买入成交永远不触发挂单，而日志干净得像一切正常——「看起来在跑、实际失明」
+  // 比直接崩掉危险得多。这个地址以前没有任何断言，才让问题一直藏着。
+  it('用户数据流必须走 /private 路由，旧地址静默收不到事件', () => {
+    const client = clientWith((async () => jsonResponse({})) as unknown as typeof fetch);
+    const url = client.listenKeyUrl('KEY-123');
+    expect(url).toContain('/private/ws');
+    expect(url).toContain('listenKey=KEY-123');
+    // 旧写法：`${streamUrl}/ws/${listenKey}`。这条断言失败即表示地址回退了。
+    expect(url).not.toMatch(/\/ws\/KEY-123$/);
+  });
 });
 
 describe('parseOrderTradeUpdate', () => {
