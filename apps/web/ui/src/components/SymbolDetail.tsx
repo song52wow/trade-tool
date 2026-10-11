@@ -3,6 +3,7 @@ import type { DerivedIntervalDto } from '../../../src/types';
 import type { SymbolDetailDto } from '../../../src/types';
 import { ALL_INTERVALS } from './gaps.js';
 import { BracketPanel } from './BracketPanel.js';
+import { ReconcilePanel } from './ReconcilePanel.js';
 import { PriceChart } from './PriceChart.js';
 
 export function SymbolDetail(props: {
@@ -111,6 +112,10 @@ export function SymbolDetail(props: {
       {/* 止盈止损（v0.4.0）放在合约状态之后、缺口清单之前：它回答的是「我的仓位现在
           有没有保护」，与「数据全不全」是两件事，各自的处置方式也不同。 */}
       <BracketPanel symbol={props.detail.symbol} tick={props.tick} />
+
+      {/* 交易对账（v0.6.0）紧跟止盈止损：那个面板回答「我们记了什么」，这个回答
+          「交易所现在到底是什么」。key 让换标的时整个面板重挂载，从而清掉上一份快照。 */}
+      <ReconcilePanel key={props.detail.symbol} symbol={props.detail.symbol} />
 
       <h2 style={{ fontSize: 13, color: 'var(--muted)', fontWeight: 500, marginTop: 18 }}>
         缺口清单（{gaps.length}）

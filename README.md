@@ -142,6 +142,43 @@ pnpm --filter @trade-tool/executor start   # 需 executor.enabled = true（会�
 冲突即说明这笔成交已处理过（用户数据流会重放事件，而止盈止损是真的会下单）。
 细节见 `apps/executor/README.md`。
 
+## 交易对账（v0.6.0）
+
+止盈止损只有写入侧：占坑在 PG、下单在交易所，两者无法原子提交。进程死在中间是必然的
+——单挂上了而单号没回填，或本地记着 `armed` 而那张单早没了。这类漂移**没有任何日志会
+告诉你**：用户数据流不重放历史，页面又只读本地表，于是一切看上去正常。
+
+对账就是补上这个只读的眼睛：拉交易所真实的持仓与条件单，同本地 `risk_bracket` 比对。
+
+```bash
+pnpm --filter @trade-tool/cli start -- reconcile                 # 全账户
+pnpm --filter @trade-tool/cli start -- reconcile -s BTCUSDT      # 单标的
+```
+
+控制面详情页有同一个功能的「开始对账」按钮。**只报告，不动手**：不下单、不撤单、
+不写库，处置一律人工决定——自动补挂一张止损会平掉真实仓位，且不可逆。
+
+判据只有一份实现（`packages/core/src/reconcile.ts`，纯函数），CLI 与控制面共用，因此两个
+出口不可能给出不同结论。差异分两档而不是「有异常 / 没异常」：
+
+| 差异 | 严重度 | 含义 |
+| --- | --- | --- |
+| `missing-stop-order` | 紧急 | 本地记为已挂单，交易所没有止损单——**仓位当前是裸的** |
+| `unprotected-position` | 紧急 | 一笔入场成交占坑成功但没挂上单，而仓位还在 |
+| `position-without-record` | 紧急 | 交易所有仓位，本地没有任何未终结记录 |
+| `missing-take-profit-order` | 注意 | 止损还在，止盈没了 |
+| `price-mismatch` | 注意 | 单还在，但触发价与本地记录不一致 |
+| `record-without-position` | 注意 | 本地记为已挂单，交易所已无仓位（平仓事件多半没收到） |
+| `orphan-algo-order` | 注意 | 交易所挂着我方单，但本地没有记录引用它 |
+
+「有止盈没止损」是紧急，「只有止损没止盈」只是注意——合成「有没有问题」会让最要紧的
+那种被淹掉。
+
+**对账不出网是不可能的**：它要签名访问交易所私有接口（`GET /fapi/v3/positionRisk`、
+`GET /fapi/v1/openAlgoOrders`），因此**不能挂自动刷新**，控制面上是一个手动按钮，快照
+时间常驻可见。不带标的的 `openAlgoOrders` 权重是 **40**（带标的只要 1），所以控制面的
+路由按标的走，全账户对账走 CLI。
+
 ## 控制面（`apps/web`）
 
 `docs/…sync.md` 最初把控制面列为下期，只交付数据层原语（R-22）——`@trade-tool/sync`

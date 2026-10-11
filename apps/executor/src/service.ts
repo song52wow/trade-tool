@@ -30,8 +30,10 @@
 
 import {
   SyncError,
+  bracketClientOrderId,
   createLogger,
   deriveBracketPlan,
+  parseBracketClientOrderId,
   type BracketPlan,
   type ExecutorConfig,
   type TradeToolConfig,
@@ -52,36 +54,19 @@ import type { AtrProvider } from './atr.js';
 
 const log = createLogger('executor');
 
-/** 我们自己下的两张条件单的 `clientOrderId` 前缀。用来把自己的成交认出来。 */
-export const RISK_CLIENT_ID_PREFIX = 'rsk';
+/**
+ * 编号约定**只有一份实现**，在 `@trade-tool/core`（v0.6.0 从这里上移）。
+ *
+ * 之前它只长在本文件里，而 v0.6.0 的交易对账要靠同一个约定把交易所挂着的条件单认回
+ * 本地记录。两处各写一遍前缀解析，漂移的症状是「止损挂在错误的仓位上」——在两边都
+ * 看起来正常的日志里。
+ *
+ * 这里仍然原样导出，`apps/executor` 的对外签名不变。
+ */
+export { bracketClientOrderId, parseBracketClientOrderId, RISK_CLIENT_ID_PREFIX } from '@trade-tool/core';
+
 const TP_TAG = 'tp';
 const SL_TAG = 'sl';
-/** Binance 的 clientOrderId 长度上限。 */
-const CLIENT_ID_MAX = 36;
-
-/**
- * 由入场订单号派生条件单的 clientOrderId。
- *
- * 带前缀是为了在事件流里一眼认出「这是止盈止损成交，不是新的入场」——
- * 认错了会把一笔止损平仓当成新的买入成交，再挂一组单，仓位直接翻倍。
- */
-export function bracketClientOrderId(tag: 'tp' | 'sl', entryOrderId: string): string {
-  return `${RISK_CLIENT_ID_PREFIX}-${tag}-${entryOrderId}`.slice(0, CLIENT_ID_MAX);
-}
-
-/** 反解：这是不是我们挂的单？是的话返回是哪一张与对应的入场订单号。 */
-export function parseBracketClientOrderId(
-  clientOrderId: string,
-): { tag: 'tp' | 'sl'; entryOrderId: string } | null {
-  if (!clientOrderId.startsWith(`${RISK_CLIENT_ID_PREFIX}-`)) return null;
-  const rest = clientOrderId.slice(RISK_CLIENT_ID_PREFIX.length + 1);
-  const dash = rest.indexOf('-');
-  if (dash < 0) return null;
-  const tag = rest.slice(0, dash);
-  const entryOrderId = rest.slice(dash + 1);
-  if ((tag !== TP_TAG && tag !== SL_TAG) || entryOrderId === '') return null;
-  return { tag, entryOrderId };
-}
 
 /**
  * 下单能力。只声明用到的两个方法，测试可整体替身。
@@ -160,7 +145,7 @@ export function createExecutorService(deps: ExecutorServiceDeps): ExecutorServic
   async function settle(
     update: OrderTradeUpdate,
     entryOrderId: string,
-    tag: 'tp' | 'sl',
+    tag: typeof TP_TAG | typeof SL_TAG,
   ): Promise<HandleOutcome> {
     const state: BracketState = tag === TP_TAG ? 'take_profit' : 'stop_loss';
     try {
@@ -196,7 +181,7 @@ export function createExecutorService(deps: ExecutorServiceDeps): ExecutorServic
         side: plan.exitSide,
         type: 'TAKE_PROFIT_MARKET',
         stopPrice: plan.takeProfitPrice,
-        clientAlgoId: bracketClientOrderId('tp', entryOrderId),
+        clientAlgoId: bracketClientOrderId(TP_TAG, entryOrderId),
         workingType,
         priceProtect,
       });
@@ -206,7 +191,7 @@ export function createExecutorService(deps: ExecutorServiceDeps): ExecutorServic
         side: plan.exitSide,
         type: 'STOP_MARKET',
         stopPrice: plan.stopPrice,
-        clientAlgoId: bracketClientOrderId('sl', entryOrderId),
+        clientAlgoId: bracketClientOrderId(SL_TAG, entryOrderId),
         workingType,
         priceProtect,
       });

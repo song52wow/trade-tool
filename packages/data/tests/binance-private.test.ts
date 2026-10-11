@@ -203,3 +203,115 @@ describe('parseTickSize', () => {
     expect(() => parseTickSize({ filters: [{ filterType: 'PRICE_FILTER' }] }, 'SYM')).toThrow();
   });
 });
+
+/**
+ * 只读查询端点的**契约断言**（v0.6.0）。
+ *
+ * AGENTS.md「交易所接缝必须核对契约」第 1 条：接缝的**值**必须有对着契约写的断言，
+ * 而不是对着自己的实现复述。`listenKeyUrl` 从对变错时 122 个测试全绿，就是因为没有任何
+ * 用例断言过那个地址——这里的每一条都对着 **2026-10-11 核对**过的官方文档。
+ *
+ * 锁住的「值」：
+ *   * `GET /fapi/v3/positionRisk` —— **v3**，v2 已被官方列入待下线；
+ *   * `GET /fapi/v1/openAlgoOrders` —— 条件单查询走 Algo Order API 家族；
+ *   * 数量字段在 payload 里是**字符串**，必须转成数字；
+ *   * `orderType` 查询侧回 `TAKE_PROFIT` / `STOP`（**不是**下单侧的 `*_MARKET`）。
+ */
+describe('只读查询端点（v0.6.0 对账用）', () => {
+  /** 官方 positionRisk 示例，字段值原样照抄。 */
+  const POSITION_PAYLOAD = [
+    {
+      symbol: 'ADAUSDT',
+      positionSide: 'BOTH',
+      positionAmt: '30',
+      entryPrice: '0.385',
+      markPrice: '0.41047590',
+      unRealizedProfit: '0.76427700',
+      updateTime: 1720736417660,
+    },
+  ];
+
+  /** 官方 openAlgoOrders 示例。`orderType` 是 `TAKE_PROFIT`，与下单侧不同。 */
+  const ALGO_PAYLOAD = [
+    {
+      algoId: 2148627,
+      clientAlgoId: 'rsk-sl-1001',
+      algoType: 'CONDITIONAL',
+      orderType: 'TAKE_PROFIT',
+      symbol: 'BNBUSDT',
+      side: 'SELL',
+      positionSide: 'BOTH',
+      algoStatus: 'NEW',
+      triggerPrice: '750.000',
+      closePosition: true,
+      createTime: 1750514941540,
+      updateTime: 1750514941540,
+    },
+  ];
+
+  it('positionRisk 走 v3（不是已被列入待下线的 v2），且带 symbol', async () => {
+    const urls: string[] = [];
+    const client = clientWith((async (url: string) => {
+      urls.push(String(url));
+      return jsonResponse(POSITION_PAYLOAD);
+    }) as unknown as typeof fetch);
+
+    const rows = await client.positionRisk({ symbol: 'ADAUSDT' });
+
+    expect(urls).toHaveLength(1);
+    expect(urls[0]).toContain('/fapi/v3/positionRisk');
+    expect(urls[0]).not.toContain('/v2/positionRisk');
+    expect(urls[0]).toContain('symbol=ADAUSDT');
+    expect(rows[0]).toEqual({
+      symbol: 'ADAUSDT',
+      positionSide: 'BOTH',
+      // 字符串必须转成数字：直接透传会让「positionAmt === 0」永远不成立。
+      positionAmt: 30,
+      entryPrice: 0.385,
+      markPrice: 0.4104759,
+      updateTime: 1720736417660,
+    });
+  });
+
+  it('openAlgoOrders 走 /fapi/v1/openAlgoOrders，并原样保留查询侧的 orderType', async () => {
+    const urls: string[] = [];
+    const client = clientWith((async (url: string) => {
+      urls.push(String(url));
+      return jsonResponse(ALGO_PAYLOAD);
+    }) as unknown as typeof fetch);
+
+    const rows = await client.openAlgoOrders({ symbol: 'BNBUSDT' });
+
+    expect(urls[0]).toContain('/fapi/v1/openAlgoOrders');
+    expect(rows[0]?.algoId).toBe(2148627);
+    // 这里**不能**「顺手统一」成 TAKE_PROFIT_MARKET：两侧取值本来就不同，
+    // 统一掉差异就从代码里消失了，而 core 的 algoOrderTag 正是靠这个差异认类型。
+    expect(rows[0]?.orderType).toBe('TAKE_PROFIT');
+    expect(rows[0]?.triggerPrice).toBe(750);
+    expect(rows[0]?.closePosition).toBe(true);
+  });
+
+  it('不带 symbol 时**不发送** symbol 参数（不是发送空串）', async () => {
+    const urls: string[] = [];
+    const client = clientWith((async (url: string) => {
+      urls.push(String(url));
+      return jsonResponse(POSITION_PAYLOAD);
+    }) as unknown as typeof fetch);
+
+    await client.positionRisk();
+    expect(urls[0]).not.toContain('symbol=');
+  });
+
+  it('返回的不是数组就抛错，不返回空数组假装「没有仓位」', async () => {
+    const client = clientWith((async () => jsonResponse({ code: -1, msg: 'nope' })) as unknown as typeof fetch);
+    await expect(client.positionRisk()).rejects.toThrow();
+    await expect(client.openAlgoOrders()).rejects.toThrow();
+  });
+
+  it('字段缺失 / 类型不对一律抛错带字段名', async () => {
+    const client = clientWith(
+      (async () => jsonResponse([{ symbol: 'ADAUSDT', positionAmt: 'abc' }])) as unknown as typeof fetch,
+    );
+    await expect(client.positionRisk()).rejects.toThrow(/positionAmt/);
+  });
+});

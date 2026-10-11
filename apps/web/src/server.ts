@@ -34,6 +34,7 @@ import type {
   RiskPolicyScopeDto,
   RiskPolicyViewDto,
   RiskPolicyWriteBody,
+  ReconcileReport,
   StartJobBody,
   SymbolDetailDto,
   SymbolRowDto,
@@ -77,6 +78,15 @@ export interface WebDeps {
    * 库里没有记录时返回 200 + `items: []`——「还没成交过」是完全正常的状态。
    */
   listBrackets(symbol: string, options: { limit: number }): Promise<BracketsDto>;
+  /**
+   * 交易对账（v0.6.0）：交易所真实持仓/挂单 vs 本地记录，**只报告不动手**。
+   *
+   * 与上面那些纯读本地库的取数不同，这条**要签名访问交易所私有接口**，因此：
+   *   * 不挂在刷新节奏上，只在用户点按钮时跑一次；
+   *   * `symbol` **必填**——不带标的的 `openAlgoOrders` 权重是 40（带标的只要 1），
+   *     一个能被随手连点的接口不该默认按那个价走。全账户对账走 CLI。
+   */
+  reconcile(symbol: string): Promise<ReconcileReport>;
   /**
    * 凭据状态（v0.5.0）。**只回「配没配」与末 4 位**。
    *
@@ -270,6 +280,24 @@ export function buildApp(deps: WebDeps): Hono {
       MAX_BRACKET_LIMIT,
     );
     return c.json(await deps.listBrackets(symbol, { limit }));
+  });
+
+  /**
+   * 交易对账（v0.6.0）：**手动触发**的只读快照。
+   *
+   * 与 `/bars` 的关键差别：`/bars` 只打 PG，所以能挂在 5s 刷新节奏上；这条要走交易所
+   * 私有接口（签名 + 消耗请求权重 + 出网），因此**绝不自动刷新**——页面只在用户点按钮
+   * 时调一次，并在界面上写明「这是一次性快照」。
+   *
+   * `symbol` **必填**：不带标的的 `GET /fapi/v1/openAlgoOrders` 权重是 **40**（带标的
+   * 只要 1）。一个能被反复连点的接口不该默认按 40 计价，因此全账户对账走 CLI。
+   *
+   * 一致返回 200 + `healthy: true`，**不是 404**：查出来「没问题」是完全正常的答案，
+   * 与「这个路由不存在」必须分开。
+   */
+  app.get('/api/symbols/:symbol/reconcile', async (c) => {
+    const symbol = normalizeSymbol(c.req.param('symbol'));
+    return c.json(await deps.reconcile(symbol));
   });
 
   /** 规模预估（R-8.3）：首次全量前必须先算给人看，确认弹窗的数据就来自这里。 */

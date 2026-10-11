@@ -10,6 +10,7 @@ import type {
   IndicatorsDto,
   JobDto,
   OverviewDto,
+  ReconcileReport,
   RiskPolicyEntryDto,
   RiskPolicyScopeDto,
   RiskPolicyViewDto,
@@ -143,6 +144,26 @@ export const api = {
       }
       throw error;
     }),
+  /**
+   * 交易对账（v0.6.0）。**手动触发**，不进自动刷新：
+   * 这条要签名访问交易所私有接口（出网 + 消耗请求权重），与 `/bars` 的纯读本地库
+   * 不是一回事，挂在刷新节奏上等于按秒消耗配额。
+   *
+   * 404 同样单列成「控制面还是旧进程」——路由在启动时注册，新增路由后不重启就
+   * 看不到它，而页面会安静地什么都不显示。
+   */
+  reconcile: (s: string) =>
+    request<ReconcileReport>(`/api/symbols/${encodeURIComponent(s)}/reconcile`).catch(
+      (error: unknown) => {
+        if (error instanceof ApiError && error.status === 404) {
+          throw new ApiError(
+            'CONTROL_PLANE_STALE',
+            '控制面没有 /reconcile 路由：它还是改动前启动的旧进程。重启 trade-tool 控制面后刷新页面即可。',
+          );
+        }
+        throw error;
+      },
+    ),
   exchange: (refresh = false) =>
     request<ExchangeListDto>(`/api/exchange${refresh ? '?refresh=true' : ''}`),
   addSymbol: (symbol: string) => post<SymbolRowDto>('/api/symbols', { symbol }),

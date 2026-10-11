@@ -10,6 +10,8 @@ import { DEFAULT_BRACKET_LIMIT, MAX_BAR_LIMIT, MAX_BRACKET_LIMIT } from '../src/
 import { buildApp, type WebDeps } from '../src/server.js';
 import type {
   BracketsDto,
+  ErrorBody,
+  ReconcileReport,
   RiskPolicyViewDto,
   JobDto,
   OverviewDto,
@@ -147,6 +149,18 @@ function fakeDeps(overrides: Partial<WebDeps> = {}): WebDeps & { calls: string[]
         limit: options.limit,
         items: [],
         countsByState: { armed: 0, take_profit: 0, stop_loss: 0, cancelled: 0, failed: 0 },
+      };
+    },
+    reconcile: async (symbol) => {
+      calls.push(`reconcile:${symbol}`);
+      return {
+        exchange: 'binance',
+        symbol,
+        checkedAt: NOW,
+        healthy: true,
+        counts: { critical: 0, warning: 0, total: 0 },
+        differences: [],
+        scope: { localUnsettled: 0, exchangePositions: 0, exchangeAlgoOrders: 0 },
       };
     },
     getCredentialStatus: async () => ({
@@ -746,8 +760,8 @@ describe('POST /api/symbols/:symbol/aggregate', () => {
               atrWindowTo: NOW - 3_600_000,
               stopPrice: 96,
               takeProfit: 108,
-              tpOrderId: 1,
-              slOrderId: 2,
+              tpAlgoId: 1,
+              slAlgoId: 2,
               state: 'armed' as const,
               lastError: null,
               createdAt: NOW - 3_600_000,
@@ -875,5 +889,51 @@ describe('POST /api/symbols/:symbol/aggregate', () => {
     const app = buildApp(fakeDeps());
     const res = await app.request('/api/settings/risk-policy?scope=bogus', { method: 'DELETE' });
     expect(res.status).toBe(400);
+  });
+});
+
+/**
+ * 交易对账路由（v0.6.0）。
+ *
+ * 锁三件事：
+ *   1. 一致时返回 **200 + healthy**，不是 404——「查出来没问题」是完全正常的答案；
+ *   2. 路由**按标的**走（不带 symbol 的交易所权重是 40，不能默认按那个价走）；
+ *   3. 404 单列成「控制面还是改动前的旧进程」，因为路由在启动时注册。
+ */
+describe('GET /api/symbols/:symbol/reconcile', () => {
+  it('返回报告，并把规范化后的 symbol 传给依赖', async () => {
+    const deps = fakeDeps();
+    const res = await buildApp(deps).request('/api/symbols/AAAUSDT/reconcile');
+    const body = (await res.json()) as ReconcileReport;
+
+    expect(res.status).toBe(200);
+    expect(deps.calls).toContain('reconcile:AAAUSDT');
+    expect(body.symbol).toBe('AAAUSDT');
+    expect(body.healthy).toBe(true);
+  });
+
+  it('查出一致时不是 404', async () => {
+    const res = await buildApp(fakeDeps()).request('/api/symbols/AAAUSDT/reconcile');
+    expect(res.status).not.toBe(404);
+  });
+
+  it('依赖抛错时如实报错，不返回「一致」', async () => {
+    const deps = fakeDeps({
+      reconcile: async () => {
+        throw new SyncError('CONFIG_INVALID', '库里没有配置过 binance 凭据');
+      },
+    });
+    const res = await buildApp(deps).request('/api/symbols/AAAUSDT/reconcile');
+    expect(res.status).toBe(400);
+    // 最不能出的错：签名失败却被显示成「交易所持仓正常」。
+    const body = (await res.json()) as ErrorBody;
+    expect(body.error.message).toContain('凭据');
+  });
+
+  it('symbol 为空白时 400，且一次查询都不发', async () => {
+    const deps = fakeDeps();
+    const res = await buildApp(deps).request('/api/symbols/%20/reconcile');
+    expect(res.status).toBe(400);
+    expect(deps.calls.some((c) => c.startsWith('reconcile:'))).toBe(false);
   });
 });

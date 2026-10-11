@@ -16,6 +16,7 @@ import {
   summarize,
 } from './commands/data.js';
 import { runDbStatus, runMigrate } from './commands/db.js';
+import { runReconcile } from './commands/reconcile.js';
 import { runSyncStatus } from './commands/sync.js';
 import { collectDiagnostics } from './doctor.js';
 
@@ -296,6 +297,18 @@ syncCmd
   .option('--json', '输出 JSON')
   .action(async (options: { symbol?: string; json?: boolean }) => {
     process.exitCode = await runSyncStatus(options).catch((error: unknown) => {
+      fail(error);
+      return 1;
+    });
+  });
+
+program
+  .command('reconcile')
+  .description('交易对账：交易所真实持仓/挂单 vs 本地止盈止损记录（只报告，不改动）')
+  .option('-s, --symbol <symbol>', '只对单个标的；缺省全账户')
+  .option('--json', '输出 JSON')
+  .action(async (options: { symbol?: string; json?: boolean }) => {
+    process.exitCode = await runReconcile(options).catch((error: unknown) => {
       fail(error);
       return 1;
     });

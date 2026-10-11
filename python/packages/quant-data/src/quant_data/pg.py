@@ -47,6 +47,11 @@ KNOWN_MIGRATION_VERSIONS: frozenset[str] = frozenset(
         "006_risk_bracket",
         # v0.5.0：控制面可写的运行期设置（加密凭据 + 止盈止损策略）
         "007_executor_settings",
+        # v0.4.0 的列语义修正：条件单迁到 Algo Order API 后，risk_bracket 的
+        # tp_order_id / sl_order_id 改名为 tp_algo_id / sl_algo_id。
+        # 只做重命名，Python 侧不读写该表，但版本闸门两个方向都要校，
+        # 漏登记会让**所有**碰 PG 的用例报「库比代码新」。
+        "008_algo_order_ids",
     }
 )
 

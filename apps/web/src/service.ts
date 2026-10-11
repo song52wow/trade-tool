@@ -13,6 +13,7 @@ import {
 import {
   aggregateSymbol,
   assertSchemaVersion,
+  BinancePrivateClient,
   buildContext,
   createPool,
   estimateFirstPull,
@@ -35,7 +36,9 @@ import {
   readDerivedIntervals,
   readIndicatorSpec,
   readLatestBars,
+  resolveActiveCredentials,
   resolveContract,
+  runReconciliation,
   schemaStatus,
   specLabel,
   syncSymbol,
@@ -71,6 +74,19 @@ function masterKeyStatus(): { ok: boolean; reason?: string } {
 function requireMasterKey(): Buffer {
   return parseSecretKey(process.env[SECRET_KEY_ENV]);
 }
+
+/**
+ * 主密钥的**可缺省**版本：只给交易对账用（v0.6.0）。
+ *
+ * 写凭据必须要有主密钥（`requireMasterKey`），但对账是只读的：主密钥没注入只意味着
+ * 读不到库里加密存的那份，环境变量注入的仍可用。为此把对账整条封在「主密钥必须已
+ * 配置」后面，是凭空加一道门槛。
+ */
+function masterKeyOrNull(): Buffer | null {
+  const raw = process.env[SECRET_KEY_ENV];
+  if (raw === undefined || raw.trim() === '') return null;
+  return requireMasterKey();
+}
 import type {
   BarDto,
   BracketsDto,
@@ -78,6 +94,7 @@ import type {
   RiskPolicyEntryDto,
   RiskPolicyViewDto,
   DaemonStatusDto,
+  ReconcileReport,
   IndicatorsDto,
   ExchangeListDto,
   OverviewDto,
@@ -369,6 +386,28 @@ export function createWebRuntime(config: TradeToolConfig): WebRuntime {
 
     // 预估要出网读元数据但**不写库**（R-8.3），所以由确认弹窗按需单独触发。
     estimate: (symbol) => estimateFirstPull(ctx, symbol),
+
+    /**
+     * 交易对账（v0.6.0）：**只读**地比对交易所与本地，绝不下单/撤单/写库。
+     *
+     * 需要明文凭据来签名私有接口（AGENTS.md 约定 2 的同一原则：密钥只经环境变量与
+     * `X-MBX-APIKEY` 出现，不进 argv、不打日志）。这里**不回传任何密钥字段**——
+     * `WebDeps` 的签名里就没有能带出明文的位置，报告里只有 algoId 与价格。
+     *
+     * 主密钥缺失不算致命：这只意味着读不到控制面里加密存的那份凭据，环境变量注入的
+     * 仍可用；两条都拿不到时 `resolveActiveCredentials` 抛错并说清缺哪个变量。
+     */
+    async reconcile(symbol: string): Promise<ReconcileReport> {
+      const credentials = await resolveActiveCredentials({
+        pool,
+        masterKey: masterKeyOrNull(),
+        exchange: ctx.exchange,
+        apiKeyEnv: config.executor.apiKeyEnv,
+        apiSecretEnv: config.executor.apiSecretEnv,
+      });
+      const client = new BinancePrivateClient({ credentials });
+      return runReconciliation({ pool, client, exchange: ctx.exchange, symbol });
+    },
 
     /**
      * 凭据状态。**主密钥缺失时如实说 `masterKeyReady: false`**：

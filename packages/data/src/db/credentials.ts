@@ -8,12 +8,19 @@
  *     连密文都不往外带。控制面永远没有能力把密钥显示出来，这是有意的：
  *     一旦有 GET 能拿到明文，任何一次 XSS、一个误开的日志、一张截图就都成了
  *     凭据泄露，而「配没配」已经足够让人确认状态。
- *   * `readCredentials()` —— **只给 executor**。返回明文，因此调用点要显眼。
+ *   * `readCredentials()` / `resolveActiveCredentials()` —— 返回明文，因此调用点要显眼。
+ *     合法理由只有一个：拿它去**签名交易所请求**（executor 下单、v0.6.0 对账）。
  *
  * 表结构在 `sql/007_executor_settings.sql`，本模块不另持影子定义。
  */
 
-import { SyncError, keyHint, openCredentials, sealCredentials } from '@trade-tool/core';
+import {
+  SyncError,
+  keyHint,
+  openCredentials,
+  sealCredentials,
+  type Credentials,
+} from '@trade-tool/core';
 
 import { toSyncError } from './errors.js';
 import type { Pool } from './pool.js';
@@ -187,4 +194,57 @@ export async function readCredentials(
     if (error instanceof SyncError) throw error;
     throw toSyncError(error, `读取 ${exchange} 凭据密文失败`);
   }
+}
+
+/**
+ * 解析**当前生效**的凭据：先读库里加密存的那份，再回落环境变量。
+ *
+ * v0.6.0 起这里有了第二个调用方（交易对账），因此从 `apps/executor/src/main.ts`
+ * 抽成一份实现。优先级只有这一份实现是硬要求：两份不一致时，只有明确的那一份算数，
+ * 而「哪一份在生效」正是排障时第一个要回答的问题。
+ *
+ * 两个调用方的差别只有一处，且是刻意的：
+ *   * executor **要求**主密钥存在（它本来就必须在控制面存过或用环境变量）；
+ *   * 这里 `masterKey` 可以是 `null`——主密钥没注入时只是读不到库里那份，
+ *     环境变量那一档仍然可用。只读对账不该因为没配主密钥就整个不可用。
+ *
+ * 环境变量这一档**缺一即拒**，不做「读到一半先用空密钥试一下」：Binance 会返回 401，
+ * 而一个带着空密钥反复重试的进程看起来只是「连不上」，很难定位。
+ */
+export async function resolveActiveCredentials(options: {
+  pool: Pool;
+  masterKey: Buffer | null;
+  exchange: string;
+  /** 环境变量名（来自 `config.executor.apiKeyEnv` / `apiSecretEnv`）。 */
+  apiKeyEnv: string;
+  apiSecretEnv: string;
+  /** 记录用哪一档生效了。走 stderr，stdout 留给命令结果。 */
+  note?: (message: string) => void;
+}): Promise<Credentials> {
+  const { pool, masterKey, exchange, apiKeyEnv, apiSecretEnv } = options;
+  if (masterKey !== null) {
+    const stored = await readCredentials(pool, masterKey, exchange);
+    if (stored !== null) {
+      options.note?.(`使用控制面录入的凭据（${exchange}）`);
+      return stored;
+    }
+  }
+
+  const key = process.env[apiKeyEnv];
+  const secret = process.env[apiSecretEnv];
+  const missing: string[] = [];
+  if (key === undefined || key.trim() === '') missing.push(apiKeyEnv);
+  if (secret === undefined || secret.trim() === '') missing.push(apiSecretEnv);
+  if (missing.length > 0) {
+    const viaEnv = `环境变量 ${missing.join(', ')}`;
+    const viaDb = masterKey === null ? '（主密钥未注入，读不到库里那份）' : '';
+    throw new SyncError(
+      'CONFIG_INVALID',
+      `库里没有配置过 ${exchange} 凭据${viaDb}，且${viaEnv}也没有设置。` +
+        '请在控制面「设置」页录入，或在仓库根 .env 里设置这两个变量。',
+      { missing },
+    );
+  }
+  options.note?.(`使用环境变量注入的凭据（${exchange}）`);
+  return { apiKey: key as string, apiSecret: secret as string };
 }

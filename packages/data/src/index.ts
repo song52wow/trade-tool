@@ -14,5 +14,7 @@ export * from './db/risk-policy.js';
 export * from './db/sql-files.js';
 /** 私有交易接口（签名 REST + 用户数据流），v0.4.0 `apps/executor` 的交易所侧适配。 */
 export * from './binance-private.js';
+/** 交易对账（v0.6.0）：只读取数 + 编排，判据在 core。 */
+export * from './reconcile.js';
 /** 测试专用：本地假交易所实现，详见文件头说明。 */
 export * from './testing.js';

@@ -294,6 +294,64 @@ export async function listBrackets(
   }
 }
 
+/**
+ * 未终结记录的返回类型：`state` **窄化**为两态。
+ *
+ * 窄化不是洁癖：`state` 若是完整的五态类型，`reconcileBrackets` 里那个
+ * 「不是 failed 就当 armed」的分支就会在运行时悄悄把一条已终结记录当成未终结的，
+ * 凭空报出「止损单不见了」。这里用同一个取值函数把类型收窄，转换点只有一处。
+ */
+export type UnsettledBracketRecord = Omit<BracketRecord, 'state' | 'positionSide'> & {
+  state: Extract<BracketState, 'armed' | 'failed'>;
+  /** 表上的 CHECK 约束只允许 LONG / SHORT，这里把它显式收窄而不是靠调用方相信。 */
+  positionSide: Extract<PositionSide, 'LONG' | 'SHORT'>;
+};
+
+function toUnsettledRecord(row: Record<string, unknown>): UnsettledBracketRecord {
+  const record = toRecord(row);
+  if (record.state !== 'armed' && record.state !== 'failed') {
+    // WHERE 已经限定了这两态，能走到这里说明约束被绕过或查询被改坏了。
+    // 抛错而不是当成 armed —— 那正是上面说的假警报来源（AGENTS.md 约定 9）。
+    throw new SyncError('CONFIG_INVALID', `listUnsettledBrackets 收到非未终结状态：${record.state}`, {
+      state: record.state,
+    });
+  }
+  if (record.positionSide !== 'LONG' && record.positionSide !== 'SHORT') {
+    throw new SyncError(
+      'CONFIG_INVALID',
+      `listUnsettledBrackets 收到非法仓位方向：${record.positionSide}`,
+      { positionSide: record.positionSide },
+    );
+  }
+  return { ...record, state: record.state, positionSide: record.positionSide };
+}
+
+/**
+ * 未终结的记录（`armed` + `failed`），对账用。
+ *
+ * 为什么只取这两态：`take_profit` / `stop_loss` / `cancelled` 的单**本来就该不在**
+ * 交易所，把它们一起拉进对账会凭空造出一堆「少了止损单」的假警报。
+ *
+ * `symbol` 为空串时查全部标的（对账要支持全账户扫描）。表名仍是常量，绝不拼 symbol。
+ */
+export async function listUnsettledBrackets(
+  pool: Pool,
+  exchange: string,
+  symbol?: string,
+): Promise<UnsettledBracketRecord[]> {
+  try {
+    const result = await pool.query<Record<string, unknown>>(
+      `SELECT ${COLUMNS} FROM ${TABLE} WHERE exchange = $1 AND state IN ('armed', 'failed')
+         ${symbol === undefined ? '' : 'AND symbol = $2'}
+       ORDER BY updated_at DESC`,
+      symbol === undefined ? [exchange] : [exchange, symbol],
+    );
+    return result.rows.map(toUnsettledRecord);
+  } catch (error) {
+    throw toSyncError(error, `读取未终结的止盈止损记录失败${symbol ?? ''}`);
+  }
+}
+
 /** 五态计数，**五项永远都在**，没有的态是 0。
  *
  * 为什么要一份独立的统计而不是从 `listBrackets` 的结果里数：控制面只回最近 N 条，

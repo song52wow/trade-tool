@@ -365,6 +365,23 @@ export interface ErrorBody {
   };
 }
 
+// ------------------------------------------------- 交易对账（v0.6.0）
+
+/**
+ * 对账结果的形状直接用 core 判据的那一份，**不另立 DTO**。
+ *
+ * 判据是纯函数、报告是它的输出，两侧共用一个类型就意味着控制面不可能「显示的差异」
+ * 与 CLI「报出的差异」在字段上分叉——那正是两份口径必然漂移的地方。
+ */
+export type {
+  ExchangeAlgoOrder,
+  ExchangePosition,
+  ReconcileDifference,
+  ReconcileKind,
+  ReconcileReport,
+  ReconcileSeverity,
+} from '@trade-tool/core';
+
 /** 增删标的的请求体。删除必须显式给处置策略，不做隐式删除（R-18.3）。 */
 export interface AddSymbolBody {
   symbol: string;

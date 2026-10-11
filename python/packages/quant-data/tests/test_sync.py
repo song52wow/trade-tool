@@ -1118,6 +1118,8 @@ def test_migrations_are_idempotent(conn: DbConn, pg_dsn: str) -> None:
         "006_risk_bracket",
         # v0.5.0：控制面可写的运行期设置
         "007_executor_settings",
+        # v0.4.0：条件单迁到 Algo Order API 后的列改名（只做重命名）
+        "008_algo_order_ids",
     ]
     pg.ensure_schema(conn)
 

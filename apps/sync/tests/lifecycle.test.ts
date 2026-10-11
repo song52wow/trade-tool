@@ -46,6 +46,10 @@ function okSummary(symbol: string): SyncRunSummary {
     metadataStale: false,
     // v0.2.0：未启用派生时是 null（与「启用了但没写桶」区分，AC-22）
     aggregated: null,
+    // v0.3.0：同样按「未启用」给 null，而不是 `[]`（R-11.4：0 行会让人以为「还没算」）
+    indicators: null,
+    // 这组用例不跑指标层，版本号只是为了让摘要满足跨语言契约的形状；断言不依赖它。
+    implVersion: 1,
   };
 }
 

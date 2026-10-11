@@ -24,6 +24,8 @@ import {
   SyncError,
   type Credentials,
   type ExecutionType,
+  type ExchangeAlgoOrder,
+  type ExchangePosition,
   type OrderSide,
   type OrderStatus,
   type PositionSide,
@@ -405,6 +407,107 @@ export class BinancePrivateClient {
     await this.request('DELETE', '/fapi/v1/algoOrder', {
       signed: true,
       params: { algoId },
+    });
+  }
+
+  // ------------------------------------------------- 只读查询（v0.6.0 交易对账）
+  //
+  // 下面两个端点**只读不写**，因此可以安全地挂在页面上由人手动触发。但它们是
+  // **私有接口**：要签名、消耗请求权重，且走的是出网路径——这正是对账不能挂在 5s 刷新
+  // 节奏上的原因（`/bars` 可以，因为它只打 PG）。
+  //
+  // 口径核对日期 **2026-10-11**，官方文档 + 变更日志交叉确认：
+  //
+  // * `GET /fapi/v3/positionRisk`（权重 5）。**是 v3 不是 v2**：v2 已被官方列入待下线
+  //   清单（2024-07-17 变更日志），v3 是替代端点。v3 **只返回有持仓或挂单的交易对**，
+  //   因此「某标的没出现在结果里」= 无仓位也无挂单，这恰好是对账要用的语义。
+  // * `GET /fapi/v1/openAlgoOrders`（带 symbol 权重 1，不带 **40**）。条件单查询走的是
+  //   Algo Order API 这一套，与下单 / 撤单同一个家族（`/fapi/v1/algoOrder`）。
+
+  /**
+   * 当前持仓。
+   *
+   * **数量类字段在 payload 里是字符串**（`"positionAmt": "30"`）——按字符串塞进查询里
+   * 或者用 `parseFloat` 随手处理都会在空仓上翻车，因此统一走 `requireNumber`，
+   * 形状不对就抛错（AGENTS.md 约定 9）。
+   */
+  async positionRisk(options: { symbol?: string } = {}): Promise<ExchangePosition[]> {
+    const body = await this.request<unknown[]>('GET', '/fapi/v3/positionRisk', {
+      signed: true,
+      // exactOptionalPropertyTypes：不能显式传 undefined，用空对象表达「不带这个参数」。
+      params: options.symbol === undefined ? {} : { symbol: options.symbol },
+    });
+    if (!Array.isArray(body)) {
+      throw new SyncError('EXCHANGE_ERROR', 'positionRisk 返回的不是数组', {
+        body: JSON.stringify(body).slice(0, 200),
+      });
+    }
+    return body.map((raw, index) => {
+      if (typeof raw !== 'object' || raw === null) {
+        throw new SyncError('EXCHANGE_ERROR', `positionRisk 第 ${index} 条不是对象`);
+      }
+      const row = raw as Record<string, unknown>;
+      const symbol = requireString(row['symbol'], 'symbol', `positionRisk[${index}]`);
+      const where = `positionRisk ${symbol}`;
+      return {
+        symbol,
+        positionSide: (typeof row['positionSide'] === 'string'
+          ? row['positionSide']
+          : 'BOTH') as PositionSide,
+        positionAmt: requireNumber(row['positionAmt'], 'positionAmt', where),
+        entryPrice: requireNumber(row['entryPrice'], 'entryPrice', where),
+        // 空仓时交易所给 "0.00000"，合法数字；解析不了说明字段改名了，必须报出来。
+        markPrice: requireNumber(row['markPrice'], 'markPrice', where),
+        updateTime: requireNumber(row['updateTime'], 'updateTime', where),
+      };
+    });
+  }
+
+  /**
+   * 当前挂着的条件单（止盈 / 止损 / 追踪止损）。
+   *
+   * ⚠️ 不带 `symbol` 的权重是 **40**（带 symbol 只要 1）。因此全账户对账要显式提醒
+   * 这一点，别让人在页面上无脑点。
+   *
+   * `orderType` 的取值**不唯一**：官方文档示例回 `TAKE_PROFIT` / `STOP`，而下单侧发的是
+   * `TAKE_PROFIT_MARKET` / `STOP_MARKET`——**2026-10-11 实测真实账户回的也是
+   * `*_MARKET`**，即文档示例本身就不能当契约。两种都原样透传，由 core 的
+   * `algoOrderTag()` 按前缀统一归类——不要在这里「顺手统一」，那会让差异从代码里消失，
+   * 而一旦交易所再改一次命名，本地连「这张单是止损还是止盈」都答不出来。
+   */
+  async openAlgoOrders(options: { symbol?: string } = {}): Promise<ExchangeAlgoOrder[]> {
+    const body = await this.request<unknown[]>('GET', '/fapi/v1/openAlgoOrders', {
+      signed: true,
+      // exactOptionalPropertyTypes：不能显式传 undefined，用空对象表达「不带这个参数」。
+      params: options.symbol === undefined ? {} : { symbol: options.symbol },
+    });
+    if (!Array.isArray(body)) {
+      throw new SyncError('EXCHANGE_ERROR', 'openAlgoOrders 返回的不是数组', {
+        body: JSON.stringify(body).slice(0, 200),
+      });
+    }
+    return body.map((raw, index) => {
+      if (typeof raw !== 'object' || raw === null) {
+        throw new SyncError('EXCHANGE_ERROR', `openAlgoOrders 第 ${index} 条不是对象`);
+      }
+      const row = raw as Record<string, unknown>;
+      const where = `openAlgoOrders[${index}]`;
+      return {
+        algoId: requireNumber(row['algoId'], 'algoId', where),
+        clientAlgoId: requireString(row['clientAlgoId'], 'clientAlgoId', where),
+        algoType: requireString(row['algoType'], 'algoType', where),
+        orderType: requireString(row['orderType'], 'orderType', where),
+        symbol: requireString(row['symbol'], 'symbol', where),
+        side: requireString(row['side'], 'side', where) as OrderSide,
+        positionSide: (typeof row['positionSide'] === 'string'
+          ? row['positionSide']
+          : 'BOTH') as PositionSide,
+        algoStatus: requireString(row['algoStatus'], 'algoStatus', where),
+        triggerPrice: requirePositive(row['triggerPrice'], 'triggerPrice', where),
+        closePosition: row['closePosition'] === true,
+        createTime: requireNumber(row['createTime'], 'createTime', where),
+        updateTime: requireNumber(row['updateTime'], 'updateTime', where),
+      };
     });
   }
 }

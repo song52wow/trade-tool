@@ -6,7 +6,7 @@ import {
   createPool,
   openUserDataStream,
   parseOrderTradeUpdate,
-  readCredentials as readStoredCredentials,
+  resolveActiveCredentials,
   resolvePolicy,
 } from '@trade-tool/data';
 import { parseSecretKey, SECRET_KEY_ENV } from '@trade-tool/core';
@@ -25,47 +25,26 @@ let stopRequested = false;
 let closeStream: (() => void) | undefined;
 
 /**
- * 凭据解析。**先读库里加密存的那份，再回落环境变量**。
+ * 凭据解析：走 `resolveActiveCredentials()`（**库里优先、环境变量兜底**）。
  *
- * 两条路径的优先级必须写在这里并且只有一处：控制面 v0.5.0 起可以在页面上录入密钥，
- * 加密后落库；但部署环境仍然可以用环境变量注入（CI、临时排障、容器编排）。
- * 谁优先不是偏好问题——两份不一致时，只有明确的那一份算数。
+ * 优先级只有一份实现（v0.6.0 从这里抽到 `packages/data`），因为 v0.6.0 的交易对账
+ * 也要解析同一份凭据。两处各判一次的话，「哪一份在生效」就有两个答案。
  *
- * 选择「库优先」是因为页面是更近的一步操作：改了之后不必再去改 .env 并重启。
- * 环境变量仍然兜底，是为了不配置控制面的部署方式完全不受影响。
- *
- * 环境变量这一档**缺一即拒**，不做「读到一半先用空密钥试一下」：Binance 会返回 401，
- * 而一个带着空密钥反复重连的进程看起来只是「连不上」，很难定位。
+ * 唯一差异是 executor **要求主密钥存在**：它本来就在持续下单，凭据配置错了必须立刻
+ * 失败，而不是悄悄用环境变量里的另一份跑起来。
  */
 async function loadCredentials(
   config: Awaited<ReturnType<typeof loadConfigOrDefault>>,
   pool: Pool,
 ): Promise<Credentials> {
-  const stored = await readStoredCredentials(
+  return resolveActiveCredentials({
     pool,
-    parseSecretKey(process.env[SECRET_KEY_ENV]),
-    config.market.exchange,
-  );
-  if (stored !== null) {
-    console.error(`[executor] 使用控制面录入的凭据（${config.market.exchange}）`);
-    return stored;
-  }
-
-  const key = process.env[config.executor.apiKeyEnv];
-  const secret = process.env[config.executor.apiSecretEnv];
-  const missing: string[] = [];
-  if (!key || key.trim() === '') missing.push(config.executor.apiKeyEnv);
-  if (!secret || secret.trim() === '') missing.push(config.executor.apiSecretEnv);
-  if (missing.length > 0) {
-    throw new SyncError(
-      'CONFIG_INVALID',
-      `库里没有配置过 ${config.market.exchange} 凭据，且环境变量 ${missing.join(', ')} 也没有设置。` +
-        `请在控制面「设置」页录入，或在仓库根 .env 里设置这两个变量。`,
-      { missing },
-    );
-  }
-  console.error(`[executor] 使用环境变量注入的凭据（${config.market.exchange}）`);
-  return { apiKey: key as string, apiSecret: secret as string };
+    masterKey: parseSecretKey(process.env[SECRET_KEY_ENV]),
+    exchange: config.market.exchange,
+    apiKeyEnv: config.executor.apiKeyEnv,
+    apiSecretEnv: config.executor.apiSecretEnv,
+    note: (message) => console.error(`[executor] ${message}`),
+  });
 }
 
 function sleep(ms: number): Promise<void> {

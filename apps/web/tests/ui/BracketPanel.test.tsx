@@ -43,8 +43,9 @@ function armed() {
     atrWindowTo: NOW - 3_600_000,
     stopPrice: 96,
     takeProfit: 108,
-    tpOrderId: 111,
-    slOrderId: 222,
+    // 008 迁移把这两列改名为 tp_algo_id / sl_algo_id（Algo Order API 用 algoId）。
+    tpAlgoId: 111,
+    slAlgoId: 222,
     state: 'armed' as const,
     lastError: null,
     createdAt: NOW - 3_600_000,
@@ -105,7 +106,7 @@ describe('BracketPanel', () => {
   it('单号不成对时标红说明（两张单必须都在）', async () => {
     stubFetch(
       payload({
-        items: [{ ...armed(), state: 'failed', tpOrderId: 111, slOrderId: null }],
+        items: [{ ...armed(), state: 'failed', tpAlgoId: 111, slAlgoId: null }],
         countsByState: { armed: 0, take_profit: 0, stop_loss: 0, cancelled: 0, failed: 1 },
       }),
     );
