@@ -30,6 +30,20 @@ DEFAULT_BUDGET_PER_MINUTE = 1920
 #: 429 时无法解析 ``Retry-After`` 时的保守默认暂停秒数。
 DEFAULT_RETRY_AFTER_SECONDS = 60
 
+#: 单次全局暂停的**上限**秒数（R-21.4）。
+#:
+#: 交易所回的 ``Retry-After`` 不是可信的有限值：HTTP 418（IP 因重复违规被自动封禁）
+#: 带着几小时的 ``Retry-After`` 回来过一次（实测 44994 秒 ≈ 12.5 小时）。照单全收的话，
+#: :meth:`WeightBudget.register_pause` 会把这一次封禁**固化成绝对时间戳**，而表里
+#: ``pause_until`` 只会被写长、不会被任何东西收回——于是交易所几分钟后早已解封，
+#: 本地却仍然停在 12 小时后的暂停里，同步彻底停摆，且**没有任何路径能让它恢复**。
+#:
+#: 上限必须**小于** :data:`MAX_RESERVE_WAIT_MS`：否则暂停期内的 ``reserve`` 一进来就
+#: 超过等待上限（见 :meth:`WeightBudget.reserve`），退化成「每轮立即抛 RATE_LIMITED」，
+#: 还是得等满整个暂停才有机会重来一次。取 5 分钟时，``reserve`` 会在本轮内 sleep 等待
+#: 到期并自动恢复，无需人工介入。
+MAX_PAUSE_SECONDS = 5 * 60
+
 #: 等待预算超过该时长仍拿不到令牌即放弃，避免无期限挂起。
 MAX_RESERVE_WAIT_MS = 10 * WINDOW_MS
 
@@ -80,15 +94,24 @@ class WeightBudget:
             self._sleep(wait_ms / 1000)
 
     def register_pause(self, retry_after_seconds: int) -> int:
-        """429/418 时设置全局暂停截止时间，返回截止的 epoch ms（R-21.4）。"""
+        """429/418 时设置全局暂停截止时间，返回截止的 epoch ms（R-21.4）。
+
+        交易所给的 ``retry_after_seconds`` 先经 :data:`MAX_PAUSE_SECONDS` 封顶，再落库。
+        """
         seconds = retry_after_seconds if retry_after_seconds > 0 else DEFAULT_RETRY_AFTER_SECONDS
+        effective = min(seconds, MAX_PAUSE_SECONDS)
         now = self._clock_ms()
-        until = now + seconds * 1000
+        until = now + effective * 1000
         with self._conn.transaction():
+            # 刻意**不用** GREATEST：那个「只许延长」的写法会让一次荒谬的 Retry-After
+            # （418 曾给出 44994 秒）永久钉死此后每一次合法暂停——旧值永远压着新值，
+            # 而表里没有任何机制会在交易所恢复后收回它。封顶后的值每次都由 now 重新
+            # 算出，正常时序下本来就单调递增，直接覆盖与 GREATEST 等价，却能让
+            # 已经写坏的存量值在下一轮 429 时自动回到合理范围。
             self._conn.execute(
                 """
                 UPDATE weight_budget
-                   SET pause_until = GREATEST(COALESCE(pause_until, 0), %s)
+                   SET pause_until = %s
                  WHERE id = 1
                 """,
                 (until,),

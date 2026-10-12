@@ -53,6 +53,7 @@ pnpm check      # = build + TS 测试 + Python 测试
 | 命令行命令                                   | `apps/cli/src/commands/`                             |
 | 常驻同步、生命周期、控制原语                 | `apps/sync/src`                                      |
 | 控制面 HTTP 路由与前端页面                   | `apps/web/src` + `apps/web/ui`                       |
+| **部署镜像与编排（服务器）**                | **`deploy/`**（Dockerfile + compose；根 `compose.yaml` 只是本机开发库） |
 | 计算密集逻辑、指标、真实行情源               | `python/packages/*/src`                              |
 
 ## 派生周期层（v0.2.0）
@@ -158,6 +159,32 @@ Binance U 本位**没有单请求 OCO**（`/fapi/v1/order/oco` 已下架）：�
 新增口径时：策略放 `packages/core/src/risk-policy.ts`（纯函数），
 ATR 取数放 `quant_data.risk`，交易所差异放 `packages/data/src/binance-private.ts`，
 执行记录放 `sql/006_risk_bracket.sql` + `packages/data/src/db/risk.ts`。
+
+### `Retry-After` 是不可信输入，暂停必须封顶（2026-10-12 教训）
+
+线上事故：交易所回过一次 **HTTP 418**（IP 因重复违规被自动封禁），带着
+`Retry-After: 44994`（约 12.5 小时）。旧代码把它写成 `pause_until = now + 44994s`
+并用 `GREATEST` 落库，结果是**这一次的封禁被固化成绝对时间戳，且再也没有任何路径能收回它**
+——交易所几分钟后早已解封，本地却仍停在 12 小时后的暂停里，同步彻底停摆。
+
+停摆之所以「不可恢复」是两个细节叠出来的，任一单独存在都还能自愈：
+
+1. `pause_until` 只会被写长（`GREATEST`），交易所恢复后没有任何东西去收缩它；
+2. 封顶值若 ≥ `MAX_RESERVE_WAIT_MS`，`reserve` 一进门就超过等待上限而**立即**抛
+   `RATE_LIMITED`，于是一轮都撑不过，还是得等满整个暂停。
+
+因此 `MAX_PAUSE_SECONDS`（5 分钟）**必须小于** `MAX_RESERVE_WAIT_MS`：这样 `reserve`
+能在本轮内 sleep 等待到期并自动恢复，不需要人工介入。`register_pause` 也因此改成直接覆盖
+而非 `GREATEST` ——封顶后的值每次都由 now 重算，正常时序下本就是单调递增，覆盖与
+`GREATEST` 等价，却能让已写坏的存量值在下一轮 429 时自动回到合理范围。
+
+> 教训不止于限流：**任何把外部响应写进「到某个时刻为止」的绝对时间戳的地方，
+> 都必须能到期自愈。** 「只在失败时写、从不主动收回」的状态机，就是一次外部事件
+> 足以让系统永久停摆的形状。
+
+排查这类停摆时先分清**症状与病因**：日志里刷屏的 `RATE_LIMITED`（配额不足）可能完全是
+假象，先直接探测交易所（一次 `curl` 就能看出配额是否真的耗尽），再看 `weight_budget`
+那一行的 `pause_until` 是否还停在未来。
 
 ## 交易对账层（v0.6.0）
 
