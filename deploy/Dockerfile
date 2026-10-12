@@ -16,20 +16,58 @@ ARG NODE_MAJOR=22
 # 版本在此钉死：换 uv 大版本可能改变解析结果，与本地 uv.lock 产生漂移。
 ARG UV_VERSION=0.9.12
 
+# 构建期的网络出口。HTTP_PROXY/HTTPS_PROXY 是 Docker 预定义 build arg，build 时
+# 用 --build-arg 传入即可，无需在此声明；只在 build 时生效，不进镜像层。
+#
+# NODE_OPTIONS 必须单独处理：`pnpm install` 第一步是 corepack 用 **Node 的 fetch**
+# 下载 pnpm 本体，而 fetch **默认不读代理环境变量**——不打开这个开关，受限网络下
+# 构建会死在「Error when performing the request to …/pnpm-11.23.0.tgz」。
+# 传空值（默认）即保持原状，因此直连网络的环境不受影响。
+ARG BUILD_NODE_OPTIONS=""
+
+# apt 是这里唯一只认**小写**代理变量的工具（Docker 预定义 build arg 注入的是大写
+# HTTP_PROXY/HTTPS_PROXY，apt 两个都不认，于是 `apt-get update` 会去直连
+# deb.debian.org 并在受限网络下失败）。因此显式声明小写版本并透传，
+# build 时与预定义变量一起给：`--build-arg http_proxy=… --build-arg https_proxy=…`。
+# 未传入时为空字符串，apt 与大多数工具都会忽略，不影响直连网络的环境。
+ARG http_proxy=""
+ARG https_proxy=""
+ARG no_proxy=""
+
 ENV DEBIAN_FRONTEND=noninteractive \
     CI=true \
     PNPM_HOME=/pnpm \
     COREPACK_ENABLE_DOWNLOAD_PROMPT=0 \
     UV_PROJECT_ENVIRONMENT=/app/python/.venv \
+    NODE_OPTIONS=${BUILD_NODE_OPTIONS} \
+    http_proxy=${http_proxy} \
+    https_proxy=${https_proxy} \
+    no_proxy=${no_proxy} \
     PATH=/pnpm:/app/python/.venv/bin:$PATH
 
 # ca-certificates：出网访问交易所。tini：让 SIGTERM 真的到达 Node 进程，
 # 否则 compose stop 只能等超时强杀，sync 的优雅退出（删心跳行）就跑了。
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates curl gnupg tini \
-    && curl -fsSL "https://deb.nodesource.com/setup_${NODE_MAJOR}.x" | bash - \
-    && apt-get install -y --no-install-recommends nodejs \
-    && rm -rf /var/lib/apt/lists/*
+#
+# 三条都是**故意这么写的**，改动前请先读完：
+#
+# 1. `set -eux`：任何一步静默退化都要让构建当场失败。
+# 2. NodeSource 脚本先**下载到文件再执行**，不用 `curl … | bash -`。
+#    管道里 curl 挂了右侧照样能正常退出（拿到空输入的 bash 返回 0），
+#    于是一次完全没发生的安装会「成功」过去。
+# 3. 装完立刻断言主版本。Debian bookworm 自带 Node 18，它**没有 corepack**；
+#    若 NodeSource 的源没生效，apt 会安静地装上 18，而失败点会推迟到下一步
+#    `corepack enable` 报一句 `corepack: not found`——离根因隔了整整一步。
+RUN set -eux; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends ca-certificates curl gnupg tini; \
+    curl -fsSL "https://deb.nodesource.com/setup_${NODE_MAJOR}.x" -o /tmp/nodesource_setup.sh; \
+    bash /tmp/nodesource_setup.sh; \
+    rm -f /tmp/nodesource_setup.sh; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends nodejs; \
+    node -v; \
+    test "$(node -p 'process.versions.node.split(".")[0]')" = "${NODE_MAJOR}"; \
+    rm -rf /var/lib/apt/lists/*
 
 # 只开 shim，不在这里钉 pnpm 版本：`corepack prepare` 需要一个带 packageManager
 # 字段的 package.json，而这一层还没有拷贝源码。版本由下面 `pnpm install` 在 /app 下
@@ -37,7 +75,12 @@ RUN apt-get update \
 #
 # 之所以走 corepack 而不是 `npm i -g pnpm`：版本与 packageManager 不一致时，
 # 仓库里任何 pnpm 命令都会以 `Cannot verify the identity of the @pnpm/exe…` 失败（AGENTS.md）。
-RUN corepack enable && pip install --no-cache-dir "uv==${UV_VERSION}"
+# 同样 `set -eux`：corepack 只在 Node 22 里存在，装成 18 时这一步会静默退化成别的行为。
+RUN set -eux; \
+    corepack enable; \
+    corepack --version; \
+    pip install --no-cache-dir "uv==${UV_VERSION}"; \
+    uv --version
 
 # ---- 构建层：装全部依赖并产出 dist ----------------------------------------
 FROM toolchain AS builder
