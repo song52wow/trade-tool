@@ -1,0 +1,138 @@
+{
+  "version": 1,
+  "market": {
+    "symbol": "BTCUSDT",
+    "interval": "1h",
+    "source": "binance",
+    "exchange": "binance",
+    "marketType": "usdm",
+    "initialCapital": 10000,
+    "feeRate": 0.0005,
+    "slippageRate": 0,
+    "bars": 500
+  },
+  "backtest": {
+    "strategy": "ma-cross",
+    "params": {
+      "fast": 20,
+      "slow": 60
+    }
+  },
+  "data": {
+    "python": "python3",
+    "rawDir": "data/raw",
+    "cacheDir": "data/cache",
+    "metaDir": "data/meta",
+    "metadataTtlMs": 3600000,
+    "allowStaleMetadata": true,
+    "timeoutMs": 60000,
+    "batchSize": 5000,
+    "maxGapAttempts": 5,
+    "aggregateIntervals": [
+      "15m",
+      "1h",
+      "4h",
+      "1d"
+    ],
+    "aggregateBatchBars": 20000,
+    "indicatorIntervals": [
+      "15m",
+      "1h",
+      "4h",
+      "1d"
+    ],
+    "indicatorSpecs": {
+      "ma": [
+        {
+          "kind": "sma",
+          "window": 5
+        },
+        {
+          "kind": "sma",
+          "window": 10
+        },
+        {
+          "kind": "sma",
+          "window": 20
+        },
+        {
+          "kind": "sma",
+          "window": 60
+        }
+      ],
+      "macd": [
+        {
+          "fast": 12,
+          "slow": 26,
+          "signal": 9
+        }
+      ],
+      "rsi": [
+        {
+          "period": 14
+        }
+      ],
+      "boll": [
+        {
+          "period": 20,
+          "kMilli": 2000
+        }
+      ],
+      "kdj": [
+        {
+          "n": 9,
+          "kPeriod": 3,
+          "dPeriod": 3
+        }
+      ],
+      "atr": [
+        {
+          "period": 14
+        }
+      ],
+      "obv": [
+        {}
+      ]
+    },
+    "indicatorBatchBars": 20000
+  },
+  "database": {
+    "host": "postgres",
+    "port": 5432,
+    "database": "trade_tool",
+    "user": "trade",
+    "passwordEnv": "TRADE_TOOL_PG_PASSWORD",
+    "poolMax": 10,
+    "connectionTimeoutMs": 10000,
+    "ssl": false
+  },
+  "sync": {
+    "symbols": [],
+    "concurrency": 4,
+    "pollIntervalMs": 15000,
+    "weightBudgetPerMinute": 1920,
+    "backoffBaseMs": 5000,
+    "backoffMaxMs": 300000,
+    "maxConsecutiveErrors": 5,
+    "onRemove": "keep"
+  },
+  "executor": {
+    "enabled": false,
+    "atrPeriod": 14,
+    "atrInterval": "1m",
+    "atrWindowBars": 240,
+    "stopAtrMult": 2,
+    "takeProfitAtrMult": 3,
+    "symbols": [],
+    "onPartialFill": "ignore",
+    "workingType": "MARK_PRICE",
+    "priceProtect": true,
+    "maxEntryNotional": 0,
+    "apiKeyEnv": "TRADE_TOOL_BINANCE_API_KEY",
+    "apiSecretEnv": "TRADE_TOOL_BINANCE_API_SECRET",
+    "recvWindowMs": 5000,
+    "reconnectBaseMs": 2000,
+    "reconnectMaxMs": 60000,
+    "reconcileIntervalMs": 300000
+  }
+}

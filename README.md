@@ -237,6 +237,20 @@ docker compose down       # 停库，保留数据卷
 本机没有 Docker Desktop 时用 colima（本仓库的 docker context 指向它）：`colima start`
 之后容器带 `restart: unless-stopped`，colima 起来时会自动恢复。
 
+## 部署到服务器（deploy/）
+
+`compose.yaml` 是**本机开发**用的，上面那份只是本地依赖。要把整套服务（控制面 /
+常驻同步 / 止盈止损 / PostgreSQL）部署到一台服务器上，走 `deploy/`：
+
+```bash
+./deploy/build-image.sh          # 本机构建镜像 → dist-deploy/trade-tool-deploy.tar
+```
+
+镜像在本机构建、`docker save` / `docker load` 搬运，目标机不需要 git / pnpm / uv。
+`deploy/compose.yaml` 里四个应用服务共用同一个镜像、只靠 `command` 区分；
+止盈止损放在 `executor` profile 里，`docker compose up -d` 不会启动它。
+完整的搬运步骤、环境变量、排查表见 [`deploy/README.md`](deploy/README.md)。
+
 ## 常驻同步（v0.1.0）
 
 ```bash
