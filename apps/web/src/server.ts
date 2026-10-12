@@ -88,6 +88,13 @@ export interface WebDeps {
    */
   reconcile(symbol: string): Promise<ReconcileReport>;
   /**
+   * 最近一次**自动**对账的快照；从没跑过时 `null`。
+   *
+   * 纯读本地表，因此可以挂在刷新节奏上——与 `/bars` 同性质：出网发生在
+   * executor 里，这里只是把已经算好的结果读出来。
+   */
+  latestReconciliation(): Promise<ReconcileReport | null>;
+  /**
    * 凭据状态（v0.5.0）。**只回「配没配」与末 4 位**。
    *
    * WebDeps 里刻意**没有**任何能返回明文密钥的方法：控制面在类型层面就没有这个能力。
@@ -295,6 +302,17 @@ export function buildApp(deps: WebDeps): Hono {
    * 一致返回 200 + `healthy: true`，**不是 404**：查出来「没问题」是完全正常的答案，
    * 与「这个路由不存在」必须分开。
    */
+  /**
+   * 最近一次**自动**对账快照，**全账户范围**。
+   *
+   * 自动对账按全账户跑（一次 positionRisk + 一次 openAlgoOrders 就够，逐标的反而更贵），
+   * 因此这里也只有一份。单个标的的差异由**页面**按 symbol 过滤展示——
+   * 过滤是视图行为，不是判据，判据仍只有 core 那一份。
+   */
+  app.get('/api/reconcile/latest', async (c) => {
+    return c.json({ report: await deps.latestReconciliation() });
+  });
+
   app.get('/api/symbols/:symbol/reconcile', async (c) => {
     const symbol = normalizeSymbol(c.req.param('symbol'));
     return c.json(await deps.reconcile(symbol));

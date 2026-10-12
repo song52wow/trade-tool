@@ -269,6 +269,18 @@ export const executorSchema = z.object({
   /** 重连退避：初始 / 上限。断线必须重连，否则服务会「看起来在跑」而实际不再设单。 */
   reconnectBaseMs: z.number().int().positive().default(2_000),
   reconnectMaxMs: z.number().int().positive().default(60_000),
+  /**
+   * 交易对账的周期（毫秒）。**0 = 关闭自动对账**，只留 CLI / 控制面手动触发。
+   *
+   * 为什么默认开着：止盈止损的「单已挂上、单号没回填」只在崩溃那一瞬间发生，
+   * 迟到几小时再查也来得及；但**在交易所 App 上手动开的仓**是持续形成的漂移，
+   * 只靠人想起来跑一次命令等于没有对账。
+   *
+   * 默认 5 分钟的依据是权重：全账户一次 `positionRisk`（5）+ 一次
+   * `openAlgoOrders`（40）= 45 权重，折合 9 权重/分钟，相对限频可以忽略。
+   * 逐标的跑反而更贵（每标的 6），因此默认全账户。
+   */
+  reconcileIntervalMs: z.number().int().min(0).default(5 * 60_000),
 });
 
 export const configSchema = z.object({

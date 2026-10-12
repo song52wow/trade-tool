@@ -115,7 +115,7 @@ export function SymbolDetail(props: {
 
       {/* 交易对账（v0.6.0）紧跟止盈止损：那个面板回答「我们记了什么」，这个回答
           「交易所现在到底是什么」。key 让换标的时整个面板重挂载，从而清掉上一份快照。 */}
-      <ReconcilePanel key={props.detail.symbol} symbol={props.detail.symbol} />
+      <ReconcilePanel key={props.detail.symbol} symbol={props.detail.symbol} tick={props.tick} />
 
       <h2 style={{ fontSize: 13, color: 'var(--muted)', fontWeight: 500, marginTop: 18 }}>
         缺口清单（{gaps.length}）

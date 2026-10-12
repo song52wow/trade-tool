@@ -145,12 +145,29 @@ export const api = {
       throw error;
     }),
   /**
-   * 交易对账（v0.6.0）。**手动触发**，不进自动刷新：
-   * 这条要签名访问交易所私有接口（出网 + 消耗请求权重），与 `/bars` 的纯读本地库
-   * 不是一回事，挂在刷新节奏上等于按秒消耗配额。
+   * 最近一次**自动**对账快照（全账户范围）。纯读本地表，由 executor 写入，
+   * 因此可以跟着刷新节奏走。从没跑过时服务端返回 `report: null`，
+   * 页面据此显示「还没有自动对账记录」——不能拿空报告冒充「一致」。
    *
-   * 404 同样单列成「控制面还是旧进程」——路由在启动时注册，新增路由后不重启就
-   * 看不到它，而页面会安静地什么都不显示。
+   * 404 单列成「控制面还是旧进程」：路由在启动时注册，不重启就看不到它。
+   */
+  latestReconcile: () =>
+    request<{ report: ReconcileReport | null }>('/api/reconcile/latest').catch(
+      (error: unknown) => {
+        if (error instanceof ApiError && error.status === 404) {
+          throw new ApiError(
+            'CONTROL_PLANE_STALE',
+            '控制面没有 /reconcile/latest 路由：它还是改动前启动的旧进程。重启 trade-tool 控制面后刷新页面即可。',
+          );
+        }
+        throw error;
+      },
+    ),
+  /**
+   * 立刻手动对账一次（出网、签名、消耗权重），并覆盖最近一次自动快照。
+   *
+   * 与 `latestReconcile` 的性质不同：那条只读本地表，这条要现花交易所请求。
+   * 404 同样单列成旧进程提示。
    */
   reconcile: (s: string) =>
     request<ReconcileReport>(`/api/symbols/${encodeURIComponent(s)}/reconcile`).catch(

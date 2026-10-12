@@ -14,6 +14,7 @@ import { parseSecretKey, SECRET_KEY_ENV } from '@trade-tool/core';
 import type { Pool } from '@trade-tool/data';
 
 import { createAtrProvider } from './atr.js';
+import { startPeriodicReconcile, type PeriodicReconcile } from './reconcile.js';
 import { createExecutorService } from './service.js';
 
 // 必须在 loadConfigOrDefault / createPool 之前：配置路径、数据库密码与 API 密钥
@@ -23,6 +24,8 @@ loadProjectEnv();
 /** 停止信号。由 SIGINT / SIGTERM 置位，主循环据此退出而不是被强杀。 */
 let stopRequested = false;
 let closeStream: (() => void) | undefined;
+/** 周期对账的定时器。退出时必须停掉，否则进程挂着一个 setInterval 不会结束。 */
+let reconcileTimer: PeriodicReconcile | undefined;
 
 /**
  * 凭据解析：走 `resolveActiveCredentials()`（**库里优先、环境变量兜底**）。
@@ -83,6 +86,9 @@ async function main(): Promise<void> {
     resolvePolicy: async (symbol) => resolvePolicy(pool, ctx.exchange, symbol, config.executor),
   });
 
+  // 自动对账与用户数据流**并行**：它跑得慢或挂掉都不影响挂单（见 reconcile.ts）。
+  reconcileTimer = startPeriodicReconcile({ pool, client, config });
+
   let delay = config.executor.reconnectBaseMs;
 
   /**
@@ -134,6 +140,7 @@ async function main(): Promise<void> {
   }
 
   closeStream?.();
+  reconcileTimer?.stop();
   await pool.end().catch(() => undefined);
 }
 
@@ -142,6 +149,8 @@ for (const signal of ['SIGINT', 'SIGTERM'] as const) {
     console.error(`\n收到 ${signal}，停止止盈止损服务…`);
     stopRequested = true;
     closeStream?.();
+    // 定时器也要停：挂着的 setInterval 会让进程在「已收到停止信号」之后继续不退出。
+    reconcileTimer?.stop();
   });
 }
 

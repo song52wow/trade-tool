@@ -7,6 +7,8 @@ export * from './db/migrate.js';
 export * from './db/pool.js';
 export * from './db/repo.js';
 export * from './db/indicators.js';
+/** 对账观测快照（只读展示用，不参与任何判���）。 */
+export * from './db/reconcile.js';
 export * from './db/risk.js';
 /** 控制面可写的运行期设置（v0.5.0）：加密凭据 + 止盈止损策略。 */
 export * from './db/credentials.js';

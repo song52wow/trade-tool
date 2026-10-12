@@ -151,6 +151,10 @@ function fakeDeps(overrides: Partial<WebDeps> = {}): WebDeps & { calls: string[]
         countsByState: { armed: 0, take_profit: 0, stop_loss: 0, cancelled: 0, failed: 0 },
       };
     },
+    latestReconciliation: async () => {
+      calls.push('latest-reconcile');
+      return null;
+    },
     reconcile: async (symbol) => {
       calls.push(`reconcile:${symbol}`);
       return {

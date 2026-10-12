@@ -25,6 +25,7 @@ import {
   listBrackets,
   listRiskPolicies,
   readCredentialStatus,
+  recordReconciliation,
   resolvePolicy,
   writeCredential,
   deleteRiskPolicy as deleteRiskPolicyRow,
@@ -36,6 +37,7 @@ import {
   readDerivedIntervals,
   readIndicatorSpec,
   readLatestBars,
+  readLatestReconciliation,
   resolveActiveCredentials,
   resolveContract,
   runReconciliation,
@@ -397,6 +399,18 @@ export function createWebRuntime(config: TradeToolConfig): WebRuntime {
      * 主密钥缺失不算致命：这只意味着读不到控制面里加密存的那份凭据，环境变量注入的
      * 仍可用；两条都拿不到时 `resolveActiveCredentials` 抛错并说清缺哪个变量。
      */
+    /**
+     * 最近一次**自动**对账的结果（v0.6.0 由 executor 周期写入）。
+     *
+     * 面板默认展示这个而不是让用户点一下才算数：自动对账才是常态，手动按钮只是
+     * 「我现在就想看一眼」的补充。从没跑过时返回 `null` ——「还没对过账」与
+     * 「对过了、一致」在界面上必须能分开说。
+     */
+    async latestReconciliation(): Promise<ReconcileReport | null> {
+      // 空串 = 全账户范围，与 executor 自动对账的范围一致。
+      return readLatestReconciliation(pool, ctx.exchange, '');
+    },
+
     async reconcile(symbol: string): Promise<ReconcileReport> {
       const credentials = await resolveActiveCredentials({
         pool,
@@ -406,7 +420,16 @@ export function createWebRuntime(config: TradeToolConfig): WebRuntime {
         apiSecretEnv: config.executor.apiSecretEnv,
       });
       const client = new BinancePrivateClient({ credentials });
-      return runReconciliation({ pool, client, exchange: ctx.exchange, symbol });
+      const report = await runReconciliation({
+        pool,
+        client,
+        exchange: ctx.exchange,
+        symbol,
+      });
+      // 手动这一轮也落快照：否则界面会继续显示**上一次自动**的结果，
+      // 而用户刚刚点的按钮看起来像什么都没发生。
+      await recordReconciliation(pool, report, Date.now());
+      return report;
     },
 
     /**

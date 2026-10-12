@@ -17,6 +17,9 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
 import {
   claimBracket,
+  listReconciliations,
+  readLatestReconciliation,
+  recordReconciliation,
   markBracketArmed,
   markBracketFailed,
   markBracketSettled,
@@ -25,6 +28,7 @@ import {
   type BinancePrivateClient,
   type ExchangeAlgoOrder,
   type ExchangePosition,
+  type ReconcileReport,
 } from '../src/index.js';
 
 import { createTestSchema, type TestSchema } from './helpers/pg.js';
@@ -52,6 +56,17 @@ function fakeClient(input: {
     },
   };
   return { client: client as unknown as BinancePrivateClient, calls };
+}
+
+function position(symbol: string): ExchangePosition {
+  return {
+    symbol,
+    positionSide: 'BOTH',
+    positionAmt: 1,
+    entryPrice: 100,
+    markPrice: 101,
+    updateTime: NOW,
+  };
 }
 
 function algo(symbol: string, entryOrderId: string, tag: 'tp' | 'sl', algoId: number, price: number) {
@@ -244,5 +259,103 @@ describe('交易对账的取数与范围', () => {
     await runReconciliation({ pool: ctx.pool, client, exchange: 'binance' });
     const after = await readBracket(ctx.pool, 'binance', 'BBBUSDT', '2002');
     expect(after).toEqual(before);
+  });
+});
+
+/**
+ * 对账**快照**的读写（v0.6.0）。
+ *
+ * 这张表只服务「让自动对账的结果能被界面看到」，因此用例也只锁三件事：
+ *   1. 一致与有差异都写得进去，且差异明细原样存回；
+ *   2. 写失败**整体回滚**，不留下半套状态（半套会让界面显示一个不存在的结论）；
+ *   3. 同一范围只留最近 N 次——不设上限总有一天会拖慢查询。
+ *
+ * 另外锁住「从没跑过时返回 null」：把「还没对过账」和「对过了、一致」混成同一个
+ * 空状态，正是这份面板最不该犯的错。
+ */
+describe('对账快照', () => {
+  let ctx: TestSchema;
+
+  beforeAll(async () => {
+    ctx = await createTestSchema('reconrun');
+  });
+  afterAll(async () => {
+    await ctx.close();
+  });
+
+  async function seed(symbol: string, checkedAt: number): Promise<ReconcileReport> {
+    return runReconciliation({
+      pool: ctx.pool,
+      // 取 .client：fakeClient 返回的是 { client, calls }，整个传进去会得到
+      // 「client.positionRisk is not a function」——外层对象上没有这些方法。
+      client: fakeClient({ positions: [position(symbol)] }).client,
+      exchange: 'binance',
+      // 必须传 symbol：缺省会按**全账户**跑，快照落在空 scope 上，
+      // 读回单标的时自然是 null。这正是本模块强调的「范围必须一致」。
+      symbol,
+      now: () => checkedAt,
+    });
+  }
+
+  it('从未跑过时返回 null（不是一份空报告）', async () => {
+    expect(await readLatestReconciliation(ctx.pool, 'binance', 'NEVERRANUSDT')).toBeNull();
+  });
+
+  it('差异明细原样存回，读出来逐字段相同', async () => {
+    const report = await seed('SNAPUSDT', NOW);
+    await recordReconciliation(ctx.pool, report, NOW);
+
+    const snapshot = await readLatestReconciliation(ctx.pool, 'binance', 'SNAPUSDT');
+    expect(snapshot?.healthy).toBe(false);
+    expect(snapshot?.checkedAt).toBe(NOW);
+    expect(snapshot?.differences).toEqual(report.differences);
+    expect(snapshot?.counts).toEqual(report.counts);
+    expect(snapshot?.scope).toEqual(report.scope);
+  });
+
+  it('全账户快照记在空 scope 上，与单标的快照互不覆盖', async () => {
+    const account = await runReconciliation({
+      pool: ctx.pool,
+      client: fakeClient({ positions: [position('ACCUSDT')] }).client,
+      exchange: 'binance',
+      now: () => NOW,
+    });
+    await recordReconciliation(ctx.pool, account, NOW);
+
+    expect(await readLatestReconciliation(ctx.pool, 'binance', '')).not.toBeNull();
+    expect(await readLatestReconciliation(ctx.pool, 'binance', 'ACCUSDT')).toBeNull();
+    // 全账户快照的 symbol 是 null，不是空串——界面上要能说清「这是全账户」。
+    expect((await readLatestReconciliation(ctx.pool, 'binance', ''))?.symbol).toBeNull();
+  });
+
+  it('后写的覆盖先读的（取最新一条）', async () => {
+    await recordReconciliation(ctx.pool, await seed('LATESTUSDT', NOW), NOW);
+    await recordReconciliation(ctx.pool, await seed('LATESTUSDT', NOW + 1000), NOW + 1000);
+    expect((await readLatestReconciliation(ctx.pool, 'binance', 'LATESTUSDT'))?.checkedAt).toBe(
+      NOW + 1000,
+    );
+  });
+
+  it('同一范围只保留最近 50 次，且最新的不能被裁掉', async () => {
+    for (let i = 0; i < 60; i += 1) {
+      await recordReconciliation(ctx.pool, await seed('TRIMUSDT', NOW + i), NOW + i);
+    }
+    // 保留条数直接数表：用 listReconciliations 的默认 limit（20）去断言「保留 50 条」
+    // 会在页大小上失败，而本页大小与保留策略是两件事。
+    const kept = await ctx.pool.query<{ n: string }>(
+      `SELECT count(*)::text AS n FROM reconcile_run WHERE exchange = $1 AND scope = $2`,
+      ['binance', 'TRIMUSDT'],
+    );
+    expect(Number(kept.rows[0]?.n)).toBe(50);
+    const rows = await listReconciliations(ctx.pool, 'binance', 'TRIMUSDT');
+    expect(rows[0]?.checkedAt).toBe(NOW + 59);
+  });
+
+  it('裁剪不影响别的范围', async () => {
+    await recordReconciliation(ctx.pool, await seed('OTHERUSDT', NOW), NOW);
+    for (let i = 0; i < 60; i += 1) {
+      await recordReconciliation(ctx.pool, await seed('TRIM2USDT', NOW + i), NOW + i);
+    }
+    expect(await readLatestReconciliation(ctx.pool, 'binance', 'OTHERUSDT')).not.toBeNull();
   });
 });

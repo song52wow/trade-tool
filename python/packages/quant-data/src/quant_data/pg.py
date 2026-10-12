@@ -52,6 +52,9 @@ KNOWN_MIGRATION_VERSIONS: frozenset[str] = frozenset(
         # 只做重命名，Python 侧不读写该表，但版本闸门两个方向都要校，
         # 漏登记会让**所有**碰 PG 的用例报「库比代码新」。
         "008_algo_order_ids",
+        # v0.6.0：交易对账的观测快照。Python 侧不读写该表，但版本闸门两个方向都要校，
+        # 漏登记会让**所有**碰 PG 的用例报「库比代码新」。
+        "009_reconcile_run",
     }
 )
 
