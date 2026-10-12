@@ -150,13 +150,24 @@ pnpm --filter @trade-tool/executor start   # 需 executor.enabled = true（会�
 
 对账就是补上这个只读的眼睛：拉交易所真实的持仓与条件单，同本地 `risk_bracket` 比对。
 
+**默认是自动的**：`apps/executor` 每 5 分钟做一次全账户对账（`executor.reconcileIntervalMs`
+设为 `0` 可关闭），启动时立刻先跑一次。结果落 `reconcile_run` 表，控制面详情页读的就是它。
+
+为什么自动：止盈止损的「单已挂上、单号没回填」只在崩溃那一瞬间发生，迟到几小时再查也
+来得及；但**在交易所 App 上手动开的仓**是持续形成的漂移——只靠人想起来跑一次命令，等于
+没有对账。上面 ETHUSDT / SOLUSDT 两条「紧急」正是这一类。
+
 ```bash
-pnpm --filter @trade-tool/cli start -- reconcile                 # 全账户
+pnpm --filter @trade-tool/cli start -- reconcile                 # 手动跑一次（全账户）
 pnpm --filter @trade-tool/cli start -- reconcile -s BTCUSDT      # 单标的
 ```
 
-控制面详情页有同一个功能的「开始对账」按钮。**只报告，不动手**：不下单、不撤单、
-不写库，处置一律人工决定——自动补挂一张止损会平掉真实仓位，且不可逆。
+为什么默认全账户：一次 `positionRisk`（权重 5）+ 一次 `openAlgoOrders`（权重 **40**）= 45，
+而逐标的每个标的 6——全账户既更便宜、覆盖也更全。
+
+控制面上是只读面板（显示最近一次快照 + 查询时间，过期会标黄），另留「立即对账」按钮供
+当场重查。**只报告，不动手**：不下单、不撤单、不改 `risk_bracket`，处置一律人工决定——
+自动补挂一张止损会平掉真实仓位，且不可逆。
 
 判据只有一份实现（`packages/core/src/reconcile.ts`，纯函数），CLI 与控制面共用，因此两个
 出口不可能给出不同结论。差异分两档而不是「有异常 / 没异常」：
@@ -174,10 +185,10 @@ pnpm --filter @trade-tool/cli start -- reconcile -s BTCUSDT      # 单标的
 「有止盈没止损」是紧急，「只有止损没止盈」只是注意——合成「有没有问题」会让最要紧的
 那种被淹掉。
 
-**对账不出网是不可能的**：它要签名访问交易所私有接口（`GET /fapi/v3/positionRisk`、
-`GET /fapi/v1/openAlgoOrders`），因此**不能挂自动刷新**，控制面上是一个手动按钮，快照
-时间常驻可见。不带标的的 `openAlgoOrders` 权重是 **40**（带标的只要 1），所以控制面的
-路由按标的走，全账户对账走 CLI。
+**对账必须出网**：它要签名访问交易所私有接口（`GET /fapi/v3/positionRisk`、
+`GET /fapi/v1/openAlgoOrders`）。但出网的那一步**不在控制面**——控制面不许再起守护进程，
+所以周期对账放在本来就常驻的 `apps/executor` 里；控制面只读已经算好的快照，
+因此可以安全地挂刷新节奏。
 
 ## 控制面（`apps/web`）
 

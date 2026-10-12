@@ -941,3 +941,55 @@ describe('GET /api/symbols/:symbol/reconcile', () => {
     expect(deps.calls.some((c) => c.startsWith('reconcile:'))).toBe(false);
   });
 });
+
+/**
+ * 最近一次**自动**对账快照的路由（v0.6.0）。
+ *
+ * 锁两件事：
+ *   1. 全账户范围（`scope = ''`）——自动对账按全账户跑，路由也只给一份；
+ *   2. **从没跑过时返回 `null`**，不是一份空报告。把「还没对过账」和「对过了、
+ *      一致」混成同一个空状态，正是这块面板最不该犯的错。
+ */
+describe('GET /api/reconcile/latest', () => {
+  it('返回最近一次自动快照', async () => {
+    const checkedAt = NOW - 120_000;
+    const deps = fakeDeps();
+    // 覆盖实现里也要记账，否则断言只能证明「没报错」，证明不了「真的读了快照」。
+    deps.latestReconciliation = async () => {
+      deps.calls.push('latest-reconcile');
+      return {
+        exchange: 'binance',
+        symbol: null,
+        checkedAt,
+        healthy: false,
+        counts: { critical: 2, warning: 0, total: 2 },
+        differences: [],
+        scope: { localUnsettled: 1, exchangePositions: 3, exchangeAlgoOrders: 5 },
+      };
+    };
+    const res = await buildApp(deps).request('/api/reconcile/latest');
+    const body = (await res.json()) as { report: ReconcileReport | null };
+
+    expect(res.status).toBe(200);
+    expect(deps.calls).toContain('latest-reconcile');
+    expect(body.report?.checkedAt).toBe(checkedAt);
+    // 全账户快照的 symbol 必须是 null，界面上要能说清「这是全账户」。
+    expect(body.report?.symbol).toBeNull();
+  });
+
+  it('从没跑过时 report 为 null，而不是 healthy 的空报告', async () => {
+    const res = await buildApp(fakeDeps()).request('/api/reconcile/latest');
+    const body = (await res.json()) as { report: ReconcileReport | null };
+
+    expect(res.status).toBe(200);
+    expect(body.report).toBeNull();
+  });
+
+  it('纯读本地表，因此可以挂在刷新节奏上（不签名、不出网）', async () => {
+    const deps = fakeDeps();
+    // 连点两次都只读库：依赖里只有 latestReconciliation，没有任何下单/写库动作。
+    await buildApp(deps).request('/api/reconcile/latest');
+    await buildApp(deps).request('/api/reconcile/latest');
+    expect(deps.calls.filter((c) => c === 'latest-reconcile')).toHaveLength(2);
+  });
+});
