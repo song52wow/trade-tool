@@ -15,17 +15,13 @@
  * `--json` 输出纯 JSON 到 stdout（对账结果），一切提示走 stderr。
  */
 
-import {
-  parseSecretKey,
-  SECRET_KEY_ENV,
-  SyncError,
-  type ReconcileReport,
-} from '@trade-tool/core';
+import { parseSecretKey, SECRET_KEY_ENV, SyncError, type ReconcileReport } from '@trade-tool/core';
 import {
   BinancePrivateClient,
   resolveActiveCredentials,
   resolveContract,
   runReconciliation,
+  exchangeEndpointsFromEnv,
 } from '@trade-tool/data';
 
 import { withContext } from '../context.js';
@@ -99,6 +95,8 @@ export async function runReconcile(options: ReconcileCommandOptions = {}): Promi
     });
     const client = new BinancePrivateClient({
       credentials,
+      // 与 executor 共用同一份端点解析：对账若连错环境，报出来的差异全是假的。
+      ...exchangeEndpointsFromEnv(config.executor),
       recvWindowMs: config.executor.recvWindowMs,
     });
 

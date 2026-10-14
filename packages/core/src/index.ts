@@ -9,4 +9,6 @@ export * from './secret.js';
 export * from './config.js';
 export * from './config-io.js';
 export * from './env.js';
+/** 交易所端点解析（REST + 用户数据流同源，v0.7 本地开发跑 Demo Trading）。 */
+export * from './exchange-endpoints.js';
 export * from './logger.js';

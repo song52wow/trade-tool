@@ -8,6 +8,7 @@ import {
   parseOrderTradeUpdate,
   resolveActiveCredentials,
   resolvePolicy,
+  exchangeEndpointsFromEnv,
 } from '@trade-tool/data';
 import { parseSecretKey, SECRET_KEY_ENV } from '@trade-tool/core';
 
@@ -68,6 +69,9 @@ async function main(): Promise<void> {
   const ctx = buildContext(pool, config);
   const client = new BinancePrivateClient({
     credentials,
+    // 端点来自 `executor.environment`（live / demo）。以前这里不传，
+    // 于是不管配置写什么私有侧一律打主网——本地想跑沙箱根本无从下手。
+    ...exchangeEndpointsFromEnv(config.executor),
     recvWindowMs: config.executor.recvWindowMs,
   });
   const atr = createAtrProvider({

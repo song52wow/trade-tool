@@ -16,6 +16,7 @@ import {
 } from '@trade-tool/core';
 
 import { runPython, type PythonRuntime } from './bridge.js';
+import { pythonEnvFromEnv } from './exchange-endpoints.js';
 import * as repo from './db/repo.js';
 import { buildDsn, connectionOptions, type ConnectionOptions, type Pool } from './db/pool.js';
 
@@ -87,7 +88,12 @@ async function invoke<T>(ctx: MarketContext, options: InvokeOptions): Promise<T>
     module: 'quant_data',
     args: options.args,
     timeoutMs: syncTimeout(data),
-    env: options.withDsn ? { TRADE_TOOL_PG_DSN: ctx.dsn } : {},
+    env: {
+      // demo 环境：Python 侧的 exchangeInfo / K 线基址从子进程环境读，
+      // 不注入的话会继续抓主网，于是同一个进程里「下单在沙箱、行情在主网」。
+      ...pythonEnvFromEnv(ctx.config.executor),
+      ...(options.withDsn ? { TRADE_TOOL_PG_DSN: ctx.dsn } : {}),
+    },
   });
   return value;
 }

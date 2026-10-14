@@ -49,6 +49,7 @@ import {
   type IndicatorSpec,
   type MarketContext,
   type Pool,
+  exchangeEndpointsFromEnv,
 } from '@trade-tool/data';
 import { createSyncService, HEARTBEAT_INTERVAL_MS, type SyncService } from '@trade-tool/sync';
 
@@ -419,7 +420,10 @@ export function createWebRuntime(config: TradeToolConfig): WebRuntime {
         apiKeyEnv: config.executor.apiKeyEnv,
         apiSecretEnv: config.executor.apiSecretEnv,
       });
-      const client = new BinancePrivateClient({ credentials });
+      const client = new BinancePrivateClient({
+        credentials,
+        ...exchangeEndpointsFromEnv(config.executor),
+      });
       const report = await runReconciliation({
         pool,
         client,

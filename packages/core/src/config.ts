@@ -1,5 +1,6 @@
 import { z } from 'zod';
 
+import { EXCHANGE_ENVIRONMENTS } from './exchange-endpoints.js';
 import { INTERVALS } from './types.js';
 
 export const marketSchema = z.object({
@@ -280,7 +281,22 @@ export const executorSchema = z.object({
    * `openAlgoOrders`（40）= 45 权重，折合 9 权重/分钟，相对限频可以忽略。
    * 逐标的跑反而更贵（每标的 6），因此默认全账户。
    */
-  reconcileIntervalMs: z.number().int().min(0).default(5 * 60_000),
+  reconcileIntervalMs: z
+    .number()
+    .int()
+    .min(0)
+    .default(5 * 60_000),
+  /**
+   * 交易所环境：`live` 主网 / `demo` Binance Demo Trading（`demo.binance.com`）。
+   *
+   * 它**同时**决定 REST 基址与用户数据流地址（`resolveExchangeEndpoints`），不是两个
+   * 各自独立的开关——只改一个就会复现「下单进沙箱、成交事件从主网来、于是永远等不到
+   * 挂单」这个静默分叉。
+   *
+   * 缺省 `live`。它是会**真实下单**的开关之一，改成 `demo` 时应当清楚：这是让本地
+   * 跑在虚拟资金上，不是把生产环境改成安全的。
+   */
+  environment: z.enum(EXCHANGE_ENVIRONMENTS).default('live'),
 });
 
 export const configSchema = z.object({
