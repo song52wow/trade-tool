@@ -41,10 +41,13 @@ export interface ResolveExchangeEndpointsOptions {
   /**
    * Demo 环境的用户数据流地址。`environment = 'demo'` 时**必填**，缺它直接抛错。
    *
-   * 刻意不给默认值：demo 的 WS host 在公开资料里就有两个互相矛盾的说法
-   * （`demo-fstream.binance.com` 与 `fstream.binancefuture.com`），本仓库
-   * **不把未经核实的地址写进代码**（AGENTS.md §10 第 1 条）。宁可在启动时报错，
-   * 也不让一个猜出来的 host 悄悄接上一条「握手成功但不投递事件」的流。
+   * 仍然不给代码默认值——**理由已经变了**：2026-10-15 核对官方 USDⓈ-M Futures
+   * General Info 的 "Testnet API Information"，host 已确认是
+   * `wss://demo-fstream.binance.com`（此前记录的「两个说法互相矛盾」已作废）。
+   * 不给默认值是为了让**切换环境这件事必须显式发生**：`environment = demo` 与地址
+   * 同时出现在配置里，比一个隐式默认值更容易在事后回答「这笔单去了哪个环境」。
+   * 宁可在启动时报错，也不让一个没被确认过的 host 悄悄接上一条
+   * 「握手成功但不投递事件」的流（AGENTS.md §10 第 1 条）。
    */
   demoStreamUrl?: string | undefined;
 }

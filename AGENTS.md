@@ -370,14 +370,18 @@ BOLL 的 `k` 以**千分之一整数** `kMilli` 存（浮点参数不得进主�
    历史上那个失败模式：下单进沙箱、成交事件从主网流过来，于是永远等不到挂单，而日志与界面都
    正常。四处 `new BinancePrivateClient`（executor / 对账 CLI / 控制面手动对账 / 测试）
    **一律**走 `exchangeEndpointsFromEnv(config.executor)`，不许各传各的。
-   `demo` 的 WS 基址**刻意不内置默认值**（公开资料有 `demo-fstream.binance.com` 与
-   `fstream.binancefuture.com` 两种互相矛盾的说法），缺 `TRADE_TOOL_BINANCE_DEMO_STREAM_URL`
-   就抛 `CONFIG_INVALID`——宁可启动时炸，也不接一条猜出来的流。本地要跑沙箱就改这一处配置，
+   `demo` 的 WS 基址仍**不内置代码默认值**，缺 `TRADE_TOOL_BINANCE_DEMO_STREAM_URL`
+   就抛 `CONFIG_INVALID`——启动时炸好过接一条猜出来的流。**但"两种说法互相矛盾"已经过时**：
+   2026-10-15 核对官方 USDⓈ-M Futures General Info 的 "Testnet API Information"，
+   现行答案是 `wss://demo-fstream.binance.com`（REST 为 `https://demo-fapi.binance.com`，
+   与代码里的 `DEMO_REST_BASE_URL` 一致）；另一个候选 `fstream.binancefuture.com`
+   在同日只读探测里返回 404，已不是有效基址。本地要跑沙箱就改这一处配置，
    不要拿 `TRADE_TOOL_BINANCE_BASE_URL` 凑：它只覆盖 REST，而且 `demo` 下这个基址本来就由
    `pythonEnvFromEnv` 注入 Python 子进程，人去设它只会造出「下单在 demo、行情在主网」的
    又一处分叉。
    Binance 已于 2025-08-27 关停老 Futures Testnet，`testnet.binancefuture.com` 只在
-   **尚未更新的单 endpoint 文档页**里出现；权威来源是 General Info 页。
+   **尚未更新的单 endpoint 文档页**里出现；权威来源是 General Info 页——它同时也是上面
+   那个 demo host 的权威来源。
 
 Binance U 本位**没有单请求 OCO**（`/fapi/v1/order/oco` 已下架）：用 `TAKE_PROFIT_MARKET` +
 `STOP_MARKET`（`closePosition=true`），**下单走 `POST /fapi/v1/algoOrder` +
@@ -646,7 +650,7 @@ stdout 是命令结果（日志走 stderr），`--json` 时输出纯 JSON。**�
 
 ### 10.1 接缝必须核对契约（2026-10-10 教训）
 
-本节关于 Binance 的陈述来自 **2026-10-10 与 2026-10-14 两次核对**（见 git 历史）。它们会过期，
+本节关于 Binance 的陈述来自 **2026-10-10、2026-10-14 与 2026-10-15 三次核对**（见 git 历史）。它们会过期，
 而**过期的写法比没有更危险**：读代码的人会默认「这个文件的交易所部分被人校准过」。
 改动接缝、或依赖任何关于交易所行为的陈述之前，**重新核对官方文档并更新核对日期**。
 
