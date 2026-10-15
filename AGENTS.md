@@ -300,8 +300,9 @@ schema 的唯一来源是 `packages/data/sql/*.sql`；**每张迁移文件头部
 3. `python/.../quant_data/aggregate.py`：`DERIVED_TABLES` + `BUCKET_WIDTHS_MS`。
 4. `packages/data/sql/`：新增一张与 `klines_1m` 同形状的表 + 一轮迁移登记；
    `005_indicators.sql` 里 **7 张指标表**的 `interval` CHECK 白名单要同步加值。
-5. `apps/web/ui/src/components/`：`gaps.ts` 的周期表与 `indicators.tsx` /
-   `RiskPolicyPanel.tsx` 的白名单。
+5. `apps/web/ui/src/components/`：`gaps.ts` 的周期表与 `RiskPolicyPanel.tsx` 的白名单。
+   （页面上已无指标面板：`indicators.tsx` / `IndicatorPanels.tsx` 与 `/indicators` 路由
+   已随「指标层默认关闭」删除，见 §6.2。）
 6. `packages/data/src/db/repo.ts` 里控制面用的周期白名单与响应字段。
 
 ### 6.2 技术指标层（v0.3.0）
@@ -320,7 +321,7 @@ TS 侧（`packages/*`、`apps/*`）**不得出现任何指标实现**。两侧�
 3. **连续段各自独立重算，段间不递推**：回补一个久远的缺口**不得**静默改写此后的指标值。
    缺口就是噪声，不得跨越。
 4. **预热期不落库**：不写 NaN、不写 NULL、更不写 0 冒充缺失。库里每一行都是有效值。
-   指标在界面上的语义是「**收盘后可用**」，指标线在缺口处**断开**（不跨缺口连线）。
+   语义是「**收盘后可用**」，任何画指标线的读侧都必须在缺口处**断开**（不跨缺口连线）。
 
 `window` 是 PostgreSQL 的**完全保留字**，所以参数列名按指标各取本名：MA 用 `bars`，
 RSI / BOLL / ATR 用 `period`，KDJ 用 `n` / `k_period` / `d_period`，MACD 用
@@ -332,6 +333,20 @@ BOLL 的 `k` 以**千分之一整数** `kMilli` 存（浮点参数不得进主�
 ×2），**KDJ 横盘时 `RSV = 50`**（分母为 0 时没有信息，取中性点而不是产生 `NaN`）。
 1m 不做指标物化是**容量结论**不是疏漏（单标的 1m 约 320 万行 ≈ 4.3 GB，
 四个高周期合计约 386 MB）。
+
+**指标层默认关闭**（`data.indicatorSpecs` 缺省 `{}`，v0.3.0 起缺省是 10 个参数集）。
+理由是实测的：物化挂在 1m 的**每批**写入出口上（R-5.1），一轮 43k 根的首次全量被切成
+216 批，同一批指标于是被 `216 × 4 × 7` 重写一遍——单轮同步里指标占 **72%** 的墙钟
+（profiler：`psycopg.wait` 61.9s/76.8s，纯计算仅 3s），`sync-integration` 从 **698s
+降到 301s**。而默认配置下**没有任何消费方读这些表**：
+
+- 止盈止损的 ATR 走 `quant_data.risk`，`ATR_TABLES = {1m: klines_1m, **DERIVED_TABLES}`
+  ——**`indicator_atr` 不在链路上，全仓也没有任何读取方**；
+- 回测只消费 `quant_core` 的指标序列，不碰指标表；
+- 控制面的 `/indicators` 路由与两个 UI 组件已随此次改动删除。
+
+要打开就显式写出参数集（见 `packages/core/src/config.ts` 的 `indicatorSpecs`）。
+**不要**把物化重新挂回每批——真要恢复物化，先把它改成一轮一次或按触及区间合并。
 
 ### 6.3 止盈止损层（v0.4.0）
 
@@ -490,6 +505,11 @@ v0.5.0 把「密钥只从环境变量读」改成「**也可以从控制面录�
    「按序号排的通用图表」——那会把空洞压成连续走势。桶宽来自**服务端回传的 `intervalMs`**，
    不在前端算（写死 `60_000` 会把「4h 图上缺一根」说成「缺一分钟」；前端另有一个
    `DEFAULT_BAR_MS` 兜底常量与一份展示用周期表，但缺口折算必须用服务端值）。
+
+> **指标路由已移除**：`GET /api/symbols/:symbol/indicators` 与页面的指标面板已随
+> 「指标层默认关闭」删除（§6.2）。K 线图因此只剩蜡烛与真实缺口，`/bars` 的上述约束
+> 全部不变。要恢复指标展示，先按 §6.2 打开物化，再把读路径加回来——不要只加回路由，
+> 那会画出库里根本没有的行。
 
 另有两条与安全 / 依赖有关的固定做法：
 

@@ -1,5 +1,4 @@
 import type { GapRecord, RemovePolicy, StoredInterval } from '@trade-tool/core';
-import type { IndicatorInterval } from '@trade-tool/data';
 
 import type {
   BarsDto,
@@ -7,7 +6,6 @@ import type {
   CredentialStatusDto,
   CredentialWriteBody,
   ExchangeListDto,
-  IndicatorsDto,
   JobDto,
   OverviewDto,
   ReconcileReport,
@@ -107,25 +105,6 @@ export const api = {
       throw error;
     }),
   /**
-   * 指标序列（R-10）。纯读本地库，可挂在刷新节奏上。
-   *
-   * 404 在这里**同样单列**：路由在进程启动时注册，404 几乎总是「控制面还是改动前的
-   * 旧进程」，而前端已经是新的——报一句笼统的 `404 Not Found`，用户根本判断不出
-   * 该重启还是该去物化指标（v0.1.0 R-23.9 的延续）。
-   */
-  indicators: (s: string, limit: number, interval: IndicatorInterval = '1h') =>
-    request<IndicatorsDto>(
-      `/api/symbols/${encodeURIComponent(s)}/indicators?limit=${String(limit)}&interval=${interval}`,
-    ).catch((error: unknown) => {
-      if (error instanceof ApiError && error.status === 404) {
-        throw new ApiError(
-          'CONTROL_PLANE_STALE',
-          '控制面没有 /indicators 路由：它还是改动前启动的旧进程。重启 trade-tool 控制面后刷新页面即可。',
-        );
-      }
-      throw error;
-    }),
-  /**
    * 止盈止损记录（v0.4.0）。纯读本地库，可挂在刷新节奏上。
    *
    * 404 在这里**同样单列**：路由在进程启动时注册，404 几乎总是「控制面还是改动前的
@@ -152,17 +131,15 @@ export const api = {
    * 404 单列成「控制面还是旧进程」：路由在启动时注册，不重启就看不到它。
    */
   latestReconcile: () =>
-    request<{ report: ReconcileReport | null }>('/api/reconcile/latest').catch(
-      (error: unknown) => {
-        if (error instanceof ApiError && error.status === 404) {
-          throw new ApiError(
-            'CONTROL_PLANE_STALE',
-            '控制面没有 /reconcile/latest 路由：它还是改动前启动的旧进程。重启 trade-tool 控制面后刷新页面即可。',
-          );
-        }
-        throw error;
-      },
-    ),
+    request<{ report: ReconcileReport | null }>('/api/reconcile/latest').catch((error: unknown) => {
+      if (error instanceof ApiError && error.status === 404) {
+        throw new ApiError(
+          'CONTROL_PLANE_STALE',
+          '控制面没有 /reconcile/latest 路由：它还是改动前启动的旧进程。重启 trade-tool 控制面后刷新页面即可。',
+        );
+      }
+      throw error;
+    }),
   /**
    * 立刻手动对账一次（出网、签名、消耗权重），并覆盖最近一次自动快照。
    *

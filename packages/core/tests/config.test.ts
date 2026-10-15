@@ -52,32 +52,45 @@ function parseData(data: Record<string, unknown>) {
 }
 
 describe('indicatorSpecs', () => {
-  it('缺省值与 005_indicators.sql 的表集合一致（AC-2）', () => {
-    const parsed = parseData({});
-    const specs = parsed.data.indicatorSpecs;
-    // 7 张表全部有缺省参数集：少任何一个，那张表就永远不会被写入，
-    // 而控制面只会显示「该周期 0 行」——看不出是「没配」还是「还没算」。
+  it('缺省 = 关闭指标层（0 个参数集）', () => {
+    const specs = parseData({}).data.indicatorSpecs;
+    // 指标物化挂在 1m 的每批写入出口上，一轮首次全量会把同一批指标重写几百遍。
+    // 当前没有任何消费方读这些表（ATR 走 quant_data.risk 直读派生 K 线，回测只消费
+    // quant_core），因此缺省关闭；打开方式见下一条。
     expect(Object.keys(specs).sort()).toEqual(
       ['atr', 'boll', 'kdj', 'ma', 'macd', 'obv', 'rsi'].sort(),
     );
-    expect(specs.ma.map((m) => m.window)).toEqual([5, 10, 20, 60]);
-    expect(specs.macd).toEqual([{ fast: 12, slow: 26, signal: 9 }]);
-    expect(specs.boll).toEqual([{ period: 20, kMilli: 2000 }]);
-    expect(specs.kdj).toEqual([{ n: 9, kPeriod: 3, dPeriod: 3 }]);
-    expect(specs.obv).toEqual([{}]);
+    expect(
+      specs.ma.length +
+        specs.macd.length +
+        specs.rsi.length +
+        specs.boll.length +
+        specs.kdj.length +
+        specs.atr.length +
+        specs.obv.length,
+    ).toBe(0);
   });
 
-  it('缺省行集数为 10（附录 B.2：体积的直接决定因素）', () => {
-    const { indicatorSpecs } = parseData({}).data;
-    const count =
-      indicatorSpecs.ma.length +
-      indicatorSpecs.macd.length +
-      indicatorSpecs.rsi.length +
-      indicatorSpecs.boll.length +
-      indicatorSpecs.kdj.length +
-      indicatorSpecs.atr.length +
-      indicatorSpecs.obv.length;
-    expect(count).toBe(10);
+  it('显式写出参数集即可打开，且缺省形状与 005_indicators.sql 的 7 张表一致（AC-2）', () => {
+    const specs = parseData({
+      indicatorSpecs: {
+        ma: [{ window: 20 }],
+        macd: [{ fast: 12, slow: 26, signal: 9 }],
+        rsi: [{ period: 14 }],
+        boll: [{ period: 20, kMilli: 2000 }],
+        kdj: [{ n: 9, kPeriod: 3, dPeriod: 3 }],
+        atr: [{ period: 14 }],
+        obv: [{}],
+      },
+    }).data.indicatorSpecs;
+    // 零 DDL：7 张表各自有参数集就会被写入，改窗口只是换个数
+    expect(specs.ma).toEqual([{ kind: 'sma', window: 20 }]);
+    expect(specs.macd).toEqual([{ fast: 12, slow: 26, signal: 9 }]);
+    expect(specs.rsi).toEqual([{ period: 14 }]);
+    expect(specs.boll).toEqual([{ period: 20, kMilli: 2000 }]);
+    expect(specs.kdj).toEqual([{ n: 9, kPeriod: 3, dPeriod: 3 }]);
+    expect(specs.atr).toEqual([{ period: 14 }]);
+    expect(specs.obv).toEqual([{}]);
   });
 
   it('{} = 显式关闭指标层，是合法配置（R-12.2 / AC-23）', () => {

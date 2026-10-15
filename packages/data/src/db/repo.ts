@@ -994,7 +994,26 @@ export async function readDerivedTableStats(
  * 「未启用派生」**。把它们按启用态统计会得到一份「0 个桶 + 全 0 扣留」——
  * 看起来像「已启用但还没聚合」，用户会一直点重建，而重建（读的是同一个配置）
  * 根本不会写这几张表（AC-22 / R-8.4）。
+ *
+ * **扣留统计只看最近 `WITHHELD_LOOKBACK_MS`**（见下），不是全部历史。
+ * 判据要求按桶统计 `min(time)`，因此无下界时每条查询都要哈希聚合该标的的**全部 1m**
+ * ——实测 BTCUSDT（372 万行）单次 **4.74s**，而它挂在标的详情页上，等于每次点开
+ * 白等近 5 秒。加上 90 天下界后同一份数据 **341ms**（14 倍）。
+ *
+ * 这个窗口是**有意的语义边界**：页面要回答的是「最近为什么没有 4h 蜡烛」，
+ * 而几百天前那个因为 onboard 首日而永远闭合不了的 1d 桶既不可处置、也不该一直
+ * 挂在那里。窗口值由 :data:`WITHHELD_LOOKBACK_MS` 单一给出（**固定窗口**，
+ * 不做成配置项：它调大只会让页面变慢，调小则连最近一个 1d 桶都统计不全）。
  */
+/**
+ * 扣留统计的回看窗口：只统计最近这段时间内的桶。
+ *
+ * 取值理由：90 天覆盖 1d 桶 90 个、4h 桶 541 个、15m 桶 8641 个——最细的周期也还有
+ * 八千多个桶可看，足够回答「最近为什么没有蜡烛」；而扫描量从「全部历史」降到
+ * 约 13 万根 1m，查询从 4.74s 降到 341ms。
+ */
+export const WITHHELD_LOOKBACK_MS = 90 * 24 * 60 * 60 * 1000;
+
 export async function readDerivedIntervals(
   pool: Pool,
   symbol: string,
@@ -1077,7 +1096,7 @@ export async function readDerivedIntervals(
                   count(*) AS actual,
                   min(k.time) AS bucket_first
              FROM klines_1m k
-            WHERE k.symbol = $1
+            WHERE k.symbol = $1 AND k.time >= $2::bigint - $6::bigint
             GROUP BY 1
          ) s
         WHERE least(s.bucket + w.width_ms - 60000, $2::bigint)
@@ -1085,8 +1104,15 @@ export async function readDerivedIntervals(
         GROUP BY w.interval, w.width_ms
         ORDER BY w.width_ms`,
       // $1 symbol、$2 该标的 1m 的 max(time)、$3 min(time)、$4 本次要统计的周期、
-      // $5 与 $4 一一对应的桶宽（毫秒）
-      [symbol, lastMs, firstMs, active, active.map((interval) => INTERVAL_MS[interval])],
+      // $5 与 $4 一一对应的桶宽（毫秒）、$6 扣留统计的回看窗口（毫秒）
+      [
+        symbol,
+        lastMs,
+        firstMs,
+        active,
+        active.map((interval) => INTERVAL_MS[interval]),
+        WITHHELD_LOOKBACK_MS,
+      ],
     );
     const withheld = new Map(
       result.rows.map((row) => [

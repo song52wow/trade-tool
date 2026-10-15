@@ -99,7 +99,14 @@ export const dataSchema = z.object({
    * 但 1m 同步还要继续」。关闭状态必须从 `sync status` 与控制面**看得见**
    * （R-11.4 / AC-23），而不是显示 0 行让人以为「还没算」。
    *
-   * 缺省值必须与 `sql/005_indicators.sql` 的表集合一致，由 AC-2 的测试守住。
+   * **缺省值就是 `{}`（关闭）**：指标物化挂在 1m 的每批写入出口上（R-5.1），一轮
+   * 43k 根的首次全量被切成 216 批，同一批指标于是被 `216 × 4 × 7` 重写一遍。实测
+   * 指标占单轮同步耗时的 **72%**（`sync-integration` 698s → 301s），而目前**没有任何
+   * 消费方读这些表**：止盈止损的 ATR 走 `quant_data.risk` 直接读派生 K 线
+   * （`ATR_TABLES` 里没有 `indicator_atr`），回测只消费 `quant_core` 的指标序列。
+   * 因此**默认不物化**；要看得显式写出参数集（见 `.env.example` 的注释）。
+   *
+   * 打开时参数集要与 `sql/005_indicators.sql` 的表集合一致，由 AC-2 的测试守住。
    */
   indicatorSpecs: z
     .object({
@@ -138,20 +145,8 @@ export const dataSchema = z.object({
       atr: z.array(z.object({ period: z.number().int().positive() })).default([]),
       obv: z.array(z.object({})).default([]),
     })
-    .default({
-      ma: [
-        { kind: 'sma', window: 5 },
-        { kind: 'sma', window: 10 },
-        { kind: 'sma', window: 20 },
-        { kind: 'sma', window: 60 },
-      ],
-      macd: [{ fast: 12, slow: 26, signal: 9 }],
-      rsi: [{ period: 14 }],
-      boll: [{ period: 20, kMilli: 2000 }],
-      kdj: [{ n: 9, kPeriod: 3, dPeriod: 3 }],
-      atr: [{ period: 14 }],
-      obv: [{}],
-    }),
+    // 缺省关闭指标层：见上面 indicatorSpecs 的注释（实测占单轮同步 72% 且无消费方）。
+    .default({}),
   /**
    * 指标补齐 / `--rebuild` 的分批大小（v0.3.0 R-6.3），每批一个事务。
    * 单位是**派生 bar 数**而不是时间：按时间推进会让数据稀疏的标的（大量缺口 → 大量
