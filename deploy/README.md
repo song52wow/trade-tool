@@ -2,11 +2,11 @@
 
 本机（darwin x86_64）构建镜像 → `docker save` → 目标机 `docker load` → compose 起四个服务。
 
-| 服务 | 镜像 | 作用 | 默认是否启动 |
-| --- | --- | --- | --- |
-| `postgres` | postgres:16 | 唯一的数据通道（K 线不走 stdout） | 是 |
-| `web` | trade-tool:deploy | 控制面 HTTP + 看板 | 是 |
-| `sync` | trade-tool:deploy | 常驻同步守护进程 | 是 |
+| 服务       | 镜像              | 作用                                        | 默认是否启动             |
+| ---------- | ----------------- | ------------------------------------------- | ------------------------ |
+| `postgres` | postgres:16       | 唯一的数据通道（K 线不走 stdout）           | 是                       |
+| `web`      | trade-tool:deploy | 控制面 HTTP + 看板                          | 是                       |
+| `sync`     | trade-tool:deploy | 常驻同步守护进程                            | 是                       |
 | `executor` | trade-tool:deploy | 买入成交 → ATR → 止盈止损（**会真实下单**） | **否**，需显式开 profile |
 
 四个应用服务跑**同一个镜像**、只靠 `command` 区分：它们共用同一份 workspace 产物与同一个
@@ -14,9 +14,9 @@ Python venv，拆成四个镜像只会让 save/load 的传输量翻倍。
 
 ## 0. 前置
 
-* 本机：Docker（colima 已在用）、仓库当前工作区。
-* 目标机：Linux + Docker、能访问外网（容器要访问 Binance）、x86_64 架构。
-* 目标机上这个目录结构是最终形态：
+- 本机：Docker（colima 已在用）、仓库当前工作区。
+- 目标机：Linux + Docker、能访问外网（容器要访问 Binance）、x86_64 架构。
+- 目标机上这个目录结构是最终形态：
 
 ```
 /opt/trade-tool/
@@ -67,12 +67,24 @@ openssl rand -hex 32            # 写进 .env 的 TRADE_TOOL_SECRET_KEY
 vi .env                         # 至少改 TRADE_TOOL_PG_PASSWORD
 ```
 
-配置文件由本机一并带过去（`deploy/config/trade-tool.config.json`），它相对
-`config init` 的默认产物只改了三处，都是部署环境必须不同的：
+配置文件由本机一并带过去（`deploy/config/trade-tool.config.json`）。注意它**同时**通过
+「改值」和「删键（用缺省）」两种方式偏离 `config init` 的默认产物——看 `git diff` 时
+别只盯着改过的值，删掉的键同样是意图：
 
-* `database.host: "postgres"` —— compose 里的服务名，不是 `127.0.0.1`；
-* `data.python: "python3"` —— 走镜像内建好的 venv，不在运行期调 `uv`；
-* `market.source: "binance"` —— 默认的 `synthetic` 是离线合成数据。
+- `database.host: "postgres"` —— compose 里的服务名，不是 `127.0.0.1`；
+- `data.python: "python3"` —— 走镜像内建好的 venv，不在运行期调 `uv`；
+- `market.source: "binance"` —— 默认的 `synthetic` 是离线合成数据；
+- **删掉了 `data.indicatorIntervals` / `data.indicatorSpecs` / `data.indicatorBatchBars`**
+  —— 让它们走新缺省，即**关闭指标物化**。理由与实测见
+  [`AGENTS.md` §6.2](../AGENTS.md)：物化挂在 1m 的每批写入出口上，一轮首次全量会把同一批
+  指标重写成百上千遍（实测占单轮同步 72% 的墙钟）；而控制面已无指标读路径。
+
+  ⚠️ **这些键以前是显式写着的（10 个参数集）**。JSON 不支持注释，所以意图只能靠「删键」
+  表达——如果把这一段回滚成显式配置，优化就静默失效了。要重新打开，就在控制面或这里
+  显式写出参数集；重新物化用
+  `node apps/cli/dist/index.js data indicators -s <SYMBOL>`（首次要算完才看得到）。
+
+  `data.aggregateIntervals` 是另一回事，**保留**：派生周期是 K 线本身的形态，与指标层无关。
 
 `sync.symbols` 与 `executor.*` 建议在控制面上改，不要手改文件：控制面写库、
 守护进程读库，改文件不会触发任何生效动作。
@@ -160,14 +172,14 @@ curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8787/api/overview   # 
 
 ## 7. 排查
 
-| 现象 | 多半是 |
-| --- | --- |
-| 容器反复重启，日志停在「等待 PostgreSQL」 | PG 没起来或 `TRADE_TOOL_PG_PASSWORD` 与库不一致；`docker compose logs postgres` |
+| 现象                                             | 多半是                                                                                                                                |
+| ------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------- |
+| 容器反复重启，日志停在「等待 PostgreSQL」        | PG 没起来或 `TRADE_TOOL_PG_PASSWORD` 与库不一致；`docker compose logs postgres`                                                       |
 | `EISDIR: illegal operation on a directory, read` | `/data/trade-tool.config.json` 被挂成了**目录**：宿主机上那个路径当时不存在，Docker 就地建了同名目录。确认文件已 `scp` 过去再 `up -d` |
-| 控制面起不来，日志说 schema 版本对不上 | 迁移没跑成。入口每次启动都迁移，这里多半是它自己也连不上库 |
-| 同步进程起来了但一条数据没进 | `sync.symbols` 为空、或全是 `paused`；控制面「标的」页看状态 |
-| 首次同步卡很久 | 首次全量是几十分钟量级，属正常。控制面能看 `sync_state` 的进度 |
-| `Loaded image` 后仍然 `pull_policy` 报错 | 镜像标签与 `.env` 的 `TRADE_TOOL_IMAGE` 不一致 |
+| 控制面起不来，日志说 schema 版本对不上           | 迁移没跑成。入口每次启动都迁移，这里多半是它自己也连不上库                                                                            |
+| 同步进程起来了但一条数据没进                     | `sync.symbols` 为空、或全是 `paused`；控制面「标的」页看状态                                                                          |
+| 首次同步卡很久                                   | 首次全量是几十分钟量级，属正常。控制面能看 `sync_state` 的进度                                                                        |
+| `Loaded image` 后仍然 `pull_policy` 报错         | 镜像标签与 `.env` 的 `TRADE_TOOL_IMAGE` 不一致                                                                                        |
 
 macOS 本机用 colima 跑这套 compose 时注意：colima 默认只挂 `/Users`，
 **不挂 `/Volumes`**。仓库在 `/Volumes/data/...` 时，配置文件绑定会被 Docker
@@ -202,12 +214,14 @@ daemon 读成 `stopped` 而不是它应有的样子。
 
 在 macOS + colima 上用同一份 compose 做过一次完整冒烟（起 PG / web / sync，真实出网）：
 
-* 入口等库 → `db migrate`（幂等，第二次报「已是最新」）→ 启动进程，全通；
-* 控制面 `/api/health` 返回 `{"ok":true}`，首页 HTML 与 `/api/symbols`、`/api/symbols/:symbol/bars`
-  都能取到**真实** K 线——说明 Python 子进程、PG 写入、派生聚合与指标链路在镜像里都工作；
-* `?interval=5m` 返回 400（不静默回落 1m）；
-* sync 守护进程起来后立刻调度标的并写库；
-* `executor` 不在默认启动集合里，`docker compose ps` 里没有它。
+- 入口等库 → `db migrate`（幂等，第二次报「已是最新」）→ 启动进程，全通；
+- 控制面 `/api/health` 返回 `{"ok":true}`，首页 HTML 与 `/api/symbols`、`/api/symbols/:symbol/bars`
+  都能取到**真实** K 线——说明 Python 子进程、PG 写入与**派生聚合**链路在镜像里都工作；
+  （指标物化在 `deploy/config` 里是**关闭**的，所以这条冒烟不覆盖它。要验证那条链路，
+  得先显式写出 `data.indicatorSpecs` 并跑一次 `data indicators`。）
+- `?interval=5m` 返回 400（不静默回落 1m）；
+- sync 守护进程起来后立刻调度标的并写库；
+- `executor` 不在默认启动集合里，`docker compose ps` 里没有它。
 
 **没验证的**：目标机上的实际启动、`docker load` 后的架构一致性、以及 executor——
 它要真实密钥与 `executor.enabled=true`，本机没有条件跑，也没有在这里下过任何真实订单。
