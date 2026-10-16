@@ -1,0 +1,138 @@
+# 部署编排（目标机：192.168.1.90，x86_64）。
+#
+# 与仓库根的 compose.yaml 是两回事：那份是**本机开发**依赖（PostgreSQL 只绑 127.0.0.1），
+# 这份是**部署**编排，四个服务跑在同一个镜像上。
+#
+# 镜像不在这里 build：按约定在本地 build 好，用 `docker save` / `docker load` 搬过来，
+# 因此 `pull_policy: never`——宁可启动失败，也不要在生产机上悄悄拉一个同名但不同版本的镜像。
+name: trade-tool
+
+services:
+  postgres:
+    image: postgres:16
+    container_name: trade-tool-pg
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${TRADE_TOOL_PG_USER:-trade}
+      POSTGRES_PASSWORD: ${TRADE_TOOL_PG_PASSWORD:?必须在 .env 里设置 TRADE_TOOL_PG_PASSWORD}
+      POSTGRES_DB: ${TRADE_TOOL_PG_DATABASE:-trade_tool}
+    ports:
+      # 有意暴露到宿主机端口（需求确认过）：方便在目标机上直接 psql / 备份。
+      # 数据库无鉴权强度可言，密码即全部防线——确认目标机所在网段可信再暴露。
+      - '${TRADE_TOOL_PG_BIND:-0.0.0.0}:${TRADE_TOOL_PG_PORT:-5432}:5432'
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - pg_isready -U ${TRADE_TOOL_PG_USER:-trade} -d ${TRADE_TOOL_PG_DATABASE:-trade_tool}
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 10s
+
+  web:
+    image: ${TRADE_TOOL_IMAGE:-trade-tool:deploy}
+    pull_policy: never
+    container_name: trade-tool-web
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    env_file:
+      - .env
+    environment:
+      # 有意监听 0.0.0.0（需求确认过）。控制面**本期无鉴权**：能打开的人就能读全部数据、
+      # 触发首次全量拉取。改回 127.0.0.1 即可只走 SSH 端口转发。
+      TRADE_TOOL_WEB_HOST: 0.0.0.0
+      TRADE_TOOL_PG_HOST: postgres
+      TRADE_TOOL_PG_PORT: 5432
+      # 显式代理（可选，留空即直连）。Python 侧 urllib 读这两个变量；
+      # Node 侧靠 NODE_OPTIONS=--use-env-proxy 才会读，否则 fetch 直连。
+      # NO_PROXY 必须含 postgres：容器之间与数据库的连接不该绕一圈代理。
+      HTTP_PROXY: ${TRADE_TOOL_HTTP_PROXY:-}
+      HTTPS_PROXY: ${TRADE_TOOL_HTTPS_PROXY:-}
+      NO_PROXY: ${TRADE_TOOL_NO_PROXY:-postgres,127.0.0.1,localhost}
+      NODE_OPTIONS: ${TRADE_TOOL_NODE_OPTIONS:-}
+    ports:
+      # 两端同值：控制面读的就是 TRADE_TOOL_WEB_PORT，容器内监听端口由它决定，
+      # 所以映射的容器侧必须跟着变量走，写死会在改了 .env 之后连不上（而且是静默的）。
+      - '${TRADE_TOOL_WEB_PORT:-8787}:${TRADE_TOOL_WEB_PORT:-8787}'
+    volumes:
+      - appli:/data
+      # 配置以只读方式挂进工作根目录：控制面改不动它，也就不会出现
+      # 「页面上改的配置和 /data 里的文件对不上」。
+      - ./config/trade-tool.config.json:/data/trade-tool.config.json:ro
+    command: ['node', '/app/apps/web/dist/main.js']
+    healthcheck:
+      test:
+        [
+          'CMD-SHELL',
+          'curl -fsS "http://127.0.0.1:$${TRADE_TOOL_WEB_PORT:-8787}/api/health" || exit 1',
+        ]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 40s
+
+  sync:
+    image: ${TRADE_TOOL_IMAGE:-trade-tool:deploy}
+    pull_policy: never
+    container_name: trade-tool-sync
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    env_file:
+      - .env
+    environment:
+      TRADE_TOOL_PG_HOST: postgres
+      TRADE_TOOL_PG_PORT: 5432
+      # 显式代理（可选，留空即直连）。Python 侧 urllib 读这两个变量；
+      # Node 侧靠 NODE_OPTIONS=--use-env-proxy 才会读，否则 fetch 直连。
+      # NO_PROXY 必须含 postgres：容器之间与数据库的连接不该绕一圈代理。
+      HTTP_PROXY: ${TRADE_TOOL_HTTP_PROXY:-}
+      HTTPS_PROXY: ${TRADE_TOOL_HTTPS_PROXY:-}
+      NO_PROXY: ${TRADE_TOOL_NO_PROXY:-postgres,127.0.0.1,localhost}
+      NODE_OPTIONS: ${TRADE_TOOL_NODE_OPTIONS:-}
+    volumes:
+      - appli:/data
+      - ./config/trade-tool.config.json:/data/trade-tool.config.json:ro
+    command: ['node', '/app/apps/sync/dist/main.js']
+    # 同步守护进程的第一全量可能跑几十分钟，期间 CPU 会长时间打满；
+    # 不限制 CPU，否则它会把同机的控制面一起拖慢。
+    stop_grace_period: 60s
+
+  executor:
+    # 放 profile 里：`docker compose up -d` **不会**启动它。止盈止损会真实下单，
+    # 密钥配齐、确认口径无误之后，用 `docker compose --profile executor up -d executor` 显式开。
+    profiles: ['executor']
+    image: ${TRADE_TOOL_IMAGE:-trade-tool:deploy}
+    pull_policy: never
+    container_name: trade-tool-executor
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    env_file:
+      - .env
+    environment:
+      TRADE_TOOL_PG_HOST: postgres
+      TRADE_TOOL_PG_PORT: 5432
+      # 显式代理（可选，留空即直连）。Python 侧 urllib 读这两个变量；
+      # Node 侧靠 NODE_OPTIONS=--use-env-proxy 才会读，否则 fetch 直连。
+      # NO_PROXY 必须含 postgres：容器之间与数据库的连接不该绕一圈代理。
+      HTTP_PROXY: ${TRADE_TOOL_HTTP_PROXY:-}
+      HTTPS_PROXY: ${TRADE_TOOL_HTTPS_PROXY:-}
+      NO_PROXY: ${TRADE_TOOL_NO_PROXY:-postgres,127.0.0.1,localhost}
+      NODE_OPTIONS: ${TRADE_TOOL_NODE_OPTIONS:-}
+    volumes:
+      - appli:/data
+      - ./config/trade-tool.config.json:/data/trade-tool.config.json:ro
+    command: ['node', '/app/apps/executor/dist/main.js']
+
+volumes:
+  pgdata:
+    name: trade-tool-pgdata
+  appli:
+    name: trade-tool-home

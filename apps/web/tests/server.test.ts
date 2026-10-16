@@ -1,8 +1,23 @@
-import { SyncError } from '@trade-tool/core';
+import {
+  DERIVED_INTERVALS,
+  INTERVAL_TABLES,
+  SyncError,
+  type StoredInterval,
+} from '@trade-tool/core';
 import { describe, expect, it } from 'vitest';
 
+import { DEFAULT_BRACKET_LIMIT, MAX_BAR_LIMIT, MAX_BRACKET_LIMIT } from '../src/bars.js';
 import { buildApp, type WebDeps } from '../src/server.js';
-import type { JobDto, OverviewDto, SymbolDetailDto, SymbolRowDto } from '../src/types.js';
+import type {
+  BracketsDto,
+  ErrorBody,
+  ReconcileReport,
+  RiskPolicyViewDto,
+  JobDto,
+  OverviewDto,
+  SymbolDetailDto,
+  SymbolRowDto,
+} from '../src/types.js';
 
 const NOW = 1_760_000_000_000;
 
@@ -15,13 +30,6 @@ function row(symbol: string, overrides: Partial<SymbolRowDto> = {}): SymbolRowDt
     onboardDate: NOW - 86_400_000,
     addedAt: NOW,
     state: null,
-    coverage: {
-      onboardDate: NOW - 86_400_000,
-      earliest: null,
-      watermark: null,
-      verifiedUpTo: null,
-      now: NOW,
-    },
     hasHistory: false,
     ...overrides,
   };
@@ -60,6 +68,13 @@ function fakeDeps(overrides: Partial<WebDeps> = {}): WebDeps & { calls: string[]
           totalRows: 0,
           totalBytes: 0,
           pendingGaps: 0,
+          // v0.2.0 R-8.2：派生表的行数与实测体积（`pg_total_relation_size`）
+          derived: DERIVED_INTERVALS.map((interval) => ({
+            interval,
+            table: INTERVAL_TABLES[interval],
+            rows: 0,
+            bytes: 0,
+          })),
           rateLimit: {
             budgetPerMinute: 1920,
             windowFrom: NOW,
@@ -83,7 +98,9 @@ function fakeDeps(overrides: Partial<WebDeps> = {}): WebDeps & { calls: string[]
       }) satisfies OverviewDto,
     listSymbols: async () => [row('AAAUSDT')],
     getSymbol: async (symbol) =>
-      symbol === 'AAAUSDT' ? { ...row(symbol), contract: null, gaps: [], estimate: null } : null,
+      symbol === 'AAAUSDT'
+        ? { ...row(symbol), contract: null, gaps: [], estimate: null, derived: {} }
+        : null,
     listExchangeSymbols: async (options) => {
       calls.push(`exchange:${String(options?.refresh ?? false)}`);
       return { exchange: 'binance', count: 0, cachedAt: NOW, ageMs: 0, stale: false, symbols: [] };
@@ -103,6 +120,82 @@ function fakeDeps(overrides: Partial<WebDeps> = {}): WebDeps & { calls: string[]
       calls.push(`gaps:${symbol}`);
       return [];
     },
+    listBars: async (symbol, options) => {
+      calls.push(`bars:${symbol}:${String(options.limit)}:${options.interval}`);
+      return [
+        { time: NOW - 60_000, open: 1, high: 2, low: 0.5, close: 1.5, volume: 10 },
+        { time: NOW, open: 1.5, high: 2.5, low: 1, close: 2, volume: 12 },
+      ];
+    },
+    listBrackets: async (symbol, options) => {
+      calls.push(`brackets:${symbol}:${String(options.limit)}`);
+      return {
+        symbol,
+        limit: options.limit,
+        items: [],
+        countsByState: { armed: 0, take_profit: 0, stop_loss: 0, cancelled: 0, failed: 0 },
+      };
+    },
+    latestReconciliation: async () => {
+      calls.push('latest-reconcile');
+      return null;
+    },
+    reconcile: async (symbol) => {
+      calls.push(`reconcile:${symbol}`);
+      return {
+        exchange: 'binance',
+        symbol,
+        checkedAt: NOW,
+        healthy: true,
+        counts: { critical: 0, warning: 0, total: 0 },
+        differences: [],
+        scope: { localUnsettled: 0, exchangePositions: 0, exchangeAlgoOrders: 0 },
+      };
+    },
+    getCredentialStatus: async () => ({
+      exchange: 'binance',
+      configured: false,
+      hint: null,
+      updatedAt: null,
+      masterKeyReady: true,
+    }),
+    writeCredentials: async () => ({
+      exchange: 'binance',
+      configured: true,
+      hint: '0000',
+      updatedAt: NOW,
+      masterKeyReady: true,
+    }),
+    clearCredentials: async () => ({
+      exchange: 'binance',
+      configured: false,
+      hint: null,
+      updatedAt: NOW,
+      masterKeyReady: true,
+    }),
+    getRiskPolicy: async () => ({
+      exchange: 'binance',
+      global: null,
+      overrides: [],
+      resolved: {
+        atrPeriod: 14,
+        atrInterval: '1h',
+        stopAtrMult: 2,
+        takeProfitAtrMult: 3,
+        source: 'config' as const,
+      },
+    }),
+    writeRiskPolicy: async (body) => ({
+      scope: body.scope,
+      exchange: 'binance',
+      symbol: body.symbol ?? '',
+      atrPeriod: body.atrPeriod,
+      atrInterval: body.atrInterval,
+      stopAtrMult: body.stopAtrMult,
+      takeProfitAtrMult: body.takeProfitAtrMult,
+      updatedAt: NOW,
+    }),
+    deleteRiskPolicy: async () => ({ ok: true as const }),
     estimate: async (symbol) => {
       calls.push(`estimate:${symbol}`);
       return {
@@ -227,7 +320,14 @@ describe('buildApp 路由', () => {
     const body = (await res.json()) as { error: { code: string; details: { allowed: string[] } } };
 
     expect(res.status).toBe(400);
-    expect(body.error.details.allowed).toEqual(['start', 'pause', 'resume', 'full', 'verify']);
+    expect(body.error.details.allowed).toEqual([
+      'start',
+      'pause',
+      'resume',
+      'full',
+      'verify',
+      'aggregate',
+    ]);
   });
 
   it('首次全量返回 202 + job id，并把目标行数透传下去', async () => {
@@ -357,6 +457,25 @@ describe('SyncError → HTTP 映射', () => {
     expect(body.error.code).toBe('INTERNAL_ERROR');
     expect(body.error.message).toContain('undefined is not a function');
   });
+
+  it('SyncError 的 message 不再自带一遍 [CODE] 前缀', async () => {
+    // `SyncError` 的 message 本身就是 "[CODE] 正文"（CLI 靠它一行说清错误），而响应体
+    // 已经把 code 放在单独字段里；原样透传会让页面拼出 `[CODE] [CODE] 正文`。
+    const app = buildApp(
+      fakeDeps({
+        listSymbols: async () => {
+          throw new SyncError('DB_CONNECTION_FAILED', '连不上 PostgreSQL');
+        },
+      }),
+    );
+
+    const res = await app.request('/api/symbols');
+    const body = (await res.json()) as { error: { code: string; message: string } };
+
+    expect(res.status).toBe(503);
+    expect(body.error.code).toBe('DB_CONNECTION_FAILED');
+    expect(body.error.message).toBe('连不上 PostgreSQL');
+  });
 });
 
 describe('详情返回结构', () => {
@@ -373,5 +492,489 @@ describe('详情返回结构', () => {
     expect(body).toHaveProperty('contract');
     expect(body).toHaveProperty('gaps');
     expect(body).toHaveProperty('estimate');
+  });
+});
+
+/**
+ * K 线取数路由（R-23）。
+ *
+ * 重点不是「能返回 K 线」，而是**闸门**：`limit` 来自 URL，是唯一能放大这条查询的旋钮，
+ * 非法值必须报错、超限必须截断，并且回包里的 `limit` 是**实际生效值**，页面据此说明
+ * 自己看到的不是全部。
+ */
+describe('GET /api/symbols/:symbol/bars', () => {
+  it('不传 limit 用缺省 300', async () => {
+    const deps = fakeDeps();
+    const app = buildApp(deps);
+    const res = await app.request('/api/symbols/AAAUSDT/bars');
+
+    expect(res.status).toBe(200);
+    expect(deps.calls).toContain('bars:AAAUSDT:300:1m');
+  });
+
+  it('回包带上生效 limit 与升序 bar', async () => {
+    const app = buildApp(fakeDeps());
+    const body = (await (await app.request('/api/symbols/AAAUSDT/bars?limit=120')).json()) as {
+      symbol: string;
+      limit: number;
+      items: { time: number; close: number }[];
+    };
+
+    expect(body.symbol).toBe('AAAUSDT');
+    expect(body.limit).toBe(120);
+    expect(body.items).toHaveLength(2);
+    expect(body.items[0]?.time).toBeLessThan(body.items[1]?.time ?? 0);
+  });
+
+  it('超上限截断，并把截断后的值如实回传', async () => {
+    const deps = fakeDeps();
+    const app = buildApp(deps);
+    const res = await app.request('/api/symbols/AAAUSDT/bars?limit=999999');
+    const body = (await res.json()) as { limit: number };
+
+    expect(body.limit).toBe(MAX_BAR_LIMIT);
+    expect(deps.calls).toContain(`bars:AAAUSDT:${String(MAX_BAR_LIMIT)}:1m`);
+  });
+
+  it('非法 limit 报 400 且**不落到查询层**', async () => {
+    for (const raw of ['0', '-5', '1.5', 'abc']) {
+      const deps = fakeDeps();
+      const app = buildApp(deps);
+      const res = await app.request(`/api/symbols/AAAUSDT/bars?limit=${raw}`);
+
+      expect(res.status).toBe(400);
+      expect(((await res.json()) as { error: { code: string } }).error.code).toBe('CONFIG_INVALID');
+      // 静默换成缺省值会让人以为「数据就这么多」，所以必须一次查询都不发
+      expect(deps.calls.some((c) => c.startsWith('bars:'))).toBe(false);
+    }
+  });
+
+  it('库里没有该标的数据时 200 + 空数组，不是 404', async () => {
+    const app = buildApp(fakeDeps({ listBars: async () => [] }));
+    const res = await app.request('/api/symbols/NEVERSYNCED/bars');
+    const body = (await res.json()) as { items: unknown[] };
+
+    expect(res.status).toBe(200);
+    expect(body.items).toEqual([]);
+  });
+
+  it('symbol 前后空格照旧归一化（与其它路由同一口径）', async () => {
+    const deps = fakeDeps();
+    const app = buildApp(deps);
+    await app.request('/api/symbols/%20AAAUSDT%20/bars');
+    expect(deps.calls.some((c) => c === 'bars:AAAUSDT:300:1m')).toBe(true);
+  });
+});
+
+/**
+ * 周期白名单（R-7.1 / R-7.2 / AC-12）。
+ *
+ * 重点是**不静默回落**：用户以为在看 4h、实际拿到 1m，正是最典型的静默兜底——图能画
+ * 出来，只是每根蜡烛只有 1 分钟数据，不报错也没人发现。因此非法周期必须 400 且**一次
+ * 查询都不发**。
+ */
+describe('GET /bars 的 ?interval=', () => {
+  it('缺省按 1m 分派，并回传生效值', async () => {
+    const deps = fakeDeps();
+    const app = buildApp(deps);
+    const res = await app.request('/api/symbols/AAAUSDT/bars');
+    const body = (await res.json()) as { interval: string; intervalMs: number; items: unknown[] };
+
+    expect(res.status).toBe(200);
+    expect(deps.calls).toContain('bars:AAAUSDT:300:1m');
+    // 桶宽必须回传：页面要靠它把缺口算成「几根」（R-7.3）
+    expect(body.interval).toBe('1m');
+    expect(body.intervalMs).toBe(60_000);
+    // items 的内容与顺序与改动前一致（AC-12，见需求 §6.4）
+    expect(body.items).toHaveLength(2);
+  });
+
+  it.each(['15m', '1h', '4h', '1d'])('合法周期 %s 被放行', async (interval) => {
+    const deps = fakeDeps();
+    const app = buildApp(deps);
+    const res = await app.request(`/api/symbols/AAAUSDT/bars?interval=${interval}`);
+
+    expect(res.status).toBe(200);
+    expect(deps.calls).toContain(`bars:AAAUSDT:300:${interval}`);
+    const body = (await res.json()) as { interval: string; intervalMs: number };
+    expect(body.interval).toBe(interval);
+    expect(body.intervalMs).toBeGreaterThan(60_000);
+  });
+
+  it.each(['5m', '2h', 'foo', '1M', '15m%20'])(
+    '未实现周期 %s 报 400 且**一次查询都不发**',
+    async (interval) => {
+      const deps = fakeDeps();
+      const app = buildApp(deps);
+      const res = await app.request(`/api/symbols/AAAUSDT/bars?interval=${interval}`);
+
+      expect(res.status).toBe(400);
+      expect(((await res.json()) as { error: { code: string } }).error.code).toBe('CONFIG_INVALID');
+      // 静默换成 1m 会让人以为「数据就这么多」，所以必须不落查询层
+      expect(deps.calls.some((c) => c.startsWith('bars:'))).toBe(false);
+    },
+  );
+
+  it('interval 与 limit 同时非法时，先报 interval（顺序稳定）', async () => {
+    const deps = fakeDeps();
+    const app = buildApp(deps);
+    const res = await app.request('/api/symbols/AAAUSDT/bars?interval=5m&limit=0');
+    expect(res.status).toBe(400);
+    expect(deps.calls).toHaveLength(0);
+  });
+});
+
+/**
+ * 重建作业（R-7.6）。
+ *
+ * 重建是几十分钟量级的重活儿：必须 **202 + job id** 立即返回，不许挂在 HTTP 请求上；
+ * 同一标的存在作业时按单写者语义报 409。
+ */
+describe('POST /api/symbols/:symbol/aggregate', () => {
+  it('返回 202 + job id，不阻塞等待重建完成', async () => {
+    const deps = fakeDeps();
+    const app = buildApp(deps);
+
+    const res = await app.request('/api/symbols/AAAUSDT/aggregate', {
+      method: 'POST',
+      body: JSON.stringify({ target: 100 }),
+      headers: { 'content-type': 'application/json' },
+    });
+
+    expect(res.status).toBe(202);
+    expect((await res.json()) as JobDto).toMatchObject({ id: 'job-aggregate', status: 'running' });
+    expect(deps.calls).toContain('job:aggregate:AAAUSDT:100');
+  });
+
+  it('同一标的已有作业在跑时 409（不并发重建）', async () => {
+    const app = buildApp(
+      fakeDeps({
+        startJob: async () => {
+          throw new SyncError('SYNC_ALREADY_RUNNING', '该标的已有作业在进行中', {
+            symbol: 'AAAUSDT',
+          });
+        },
+      }),
+    );
+    const res = await app.request('/api/symbols/AAAUSDT/aggregate', { method: 'POST' });
+    expect(res.status).toBe(409);
+  });
+
+  it('aggregate 出现在允许的动作列表里', async () => {
+    const app = buildApp(fakeDeps());
+    const res = await app.request('/api/symbols/AAAUSDT/destroy', { method: 'POST' });
+    const body = (await res.json()) as { error: { details: { allowed: string[] } } };
+    expect(body.error.details.allowed).toContain('aggregate');
+  });
+
+  // ------------------------------------------------------------ 止盈止损（v0.4.0）
+
+  it('GET /brackets 透传生效 limit，并回传全量五态计数', async () => {
+    const deps = fakeDeps();
+    const app = buildApp(deps);
+    const res = await app.request('/api/symbols/AAAUSDT/brackets?limit=5');
+    const body = (await res.json()) as BracketsDto;
+
+    expect(res.status).toBe(200);
+    expect(body.symbol).toBe('AAAUSDT');
+    expect(body.limit).toBe(5);
+    expect(deps.calls).toContain('brackets:AAAUSDT:5');
+    // 五态必须**全部**在，哪怕计数是 0：页面按固定顺序渲染，缺一个键就会打出 undefined。
+    expect(Object.keys(body.countsByState).sort()).toEqual([
+      'armed',
+      'cancelled',
+      'failed',
+      'stop_loss',
+      'take_profit',
+    ]);
+  });
+
+  it('limit 缺省用止盈止损自己的缺省值，而不是 K 线的根数', async () => {
+    const deps = fakeDeps();
+    const app = buildApp(deps);
+    await app.request('/api/symbols/AAAUSDT/brackets');
+
+    expect(deps.calls).toContain(`brackets:AAAUSDT:${String(DEFAULT_BRACKET_LIMIT)}`);
+  });
+
+  it('超上限的 limit 被夹住，且回传生效值', async () => {
+    const deps = fakeDeps();
+    const app = buildApp(deps);
+    const body = (await (
+      await app.request('/api/symbols/AAAUSDT/brackets?limit=99999')
+    ).json()) as BracketsDto;
+
+    expect(body.limit).toBe(MAX_BRACKET_LIMIT);
+    expect(deps.calls).toContain(`brackets:AAAUSDT:${String(MAX_BRACKET_LIMIT)}`);
+  });
+
+  it('非法 limit 报 400，且一次查询都不发（不静默换值）', async () => {
+    const deps = fakeDeps();
+    const app = buildApp(deps);
+    const res = await app.request('/api/symbols/AAAUSDT/brackets?limit=0');
+
+    expect(res.status).toBe(400);
+    expect(deps.calls.some((c) => c.startsWith('brackets:'))).toBe(false);
+  });
+
+  it('没有止盈止损记录时 200 + 空数组，不是 404', async () => {
+    const app = buildApp(fakeDeps());
+    const res = await app.request('/api/symbols/NEVERFILLED/brackets');
+    const body = (await res.json()) as BracketsDto;
+
+    // 「这个标的还没成交过」是完全正常的状态，页面要能显示空状态而不是报错。
+    expect(res.status).toBe(200);
+    expect(body.items).toEqual([]);
+  });
+
+  it('failed 记录被 limit 截掉时，计数仍然能暴露它', async () => {
+    const app = buildApp(
+      fakeDeps({
+        listBrackets: async (symbol, options) => ({
+          symbol,
+          limit: options.limit,
+          items: [
+            {
+              entryOrderId: 'order-1',
+              exchange: 'binance',
+              symbol,
+              entryPrice: 100,
+              entryTime: NOW - 3_600_000,
+              filledQty: 1,
+              positionSide: 'LONG',
+              atr: 2,
+              atrPeriod: 14,
+              atrInterval: '1h',
+              atrWindowFrom: NOW - 7_200_000,
+              atrWindowTo: NOW - 3_600_000,
+              stopPrice: 96,
+              takeProfit: 108,
+              tpAlgoId: 1,
+              slAlgoId: 2,
+              state: 'armed' as const,
+              lastError: null,
+              createdAt: NOW - 3_600_000,
+              updatedAt: NOW - 3_600_000,
+            },
+          ],
+          // 有 2 笔 failed，但当前 items 里一条都没有——这正是 countsByState 存在的理由。
+          countsByState: {
+            armed: 1,
+            take_profit: 0,
+            stop_loss: 0,
+            cancelled: 0,
+            failed: 2,
+          },
+        }),
+      }),
+    );
+    const body = (await (await app.request('/api/symbols/AAAUSDT/brackets')).json()) as BracketsDto;
+
+    expect(body.items).toHaveLength(1);
+    expect(body.countsByState.failed).toBe(2);
+  });
+
+  // ------------------------------------------------- 运行期设置（v0.5.0）
+
+  it('凭据读取接口的回包里没有任何 secret 字段', async () => {
+    const app = buildApp(fakeDeps());
+    const body = (await (await app.request('/api/settings/credentials')).json()) as Record<
+      string,
+      unknown
+    >;
+
+    // 整个接口的存在前提就是「控制面没有能力显示密钥」，所以断言字段形状而不只是断言内容。
+    expect(Object.keys(body).sort()).toEqual([
+      'configured',
+      'exchange',
+      'hint',
+      'masterKeyReady',
+      'updatedAt',
+    ]);
+    expect(JSON.stringify(body)).not.toMatch(/secret/i);
+  });
+
+  it('写入凭据后回包仍是状态，不是明文', async () => {
+    const app = buildApp(fakeDeps());
+    const res = await app.request('/api/settings/credentials', {
+      method: 'PUT',
+      body: JSON.stringify({ apiKey: 'abcdef123456', apiSecret: 'super-secret' }),
+      headers: { 'content-type': 'application/json' },
+    });
+    const text = await res.text();
+
+    expect(res.status).toBe(200);
+    expect(text).not.toContain('super-secret');
+    expect(text).not.toContain('abcdef123456');
+  });
+
+  it('空 apiKey / apiSecret 被拒', async () => {
+    const app = buildApp(fakeDeps());
+    const res = await app.request('/api/settings/credentials', {
+      method: 'PUT',
+      body: JSON.stringify({ apiKey: '  ', apiSecret: 'x' }),
+      headers: { 'content-type': 'application/json' },
+    });
+    expect(res.status).toBe(400);
+  });
+
+  it('缺字段报 400', async () => {
+    const app = buildApp(fakeDeps());
+    const res = await app.request('/api/settings/credentials', {
+      method: 'PUT',
+      body: JSON.stringify({ apiKey: 'k' }),
+      headers: { 'content-type': 'application/json' },
+    });
+    expect(res.status).toBe(400);
+  });
+
+  it('跨站写请求被拒（控制面无鉴权，这是唯一一道闸）', async () => {
+    const app = buildApp(fakeDeps());
+    const res = await app.request('http://127.0.0.1:8787/api/settings/credentials', {
+      method: 'PUT',
+      body: JSON.stringify({ apiKey: 'k', apiSecret: 's' }),
+      headers: { 'content-type': 'application/json', origin: 'http://evil.example' },
+    });
+    expect(res.status).toBe(400);
+  });
+
+  it('同源写请求放行', async () => {
+    const app = buildApp(fakeDeps());
+    const res = await app.request('http://127.0.0.1:8787/api/settings/credentials', {
+      method: 'PUT',
+      body: JSON.stringify({ apiKey: 'k', apiSecret: 's' }),
+      headers: { 'content-type': 'application/json', origin: 'http://127.0.0.1:8787' },
+    });
+    expect(res.status).toBe(200);
+  });
+
+  it('策略读取带 symbol 时回传 resolved 与来源', async () => {
+    const app = buildApp(fakeDeps());
+    const body = (await (
+      await app.request('/api/settings/risk-policy?symbol=AAAUSDT')
+    ).json()) as RiskPolicyViewDto;
+
+    expect(body.resolved.source).toBe('config');
+    expect(body.overrides).toEqual([]);
+  });
+
+  it('写入策略必须给合法 scope', async () => {
+    const app = buildApp(fakeDeps());
+    const res = await app.request('/api/settings/risk-policy', {
+      method: 'PUT',
+      body: JSON.stringify({
+        scope: 'nonsense',
+        atrPeriod: 14,
+        atrInterval: '1h',
+        stopAtrMult: 2,
+        takeProfitAtrMult: 3,
+      }),
+      headers: { 'content-type': 'application/json' },
+    });
+    expect(res.status).toBe(400);
+  });
+
+  it('删除策略必须给合法 scope', async () => {
+    const app = buildApp(fakeDeps());
+    const res = await app.request('/api/settings/risk-policy?scope=bogus', { method: 'DELETE' });
+    expect(res.status).toBe(400);
+  });
+});
+
+/**
+ * 交易对账路由（v0.6.0）。
+ *
+ * 锁三件事：
+ *   1. 一致时返回 **200 + healthy**，不是 404——「查出来没问题」是完全正常的答案；
+ *   2. 路由**按标的**走（不带 symbol 的交易所权重是 40，不能默认按那个价走）；
+ *   3. 404 单列成「控制面还是改动前的旧进程」，因为路由在启动时注册。
+ */
+describe('GET /api/symbols/:symbol/reconcile', () => {
+  it('返回报告，并把规范化后的 symbol 传给依赖', async () => {
+    const deps = fakeDeps();
+    const res = await buildApp(deps).request('/api/symbols/AAAUSDT/reconcile');
+    const body = (await res.json()) as ReconcileReport;
+
+    expect(res.status).toBe(200);
+    expect(deps.calls).toContain('reconcile:AAAUSDT');
+    expect(body.symbol).toBe('AAAUSDT');
+    expect(body.healthy).toBe(true);
+  });
+
+  it('查出一致时不是 404', async () => {
+    const res = await buildApp(fakeDeps()).request('/api/symbols/AAAUSDT/reconcile');
+    expect(res.status).not.toBe(404);
+  });
+
+  it('依赖抛错时如实报错，不返回「一致」', async () => {
+    const deps = fakeDeps({
+      reconcile: async () => {
+        throw new SyncError('CONFIG_INVALID', '库里没有配置过 binance 凭据');
+      },
+    });
+    const res = await buildApp(deps).request('/api/symbols/AAAUSDT/reconcile');
+    expect(res.status).toBe(400);
+    // 最不能出的错：签名失败却被显示成「交易所持仓正常」。
+    const body = (await res.json()) as ErrorBody;
+    expect(body.error.message).toContain('凭据');
+  });
+
+  it('symbol 为空白时 400，且一次查询都不发', async () => {
+    const deps = fakeDeps();
+    const res = await buildApp(deps).request('/api/symbols/%20/reconcile');
+    expect(res.status).toBe(400);
+    expect(deps.calls.some((c) => c.startsWith('reconcile:'))).toBe(false);
+  });
+});
+
+/**
+ * 最近一次**自动**对账快照的路由（v0.6.0）。
+ *
+ * 锁两件事：
+ *   1. 全账户范围（`scope = ''`）——自动对账按全账户跑，路由也只给一份；
+ *   2. **从没跑过时返回 `null`**，不是一份空报告。把「还没对过账」和「对过了、
+ *      一致」混成同一个空状态，正是这块面板最不该犯的错。
+ */
+describe('GET /api/reconcile/latest', () => {
+  it('返回最近一次自动快照', async () => {
+    const checkedAt = NOW - 120_000;
+    const deps = fakeDeps();
+    // 覆盖实现里也要记账，否则断言只能证明「没报错」，证明不了「真的读了快照」。
+    deps.latestReconciliation = async () => {
+      deps.calls.push('latest-reconcile');
+      return {
+        exchange: 'binance',
+        symbol: null,
+        checkedAt,
+        healthy: false,
+        counts: { critical: 2, warning: 0, total: 2 },
+        differences: [],
+        scope: { localUnsettled: 1, exchangePositions: 3, exchangeAlgoOrders: 5 },
+      };
+    };
+    const res = await buildApp(deps).request('/api/reconcile/latest');
+    const body = (await res.json()) as { report: ReconcileReport | null };
+
+    expect(res.status).toBe(200);
+    expect(deps.calls).toContain('latest-reconcile');
+    expect(body.report?.checkedAt).toBe(checkedAt);
+    // 全账户快照的 symbol 必须是 null，界面上要能说清「这是全账户」。
+    expect(body.report?.symbol).toBeNull();
+  });
+
+  it('从没跑过时 report 为 null，而不是 healthy 的空报告', async () => {
+    const res = await buildApp(fakeDeps()).request('/api/reconcile/latest');
+    const body = (await res.json()) as { report: ReconcileReport | null };
+
+    expect(res.status).toBe(200);
+    expect(body.report).toBeNull();
+  });
+
+  it('纯读本地表，因此可以挂在刷新节奏上（不签名、不出网）', async () => {
+    const deps = fakeDeps();
+    // 连点两次都只读库：依赖里只有 latestReconciliation，没有任何下单/写库动作。
+    await buildApp(deps).request('/api/reconcile/latest');
+    await buildApp(deps).request('/api/reconcile/latest');
+    expect(deps.calls.filter((c) => c === 'latest-reconcile')).toHaveLength(2);
   });
 });

@@ -74,13 +74,6 @@ function row(symbol: string, overrides: Partial<SymbolRowDto> = {}): SymbolRowDt
       metadataStale: false,
       plan: null,
     },
-    coverage: {
-      onboardDate: NOW - 86_400_000,
-      earliest: NOW - 86_000_000,
-      watermark: NOW - 60_000,
-      verifiedUpTo: NOW - 3_600_000,
-      now: NOW,
-    },
     hasHistory: true,
     ...overrides,
   };
@@ -111,6 +104,9 @@ function stubFetch(handlers: Record<string, unknown>) {
 
 beforeEach(() => {
   vi.useFakeTimers({ shouldAdvanceTime: true });
+  // 路由现在是 hash 路由（`#/symbol/X`），而 jsdom 的 window 同一个文件里跨用例复用：
+  // 上一个用例停在详情页的话，下一个用例一挂载就是详情页，而不是首页。
+  window.location.hash = '';
 });
 
 afterEach(() => {
@@ -278,7 +274,18 @@ describe('「开始同步」的分支', () => {
       baseHandlers({
         '/api/overview': overview,
         '/api/symbols': { items: [empty] },
-        '/api/symbols/BTCUSDC/estimate': { symbol: 'BTCUSDC', estimate: { bars: 3_719_360 } },
+        '/api/symbols/BTCUSDC/estimate': {
+          symbol: 'BTCUSDC',
+          estimate: {
+            symbol: 'BTCUSDC',
+            bars: 3_719_360,
+            requests: 2_480,
+            weight: 24_800,
+            estimatedMs: 775_000,
+            from: NOW - 86_400_000,
+            to: NOW,
+          },
+        },
         '/api/symbols/BTCUSDC/start': row('BTCUSDC', { desiredState: 'running' }),
       }),
     );
@@ -290,6 +297,10 @@ describe('「开始同步」的分支', () => {
     // 先出预估弹窗，**还没有**写意图
     await waitFor(() => expect(calls).toContain('/api/symbols/BTCUSDC/estimate'));
     expect(screen.getByText('3,719,360')).toBeTruthy();
+    // 请求数 / 权重 / 耗时都取**服务端**的估算值。曾是页面按 1500 与 1920 自己重算，
+    // 且把「权重 → 毫秒」算成 ×1000（正确是 ×60_000）：77.5 万毫秒的估算被显示成「0 秒」。
+    expect(screen.getByText('2,480 次')).toBeTruthy();
+    expect(screen.getByText(/24,800 · 12\.9 分钟/)).toBeTruthy();
     expect(calls).not.toContain('/api/symbols/BTCUSDC/start');
 
     // 弹窗的确认按钮与行内按钮同名，按 DOM 顺序取最后一个（弹窗在后）。
@@ -324,7 +335,8 @@ describe('「开始同步」的分支', () => {
     // 离线横幅常驻可见
     expect(screen.getByText(/守护进程未运行/)).toBeTruthy();
 
-    fireEvent.click(screen.getByRole('button', { name: '开始同步' }));
+    // 按钮标签本身就写明不会拉数据（R-25.5），不是只在 title 里说
+    fireEvent.click(screen.getByRole('button', { name: '开始同步（不会拉数据）' }));
 
     // 弹解释窗，且**没有**发出 start
     await waitFor(() => expect(screen.getByText(/只是把期望状态写进数据库/)).toBeTruthy());
@@ -376,6 +388,32 @@ describe('行内同步按钮', () => {
 
     expect(screen.getByRole('button', { name: '开始同步' })).toBeTruthy();
   });
+
+  it('守护进程离线时按钮标签本身说明「不会拉数据」（R-25.5 / AC-42）', async () => {
+    // 只改 title 不够：title 要悬停才看得到，行内那一眼仍写着「同步中」而数据一动不动，
+    // 正是 R-24 / R-25 要禁止的界面。
+    stubFetch({
+      '/api/overview': {
+        ...overview,
+        daemon: { ...overview.daemon, state: 'stopped', pid: null, lastBeatAt: null, ageMs: null },
+      },
+      '/api/symbols': { items: [row('BTCUSDC', { desiredState: 'running' })] },
+      '/api/jobs': { items: [] },
+      '/api/exchange': {
+        exchange: 'binance',
+        count: 0,
+        cachedAt: NOW,
+        ageMs: 0,
+        stale: false,
+        symbols: [],
+      },
+    });
+    render(<App />);
+    await waitFor(() => screen.getByText('BTCUSDC'));
+
+    expect(screen.getByRole('button', { name: /守护进程未运行/ })).toBeTruthy();
+    expect(screen.queryByRole('button', { name: /^同步中 · 暂停$/ })).toBeNull();
+  });
 });
 
 describe('守护进程卡片', () => {
@@ -426,5 +464,122 @@ describe('守护进程卡片', () => {
 
     await waitFor(() => expect(screen.getByText('未运行')).toBeTruthy());
     expect(screen.getByText(/守护进程未运行/)).toBeTruthy();
+  });
+});
+
+/**
+ * 详情页里的 K 线（R-23）。
+ *
+ * 这一组要验的是**接线**：选中标的 → 详情里出现 K 线面板 → 真的去 `/bars` 取数。
+ * 组件自己的行为在 CandleChart / PriceChart 的用例里验，这里只看拼装。
+ */
+describe('详情页 K 线', () => {
+  function detailStub(bars: unknown[], detail: SymbolRowDto = row('BTCUSDC')) {
+    return {
+      '/api/overview': overview,
+      '/api/symbols': { items: [detail] },
+      '/api/jobs': { items: [] },
+      '/api/exchange': {
+        exchange: 'binance',
+        count: 1,
+        cachedAt: NOW,
+        ageMs: 0,
+        stale: false,
+        symbols: [
+          {
+            exchange: 'binance',
+            symbol: 'BTCUSDC',
+            contractType: 'PERPETUAL',
+            status: 'TRADING',
+            onboardDate: NOW - 86_400_000,
+          },
+        ],
+      },
+      // 详情与 K 线是两条不同形状的响应：没有各自的 handler，前缀匹配会让
+      // `/api/symbols/BTCUSDC` 拿到列表的 { items }，详情页拿到一个空壳。
+      // v0.2.0：`/bars` 回包带上实际生效的 interval / intervalMs（页面据此换算缺口）
+      '/api/symbols/BTCUSDC/bars': {
+        symbol: 'BTCUSDC',
+        interval: '1m',
+        intervalMs: 60_000,
+        limit: 300,
+        items: bars,
+      },
+      '/api/symbols/BTCUSDC': {
+        ...detail,
+        contract: null,
+        gaps: [],
+        estimate: null,
+        derived: {
+          '15m': { buckets: 3, withheldNotClosed: 0, withheldIncomplete: 0, missingMinutes: 0 },
+          '1h': { buckets: 1, withheldNotClosed: 0, withheldIncomplete: 0, missingMinutes: 0 },
+          '4h': { buckets: 0, withheldNotClosed: 0, withheldIncomplete: 0, missingMinutes: 0 },
+          '1d': { withheldReason: 'disabled' },
+        },
+      },
+    };
+  }
+
+  const bars = Array.from({ length: 4 }, (_, i) => ({
+    time: NOW - (3 - i) * 60_000,
+    open: 100 + i,
+    high: 101 + i,
+    low: 99 + i,
+    close: 100.5 + i,
+    volume: 12,
+  }));
+
+  it('选中已有历史的标的后画出 K 线，并说明数据读自本地库', async () => {
+    const calls = stubFetch(detailStub(bars));
+    render(<App />);
+
+    await waitFor(() => expect(screen.getByText('BTCUSDC')).toBeTruthy());
+    fireEvent.click(screen.getAllByText('BTCUSDC')[0]!);
+
+    await waitFor(() => expect(screen.getByText(/读自本地库/)).toBeTruthy());
+    expect(calls.some((c) => c.startsWith('/api/symbols/BTCUSDC/bars'))).toBe(true);
+    // 周期可切（v0.2.0 R-7.4）
+    expect(screen.getByTitle('切换到 4h')).toBeTruthy();
+    // 区间可切
+    expect(screen.getByTitle(/最近 60 根/)).toBeTruthy();
+  });
+
+  /**
+   * 真实踩过的坑：控制面是**改动前启动的旧进程**，响应里没有 `derived` 字段。
+   * 派生周期表当时裸读 `derived[interval]`，于是一个附加统计面板直接把**整个详情页**
+   * 打挂（`Cannot read properties of undefined`）——连 K 线图都看不到。
+   *
+   * 这里是防线：字段缺失时该表格显示「读取中…」，主内容照常渲染。
+   */
+  it('响应缺少 derived 字段时，详情页照常渲染（附加面板不得弄垮主内容）', async () => {
+    const stub = detailStub(bars);
+    // 刻意删掉 derived，模拟旧进程 / 未迁移 schema
+    const detail = { ...(stub['/api/symbols/BTCUSDC'] as Record<string, unknown>) };
+    delete detail['derived'];
+    stub['/api/symbols/BTCUSDC'] = detail;
+
+    stubFetch(stub);
+    render(<App />);
+    await waitFor(() => expect(screen.getByText('BTCUSDC')).toBeTruthy());
+    fireEvent.click(screen.getAllByText('BTCUSDC')[0]!);
+
+    // 主内容仍在：K 线图与周期切换都要渲染出来
+    await waitFor(() => expect(screen.getByTitle('切换到 4h')).toBeTruthy());
+    expect(screen.getByText(/读自本地库/)).toBeTruthy();
+    // 派生表退化为「读取中…」而不是抛错
+    expect(screen.getAllByText(/读取中/).length).toBeGreaterThan(0);
+  });
+
+  it('库里没有历史的标的：K 线区给可执行的下一步，而不是空图', async () => {
+    const bare = row('BTCUSDC', { hasHistory: false, state: null });
+    stubFetch(detailStub([], bare));
+    render(<App />);
+
+    await waitFor(() => expect(screen.getByText('BTCUSDC')).toBeTruthy());
+    fireEvent.click(screen.getAllByText('BTCUSDC')[0]!);
+
+    // v0.2.0：空状态必须说明原因并给出下一步，文案里带上标的与动作
+    await waitFor(() => expect(screen.getByText(/库里还没有 BTCUSDC 的任何 1m 数据/)).toBeTruthy());
+    expect(screen.getByText(/开始同步后/)).toBeTruthy();
   });
 });

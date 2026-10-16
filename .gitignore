@@ -32,6 +32,9 @@ python/dist/
 **/reports/
 logs/
 *.log
+
+# deploy/build-image.sh 的本地产物（镜像 tar），可能几百 MB，只在搬运时存在。
+dist-deploy/
 .DS_Store
 .idea/
 .vscode/

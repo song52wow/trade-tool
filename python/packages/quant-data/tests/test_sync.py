@@ -16,7 +16,7 @@ from quant_data import pg, sync
 from quant_data.binance import KLINE_LIMIT_MAX, ONE_MINUTE_MS, Kline, align_bar_start
 from quant_data.errors import SyncError
 from quant_data.pg import DbConn
-from quant_data.ratelimit import WINDOW_MS, WeightBudget
+from quant_data.ratelimit import MAX_PAUSE_SECONDS, MAX_RESERVE_WAIT_MS, WINDOW_MS, WeightBudget
 from quant_data.sync import (
     DEFAULT_BATCH_SIZE,
     DEFAULT_GAP_LOOKBACK_MS,
@@ -715,9 +715,11 @@ def test_gap_detection_scan_is_bounded(
     symbol_case: SymbolCase,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """每轮只扫 [min(verified_upto, max(time)-lookback), max(time)]，不随历史线性增长。
+    """每轮只扫 [max(first_bar, max(time) - lookback), max(time)]，不随历史线性增长。
 
     AC-32 的可执行断言：把回看窗口调小后，扫描行数是**常数**，与已入库行数无关。
+    下界刻意**不取** ``verified_upto``（干净同步后它等于 max(time)，窗口会塌缩成一个点，
+    看不见 AC-7 的人为删行）——理由见 ``sync.DEFAULT_GAP_LOOKBACK_MS``。
     """
     now = fixed_now(fake, symbol_case.symbol)
     lookback = 10 * ONE_MINUTE_MS
@@ -1108,6 +1110,18 @@ def test_migrations_are_idempotent(conn: DbConn, pg_dsn: str) -> None:
         "001_init",
         "002_sync_plan",
         "003_daemon_heartbeat",
+        # v0.2.0：四张派生周期表
+        "004_klines_agg",
+        # v0.3.0：七张指标物化表
+        "005_indicators",
+        # v0.4.0：止盈止损执行记录
+        "006_risk_bracket",
+        # v0.5.0：控制面可写的运行期设置
+        "007_executor_settings",
+        # v0.4.0：条件单迁到 Algo Order API 后的列改名（只做重命名）
+        "008_algo_order_ids",
+        # v0.6.0：交易对账的观测快照
+        "009_reconcile_run",
     ]
     pg.ensure_schema(conn)
 
@@ -1495,3 +1509,74 @@ def test_observe_used_weight_only_increases(conn: DbConn) -> None:
     row = conn.execute("SELECT used FROM weight_budget WHERE id = 1").fetchone()
     assert row is not None
     assert int(row["used"]) == 50
+
+
+def test_observe_used_weight_survives_window_rollover(conn: DbConn) -> None:
+    """窗口滚动后回写的观测值必须算进**新窗口**，不能被旧窗口的残留顶掉（R-20.8 / AC-17）。
+
+    时序：本地窗口起点在 2 分钟前、``used`` 还是旧窗口的 999；此时交易所头部报 30——
+    若照旧值只做「只增不减」，30 < 999 就被丢掉，而下一轮 reserve 把 used 归零后，
+    新窗口的账本直接少了这 30。
+    """
+    budget = WeightBudget(conn, 1920)
+    conn.execute(
+        "INSERT INTO weight_budget (id, window_from, used) VALUES (1, %s, 999)"
+        " ON CONFLICT (id) DO UPDATE SET window_from = EXCLUDED.window_from, used = EXCLUDED.used,"
+        " pause_until = NULL",
+        (int(time.time() * 1000) - 2 * WINDOW_MS,),
+    )
+    budget.observe_used_weight(30)
+    row = conn.execute("SELECT window_from, used FROM weight_budget WHERE id = 1").fetchone()
+    assert row is not None
+    assert int(row["used"]) == 30
+    # 窗口起点同时被重新锚定，否则这次写入会在下一次 reserve 时被当成旧窗口残留清掉。
+    assert int(time.time() * 1000) - int(row["window_from"]) < WINDOW_MS
+
+
+def test_register_pause_caps_absurd_retry_after(conn: DbConn) -> None:
+    """418 的 ``Retry-After`` 曾是 44994 秒（12.5 小时），照单全收会把同步彻底停摆。
+
+    故障现场：交易所几分钟后早已解封，本地 ``pause_until`` 却还钉在 12 小时后，
+    且表里没有任何机制会收回它，sync 此后再也发不出一个请求。
+    """
+    now_ms = 1_791_811_845_987
+    budget = WeightBudget(conn, 1920, clock_ms=lambda: now_ms)
+    conn.execute(
+        "INSERT INTO weight_budget (id, window_from, used) VALUES (1, %s, 0)"
+        " ON CONFLICT (id) DO UPDATE SET pause_until = NULL",
+        (now_ms,),
+    )
+    until = budget.register_pause(44994)
+    row = conn.execute("SELECT pause_until FROM weight_budget WHERE id = 1").fetchone()
+    assert row is not None
+    # 落库的是**封顶后**的值，不是交易所给的原值（44994 秒）。
+    assert int(row["pause_until"]) == until
+    assert until == now_ms + MAX_PAUSE_SECONDS * 1000
+
+
+def test_capped_pause_still_lets_reserve_wait_it_out(conn: DbConn) -> None:
+    """封顶值必须落在 ``MAX_RESERVE_WAIT_MS`` 之内，否则暂停期内 ``reserve`` 会立即放弃。
+
+    这是封顶值与等待上限之间那条耦合：取大了，``reserve`` 一进门就超过等待上限，
+    退化成「每轮立即抛 RATE_LIMITED」，仍要等满整个暂停才有机会重来一次。
+    """
+    assert MAX_PAUSE_SECONDS * 1000 < MAX_RESERVE_WAIT_MS
+
+
+def test_register_pause_heals_a_previously_absurd_pause(conn: DbConn) -> None:
+    """一次写坏的存量 ``pause_until`` 必须能被下一次限流拉回合理范围。
+
+    旧的 ``GREATEST`` 写法只许延长：旧值永远压着新值，封顶后再怎么算也改不动它。
+    """
+    now_ms = int(time.time() * 1000)
+    conn.execute(
+        "INSERT INTO weight_budget (id, window_from, used, pause_until) VALUES (1, %s, 0, %s)"
+        " ON CONFLICT (id) DO UPDATE SET pause_until = EXCLUDED.pause_until",
+        (now_ms, now_ms + 44_994_000),
+    )
+    budget = WeightBudget(conn, 1920)
+    until = budget.register_pause(60)
+    row = conn.execute("SELECT pause_until FROM weight_budget WHERE id = 1").fetchone()
+    assert row is not None
+    assert int(row["pause_until"]) == until
+    assert until < now_ms + 44_994_000

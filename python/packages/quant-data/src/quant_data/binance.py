@@ -311,7 +311,7 @@ class BinanceClient:
         return payload
 
     def _observe_used_weight(self, response: HttpResponse) -> None:
-        """把 ``X-MBX-USED-WEIGHT-1M`` 并回全局预算（R-20.4 / AC-17）。
+        """把 ``X-MBX-USED-WEIGHT-1M`` 并回全局预算（R-20.4 / R-20.8 / AC-17）。
 
         这是把本地账本与**账号级**真实用量对齐的唯一信号。头部解析不了就只记一行日志，
         绝不自作猜测地填一个数——观测不到不等于用量为零。

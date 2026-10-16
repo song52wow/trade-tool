@@ -1,9 +1,18 @@
-import type { GapRecord, RemovePolicy } from '@trade-tool/core';
+import type { GapRecord, RemovePolicy, StoredInterval } from '@trade-tool/core';
 
 import type {
+  BarsDto,
+  BracketsDto,
+  CredentialStatusDto,
+  CredentialWriteBody,
   ExchangeListDto,
   JobDto,
   OverviewDto,
+  ReconcileReport,
+  RiskPolicyEntryDto,
+  RiskPolicyScopeDto,
+  RiskPolicyViewDto,
+  RiskPolicyWriteBody,
   SymbolDetailDto,
   SymbolRowDto,
 } from '../../src/types';
@@ -14,6 +23,12 @@ export class ApiError extends Error {
     readonly code: string,
     message: string,
     readonly details?: Record<string, unknown>,
+    /**
+     * HTTP 状态码。与 `code` 分开：`code` 说的是**哪一类**错误，状态码能区分
+     * 「服务端明确拒绝」（4xx 带 code）与「路由根本不存在」（404 且响应体不是本服务的
+     * 错误体）——后者说明连的进程不是这份代码，提示必须不一样。
+     */
+    readonly status?: number,
   ) {
     super(message);
     this.name = 'ApiError';
@@ -22,10 +37,26 @@ export class ApiError extends Error {
 
 const JSON_HEADERS = { 'content-type': 'application/json' };
 
+/**
+ * 错误响应的正文**未必**是 JSON：Hono 对未注册的路由直接回一段纯文本 `404 Not Found`。
+ * 让 `JSON.parse` 在那里抛错，等于把「这个进程没有这条路由」显示成一句
+ * `Unexpected token 'o'`，把真正的原因彻底盖掉。
+ */
+function parseErrorBody(text: string): unknown {
+  if (text === '') return null;
+  try {
+    return JSON.parse(text);
+  } catch {
+    return null;
+  }
+}
+
 async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
   const res = await fetch(path, init);
   const text = await res.text();
-  const payload: unknown = text ? JSON.parse(text) : null;
+  // 成功响应必须是 JSON：解析不了就是服务端违约，让它当场抛出来，而不是悄悄
+  // 当成 null 传下去（AGENTS.md 第 9 条：不静默兜底）。
+  const payload: unknown = res.ok ? (text === '' ? null : JSON.parse(text)) : parseErrorBody(text);
   if (!res.ok) {
     const err = (
       payload as {
@@ -36,6 +67,7 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
       err?.code ?? 'HTTP_ERROR',
       err?.message ?? `${res.status} ${res.statusText}`,
       err?.details,
+      res.status,
     );
   }
   return payload as T;
@@ -52,6 +84,80 @@ export const api = {
   overview: () => request<OverviewDto>('/api/overview'),
   symbols: () => request<{ items: SymbolRowDto[] }>('/api/symbols').then((r) => r.items),
   symbol: (s: string) => request<SymbolDetailDto>(`/api/symbols/${encodeURIComponent(s)}`),
+  /**
+   * 最近 limit 根 1m K 线（升序）。只读本地库，limit 超上限由服务端截断。
+   *
+   * 404 在这里单列，因为它的含义非常具体：路由是在**进程启动时**注册的，所以 404
+   * 几乎总是「正在访问的控制面是改动前的旧进程」——前端已经是新的，后端还没重启。
+   * 这与「库里没数据」（200 + 空数组）完全相反：前者要重启，后者要去同步。报一句
+   * 笼统的 `404 Not Found`，用户根本判断不出该做哪件事。
+   */
+  bars: (s: string, limit: number, interval: StoredInterval = '1m') =>
+    request<BarsDto>(
+      `/api/symbols/${encodeURIComponent(s)}/bars?limit=${String(limit)}&interval=${interval}`,
+    ).catch((error: unknown) => {
+      if (error instanceof ApiError && error.status === 404) {
+        throw new ApiError(
+          'CONTROL_PLANE_STALE',
+          `控制面没有 /bars 路由：它还是改动前启动的旧进程。重启 trade-tool 控制面后刷新页面即可（页面本身已是新的）。`,
+        );
+      }
+      throw error;
+    }),
+  /**
+   * 止盈止损记录（v0.4.0）。纯读本地库，可挂在刷新节奏上。
+   *
+   * 404 在这里**同样单列**：路由在进程启动时注册，404 几乎总是「控制面还是改动前的
+   * 旧进程」，而前端已经是新的——用户看到的是止盈止损区块整个消失，而不是任何错误提示，
+   * 那种静默比报错更难察觉。
+   */
+  brackets: (s: string, limit = 20) =>
+    request<BracketsDto>(
+      `/api/symbols/${encodeURIComponent(s)}/brackets?limit=${String(limit)}`,
+    ).catch((error: unknown) => {
+      if (error instanceof ApiError && error.status === 404) {
+        throw new ApiError(
+          'CONTROL_PLANE_STALE',
+          '控制面没有 /brackets 路由：它还是改动前启动的旧进程。重启 trade-tool 控制面后刷新页面即可。',
+        );
+      }
+      throw error;
+    }),
+  /**
+   * 最近一次**自动**对账快照（全账户范围）。纯读本地表，由 executor 写入，
+   * 因此可以跟着刷新节奏走。从没跑过时服务端返回 `report: null`，
+   * 页面据此显示「还没有自动对账记录」——不能拿空报告冒充「一致」。
+   *
+   * 404 单列成「控制面还是旧进程」：路由在启动时注册，不重启就看不到它。
+   */
+  latestReconcile: () =>
+    request<{ report: ReconcileReport | null }>('/api/reconcile/latest').catch((error: unknown) => {
+      if (error instanceof ApiError && error.status === 404) {
+        throw new ApiError(
+          'CONTROL_PLANE_STALE',
+          '控制面没有 /reconcile/latest 路由：它还是改动前启动的旧进程。重启 trade-tool 控制面后刷新页面即可。',
+        );
+      }
+      throw error;
+    }),
+  /**
+   * 立刻手动对账一次（出网、签名、消耗权重），并覆盖最近一次自动快照。
+   *
+   * 与 `latestReconcile` 的性质不同：那条只读本地表，这条要现花交易所请求。
+   * 404 同样单列成旧进程提示。
+   */
+  reconcile: (s: string) =>
+    request<ReconcileReport>(`/api/symbols/${encodeURIComponent(s)}/reconcile`).catch(
+      (error: unknown) => {
+        if (error instanceof ApiError && error.status === 404) {
+          throw new ApiError(
+            'CONTROL_PLANE_STALE',
+            '控制面没有 /reconcile 路由：它还是改动前启动的旧进程。重启 trade-tool 控制面后刷新页面即可。',
+          );
+        }
+        throw error;
+      },
+    ),
   exchange: (refresh = false) =>
     request<ExchangeListDto>(`/api/exchange${refresh ? '?refresh=true' : ''}`),
   addSymbol: (symbol: string) => post<SymbolRowDto>('/api/symbols', { symbol }),
@@ -75,5 +181,59 @@ export const api = {
     post<JobDto>(`/api/symbols/${encodeURIComponent(symbol)}/full`, { target }),
   startVerify: (symbol: string) =>
     post<JobDto>(`/api/symbols/${encodeURIComponent(symbol)}/verify`, { target: null }),
+  /**
+   * 重建派生 K 线（v0.2.0 R-7.6）。
+   *
+   * 走的是长任务通道：重建是几十分钟量级，HTTP 绝不能挂在原地等（202 + job id）。
+   *
+   * **刻意不传 target**（与 `verify` 一致）。作业进度读的是 `sync_state.rows`，
+   * 而重建**不改 sync_state**（R-5.4）——把它同时当分子和分母，进度条会全程钉在
+   * 100%：一边显示「已完成」一边还在跑，正是 R-7.6 禁止的假进度。读不到真实进度
+   * 就如实不显示（页面显示「—」），而不是编一个百分比。
+   */
+  startAggregate: (symbol: string) =>
+    post<JobDto>(`/api/symbols/${encodeURIComponent(symbol)}/aggregate`, { target: null }),
   jobs: () => request<{ items: JobDto[] }>('/api/jobs').then((r) => r.items),
+
+  // ------------------------------------------------- 运行期设置（v0.5.0）
+  //
+  // 凭据这条线**没有读取明文的能力**，前端也不许假装有：`credentialStatus` 的回包里
+  // 只有 configured / hint（末 4 位）/ updatedAt / masterKeyReady。所以页面永远不要
+  // 试图把密钥回填进输入框——它手上根本没有这个值。
+
+  credentialStatus: () => request<CredentialStatusDto>('/api/settings/credentials'),
+  /** 回包仍是状态而非凭据：提交上去的东西不会（也不可能）被回显。 */
+  writeCredentials: (body: CredentialWriteBody) =>
+    request<CredentialStatusDto>('/api/settings/credentials', {
+      method: 'PUT',
+      headers: JSON_HEADERS,
+      body: JSON.stringify(body),
+    }),
+  clearCredentials: () =>
+    request<CredentialStatusDto>('/api/settings/credentials', { method: 'DELETE' }),
+
+  /**
+   * 策略总览。`symbol` 省略时 `resolved` 按全局默认算——设置页在还没选标的时也要能显示
+   * 生效值，而不是「等选了标的才有话说」。
+   */
+  riskPolicy: (symbol?: string) =>
+    request<RiskPolicyViewDto>(
+      symbol === undefined
+        ? '/api/settings/risk-policy'
+        : `/api/settings/risk-policy?symbol=${encodeURIComponent(symbol)}`,
+    ),
+  putRiskPolicy: (body: RiskPolicyWriteBody) =>
+    request<RiskPolicyEntryDto>('/api/settings/risk-policy', {
+      method: 'PUT',
+      headers: JSON_HEADERS,
+      body: JSON.stringify(body),
+    }),
+  /** 作用域与标的都走 query：作用域缺失时服务端会 CONFIG_INVALID，不做默认猜测。 */
+  deleteRiskPolicy: (scope: RiskPolicyScopeDto, symbol?: string) =>
+    request<{ ok: boolean }>(
+      `/api/settings/risk-policy?scope=${scope}${
+        symbol === undefined ? '' : `&symbol=${encodeURIComponent(symbol)}`
+      }`,
+      { method: 'DELETE' },
+    ),
 };

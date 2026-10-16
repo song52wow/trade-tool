@@ -1,0 +1,42 @@
+# 构建上下文裁剪。镜像只需要源码与锁文件。
+# 排掉本机状态（.local/、.env）与构建产物：它们既大又会覆盖镜像里装好的依赖。
+.git
+.github
+node_modules
+**/node_modules
+.turbo
+**/dist
+**/*.tsbuildinfo
+.local
+.env
+.env.*
+!.env.example
+logs
+**/logs
+**/data/cache
+**/data/raw
+**/data/meta
+**/reports
+**/__pycache__
+**/.pytest_cache
+**/.mypy_cache
+**/.ruff_cache
+python/.venv
+# 文档不进镜像：改 README / AGENTS 不该让 `COPY . /app` 缓存失效、重装一遍依赖。
+# 注意 python/packages/*/pyproject.toml 的 readme 指向各自的 README.md，因此只排根目录
+# 与 docs/，Python 包自己的 README 必须留在上下文里。
+/README.md
+/AGENTS.md
+/docs
+# deploy/ 只有 entrypoint.sh 需要进镜像（Dockerfile 显式 COPY 它），
+# 其余是部署编排与文档，运行期从 /data 读配置，不在镜像里。
+deploy/README.md
+deploy/compose.yaml
+deploy/.env.example
+deploy/config
+deploy/build-image.sh
+
+# 排除 Dockerfile 与 .dockerignore 自身：改这两份文件时，`COPY . /app` 的缓存
+# 不会失效，重建只重跑尾部几层（否则每次改注释都要重装一遍依赖）。
+deploy/Dockerfile
+.dockerignore

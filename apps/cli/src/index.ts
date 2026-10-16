@@ -6,14 +6,17 @@ import { runBacktestCommand } from './commands/backtest.js';
 import { initConfig, showConfig } from './commands/config.js';
 import {
   fetchBars,
+  runAggregate,
   runBackfill,
   runGaps,
+  runIndicators,
   runSync,
   runSymbols,
   runVerify,
   summarize,
 } from './commands/data.js';
 import { runDbStatus, runMigrate } from './commands/db.js';
+import { runReconcile } from './commands/reconcile.js';
 import { runSyncStatus } from './commands/sync.js';
 import { collectDiagnostics } from './doctor.js';
 
@@ -214,6 +217,66 @@ dataCmd
   });
 
 dataCmd
+  .command('aggregate')
+  .description('由库内 1m 派生 / 重建 / 校验 15m / 1h / 4h / 1d')
+  .requiredOption('-s, --symbol <symbol>')
+  .option('--intervals <list>', '逗号分隔；缺省取 data.aggregateIntervals')
+  .option('--from <ms>', '区间起点，缺省 min(time)')
+  .option('--to <ms>', '区间终点，缺省 max(time)')
+  .option('--rebuild', '先删后算（修复 1m 被改动 / 派生被篡改）')
+  .option('--check', '只读校验：报出 stale / missing / mismatch')
+  .option('--json', '输出 JSON')
+  .action(
+    async (options: {
+      symbol: string;
+      intervals?: string;
+      specs?: string;
+      from?: string;
+      to?: string;
+      rebuild?: boolean;
+      check?: boolean;
+      json?: boolean;
+    }) => {
+      process.exitCode = await runAggregate(options).catch((error: unknown) => {
+        fail(error);
+        return 1;
+      });
+    },
+  );
+
+dataCmd
+  .command('indicators')
+  .description('由库内已收盘的派生 K 线物化技术指标（补齐 / --rebuild / --check）')
+  .requiredOption('-s, --symbol <symbol>')
+  .option('--intervals <list>', '逗号分隔；缺省取 data.indicatorIntervals（不含 1m）')
+  .option(
+    '--indicator-specs <specs>',
+    '要物化的参数集 JSON，缺省取 data.indicatorSpecs。例：\'{"rsi":[{"period":7}]}\'',
+  )
+  .option('--from <ms>', '区间起点，缺省 min(time)')
+  .option('--to <ms>', '区间终点，缺省 max(time)')
+  .option('--rebuild', '先删后算（修复 K 线被改动 / 指标被篡改 / impl_version 已递增）')
+  .option('--check', '只读校验：报出 stale / missing / mismatch / 混版')
+  .option('--json', '输出 JSON')
+  .action(
+    async (options: {
+      symbol: string;
+      intervals?: string;
+      specs?: string;
+      from?: string;
+      to?: string;
+      rebuild?: boolean;
+      check?: boolean;
+      json?: boolean;
+    }) => {
+      process.exitCode = await runIndicators(options).catch((error: unknown) => {
+        fail(error);
+        return 1;
+      });
+    },
+  );
+
+dataCmd
   .command('symbols')
   .description('运行时列出可同步标的')
   .option('--source <source>', '默认 binance')
@@ -234,6 +297,18 @@ syncCmd
   .option('--json', '输出 JSON')
   .action(async (options: { symbol?: string; json?: boolean }) => {
     process.exitCode = await runSyncStatus(options).catch((error: unknown) => {
+      fail(error);
+      return 1;
+    });
+  });
+
+program
+  .command('reconcile')
+  .description('交易对账：交易所真实持仓/挂单 vs 本地止盈止损记录（只报告，不改动）')
+  .option('-s, --symbol <symbol>', '只对单个标的；缺省全账户')
+  .option('--json', '输出 JSON')
+  .action(async (options: { symbol?: string; json?: boolean }) => {
+    process.exitCode = await runReconcile(options).catch((error: unknown) => {
       fail(error);
       return 1;
     });

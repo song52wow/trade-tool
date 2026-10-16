@@ -10,6 +10,7 @@ import {
   pendingGapCount,
   readBars,
   readGlobalSummary,
+  readLatestBars,
   readState,
   readWeightBudget,
   deleteDaemonHeartbeat,
@@ -408,5 +409,70 @@ describe('守护进程心跳（控制面据它回答「有人在干活吗」）'
 
   it('删除不存在的行不报错（幂等，stop 路径不能因此失败）', async () => {
     await expect(deleteDaemonHeartbeat(ctx.pool, EX)).resolves.toBeUndefined();
+  });
+});
+
+/**
+ * `readLatestBars`：控制面 K 线图的取数（R-23）。
+ *
+ * 单独一组是因为它有一条容易被忽略的语义：对外**一律升序**，但取的是**最后 N 根**。
+ * 弄反任何一个，图上就会出现「最新数据在最左边」或者「拿到的是最早那段」。
+ */
+describe('最近 N 根 K 线（readLatestBars，R-23）', () => {
+  let ctx: TestSchema;
+
+  beforeAll(async () => {
+    ctx = await createTestSchema('latest');
+  });
+  afterAll(async () => {
+    await ctx.close();
+  });
+
+  it('给 limit 时取的是**最后** N 根，且按时间升序返回', async () => {
+    const times = barTimes(BASE, 10);
+    await insertBars(ctx.pool, 'TAIL', times);
+
+    const got = await readLatestBars(ctx.pool, 'TAIL', { limit: 3 });
+    expect(got.map((b) => b.time)).toEqual(times.slice(-3));
+    // 升序：图表与导出都按时间正序消费，倒序返回会让调用方各自再翻一次
+    expect(got.map((b) => b.time)).toEqual([...got.map((b) => b.time)].sort((a, b) => a - b));
+  });
+
+  it('与 readBars 的区别正是「最早 vs 最新」，同一区间两者互补', async () => {
+    const times = barTimes(BASE, 10);
+    await insertBars(ctx.pool, 'BOTH', times);
+
+    const earliest = await readBars(ctx.pool, 'BOTH', { limit: 3 });
+    const latest = await readLatestBars(ctx.pool, 'BOTH', { limit: 3 });
+    expect(earliest.map((b) => b.time)).toEqual(times.slice(0, 3));
+    expect(latest.map((b) => b.time)).toEqual(times.slice(-3));
+  });
+
+  it('`to` 是闭区间上界：不晚于它的才算数', async () => {
+    const times = barTimes(BASE, 10);
+    await insertBars(ctx.pool, 'CUT', times);
+
+    const got = await readLatestBars(ctx.pool, 'CUT', { limit: 100, to: times[4]! });
+    expect(got.map((b) => b.time)).toEqual(times.slice(0, 5));
+  });
+
+  it('limit 大于行数时返回全部，不报错也不补空行', async () => {
+    const times = barTimes(BASE, 4);
+    await insertBars(ctx.pool, 'FEW', times);
+
+    const got = await readLatestBars(ctx.pool, 'FEW', { limit: 10_000 });
+    expect(got).toHaveLength(4);
+  });
+
+  it('从没有同步过的标的读出空数组（不是错误，调用方据此显示空状态）', async () => {
+    await expect(readLatestBars(ctx.pool, 'NEVER', { limit: 10 })).resolves.toEqual([]);
+  });
+
+  it('只读本标的：不同标的的行互不串味（跨标的通用性 R-5）', async () => {
+    await insertBars(ctx.pool, 'MINE', barTimes(BASE, 3));
+    await insertBars(ctx.pool, 'OTHER', barTimes(BASE + 10 * 60_000, 7));
+
+    const got = await readLatestBars(ctx.pool, 'MINE', { limit: 10 });
+    expect(got).toHaveLength(3);
   });
 });

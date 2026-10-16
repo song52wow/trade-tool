@@ -29,6 +29,10 @@ function harness(overrides: Partial<JobRunnerOptions> = {}): {
       calls.push(`runVerify:${symbol}`);
       return { scanned: 10 };
     },
+    runAggregate: async (symbol) => {
+      calls.push(`runAggregate:${symbol}`);
+      return { upserted: 5 };
+    },
     readProgress: async () => ({ rows: 42, pendingGaps: 1 }),
     isDaemonOwned: async () => false,
     now: () => T0,

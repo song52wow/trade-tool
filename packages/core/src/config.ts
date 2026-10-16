@@ -1,5 +1,6 @@
 import { z } from 'zod';
 
+import { EXCHANGE_ENVIRONMENTS } from './exchange-endpoints.js';
 import { INTERVALS } from './types.js';
 
 export const marketSchema = z.object({
@@ -54,6 +55,104 @@ export const dataSchema = z.object({
   batchSize: z.number().int().positive().max(100_000).default(5_000),
   /** 缺口自动回补的尝试次数上限（R-11.9），达上限后该标的进 error */
   maxGapAttempts: z.number().int().positive().default(5),
+  /**
+   * 启用哪些派生周期（v0.2.0 R-9.1）。
+   *
+   * 只接受 `15m / 1h / 4h / 1d` 的任意子集；**出现 `1m` / `5m` / 其它一律 CONFIG_INVALID**
+   * （`1m` 是基础数据不是派生目标，`5m` 本期未实现）。`[]` = **显式关闭派生**——
+   * 那是给「聚合故障、但 1m 同步还要继续」准备的开关（R-4.6），不是运行时静默跳过：
+   * 关闭状态必须从 `sync status` / 控制面看得见（R-8.4 / AC-22）。
+   *
+   * 缺省值必须与 `sql/004_klines_agg.sql` 里的表集合一致，由 AC-1 的测试守住。
+   *
+   * **不提供**「放宽覆盖判据」「写半截桶」这类开关：未收盘、未全覆盖的桶一律不写
+   * （R-3），没有例外。
+   */
+  aggregateIntervals: z.array(z.enum(['15m', '1h', '4h', '1d'])).default(['15m', '1h', '4h', '1d']),
+  /**
+   * 补齐 / `--rebuild` 的分批大小（v0.2.0 R-5.3），keyset 分页、每批一个事务。
+   * 绝不能把整段历史一次聚合：首次全量下 1d 桶虽少，但 15m 桶有几十万，
+   * 单事务会把 WAL 与锁持有时间推到不可接受。
+   */
+  aggregateBatchBars: z.number().int().positive().max(1_000_000).default(20_000),
+  /**
+   * 启用哪些**指标周期**（v0.3.0 R-9.5）。
+   *
+   * 只接受 `15m / 1h / 4h / 1d` 的任意子集；**出现 `1m` / `5m` / 其它一律 CONFIG_INVALID**。
+   * `1m` 不做指标物化是**容量结论**不是疏漏：单标的 1m 约 320 万行 × 缺省 10 个行集
+   * 约 4.3 GB/标的，而四个高周期合计约 386 MB/标的（N-2 / 附录 B.3）。
+   * `[]` = **显式关闭指标周期**，状态里会如实显示「未启用指标」。
+   *
+   * **不提供**「放宽」的开关：想看别的周期请先在派生层加表。
+   */
+  indicatorIntervals: z.array(z.enum(['15m', '1h', '4h', '1d'])).default(['15m', '1h', '4h', '1d']),
+  /**
+   * 要物化的「指标 × 参数集」集合（v0.3.0 R-12.1）。
+   *
+   * **参数是数据不是 schema**：把 `ma` 的窗口 5 改成 30、或加一组 `MACD(8,17,9)`，
+   * 都是「插新行、零 DDL」。因此这里刻意允许任意正整数窗口，不做枚举、不做 schema 校验。
+   *
+   * `kMilli` 是 BOLL 的 k 的**千分之一整数**（`2000` 表示 `k = 2.0`）：浮点参数不得进
+   * 主键，否则会有浮点相等性问题（R-3.2）。它是唯一允许 `0` 的参数（`k = 0` 时三轨重合）。
+   *
+   * **`{}`（全部为空对象）= 显式关闭指标层**——那是合法配置，用于「指标层故障、
+   * 但 1m 同步还要继续」。关闭状态必须从 `sync status` 与控制面**看得见**
+   * （R-11.4 / AC-23），而不是显示 0 行让人以为「还没算」。
+   *
+   * **缺省值就是 `{}`（关闭）**：指标物化挂在 1m 的每批写入出口上（R-5.1），一轮
+   * 43k 根的首次全量被切成 216 批，同一批指标于是被 `216 × 4 × 7` 重写一遍。实测
+   * 指标占单轮同步耗时的 **72%**（`sync-integration` 698s → 301s），而目前**没有任何
+   * 消费方读这些表**：止盈止损的 ATR 走 `quant_data.risk` 直接读派生 K 线
+   * （`ATR_TABLES` 里没有 `indicator_atr`），回测只消费 `quant_core` 的指标序列。
+   * 因此**默认不物化**；要看得显式写出参数集（见 `.env.example` 的注释）。
+   *
+   * 打开时参数集要与 `sql/005_indicators.sql` 的表集合一致，由 AC-2 的测试守住。
+   */
+  indicatorSpecs: z
+    .object({
+      ma: z
+        .array(
+          z.object({
+            kind: z.enum(['sma', 'ema']).default('sma'),
+            window: z.number().int().positive(),
+          }),
+        )
+        .default([]),
+      macd: z
+        .array(
+          z.object({
+            fast: z.number().int().positive(),
+            slow: z.number().int().positive(),
+            signal: z.number().int().positive(),
+          }),
+        )
+        .default([]),
+      rsi: z.array(z.object({ period: z.number().int().positive() })).default([]),
+      boll: z
+        .array(
+          z.object({ period: z.number().int().positive(), kMilli: z.number().int().nonnegative() }),
+        )
+        .default([]),
+      kdj: z
+        .array(
+          z.object({
+            n: z.number().int().positive(),
+            kPeriod: z.number().int().positive(),
+            dPeriod: z.number().int().positive(),
+          }),
+        )
+        .default([]),
+      atr: z.array(z.object({ period: z.number().int().positive() })).default([]),
+      obv: z.array(z.object({})).default([]),
+    })
+    // 缺省关闭指标层：见上面 indicatorSpecs 的注释（实测占单轮同步 72% 且无消费方）。
+    .default({}),
+  /**
+   * 指标补齐 / `--rebuild` 的分批大小（v0.3.0 R-6.3），每批一个事务。
+   * 单位是**派生 bar 数**而不是时间：按时间推进会让数据稀疏的标的（大量缺口 → 大量
+   * 短段）永远达不到批大小而**死循环**。
+   */
+  indicatorBatchBars: z.number().int().positive().max(1_000_000).default(20_000),
 });
 
 /**
@@ -125,8 +224,84 @@ export const syncSchema = z.object({
   maxConsecutiveErrors: z.number().int().positive().default(5),
   /** removeSymbol 时已入库数据的处置策略 */
   onRemove: removePolicySchema.default('keep'),
-  /** 是否允许执行首次全量回补；false 时新增标的仍为 paused（R-8.4） */
-  allowBackfill: z.boolean().default(true),
+});
+
+/**
+ * 止盈止损执行服务配置（v0.4.0 `executor` 段）。
+ *
+ * 每一项都会变成**真实的平仓指令**，因此默认值取保守的一侧：
+ *   * `enabled` 缺省 **false**——服务会真实下单，不该因为「装了包」就在跑；
+ *   * `workingType` 缺省 `MARK_PRICE`（标记价触发，抗插针）；最新成交价一根针就能
+ *     把止损扫掉；
+ *   * `onPartialFill` 缺省 `ignore`：部分成交就按均价重算一次，等于让止损位在
+ *     建仓过程中被改写两次——要在部分成交上也保护，必须显式打开。
+ */
+export const executorSchema = z.object({
+  enabled: z.boolean().default(false),
+  /** ATR 周期长度。 */
+  atrPeriod: z.number().int().positive().max(200).default(14),
+  /** 算 ATR 的周期。`5m` / `2h` 等未实现周期由解析层报错，**不回落**到 1m。 */
+  atrInterval: z.enum(['1m', '15m', '1h', '4h', '1d']).default('1m'),
+  /** 参与计算的连续 K 根数上限。 */
+  atrWindowBars: z.number().int().positive().max(5_000).default(240),
+  /** 止损 = 入场价 ∓ 该倍数 × ATR。 */
+  stopAtrMult: z.number().positive().max(20).default(2),
+  /** 止盈 = 入场价 ± 该倍数 × ATR。 */
+  takeProfitAtrMult: z.number().positive().max(50).default(3),
+  /** 只服务这些标的；空数组 = 全部（**含库里出现但集合外的标的**）。 */
+  symbols: z.array(z.string().min(1)).default([]),
+  /** 买入成交只部分成交时怎么办。`ignore` = 等它全成交再设一次止盈止损。 */
+  onPartialFill: z.enum(['ignore', 'accumulate']).default('ignore'),
+  workingType: z.enum(['MARK_PRICE', 'CONTRACT_PRICE']).default('MARK_PRICE'),
+  /** 触发保护：标记价与最新价偏离过大时暂停触发。 */
+  priceProtect: z.boolean().default(true),
+  /** 单笔买入成交的成交金额上限（quote 计），超过则跳过并报错。0 = 不限。 */
+  maxEntryNotional: z.number().min(0).default(0),
+  /** 私钥的**环境变量名**。配置文件里不写密钥本身。 */
+  apiKeyEnv: z.string().min(1).default('TRADE_TOOL_BINANCE_API_KEY'),
+  apiSecretEnv: z.string().min(1).default('TRADE_TOOL_BINANCE_API_SECRET'),
+  /**
+   * 请求时间戳容忍窗口（毫秒）。
+   *
+   * ⚠️ **它挡不住本机时钟不准**。本仓库实测（2026-10-16，demo 端点）：
+   * `recvWindow` 取 5000 / 15000 / 60000 三档，报的都是同一句
+   * `Timestamp ... was 1000ms ahead of the server's time`——端点对未来时间戳的
+   * 容差是硬的 ~1000ms，调大这个参数没有用。
+   *
+   * 时钟偏差由 `packages/core/src/clock-skew.ts` 在进程启动时测量并补偿，
+   * 那个才是真正起作用的地方；这里保留是给**网络延迟**留的余量。
+   */
+  recvWindowMs: z.number().int().positive().max(60_000).default(5_000),
+  /** 重连退避：初始 / 上限。断线必须重连，否则服务会「看起来在跑」而实际不再设单。 */
+  reconnectBaseMs: z.number().int().positive().default(2_000),
+  reconnectMaxMs: z.number().int().positive().default(60_000),
+  /**
+   * 交易对账的周期（毫秒）。**0 = 关闭自动对账**，只留 CLI / 控制面手动触发。
+   *
+   * 为什么默认开着：止盈止损的「单已挂上、单号没回填」只在崩溃那一瞬间发生，
+   * 迟到几小时再查也来得及；但**在交易所 App 上手动开的仓**是持续形成的漂移，
+   * 只靠人想起来跑一次命令等于没有对账。
+   *
+   * 默认 5 分钟的依据是权重：全账户一次 `positionRisk`（5）+ 一次
+   * `openAlgoOrders`（40）= 45 权重，折合 9 权重/分钟，相对限频可以忽略。
+   * 逐标的跑反而更贵（每标的 6），因此默认全账户。
+   */
+  reconcileIntervalMs: z
+    .number()
+    .int()
+    .min(0)
+    .default(5 * 60_000),
+  /**
+   * 交易所环境：`live` 主网 / `demo` Binance Demo Trading（`demo.binance.com`）。
+   *
+   * 它**同时**决定 REST 基址与用户数据流地址（`resolveExchangeEndpoints`），不是两个
+   * 各自独立的开关——只改一个就会复现「下单进沙箱、成交事件从主网来、于是永远等不到
+   * 挂单」这个静默分叉。
+   *
+   * 缺省 `live`。它是会**真实下单**的开关之一，改成 `demo` 时应当清楚：这是让本地
+   * 跑在虚拟资金上，不是把生产环境改成安全的。
+   */
+  environment: z.enum(EXCHANGE_ENVIRONMENTS).default('live'),
 });
 
 export const configSchema = z.object({
@@ -137,6 +312,7 @@ export const configSchema = z.object({
   data: dataSchema.default({}),
   database: databaseSchema.default({}),
   sync: syncSchema.default({}),
+  executor: executorSchema.default({}),
 });
 
 export type MarketConfig = z.infer<typeof marketSchema>;
@@ -144,6 +320,7 @@ export type BacktestConfig = z.infer<typeof backtestSchema>;
 export type DataConfig = z.infer<typeof dataSchema>;
 export type DatabaseConfig = z.infer<typeof databaseSchema>;
 export type SyncConfig = z.infer<typeof syncSchema>;
+export type ExecutorConfig = z.infer<typeof executorSchema>;
 // 注意：`RemovePolicy` 这个类型名归 market-sync.ts 所有，config 只导出 zod schema，
 // 避免同一概念在两个模块各有一个类型名。
 export type RemovePolicySchema = z.infer<typeof removePolicySchema>;

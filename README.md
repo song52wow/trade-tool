@@ -6,17 +6,18 @@
 trade-tool/
 ├── apps/
 │   ├── cli/                     @trade-tool/cli        命令行入口（一次性命令）
-│   └── sync/                    @trade-tool/sync       常驻同步守护进程 + 控制原语
+│   ├── sync/                    @trade-tool/sync       常驻同步守护进程 + 控制原语
+│   ├── web/                     @trade-tool/web        控制面：HTTP API + 看板（直接 import 原语）
+│   └── executor/                @trade-tool/executor   止盈止损：成交 → 净仓位 → ATR → 条件单（会真实下单）
 ├── packages/
 │   ├── tsconfig/                @trade-tool/tsconfig   共享 tsconfig 预设
-│   ├── core/                    @trade-tool/core       领域模型 / 配置 / 策略接口
-│   ├── data/                    @trade-tool/data       PG 客户端 + 迁移 + 查询层 + Python 桥接
-│   └── backtest/                @trade-tool/backtest   回测编排 + 绩效指标
+│   ├── core/                    @trade-tool/core       领域模型 / 配置 / 错误码（**无指标实现**）
+│   └── data/                    @trade-tool/data       PG 客户端 + 迁移 + 查询层 + Python 桥接
 ├── python/                      uv workspace（根）
 │   └── packages/
-│       ├── quant-core/          数据结构 + 指标
-│       ├── quant-data/          行情网络层 + 增量续传 + PG 批量写入（TS 桥接目标）
-│       └── quant-backtest/      Python 侧回测与绩效
+│       ├── quant-core/          数据结构 + **7 组技术指标的唯一实现**
+│       ├── quant-data/          行情网络层 + 增量续传 + 派生聚合 + 指标物化 + PG 批量写入 + risk-atr
+│       └── quant-backtest/      **唯一的回测实现**（信号 t 收盘确认、成交 t+1 开盘）
 ├── packages/data/sql/           版本化数据库迁移（schema 的唯一来源）
 ├── pnpm-workspace.yaml          TS 侧 workspace + 构建脚本白名单
 ├── turbo.json                   任务编排与缓存
@@ -26,16 +27,19 @@ trade-tool/
 ## 依赖方向
 
 ```
-apps/cli ──┬─> packages/backtest ──> packages/core
-           └─> packages/data ───────> packages/core
+apps/cli ─────> packages/data ───────> packages/core
 apps/sync ────> packages/data ───────> packages/core
+apps/web ─────> packages/sync ───────> packages/data ──> packages/core
+apps/executor ─> packages/data ───────> packages/core
                       │
                       └─(唯一跨语言接缝: python -m quant_data)─> python/quant-*
 ```
 
 规则：`core` 不依赖任何 workspace 包；包之间只依赖 `core`；跨语言只允许从 `packages/data` 出去；
-`apps/sync` **不得**绕过 `packages/data` 直接连 PG 写入。
-`apps/cli` 与 `apps/sync` 是**两个独立入口**，彼此不依赖（CLI 只读 `sync status`，不改生命周期）。
+`apps/sync` 与 `apps/web` **不得**绕过 `packages/data` 直接连 PG 读写。
+`apps/cli`、`apps/sync`、`apps/web`、`apps/executor` 是**四个独立入口**：CLI 只读 `sync status`、
+不改生命周期；控制面只写 `desired_state`（先落库再生效），真正拉数据的始终是 `apps/sync`
+守护进程；`apps/executor` 只做止盈止损，不碰行情同步的生命周期。
 
 ## 环境要求
 
@@ -80,13 +84,122 @@ pnpm --filter @trade-tool/cli start -- backtest -b 500
 ```
 
 行情缓存在 `$TRADE_TOOL_HOME/data/cache/`，回测报告在 `$TRADE_TOOL_HOME/reports/`。
-K 线本体存在 PostgreSQL 的 `klines_1m` 表里。
+K 线本体存在 PostgreSQL 的 `klines_1m` 表里；`15m` / `1h` / `4h` / `1d` 由它**本地派生**
+（随同步自动增量，不向交易所取高周期接口），只写「已收盘且 1m 全覆盖」的桶——桶内缺一根
+就不写，图上留白而不是画一根半截蜡烛。手动补齐 / 重建 / 校验走：
+
+```bash
+pnpm --filter @trade-tool/cli start -- data aggregate -s <SYMBOL>            # 补齐
+pnpm --filter @trade-tool/cli start -- data aggregate -s <SYMBOL> --rebuild  # 先删后算
+pnpm --filter @trade-tool/cli start -- data aggregate -s <SYMBOL> --check    # 只读校验
+```
+
+7 组技术指标（MA / MACD / RSI / BOLL / KDJ / ATR / OBV）由**库内已收盘的派生 K 线**
+派生，**唯一的实现**在 `python/packages/quant-core`。参数是数据不是表结构——改窗口、
+加一组参数集都只是插新行、零迁移；预热期**不落库**，因此库里每一行都是有效值。
+
+**这层默认关闭**（`data.indicatorSpecs` 缺省 `{}`）。物化挂在 1m 的每批写入出口上，
+一轮首次全量会把同一批指标重写几百遍——实测占单轮同步 **72%** 的耗时（见 AGENTS.md §6.2）。
+默认配置下没有任何消费方读这些表：止盈止损的 ATR 直接读派生 K 线，回测只消费
+`quant_core` 的公式。要看得显式写出参数集，再用 CLI 补齐 / 校验：
+
+```bash
+pnpm --filter @trade-tool/cli start -- data indicators -s <SYMBOL>            # 补齐
+pnpm --filter @trade-tool/cli start -- data indicators -s <SYMBOL> --rebuild  # 先删后算
+pnpm --filter @trade-tool/cli start -- data indicators -s <SYMBOL> --check    # 只读校验
+```
+
+两处口径值得记住（实现见 `quant_core/indicators.py`）：**MACD 柱取 `DIF − DEA`**
+（国际口径；国内软件的 `2×(DIF−DEA)` 请读侧自行 ×2），**KDJ 横盘时 `RSV = 50`**
+（分母为 0 时没有信息，取中性点而不是产生 `NaN`）。
+
+回测的实现同样全部在 Python 侧。成交模型是**信号在 `t` 收盘确认、成交在 `t+1` 开盘**
+——改动前是「看到本根收盘价、又以本根收盘价成交」，那是一个可复现的未来函数。
+因此**回测报告里的数字会有意变化**；命令行的参数、报告文件路径与命名、stdout 格式、
+`--json` 与退出码全部不变。
+
+## 止盈止损（`apps/executor`，v0.4.0）
+
+监听 Binance U 本位永续的成交事件，按**净仓位**判定开仓（BUY 开多 / SELL 开空），
+在成交时刻算 ATR(14)，用对称倍数换算成止盈止损，并交给交易所挂着：
+
+```
+SL = 入场价 − stopAtrMult × ATR        （缺省 2 倍）
+TP = 入场价 + takeProfitAtrMult × ATR   （缺省 3 倍）
+```
+
+ATR 来自**本地库已收盘的连续 K 线**（`python -m quant_data risk-atr`），因此这一层不出网、
+不吃交易所配额；库里数据不够就报 `RISK_ATR_UNAVAILABLE` 并**拒绝下单**，绝不换周期或用 0
+顶替——止损位等于入场价就是当场平仓。两张单都朝**远离入场价**的方向对齐到标的的最小
+价格变动：按四舍五入把止损往入场价挪半个 tick，就足以让「2×ATR 的止损」实际更近。
+
+Binance U 本位**没有单请求 OCO**（`/fapi/v1/order/oco` 已下架），因此这里挂的是
+`TAKE_PROFIT_MARKET` + `STOP_MARKET`（都带 `closePosition=true`）：仓位平掉后剩余那张
+**由交易所自动撤销**，本地不轮询、不盯市。顺序是先止盈后止损，且第二张没挂上就撤掉第一张——
+留一张有止盈没止损的单，比什么都不挂更危险。
+
+```bash
+pnpm --filter @trade-tool/executor start   # 需 executor.enabled = true（会真实下单）
+```
+
+幂等靠 `risk_bracket` 表的主键 `(exchange, symbol, entry_order_id)`：**先占坑再动手**，
+冲突即说明这笔成交已处理过（用户数据流会重放事件，而止盈止损是真的会下单）。
+细节见 `apps/executor/README.md`。
+
+## 交易对账（v0.6.0）
+
+止盈止损只有写入侧：占坑在 PG、下单在交易所，两者无法原子提交。进程死在中间是必然的
+——单挂上了而单号没回填，或本地记着 `armed` 而那张单早没了。这类漂移**没有任何日志会
+告诉你**：用户数据流不重放历史，页面又只读本地表，于是一切看上去正常。
+
+对账就是补上这个只读的眼睛：拉交易所真实的持仓与条件单，同本地 `risk_bracket` 比对。
+
+**默认是自动的**：`apps/executor` 每 5 分钟做一次全账户对账（`executor.reconcileIntervalMs`
+设为 `0` 可关闭），启动时立刻先跑一次。结果落 `reconcile_run` 表，控制面详情页读的就是它。
+
+为什么自动：止盈止损的「单已挂上、单号没回填」只在崩溃那一瞬间发生，迟到几小时再查也
+来得及；但**在交易所 App 上手动开的仓**是持续形成的漂移——只靠人想起来跑一次命令，等于
+没有对账。上面 ETHUSDT / SOLUSDT 两条「紧急」正是这一类。
+
+```bash
+pnpm --filter @trade-tool/cli start -- reconcile                 # 手动跑一次（全账户）
+pnpm --filter @trade-tool/cli start -- reconcile -s BTCUSDT      # 单标的
+```
+
+为什么默认全账户：一次 `positionRisk`（权重 5）+ 一次 `openAlgoOrders`（权重 **40**）= 45，
+而逐标的每个标的 6——全账户既更便宜、覆盖也更全。
+
+控制面上是只读面板（显示最近一次快照 + 查询时间，过期会标黄），另留「立即对账」按钮供
+当场重查。**只报告，不动手**：不下单、不撤单、不改 `risk_bracket`，处置一律人工决定——
+自动补挂一张止损会平掉真实仓位，且不可逆。
+
+判据只有一份实现（`packages/core/src/reconcile.ts`，纯函数），CLI 与控制面共用，因此两个
+出口不可能给出不同结论。差异分两档而不是「有异常 / 没异常」：
+
+| 差异                        | 严重度 | 含义                                                 |
+| --------------------------- | ------ | ---------------------------------------------------- |
+| `missing-stop-order`        | 紧急   | 本地记为已挂单，交易所没有止损单——**仓位当前是裸的** |
+| `unprotected-position`      | 紧急   | 一笔入场成交占坑成功但没挂上单，而仓位还在           |
+| `position-without-record`   | 紧急   | 交易所有仓位，本地没有任何未终结记录                 |
+| `missing-take-profit-order` | 注意   | 止损还在，止盈没了                                   |
+| `price-mismatch`            | 注意   | 单还在，但触发价与本地记录不一致                     |
+| `record-without-position`   | 注意   | 本地记为已挂单，交易所已无仓位（平仓事件多半没收到） |
+| `orphan-algo-order`         | 注意   | 交易所挂着我方单，但本地没有记录引用它               |
+
+「有止盈没止损」是紧急，「只有止损没止盈」只是注意——合成「有没有问题」会让最要紧的
+那种被淹掉。
+
+**对账必须出网**：它要签名访问交易所私有接口（`GET /fapi/v3/positionRisk`、
+`GET /fapi/v1/openAlgoOrders`）。但出网的那一步**不在控制面**——控制面不许再起守护进程，
+所以周期对账放在本来就常驻的 `apps/executor` 里；控制面只读已经算好的快照，
+因此可以安全地挂刷新节奏。
 
 ## 控制面（`apps/web`）
 
-`docs/…sync.md` 的 N-7 把控制面列为下期，`@trade-tool/sync` 的原语就是为它准备的交付边界。
-现在 `apps/web` 把它接上了：Hono 提供 JSON API，Vite + React 提供看板，**直接 import 原语**，
-不 shell out 解析 stdout。
+`docs/…sync.md` 最初把控制面列为下期，只交付数据层原语（R-22）——`@trade-tool/sync`
+的原语就是为它准备的交付边界。现在 `apps/web` 把它接上了（R-23 … R-25）：
+Hono 提供 JSON API，Vite + React 提供看板，**直接 import 原语**，不 shell out 解析 stdout。
+本期不做的只剩**鉴权 / 多用户**（N-7）。
 
 ```bash
 pnpm build
@@ -94,7 +207,13 @@ pnpm --filter @trade-tool/web start        # http://127.0.0.1:8787（地址见 .
 ```
 
 能做：状态总览（行数/占用/缺口/配额/可同步标的数/守护进程在线状态）、标的集合增删、
-同步开关、带规模预估与二次确认的首次全量、数据体检、缺口清单、每标的的覆盖时间线。
+同步开关、带规模预估与二次确认的首次全量、数据体检、缺口清单、K 线图（可切周期，
+）与派生周期的扣留统计。
+
+> 页面上**不显示指标**：`/api/symbols/:symbol/indicators` 与指标面板已随「指标层默认关闭」
+> 一起删除。K 线图只有蜡烛与真实缺口。任何将来加回指标线的读侧都要遵守同一条：
+> **在缺口处断开**（不跨缺口连线），并写明指标序列比 K 线短多少根、为什么（预热期与
+> 未收盘的最后一根），不让它看起来像数据缺失。指标值语义是「**收盘后可用**」。
 
 界面上**只有一个主流程**：「开始同步」→「同步中 · 暂停」。点开始后守护进程先补全历史，
 之后每轮增量拉取最新——补全与实时是同一个持续动作，不拆成两个按钮。行内不再有
@@ -133,6 +252,20 @@ docker compose down       # 停库，保留数据卷
 
 本机没有 Docker Desktop 时用 colima（本仓库的 docker context 指向它）：`colima start`
 之后容器带 `restart: unless-stopped`，colima 起来时会自动恢复。
+
+## 部署到服务器（deploy/）
+
+`compose.yaml` 是**本机开发**用的，上面那份只是本地依赖。要把整套服务（控制面 /
+常驻同步 / 止盈止损 / PostgreSQL）部署到一台服务器上，走 `deploy/`：
+
+```bash
+./deploy/build-image.sh          # 本机构建镜像 → dist-deploy/trade-tool-deploy.tar
+```
+
+镜像在本机构建、`docker save` / `docker load` 搬运，目标机不需要 git / pnpm / uv。
+`deploy/compose.yaml` 里四个应用服务共用同一个镜像、只靠 `command` 区分；
+止盈止损放在 `executor` profile 里，`docker compose up -d` 不会启动它。
+完整的搬运步骤、环境变量、排查表见 [`deploy/README.md`](deploy/README.md)。
 
 ## 常驻同步（v0.1.0）
 

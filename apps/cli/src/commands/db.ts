@@ -8,7 +8,7 @@ import {
 
 import { withContext } from '../context.js';
 
-/** `trade-tool db migrate` —— 应用迁移。必须幂等，可反复执行（R-15.3 / AC-1）。 */
+/** `trade-tool db migrate` —— 应用迁移。必须幂等，可反复执行（R-15 第 4 条 / AC-1）。 */
 export async function runMigrate(options: { json?: boolean } = {}): Promise<number> {
   return withContext(async ({ pool }) => {
     const result: MigrateResult = await migrate(pool);

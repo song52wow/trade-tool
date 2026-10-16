@@ -2,6 +2,7 @@ import { readFile, writeFile, mkdir } from 'node:fs/promises';
 import { dirname, isAbsolute, resolve } from 'node:path';
 
 import { configSchema, defaultConfig, type TradeToolConfig } from './config.js';
+import { SyncError } from './market-sync.js';
 
 export const CONFIG_FILENAME = 'trade-tool.config.json';
 
@@ -29,12 +30,17 @@ function isRecord(value: unknown): value is Record<string, unknown> {
  * 于是一份写了 `database.password` 的配置会被安静地接受、密码被丢掉，
  * 直到真正连库时才报「密码缺失」——错误位置与真实问题隔了一整条链路。
  * 这正是 AGENTS.md 第 9 条「不静默兜底」要禁止的。这里显式拒绝并说清怎么改。
+ *
+ * 抛 `SyncError(CONFIG_INVALID)` 而不是裸 `Error`：同一个要求在 `resolvePassword`
+ * （缺密码）那条路径上已经是结构化错误，两条路径给同一种配置问题不同的错误形态，
+ * 会让调用方无法用 `isSyncError` 统一处理（R-22.4）。
  */
 function assertNoPasswordInConfig(parsed: unknown): void {
   if (!isRecord(parsed) || !isRecord(parsed['database'])) return;
   if (!('password' in parsed['database'])) return;
-  throw new Error(
-    '配置校验失败: database.password 不得写入配置文件——' +
+  throw new SyncError(
+    'CONFIG_INVALID',
+    'database.password 不得写入配置文件——' +
       '密码只能经环境变量注入（默认变量名 TRADE_TOOL_PG_PASSWORD，可用 database.passwordEnv 改名）',
   );
 }

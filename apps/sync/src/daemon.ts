@@ -53,8 +53,12 @@ const GLOBAL_FATAL_CODES = new Set([
  *
  * 10s 的取值理由：与 `sync.pollIntervalMs`（默认 15s）同量级但更密，短到进程刚崩
  * 就能很快被看出异常，长到不会给 PG 带来可察觉的写入压力（6 次/分钟，单行 upsert）。
+ *
+ * 导出它，是因为**读的一方必须按同一个节拍判超时**：控制面拿「心跳年龄」和这个间隔的
+ * 3 倍比较（apps/web/src/service.ts）。两边各写一个数字迟早会漂移，而漂移的表现是页面
+ * 把活着的进程读成离线（或反过来），没人会想到去核对两个常量。
  */
-const HEARTBEAT_INTERVAL_MS = 10_000;
+export const HEARTBEAT_INTERVAL_MS = 10_000;
 
 /**
  * 优雅退出时等待在途轮次收尾的上限。

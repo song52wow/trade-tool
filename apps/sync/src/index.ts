@@ -11,7 +11,7 @@ export {
   type PrimitivesOptions,
   type RuntimeSlot,
 } from './primitives.js';
-export { SyncDaemon, createDaemon, type DaemonOptions } from './daemon.js';
+export { SyncDaemon, createDaemon, HEARTBEAT_INTERVAL_MS, type DaemonOptions } from './daemon.js';
 export {
   createSyncService,
   createSyncServiceFromConfig,

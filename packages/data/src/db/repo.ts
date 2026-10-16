@@ -1,13 +1,45 @@
 import {
+  DERIVED_INTERVALS,
+  INTERVAL_MS,
+  INTERVAL_TABLES,
+  isStoredInterval,
   SyncError,
+  type DerivedInterval,
+  type DerivedTableStat,
   type GapRecord,
+  type Interval,
   type RateLimitStatus,
+  type StoredInterval,
   type SymbolEntry,
   type SymbolSyncState,
 } from '@trade-tool/core';
 
 import { toSyncError } from './errors.js';
+import {
+  INDICATOR_INTERVALS,
+  INDICATOR_TABLES,
+  readIndicatorTableStats,
+  type IndicatorInterval,
+  type IndicatorTableStat,
+} from './indicators.js';
 import type { Pool, QueryResultRow } from './pool.js';
+
+/**
+ * 单个派生周期在控制面上的展示口径（v0.2.0 R-7.5 / AC-15）。
+ *
+ * 两种形态刻意分开：
+ *   * 正常：给出已入库桶数与扣留明细；
+ *   * `withheldReason: 'disabled'`：**未启用派生**（`aggregateIntervals: []`）。
+ * 用全 0 表达「未启用」会让人以为「启用了但还没聚合」，于是反复点重建。
+ */
+export type DerivedIntervalSummary =
+  | {
+      buckets: number;
+      withheldNotClosed: number;
+      withheldIncomplete: number;
+      missingMinutes: number;
+    }
+  | { withheldReason: 'disabled' };
 
 /**
  * 查询层（R-1.4 核心表的读写）。
@@ -65,6 +97,39 @@ function num(value: unknown, column: string, symbol: string, time: unknown): num
 }
 
 // ---------------------------------------------------------------- klines_1m
+
+/**
+ * 解析读请求的周期（v0.2.0 R-6.2 / R-6.5）。
+ *
+ * 缺省 `1m`；未知或**未实现**的周期（`5m` 明明在 `INTERVALS` 枚举里、这里却没有对应表）
+ * 一律抛 `CONFIG_INVALID`。
+ *
+ * 绝不静默回落到 1m：用户以为在看 4h、实际拿到 1m，那正是最典型的静默兜底——图上看着
+ * 「周期不对」，但没人知道是请求被改了。
+ */
+export function parseStoredInterval(raw: string | undefined | null): StoredInterval {
+  if (raw === undefined || raw === null || raw === '') return '1m';
+  if (isStoredInterval(raw)) return raw;
+  throw new SyncError(
+    'CONFIG_INVALID',
+    `未实现的周期：${raw}（可读周期为 1m / ${DERIVED_INTERVALS.join(' / ')}；` +
+      '5m 属于合成回测链路，派生层没有对应表）',
+    { interval: raw, supported: Object.keys(INTERVAL_TABLES) },
+  );
+}
+
+/**
+ * 周期 → 表名（R-6.2）。
+ *
+ * 表名不可参数化，所以这里只从**白名单**里取值。`isStoredInterval` 已经保证了 key
+ * 的存在性，重复校验一次是为了让 TS 收窄出 `StoredInterval`（而不是退化成 string）。
+ */
+function tableOf(interval: StoredInterval): string {
+  if (!isStoredInterval(interval)) {
+    throw new SyncError('CONFIG_INVALID', `未实现的周期：${interval}`, { interval });
+  }
+  return INTERVAL_TABLES[interval];
+}
 
 export interface Watermark {
   symbol: string;
@@ -135,12 +200,17 @@ function toBar(row: QueryResultRow, index: number, symbol: string): BarRow {
 /**
  * 读取区间。`from`/`to` 为闭区间（bar 开盘时间）。
  * 读不到行返回空数组——调用方据此区分「区间未同步」与「字段为 NULL」（R-4.4）。
+ *
+ * `interval` 缺省 `1m`，既有调用与行为**逐字节不变**（R-6.1 / AC-13）。派生表与
+ * `klines_1m` 共用同一个 `toBar` 与同一组 NULL / NaN 校验——不为派生表另写一份
+ * 行映射（R-6.3，「不持影子定义」）。
  */
 export async function readBars(
   pool: Pool,
   symbol: string,
-  range: { from?: number; to?: number; limit?: number },
+  range: { from?: number; to?: number; limit?: number; interval?: Interval | undefined },
 ): Promise<BarRow[]> {
+  const table = tableOf(parseStoredInterval(range.interval));
   try {
     const conditions = ['symbol = $1'];
     const values: unknown[] = [symbol];
@@ -154,12 +224,47 @@ export async function readBars(
     }
     values.push(range.limit ?? 10_000);
     const result = await pool.query<QueryResultRow>(
-      `SELECT ${BAR_COLUMNS} FROM klines_1m WHERE ${conditions.join(' AND ')} ORDER BY time ASC LIMIT $${values.length}`,
+      `SELECT ${BAR_COLUMNS} FROM ${table} WHERE ${conditions.join(' AND ')} ORDER BY time ASC LIMIT $${values.length}`,
       values,
     );
     return result.rows.map((row, index) => toBar(row, index, symbol));
   } catch (error) {
     throw toSyncError(error, `读取 ${symbol} K 线失败`);
+  }
+}
+
+/**
+ * 取**最后 N 根**（升序返回），可选 `to` 作为闭区间上界。
+ *
+ * 为什么不能直接给 `readBars` 传 `limit`：它按 `time ASC LIMIT n` 取，给 limit 拿到的是
+ * 区间**最早**的 n 根。看盘要的是最近这一段，所以这里先 DESC 取回再翻正——图表与
+ * 「库里最新数据长什么样」都必须看这一端。
+ *
+ * 与 `readBars` 一样：读不到行返回空数组（调用方据此区分「没同步」与「字段为 NULL」），
+ * 且复用同一组列与同一个 `toBar` 映射，不另持影子定义（R-2.5）。
+ */
+export async function readLatestBars(
+  pool: Pool,
+  symbol: string,
+  range: { limit?: number; to?: number; interval?: Interval | undefined } = {},
+): Promise<BarRow[]> {
+  const table = tableOf(parseStoredInterval(range.interval));
+  try {
+    const values: unknown[] = [symbol];
+    let upper = '';
+    if (range.to !== undefined) {
+      values.push(range.to);
+      upper = ` AND time <= $${values.length}`;
+    }
+    values.push(range.limit ?? 10_000);
+    const result = await pool.query<QueryResultRow>(
+      `SELECT ${BAR_COLUMNS} FROM ${table} WHERE symbol = $1${upper} ORDER BY time DESC LIMIT $${values.length}`,
+      values,
+    );
+    // 倒序取回是为了「取最新」，但对外一律升序：下游（图表、CSV）都按时间正序消费。
+    return result.rows.map((row, index) => toBar(row, index, symbol)).reverse();
+  } catch (error) {
+    throw toSyncError(error, `读取 ${symbol} 最近 K 线失败`);
   }
 }
 
@@ -192,6 +297,29 @@ export async function hasRange(
 }
 
 // -------------------------------------------------------------- contract_spec
+
+/**
+ * 读 exchangeInfo 的**原始条目**（`contract_spec.raw`）。
+ *
+ * 止盈止损要把价格对齐到最小价格变动（`PRICE_FILTER.tickSize`），而 tickSize 只存在于
+ * 原始 JSON 里——`readContractSpec` 那几个解析后的列不包含它。这里读的是库里**同一份
+ * 快照**，不重新出网拉 exchangeInfo：对齐依据必须与其它规格自洽。
+ *
+ * 没有快照返回 `null`（调用方据此报错，而不是拿默认 tickSize 猜一个）。
+ */
+export async function readContractSpecRaw(
+  pool: Pool,
+  exchange: string,
+  symbol: string,
+): Promise<unknown | null> {
+  const result = await pool.query<QueryResultRow>(
+    'SELECT raw FROM contract_spec WHERE exchange = $1 AND symbol = $2',
+    [exchange, symbol],
+  );
+  const row = result.rows[0];
+  if (!row || row['raw'] === null || row['raw'] === undefined) return null;
+  return row['raw'];
+}
 
 export async function readContractSpec(
   pool: Pool,
@@ -520,6 +648,20 @@ export async function removeSymbolEntry(
       if (policy === 'delete') {
         const deleted = await client.query('DELETE FROM klines_1m WHERE symbol = $1', [symbol]);
         await client.query('DELETE FROM gaps WHERE symbol = $1', [symbol]);
+        // v0.2.0 R-8.1：派生数据必须**同事务**一并删除。「1m 已删、4h 还画得出」是
+        // 自相矛盾的——页面上那根 4h 蜡烛的数据源已经不存在了。
+        // keep / archive 不动派生表：那两种策略保留数据，派生数据当然一起留。
+        for (const interval of DERIVED_INTERVALS) {
+          await client.query(`DELETE FROM ${INTERVAL_TABLES[interval]} WHERE symbol = $1`, [
+            symbol,
+          ]);
+        }
+        // v0.3.0 R-11.1：指标表同样必须**同事务**一并删除。「1m 已删、4h 还画得出」
+        // 已经自相矛盾；「K 线已删、指标还叠在图上」是同一个矛盾的下一层——
+        // 那条指标线的数据源已经不存在了，用户会以为它在描述某个还在的行情。
+        for (const table of Object.values(INDICATOR_TABLES)) {
+          await client.query(`DELETE FROM ${table} WHERE symbol = $1`, [symbol]);
+        }
         const count = deleted.rowCount ?? 0;
         // 数据已删，**所有由数据推导出来的缓存列必须一起清掉**。
         // 只把 status 改成 paused 是不够的：残留的 watermark 会在该标的下一次同步时
@@ -704,9 +846,23 @@ export async function readWeightBudget(
 export interface GlobalSummary {
   symbols: number;
   countsByStatus: Record<'paused' | 'running' | 'error', number>;
+  /** 1m 表的行数（既有语义不变，R-8.2） */
   totalRows: number;
+  /** 1m 表的体积（既有语义不变，R-8.2） */
   totalBytes: number;
   pendingGaps: number;
+  /** **启用的**派生表行数与**实测**体积（v0.2.0 R-8.2 / AC-16）；未启用派生时为空数组 */
+  derived: DerivedTableStat[];
+  /**
+   * **已启用的**指标表行数与**实测**体积（v0.3.0 R-11.2）。
+   *
+   * `totalRows` / `totalBytes` 的含义**保持为 1m 不变**（R-11.2）——把它们改成
+   * 「全部表」会让既有页面上的 1m 口径数字无声地变大，而没有任何一行代码说它变了。
+   *
+   * 未启用指标层（`indicatorSpecs: {}`）时是 `null`，与「启用了但一行没写」（`[]`）
+   * 分开说：显示 0 行会让人以为「还没算」（R-11.4 / AC-23）。
+   */
+  indicators: IndicatorTableStat[] | null;
 }
 
 /**
@@ -722,8 +878,23 @@ export interface GlobalSummary {
  *
  * `pendingGaps` 统计**库里全部**缺口，不按集合过滤：「缺口不得静默存在」（R-11.11），
  * 把集合外的缺口从汇总里藏起来正是静默。
+ *
+ * `derivedIntervals` 是**实际启用的派生周期**（`data.aggregateIntervals`，R-9.1）。
+ * 未启用派生时返回 `derived: []`，调用方据此说「未启用派生」；不传则按四个全启用算，
+ * 既有调用行为不变。
  */
-export async function readGlobalSummary(pool: Pool, exchange: string): Promise<GlobalSummary> {
+export async function readGlobalSummary(
+  pool: Pool,
+  exchange: string,
+  derivedIntervals: readonly DerivedInterval[] = DERIVED_INTERVALS,
+  /**
+   * **实际启用的**指标周期。`null` = 未启用指标层（显式配置，状态里必须如实显示）。
+   *
+   * 不传时按四个全启用算，既有调用行为不变；未启用时返回 `null` 而不是空数组——
+   * 空数组会被读成「启用了但一行都没写」，于是用户反复点重建（R-11.4 / AC-23）。
+   */
+  indicatorIntervals: readonly IndicatorInterval[] | null = INDICATOR_INTERVALS,
+): Promise<GlobalSummary> {
   try {
     const rows = await pool.query<QueryResultRow>(
       `WITH universe AS (
@@ -757,10 +928,225 @@ export async function readGlobalSummary(pool: Pool, exchange: string): Promise<G
       totalRows,
       totalBytes,
       pendingGaps: ms(gaps.rows[0]?.n) ?? 0,
+      derived: await readDerivedTableStats(pool, derivedIntervals),
+      indicators: indicatorIntervals ? await readIndicatorTableStats(pool) : null,
     };
   } catch (error) {
     throw toSyncError(error, '读取全局汇总失败');
   }
+}
+
+/**
+ * 派生表的行数与**实测**体积（v0.2.0 R-8.2 / AC-16）。
+ *
+ * 体积走 `pg_total_relation_size`（含索引摊销与 TOAST），**不沿用**附录 B.2 的
+ * 单行估算：那条估算至今未实测，而 `sync_state.bytes` 一直按它推进，谁都没量过真表。
+ * 本次要求就是把估算换成实测。
+ *
+ * `intervals` 是**实际启用的周期**（`data.aggregateIntervals`）：未启用派生时返回空数组，
+ * 调用方据此显示「未启用派生」而不是「0 个桶」——后者会让人以为「还没聚合」（R-8.4 /
+ * AC-22）。只启用一个子集时同理：只报启用那几张表，不把没启用的报成 0。
+ */
+export async function readDerivedTableStats(
+  pool: Pool,
+  intervals: readonly DerivedInterval[] = DERIVED_INTERVALS,
+): Promise<DerivedTableStat[]> {
+  const tables = intervals.map((interval) => ({
+    interval,
+    table: INTERVAL_TABLES[interval],
+  }));
+  try {
+    // 逐表两条查询：一条数行（要过表的统计信息）、一条量体积（走 pg_class）。
+    // 合成一条动态 SQL 看着更省事，但表名只能来自白名单拼进语句——为了四个数字引入
+    // 一处字符串拼接不划算，R-6.2 的白名单精神是「表名不参与字符串构造」。
+    const stats: DerivedTableStat[] = [];
+    for (const { interval, table } of tables) {
+      const count = await pool.query<{ n: string }>(`SELECT count(*)::bigint AS n FROM ${table}`);
+      const size = await pool.query<{ bytes: string | null }>(
+        'SELECT pg_total_relation_size(to_regclass($1))::bigint AS bytes',
+        [table],
+      );
+      stats.push({
+        interval,
+        table,
+        rows: ms(count.rows[0]?.n) ?? 0,
+        bytes: ms(size.rows[0]?.bytes) ?? 0,
+      });
+    }
+    return stats;
+  } catch (error) {
+    throw toSyncError(error, '读取派生表统计失败');
+  }
+}
+
+// ------------------------------------------------------------------ 派生周期
+
+/**
+ * 单标的每周期的「已入库桶数 + 被扣留桶数 + 缺失分钟数」（v0.2.0 R-7.5 / AC-15）。
+ *
+ * **桶数由 SQL 从 1m 推导**，不落「扣留表」——那是第二套状态（R-3.5）。判据与
+ * `quant_data.aggregate.judge_bucket` 同源：`closed = (b + W) <= (L + 60_000)`、
+ * 有效窗口取桶与该标的 1m 区间的交集。两处各写一套判据的风险是「页面说少一根、
+ * 写库时其实写进去了」，而那种不一致排查起来要跨两个语言。
+ *
+ * `options.enabled` 是**实际启用的派生周期集合**（`data.aggregateIntervals`），不是
+ * 布尔开关：R-9.1 允许只启用四个周期的一个子集，此时**没启用的周期必须显示成
+ * 「未启用派生」**。把它们按启用态统计会得到一份「0 个桶 + 全 0 扣留」——
+ * 看起来像「已启用但还没聚合」，用户会一直点重建，而重建（读的是同一个配置）
+ * 根本不会写这几张表（AC-22 / R-8.4）。
+ *
+ * **扣留统计只看最近 `WITHHELD_LOOKBACK_MS`**（见下），不是全部历史。
+ * 判据要求按桶统计 `min(time)`，因此无下界时每条查询都要哈希聚合该标的的**全部 1m**
+ * ——实测 BTCUSDT（372 万行）单次 **4.74s**，而它挂在标的详情页上，等于每次点开
+ * 白等近 5 秒。加上 90 天下界后同一份数据 **341ms**（14 倍）。
+ *
+ * 这个窗口是**有意的语义边界**：页面要回答的是「最近为什么没有 4h 蜡烛」，
+ * 而几百天前那个因为 onboard 首日而永远闭合不了的 1d 桶既不可处置、也不该一直
+ * 挂在那里。窗口值由 :data:`WITHHELD_LOOKBACK_MS` 单一给出（**固定窗口**，
+ * 不做成配置项：它调大只会让页面变慢，调小则连最近一个 1d 桶都统计不全）。
+ */
+/**
+ * 扣留统计的回看窗口：只统计最近这段时间内的桶。
+ *
+ * 取值理由：90 天覆盖 1d 桶 90 个、4h 桶 541 个、15m 桶 8641 个——最细的周期也还有
+ * 八千多个桶可看，足够回答「最近为什么没有蜡烛」；而扫描量从「全部历史」降到
+ * 约 13 万根 1m，查询从 4.74s 降到 341ms。
+ */
+export const WITHHELD_LOOKBACK_MS = 90 * 24 * 60 * 60 * 1000;
+
+export async function readDerivedIntervals(
+  pool: Pool,
+  symbol: string,
+  intervals: readonly StoredInterval[],
+  options: { enabled: readonly DerivedInterval[] },
+): Promise<Record<string, DerivedIntervalSummary>> {
+  const derived = intervals.filter((interval): interval is DerivedInterval => interval !== '1m');
+  if (derived.length === 0) return {};
+  const enabled = new Set<DerivedInterval>(options.enabled);
+  const active = derived.filter((interval) => enabled.has(interval));
+  const disabled: Record<string, DerivedIntervalSummary> = Object.fromEntries(
+    derived
+      .filter((interval) => !enabled.has(interval))
+      .map((interval) => [interval, { withheldReason: 'disabled' as const }]),
+  );
+  if (active.length === 0) return disabled;
+
+  try {
+    const bounds = await pool.query<{ first_ms: string | null; last_ms: string | null }>(
+      'SELECT min(time) AS first_ms, max(time) AS last_ms FROM klines_1m WHERE symbol = $1',
+      [symbol],
+    );
+    const firstMs = ms(bounds.rows[0]?.first_ms);
+    const lastMs = ms(bounds.rows[0]?.last_ms);
+    if (firstMs === null || lastMs === null) {
+      // 库里没有 1m：派生表也不该有行，「无数据」本身就是答案。
+      return Object.fromEntries(
+        derived.map((interval) => [
+          interval,
+          enabled.has(interval) ? emptySummary() : { withheldReason: 'disabled' as const },
+        ]),
+      );
+    }
+
+    // 一次查询覆盖全部周期：按宽度分别算，桶起点用取模而不是 date_trunc（R-2.1）。
+    // `date_trunc('day', …)` 的结果依赖会话 TimeZone，换个连接参数同一条 SQL 就会给出
+    // 另一组边界，而取模永远只有一种结果。
+    //
+    // **每个周期一条 LATERAL 分支，而不是 CROSS JOIN 一张 VALUES 表。**
+    //
+    // 旧写法把 `klines_1m` 与 4 行 VALUES 做 CROSS JOIN：每根 1m 被复制 4 份再排序
+    // 分组，而 `GROUP BY` 里含 `time - (time % width_ms)` 这个非单调表达式、CROSS JOIN
+    // 又打断了索引顺序，planner 只能 external merge sort。实测 SOLUSDT（319 万根 1m）
+    // 单 worker 溢出 172MB、三 worker 合计约 516MB，直接跑要 26.1s。
+    //
+    // LATERAL 让每个周期各自做一次 HashAggregate。哈希聚合**不需要有序输入**，那条巨大
+    // 的排序整个消失（并行哈希，溢出 61MB）：同一份数据上 4.6s，快 5.7 倍。桶宽由
+    // `INTERVAL_MS` 参数化传入，SQL 里不再硬编码周期宽度——新增派生周期只需在 core
+    // 加一列映射。
+    //
+    // 判据一个字都没动：桶起点取模（R-2.1）、closed、win_end、win_start、expected
+    // 的公式与 Python 侧 `judge_bucket`（R-3.4）仍逐字对应。
+    //   * win_start 两种情形：桶内**最早一根 1m 就等于该标的第一根**（onboard 首日，
+    //     附录 C.1）→ 从 F 起算，于是首日 1d 桶的期望是 675 而不是 1440，该桶应当写入；
+    //     否则从 bucket 起算。若一律用 `max(bucket, first)`，删掉该标的最早一根会让 F
+    //     右移、expected 随之减少，桶「自动变回合格」——而它的值早就是按 240 根算出来的。
+    const result = await pool.query<{
+      interval: string;
+      not_closed: string;
+      incomplete: string;
+      missing_minutes: string;
+    }>(
+      `SELECT w.interval,
+              count(*) FILTER (
+                WHERE (s.bucket + w.width_ms) > ($2::bigint + 60000))::bigint AS not_closed,
+              count(*) FILTER (
+                WHERE (s.bucket + w.width_ms) <= ($2::bigint + 60000)
+                  AND s.actual < ((least(s.bucket + w.width_ms - 60000, $2::bigint)
+                                - CASE WHEN s.bucket_first = $3::bigint THEN $3::bigint
+                                       ELSE s.bucket END) / 60000) + 1
+              )::bigint AS incomplete,
+              COALESCE(sum(GREATEST(0, ((least(s.bucket + w.width_ms - 60000, $2::bigint)
+                                - CASE WHEN s.bucket_first = $3::bigint THEN $3::bigint
+                                       ELSE s.bucket END) / 60000) + 1 - s.actual))
+                FILTER (WHERE (s.bucket + w.width_ms) <= ($2::bigint + 60000)), 0)::bigint
+                AS missing_minutes
+         FROM unnest($4::text[], $5::bigint[]) AS w(interval, width_ms)
+         CROSS JOIN LATERAL (
+           SELECT k.time - (k.time % w.width_ms) AS bucket,
+                  count(*) AS actual,
+                  min(k.time) AS bucket_first
+             FROM klines_1m k
+            WHERE k.symbol = $1 AND k.time >= $2::bigint - $6::bigint
+            GROUP BY 1
+         ) s
+        WHERE least(s.bucket + w.width_ms - 60000, $2::bigint)
+              >= CASE WHEN s.bucket_first = $3::bigint THEN $3::bigint ELSE s.bucket END
+        GROUP BY w.interval, w.width_ms
+        ORDER BY w.width_ms`,
+      // $1 symbol、$2 该标的 1m 的 max(time)、$3 min(time)、$4 本次要统计的周期、
+      // $5 与 $4 一一对应的桶宽（毫秒）、$6 扣留统计的回看窗口（毫秒）
+      [
+        symbol,
+        lastMs,
+        firstMs,
+        active,
+        active.map((interval) => INTERVAL_MS[interval]),
+        WITHHELD_LOOKBACK_MS,
+      ],
+    );
+    const withheld = new Map(
+      result.rows.map((row) => [
+        row['interval'],
+        {
+          notClosed: ms(row['not_closed']) ?? 0,
+          incomplete: ms(row['incomplete']) ?? 0,
+          missingMinutes: ms(row['missing_minutes']) ?? 0,
+        },
+      ]),
+    );
+
+    const out: Record<string, DerivedIntervalSummary> = { ...disabled };
+    for (const interval of active) {
+      const counts = withheld.get(interval) ?? { notClosed: 0, incomplete: 0, missingMinutes: 0 };
+      const stored = await pool.query<{ n: string }>(
+        `SELECT count(*)::bigint AS n FROM ${INTERVAL_TABLES[interval]} WHERE symbol = $1`,
+        [symbol],
+      );
+      out[interval] = {
+        buckets: ms(stored.rows[0]?.n) ?? 0,
+        withheldNotClosed: counts.notClosed,
+        withheldIncomplete: counts.incomplete,
+        missingMinutes: counts.missingMinutes,
+      };
+    }
+    return out;
+  } catch (error) {
+    throw toSyncError(error, `读取 ${symbol} 派生周期统计失败`);
+  }
+}
+
+function emptySummary(): DerivedIntervalSummary {
+  return { buckets: 0, withheldNotClosed: 0, withheldIncomplete: 0, missingMinutes: 0 };
 }
 
 // ---------------------------------------------------------------- 守护进程心跳

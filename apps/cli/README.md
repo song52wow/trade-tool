@@ -1,6 +1,9 @@
 # @trade-tool/cli
 
-命令行入口，串联 `@trade-tool/core` → `@trade-tool/data`（PG + Python 桥接）→ `@trade-tool/backtest`。
+命令行入口，串联 `@trade-tool/core` → `@trade-tool/data`（PG + Python 桥接）。
+
+回测与指标的**实现**都在 Python 侧（`quant_backtest` / `quant_core`），TS 侧只做编排：
+命令行的参数、报告文件与 stdout 格式全部保持不变。
 
 ```bash
 pnpm --filter @trade-tool/cli start -- <command>   # 源码直跑（tsx）

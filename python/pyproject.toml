@@ -48,6 +48,15 @@ ignore = [
     "RUF003",
 ]
 
+[tool.ruff.lint.per-file-ignores]
+# 测试夹具大量使用动态类型（`Any` 返回的工厂函数、monkeypatch 替身），
+# 与 mypy 的 `[[tool.mypy.overrides]] module = ["*.tests.*"]` 是同一件事：
+# 测试要的是「能把替身塞进去」，精确类型在这里没有价值。
+# N802：用例名沿用中文以便与需求编号对照（`test_onboard首日的1d桶应当出现`），
+# 但 ruff 只认 snake_case 的 ASCII 标识符。中文名是本仓库的既有约定，
+# 与上面忽略 RUF001~003 是同一类「工具看不懂中文」的情况。
+"*/tests/*" = ["N802", "ANN401"]
+
 [tool.mypy]
 python_version = "3.12"
 strict = true

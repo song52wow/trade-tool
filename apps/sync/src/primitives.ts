@@ -1,5 +1,6 @@
 import {
   createLogger,
+  MANUAL_INTERVENTION_CODES as coreManualInterventionCodes,
   SyncError,
   type GapRecord,
   type RemovePolicy,
@@ -31,8 +32,8 @@ import {
 /**
  * 控制原语（R-22）。
  *
- * 这是本期交付给控制面的**边界**：页面与 HTTP API 不在本期（N-7），
- * 但原语必须已经可以被直接 import。因此：
+ * 这是交付给控制面的**边界**：`apps/web` 的 HTTP API 与看板直接 `import` 这套原语
+ * （R-22.6 / R-24.6），因此：
  *   - 不依赖任何 HTTP 框架；
  *   - 错误全部是带 code 的 `SyncError`，不返回字符串；
  *   - 状态先落库再生效（R-17.3），因此跨进程协作不需要新通信机制（R-22.6）。
@@ -88,17 +89,10 @@ export interface ControlPrimitives {
  * 把它当人工介入会因一次正常竞争就把该标的钉死成 error，而 `resume()` 之后
  * 只要竞争仍在就会再次钉死——那是把可恢复的并发误报成故障（R-21.3 / R-21.5）。
  */
-const MANUAL_INTERVENTION_CODES = new Set([
-  'GAP_ATTEMPTS_EXHAUSTED',
-  'UNCLOSED_BAR_IN_STORE',
-  'BACKFILL_BOUNDARY_VIOLATION',
-  'WATERMARK_MISMATCH',
-  'NULL_NOT_ALLOWED',
-  'SYMBOL_NOT_FOUND',
-  'NOT_PERPETUAL',
-  'NOT_TRADING',
-  'SCHEMA_VERSION_MISMATCH',
-]);
+// 「需人工介入」的码表是 `@trade-tool/core` 的**唯一一份**（v0.3.0 起）。
+// 这里曾有一份私有副本，与 core 的那份会静默漂移——新增一个「需人工介入」的错误码时，
+// 只改一边就会让某个错误既不被钉死成 error、又被无限重试。
+const MANUAL_INTERVENTION_CODES = coreManualInterventionCodes;
 
 const log = createLogger('sync:control');
 

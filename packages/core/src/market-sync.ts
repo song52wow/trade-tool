@@ -38,6 +38,17 @@ export type SyncErrorCode =
   | 'WATERMARK_MISMATCH'
   // 缺口（R-11.9）
   | 'GAP_ATTEMPTS_EXHAUSTED'
+  // 派生周期（v0.2.0 R-9.3）
+  | 'AGGREGATION_FAILED'
+  | 'AGGREGATION_MISMATCH'
+  // 技术指标（v0.3.0 R-12.3）
+  | 'INDICATOR_FAILED'
+  | 'INDICATOR_MISMATCH'
+  | 'INDICATOR_IMPL_STALE'
+  // 风控（v0.4.0）：ATR 取不到——本地库里没有足够的已收盘连续 K 线。
+  // 单列而不复用 CONFIG_INVALID：这是「数据还没同步上来」，不是「参数写错了」，
+  // 两者的处置完全不同（前者去 start 标的，后者改配置）。
+  | 'RISK_ATR_UNAVAILABLE'
   // 数据库（R-21.6 / R-1.3）
   | 'DB_CONNECTION_FAILED'
   | 'DB_UNIQUE_VIOLATION'
@@ -74,6 +85,47 @@ export class SyncError extends Error {
 
 export function isSyncError(error: unknown): error is SyncError {
   return error instanceof SyncError;
+}
+
+/**
+ * **需人工介入**的错误码（v0.2.0 R-4.6；v0.3.0 R-12.3）。
+ *
+ * 语义：这些错误说明「再自动重试一次也不会变好」。常驻同步必须据此把标的钉成
+ * `error` 并停止自动重试（R-21.3），而不是在同一个确定性的失败上反复烧交易所配额。
+ *
+ * 指标层的三个码都在这里：
+ *   * `INDICATOR_FAILED` 物化失败 → 整批回滚（连 1m 与派生桶一起）；
+ *   * `INDICATOR_MISMATCH` `--check` 发现不一致；
+ *   * `INDICATOR_IMPL_STALE` `impl_version` 不一致 → **拒绝混版写入**。
+ *
+ * 要恢复 K 线同步有两条**显式**出路：修好问题，或把 `data.indicatorSpecs` 清空
+ * 关掉指标层——关闭状态在 `sync status` 与控制面上都可见（R-11.4 / AC-23），
+ * 不存在「悄悄跳过」这种状态。
+ */
+export const MANUAL_INTERVENTION_CODES: ReadonlySet<SyncErrorCode> = new Set<SyncErrorCode>([
+  'GAP_ATTEMPTS_EXHAUSTED',
+  'UNCLOSED_BAR_IN_STORE',
+  'BACKFILL_BOUNDARY_VIOLATION',
+  'WATERMARK_MISMATCH',
+  'NULL_NOT_ALLOWED',
+  'SYMBOL_NOT_FOUND',
+  'NOT_PERPETUAL',
+  'NOT_TRADING',
+  'SCHEMA_VERSION_MISMATCH',
+  // v0.2.0 R-9.3：聚合失败需人工介入。AGGREGATION_FAILED 意味着**该批 1m 已整批回滚**
+  // （连水位都没推进）——自动重试只会让标的反复失败而没人知道是派生层坏了。
+  'AGGREGATION_FAILED',
+  'AGGREGATION_MISMATCH',
+  // v0.3.0 R-12.3：指标层同理。恢复 1m 同步的显式出路是把
+  // `data.indicatorSpecs` 清空（关闭状态在状态里**可见**，R-11.4 / AC-23）。
+  'INDICATOR_FAILED',
+  'INDICATOR_MISMATCH',
+  'INDICATOR_IMPL_STALE',
+]);
+
+/** 该错误码是否需要人工介入（不进自动重试队列）。 */
+export function needsManualIntervention(code: SyncErrorCode): boolean {
+  return MANUAL_INTERVENTION_CODES.has(code);
 }
 
 /** 合约元数据快照。本需求只依赖这三个字段（R-7.3），其余仅作快照留存。 */
@@ -186,10 +238,25 @@ export interface RateLimitStatus {
 export interface SyncSummary {
   symbols: number;
   countsByStatus: Record<SyncStatus, number>;
+  /** 1m 表的行数（既有语义不变，R-8.2） */
   totalRows: number;
+  /** 1m 表的体积（既有语义不变，R-8.2） */
   totalBytes: number;
   pendingGaps: number;
   rateLimit: RateLimitStatus;
+  /**
+   * **启用的**派生表的行数与**实测**体积（v0.2.0 R-8.2 / AC-16）。
+   *
+   * 体积直接读 `pg_total_relation_size`，不沿用附录 B.2 的单行估算——那条估算至今
+   * 未实测，而 `sync_state.bytes` 一直按它推进，谁都没量过真表。
+   *
+   * 只列 `aggregateIntervals` 里启用的周期：
+   *   * `[]`（未启用派生）→ 空数组，显示「0 个桶」会让人误以为「还没聚合」；
+   *   * 只启用子集 → 只报启用那几张表，没启用的**不得**报成 0（否则 `sync status`
+   *     与控制面都会显示成「已启用但还没聚合」，用户会一直点重建）。
+   * 两种情形都必须与「启用了但确实为空」区分开（R-8.4 / R-9.1 / AC-22）。
+   */
+  derived: DerivedTableStat[];
 }
 
 /** 首次全量的规模预估（R-8.3），执行前必须先算给人看。 */
@@ -229,6 +296,66 @@ export interface SyncRunSummary {
   metadataStale: boolean;
   /** 规模预估；仅首次全量返回 */
   estimate?: SyncPlanEstimate;
+  /**
+   * 本轮派生聚合的每周期统计（v0.2.0 R-8.3）。
+   *
+   * 与 `SyncRunSummary` **同提交**更新（跨语言契约，AGENTS.md 硬性约定 2）：
+   * Python 侧 `run_sync` 产出、TS 侧消费，两边字段名必须一致。
+   *
+   * `aggregateIntervals: []`（显式关闭派生）时是 `null`——**不是**空对象：
+   * 「未启用派生」与「启用了但一个桶都没写」是两种完全不同的状态，页面必须能分开说
+   * （R-8.4 / AC-22）。空对象会让人以为「还没聚合」。
+   */
+  aggregated: Record<string, AggregateIntervalStats> | null;
+  /**
+   * 本轮指标物化的统计（v0.3.0 R-11.3），**按周期分组**：
+   * ``{ "15m": { "SMA(bars=20)": {...} }, "1h": {...} }``。
+   *
+   * 分组不是美观问题：只按「指标:参数」做键时，四个周期的同名参数集会**互相覆盖**，
+   * 摘要里只剩最后一个周期的数字——而那看起来完全正常（AC-25 的同一条教训）。
+   *
+   * 与 `SyncRunSummary` **同提交**更新（跨语言契约，AGENTS.md 硬性约定 2）：
+   * Python 侧 `run_sync` 产出、TS 侧消费，两边字段名必须一致。
+   *
+   * `indicatorSpecs: {}`（**显式关闭指标层**）时是 `null`——**不是**空对象：
+   * 「未启用指标」与「启用了但一行没写」是两种完全不同的状态，控制面必须能分开说
+   * （R-11.4 / AC-23）。空对象会让人以为「还没算」，于是反复点重建。
+   */
+  indicators: Record<string, Record<string, IndicatorMaterializeStats>> | null;
+  /**
+   * 本轮**实际使用**的指标实现版本（R-11.3）。
+   *
+   * 回传给调用方而不是让 TS 侧自己持有常量：`INDICATOR_IMPL_VERSION` 只存在于
+   * Python 侧，复制一份就会在实现递增后静默停在旧版本号上（R-3.4）。
+   */
+  implVersion: number;
+}
+
+/**
+ * 一个「周期 × 参数集」的指标物化统计（v0.3.0 R-6.6 / R-11.3）。
+ *
+ * 数字**逐周期逐参数集**报出，不许只报「成功」——一个 10 行集的物化跑完只回一句
+ * 「成功」，用户无从判断哪些周期真的算了、哪些被预热期扣光了。
+ */
+export interface IndicatorMaterializeStats {
+  indicator: string;
+  /** 参数列（键名与数据库列一致，因此控制面可直接回显成「哪几组参数」） */
+  params: Record<string, number | string>;
+  /** 真正**改动**的行数；重复执行同一区间必然为 0（幂等断言的依据） */
+  upserted: number;
+  /** 因**预热期**不落库的行数——「算不出来」而不是「没触及」 */
+  withheldWarmup: number;
+  /** `'noChange'` = 本批该周期没有任何桶变化，未重算 */
+  skipped?: string;
+}
+
+/** 全局汇总里的派生表实测体积（v0.2.0 R-8.2 / AC-16）。 */
+export interface DerivedTableStat {
+  interval: string;
+  table: string;
+  rows: number;
+  /** `pg_total_relation_size` 实测值（含索引摊销），不是估算 */
+  bytes: number;
 }
 
 /** 库内最后一根 bar 的自愈校验结果（R-10.3）。 */
@@ -237,4 +364,60 @@ export interface ClosedBarCheck {
   closeTime: number;
   /** closeTime <= now_ms */
   closed: boolean;
+}
+
+/**
+ * 单个派生周期的聚合统计（v0.2.0 R-5.6）。
+ *
+ * 数字**必须由 SQL 从 1m 推导**，不落「扣留表」（R-3.5）：被扣留的桶如果只表现为
+ * 「图上少一根」，用户就得自己猜原因。
+ *
+ * 两种扣留原因互斥且必须分开报：
+ *   * `withheldNotClosed`  —— 桶尚未走完（1m 还没到齐），等下一批自然出现；
+ *   * `withheldIncomplete` —— 桶已收盘但桶内有 1m 缺口，写进去就是一根半截蜡烛（R-3.5）。
+ *
+ * **口径是「桶次」，不是「此刻库里的桶数」**：同步一轮分多批写入，每批各自判定一次，
+ * 这里的数字是各批之和。首次全量下一个 400 根的标的（8 批）会报 `withheldNotClosed: 8`，
+ * 而轮末真正还没收盘的只有 1 个桶——前 7 个在下一批里已经被写入。上游刻意不做成
+ * 「轮末重算一遍」：那要在每轮收尾再对整段做一次全区间判定，正是 §6.3 里最贵的那次查询。
+ * 要「此刻有几桶被扣留」请看 `readDerivedIntervals`（`/api/symbols/:symbol` 的 `derived`）。
+ */
+export interface AggregateIntervalStats {
+  /** 本轮**新写入**的桶数（实际落库 − 写前已存在；`--rebuild` 与重复执行时可能为 0） */
+  upserted: number;
+  /** 本次判定中因**尚未收盘**而被扣留的桶次（各批之和，见上） */
+  withheldNotClosed: number;
+  /** 本次判定中因**已收盘但 1m 未全覆盖**而被扣留的桶次（各批之和，见上） */
+  withheldIncomplete: number;
+  /** 扣留桶内合计缺失的 1m 分钟数（= 缺口在派生层的投影） */
+  missingMinutes: number;
+}
+
+/** `data aggregate` 的结果摘要。**不许只报「成功」**（R-5.6）。 */
+export interface AggregateSummary {
+  symbol: string;
+  /** 区间起点（bucket 起点，epoch ms） */
+  from: number | null;
+  /** 区间终点（含，epoch ms） */
+  to: number | null;
+  /** 显式为 false 时表示本轮是只读校验（`--check`） */
+  rebuild: boolean;
+  check: boolean;
+  /**
+   * 每周期统计。`aggregateIntervals: []`（未启用派生）时命令直接报 `CONFIG_INVALID`
+   * 而不是返回空对象——「成功但什么都没做」正是 R-14 禁止的静默兜底（R-9.2 / AC-22）。
+   */
+  intervals: Record<string, AggregateIntervalStats>;
+  durationMs: number;
+}
+
+/** `--check` 发现的不一致明细（任一非空即抛 AGGREGATION_MISMATCH，R-5.1）。 */
+export interface AggregateMismatch {
+  interval: string;
+  /** `stale` = 派生表有但按当前 1m 已不合格；`missing` = 合格但缺失；`mismatch` = 值不一致 */
+  kind: 'stale' | 'missing' | 'mismatch';
+  /** 桶起点（epoch ms） */
+  time: number;
+  /** `mismatch` 时指出不一致的列名 */
+  column?: string;
 }
