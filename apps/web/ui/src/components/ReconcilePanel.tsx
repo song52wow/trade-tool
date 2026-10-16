@@ -130,7 +130,9 @@ export function ReconcilePanel(props: { symbol: string; tick: number }) {
       {!loaded ? null : report === null ? (
         <p className="muted" style={{ fontSize: 12, margin: '6px 0 0' }}>
           {symbol} 还没有自动对账记录。
-          {error === null ? '确认 apps/executor 正在运行（自动对账在它里面），或点上面的「立即对账」。' : ''}
+          {error === null
+            ? '确认 apps/executor 正在运行（自动对账在它里面），或点上面的「立即对账」。'
+            : ''}
         </p>
       ) : (
         <div>

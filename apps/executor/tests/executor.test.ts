@@ -8,7 +8,7 @@
  *   * ATR 取不到 → 留 failed 记录，不回退到别的周期或 0。
  */
 
-import { configSchema, type TradeToolConfig } from '@trade-tool/core';
+import { NetPositionTracker, configSchema, type TradeToolConfig } from '@trade-tool/core';
 import type { OrderTradeUpdate, Pool } from '@trade-tool/data';
 import type { OrderPlacer } from '../src/service.js';
 import {
@@ -25,6 +25,8 @@ function fakePool() {
     claims: new Map<
       string,
       {
+        symbol: string;
+        positionSide: string;
         tpOrderId: number | null;
         slOrderId: number | null;
         state: string;
@@ -43,7 +45,14 @@ function fakePool() {
       const now = p[14] as number;
       const key = `${exchange}/${symbol}/${entryOrderId}`;
       if (state.claims.has(key)) return { rows: [], rowCount: 0 };
-      state.claims.set(key, { tpOrderId: null, slOrderId: null, state: 'failed', lastError: null });
+      state.claims.set(key, {
+        symbol: String(symbol),
+        positionSide: String(positionSide),
+        tpOrderId: null,
+        slOrderId: null,
+        state: 'failed',
+        lastError: null,
+      });
       // RETURNING 的是完整一行，读侧会逐列校验（NULL_NOT_ALLOWED），因此必须给全
       return {
         rows: [
@@ -73,13 +82,56 @@ function fakePool() {
         rowCount: 1,
       };
     }
+    // listUnsettledBrackets：只取 armed / failed，形状与 INSERT 的 RETURNING 保持一致。
+    if (sql.includes('FROM risk_bracket')) {
+      const [exchange, maybeSymbol] = params as string[];
+      const rows = [...state.claims.entries()]
+        .filter(
+          ([key, row]) =>
+            key.startsWith(`${exchange}/${row.symbol}/`) &&
+            (row.state === 'armed' || row.state === 'failed') &&
+            (maybeSymbol === undefined || row.symbol === maybeSymbol),
+        )
+        .map(([key, row]) => {
+          const [, , entryOrderId] = key.split('/');
+          return {
+            exchange,
+            symbol: row.symbol,
+            entry_order_id: entryOrderId,
+            entry_price: 60_000,
+            entry_time: 1_000,
+            filled_qty: 0.1,
+            position_side: row.positionSide,
+            atr: 100,
+            atr_period: 14,
+            atr_interval: '1m',
+            atr_window_from: 1,
+            atr_window_to: 2,
+            stop_price: 59_800,
+            take_profit: 60_300,
+            tp_algo_id: row.tpOrderId,
+            sl_algo_id: row.slOrderId,
+            state: row.state,
+            last_error: row.lastError,
+            created_at: 1_000,
+            updated_at: 1_000,
+          };
+        });
+      return { rows, rowCount: rows.length };
+    }
     if (sql.includes('SET tp_algo_id')) {
       const [exchange, symbol, entryOrderId, tp, sl] = params as (string | number)[];
       const row = state.claims.get(`${exchange}/${symbol}/${entryOrderId}`);
       if (row) Object.assign(row, { tpOrderId: tp, slOrderId: sl, state: 'armed' });
       return { rows: [], rowCount: 1 };
     }
-    if (sql.includes('SET state = $4') || sql.includes("SET state = 'failed'")) {
+    if (sql.includes('SET state = $4')) {
+      const [exchange, symbol, entryOrderId, nextState] = params as (string | number)[];
+      const row = state.claims.get(`${exchange}/${symbol}/${entryOrderId}`);
+      if (row) row.state = String(nextState);
+      return { rows: [], rowCount: 1 };
+    }
+    if (sql.includes("SET state = 'failed'")) {
       return { rows: [], rowCount: 1 };
     }
     if (sql.includes('FROM contract_spec')) {
@@ -91,7 +143,7 @@ function fakePool() {
     throw new Error(`未预期的 SQL：${sql}`);
   });
   // pool 只用到 `query`；其余方法用不到也不实现。
-  return { state, pool: { query } as unknown as Pool };
+  return { state, query, pool: { query } as unknown as Pool };
 }
 
 function makeConfig(executor: Record<string, unknown> = {}): TradeToolConfig {
@@ -205,7 +257,7 @@ describe('事件判定', () => {
     expect(outcome).toBe('ignored');
   });
 
-  it('卖出成交不建保护（减仓由它自己的单触发）', async () => {
+  it('卖出成交且净仓位仍为多 → 是减仓，不建保护', async () => {
     const placer = fakePlacer();
     const service = createExecutorService({
       pool: fakePool().pool,
@@ -213,8 +265,13 @@ describe('事件判定', () => {
       placer,
       atr: fakeAtr(),
     });
-    expect(await service.handleFill(fill({ side: 'SELL' }))).toBe('ignored');
-    expect(placer.placed).toHaveLength(0);
+    // 关键：判据是**净仓位的符号**，不是成交方向。SELL 之后仓位还是正的，
+    // 说明这笔只是减了多仓，并没有开出空仓。
+    // 先建 0.2 的多仓，再卖 0.1：净额 +0.1 仍为正 → 减仓，不是平仓也不是开空。
+    await service.handleFill(fill({ lastFilledQty: 0.2, cumulativeQty: 0.2 }));
+    const placedBefore = placer.placed.length;
+    expect(await service.handleFill(fill({ side: 'SELL', orderId: 42 }))).toBe('ignored');
+    expect(placer.placed).toHaveLength(placedBefore);
   });
 
   it('自己的止损成交被认成结算而不是新买入', async () => {
@@ -278,6 +335,182 @@ describe('事件判定', () => {
     });
     expect(await service.handleFill(fill())).toBe('ignored');
     expect(placer.placed).toHaveLength(0);
+  });
+});
+
+describe('仓位事实决定开仓 / 减仓 / 平仓', () => {
+  it('卖出成交且净仓位转负 → 当作新开空仓，止损止盈挂在入场价上方', async () => {
+    const pool = fakePool();
+    const placer = fakePlacer();
+    const service = createExecutorService({
+      pool: pool.pool,
+      config: makeConfig({ stopAtrMult: 2, takeProfitAtrMult: 3 }),
+      placer,
+      atr: fakeAtr(),
+    });
+    expect(await service.handleFill(fill({ side: 'SELL', orderId: 42 }))).toBe('armed');
+    // 平空 = BUY。止损 60000+2×100 = 60200，止盈 60000−3×100 = 59700，
+    // 两者都朝远离入场价的方向，与多头完全镜像。
+    expect(placer.placed).toEqual([
+      expect.objectContaining({ type: 'TAKE_PROFIT_MARKET', stopPrice: 59_700 }),
+      expect.objectContaining({ type: 'STOP_MARKET', stopPrice: 60_200 }),
+    ]);
+    // 入场方向记为 SHORT
+    expect(pool.state.claims.get('binance/BTCUSDT/42')?.positionSide).toBe('SHORT');
+  });
+
+  it('净持仓归零 → 工具外平仓，未终结记录收敛为 cancelled', async () => {
+    const pool = fakePool();
+    const service = createExecutorService({
+      pool: pool.pool,
+      config: makeConfig(),
+      placer: fakePlacer(),
+      atr: fakeAtr(),
+    });
+    await service.handleFill(fill());
+    expect(pool.state.claims.get('binance/BTCUSDT/42')?.state).toBe('armed');
+
+    // 用户在交易所 App 上按了平仓：SELL 成交，净持仓归零，clientOrderId 不是我们的。
+    const outcome = await service.handleFill(
+      fill({ side: 'SELL', orderId: 999, clientOrderId: 'manual-close' }),
+    );
+    expect(outcome).toBe('external-close');
+    expect(pool.query).toHaveBeenCalledWith(
+      expect.stringContaining('SET state = $4'),
+      expect.arrayContaining(['cancelled']),
+    );
+  });
+
+  it('空仓但本地没有未终结记录 → 只是忽略，不凭空造状态', async () => {
+    const placer = fakePlacer();
+    const positions = new NetPositionTracker();
+    const service = createExecutorService({
+      pool: fakePool().pool,
+      config: makeConfig(),
+      placer,
+      atr: fakeAtr(),
+      positions,
+    });
+    // 种子已经是 +0.1（模拟重启后从 positionRisk 播种到既有仓位），卖 0.1 后归零。
+    // 本地没有任何未终结记录 → 什么都不该写。
+    positions.seed('BTCUSDT', 0.1);
+    expect(await service.handleFill(fill({ side: 'SELL', orderId: 999 }))).toBe('ignored');
+    expect(placer.placed).toHaveLength(0);
+  });
+
+  it('同一标的已有未终结保护 → 跳过，不叠第二套 closePosition', async () => {
+    const pool = fakePool();
+    const placer = fakePlacer();
+    const service = createExecutorService({
+      pool: pool.pool,
+      config: makeConfig(),
+      placer,
+      atr: fakeAtr(),
+    });
+    await service.handleFill(fill());
+    // 加仓：另一笔订单号，仓位方向一致 → 本该是新开仓，但同一仓位已有保护。
+    expect(await service.handleFill(fill({ orderId: 43 }))).toBe('skipped-existing-bracket');
+    expect(placer.placed).toHaveLength(2);
+  });
+
+  it('ACCOUNT_UPDATE 把本地净额拉到交易所的值，之后的成交以此为基线', async () => {
+    const pool = fakePool();
+    const service = createExecutorService({
+      pool: pool.pool,
+      config: makeConfig(),
+      placer: fakePlacer(),
+      atr: fakeAtr(),
+    });
+    await service.handleFill(fill());
+    // 校正：交易所说是空的（断线期间漏了一笔平仓）。
+    await service.correctPositions([{ symbol: 'BTCUSDT', positionAmt: 0, transactionTime: 1_000 }]);
+    // 校正只改净额、不动记录：那条 armed 仍在——这是刻意的，
+    // 因为「归零」还分不清是止损成交还是手动平仓，抢先收敛会抹掉前者的语义。
+    expect(pool.state.claims.get('binance/BTCUSDT/42')?.state).toBe('armed');
+    // 重连兜底发生在无在途事件的时刻，这才收敛。
+    await service.convergeFlatPositions([{ symbol: 'BTCUSDT' }]);
+    expect(pool.state.claims.get('binance/BTCUSDT/42')?.state).toBe('cancelled');
+    // 之后的成交以 0 为基线：SELL 0.1 → 净空 0.1 → 新开空仓。
+    expect(await service.handleFill(fill({ side: 'SELL', orderId: 77, tradeTime: 2_000 }))).toBe(
+      'armed',
+    );
+    expect(pool.state.claims.get('binance/BTCUSDT/77')?.positionSide).toBe('SHORT');
+  });
+
+  it('ACCOUNT_UPDATE 显示归零时**不抢**收敛——那可能是我们自己的止损成交', async () => {
+    const pool = fakePool();
+    const service = createExecutorService({
+      pool: pool.pool,
+      config: makeConfig(),
+      placer: fakePlacer(),
+      atr: fakeAtr(),
+    });
+    await service.handleFill(fill());
+
+    // 仓位归零了，但**还不知道是谁平的**。若此时抢先置 cancelled，
+    // 就会与下面那笔结算并发写同一行，把「止损成交」抹成「工具外平仓」。
+    await service.correctPositions([{ symbol: 'BTCUSDT', positionAmt: 0, transactionTime: 1_000 }]);
+    expect(pool.state.claims.get('binance/BTCUSDT/42')?.state).toBe('armed');
+
+    // 结算事件随后到达 → 终态必须是 stop_loss，不能是 cancelled。
+    const outcome = await service.handleFill(
+      fill({
+        side: 'SELL',
+        orderId: 901,
+        clientOrderId: bracketClientOrderId('sl', '42'),
+        tradeTime: 1_000,
+      }),
+    );
+    expect(outcome).toBe('settled');
+    expect(pool.state.claims.get('binance/BTCUSDT/42')?.state).toBe('stop_loss');
+  });
+
+  it('重连兜底：净仓位确为 0 且无在途事件时，才收敛未终结记录', async () => {
+    const pool = fakePool();
+    const service = createExecutorService({
+      pool: pool.pool,
+      config: makeConfig(),
+      placer: fakePlacer(),
+      atr: fakeAtr(),
+    });
+    await service.handleFill(fill());
+    await service.correctPositions([{ symbol: 'BTCUSDT', positionAmt: 0, transactionTime: 1_000 }]);
+    expect(pool.state.claims.get('binance/BTCUSDT/42')?.state).toBe('armed');
+
+    await service.convergeFlatPositions([{ symbol: 'BTCUSDT' }]);
+    expect(pool.state.claims.get('binance/BTCUSDT/42')?.state).toBe('cancelled');
+  });
+
+  it('兜底只处理净仓位确为 0 的标的', async () => {
+    const pool = fakePool();
+    const service = createExecutorService({
+      pool: pool.pool,
+      config: makeConfig(),
+      placer: fakePlacer(),
+      atr: fakeAtr(),
+    });
+    await service.handleFill(fill());
+    await service.convergeFlatPositions([{ symbol: 'BTCUSDT' }]);
+    expect(pool.state.claims.get('binance/BTCUSDT/42')?.state).toBe('armed');
+  });
+
+  it('ACCOUNT_UPDATE 只覆盖它推了的标的，不当成全量快照', async () => {
+    const placer = fakePlacer();
+    const service = createExecutorService({
+      pool: fakePool().pool,
+      config: makeConfig(),
+      placer,
+      atr: fakeAtr(),
+    });
+    await service.handleFill(fill({ symbol: 'BTCUSDT' }));
+    await service.handleFill(fill({ symbol: 'ETHUSDT', orderId: 43 }));
+    // 只校正 BTC：ETH 的本地净额必须原样保留，不能被「重置」掉。
+    await service.correctPositions([
+      { symbol: 'BTCUSDT', positionAmt: 0.1, transactionTime: 1_000 },
+    ]);
+    expect(await service.handleFill(fill({ symbol: 'ETHUSDT', orderId: 44 }))).toBe(
+      'skipped-existing-bracket',
+    );
   });
 });
 

@@ -260,7 +260,17 @@ export const executorSchema = z.object({
   /** 私钥的**环境变量名**。配置文件里不写密钥本身。 */
   apiKeyEnv: z.string().min(1).default('TRADE_TOOL_BINANCE_API_KEY'),
   apiSecretEnv: z.string().min(1).default('TRADE_TOOL_BINANCE_API_SECRET'),
-  /** 请求时间戳容忍窗口（毫秒）。太小会因本机时钟漂移而 -1021。 */
+  /**
+   * 请求时间戳容忍窗口（毫秒）。
+   *
+   * ⚠️ **它挡不住本机时钟不准**。本仓库实测（2026-10-16，demo 端点）：
+   * `recvWindow` 取 5000 / 15000 / 60000 三档，报的都是同一句
+   * `Timestamp ... was 1000ms ahead of the server's time`——端点对未来时间戳的
+   * 容差是硬的 ~1000ms，调大这个参数没有用。
+   *
+   * 时钟偏差由 `packages/core/src/clock-skew.ts` 在进程启动时测量并补偿，
+   * 那个才是真正起作用的地方；这里保留是给**网络延迟**留的余量。
+   */
   recvWindowMs: z.number().int().positive().max(60_000).default(5_000),
   /** 重连退避：初始 / 上限。断线必须重连，否则服务会「看起来在跑」而实际不再设单。 */
   reconnectBaseMs: z.number().int().positive().default(2_000),

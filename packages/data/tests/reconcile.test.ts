@@ -40,10 +40,7 @@ interface Call {
 }
 
 /** 记录每次调用的交易所替身：不出网，只回测试给的数据。 */
-function fakeClient(input: {
-  positions?: ExchangePosition[];
-  algoOrders?: ExchangeAlgoOrder[];
-}) {
+function fakeClient(input: { positions?: ExchangePosition[]; algoOrders?: ExchangeAlgoOrder[] }) {
   const calls: Call[] = [];
   const client = {
     positionRisk(options: Call = {}): Promise<ExchangePosition[]> {
@@ -69,7 +66,13 @@ function position(symbol: string): ExchangePosition {
   };
 }
 
-function algo(symbol: string, entryOrderId: string, tag: 'tp' | 'sl', algoId: number, price: number) {
+function algo(
+  symbol: string,
+  entryOrderId: string,
+  tag: 'tp' | 'sl',
+  algoId: number,
+  price: number,
+) {
   return {
     algoId,
     clientAlgoId: `rsk-${tag}-${entryOrderId}`,
@@ -173,7 +176,11 @@ describe('交易对账的取数与范围', () => {
     });
     expect(report.differences).toEqual([]);
     expect(report.healthy).toBe(true);
-    expect(report.scope).toEqual({ localUnsettled: 1, exchangePositions: 1, exchangeAlgoOrders: 2 });
+    expect(report.scope).toEqual({
+      localUnsettled: 1,
+      exchangePositions: 1,
+      exchangeAlgoOrders: 2,
+    });
   });
 
   it('本地记为已挂单、交易所没有止损单 → critical', async () => {

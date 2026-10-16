@@ -1,24 +1,47 @@
 # @trade-tool/executor
 
-常驻止盈止损服务（v0.4.0）：**买入成交事件 → ATR → 止盈止损条件单**。
+常驻止盈止损服务（v0.4.0）：**成交事件 → 净仓位 → ATR → 止盈止损条件单**。多空都支持。
 
 ```
 Binance 用户数据流（listenKey）
-      │  ORDER_TRADE_UPDATE
+      │  同一 symbol 串行处理
       ▼
 判定：是自己挂的单吗 → 是则记结算（另一张由交易所撤销）
       │ 否
       ▼
-只在买入成交上建保护，且必须达到门槛（FILLED，或 accumulate 模式的部分成交）
+流内增量净额（启动 / 每次重连后由 positionRisk 播种）：
+      ├── = 0      → 工具外平仓：未终结记录收敛为 cancelled
+      ├── 方向相反  → 减仓，忽略（由它自己的单触发）
+      └── 方向一致  → 新开仓（BUY 开多 / SELL 开空），继续
       ▼
-占坑 risk_bracket（exchange + symbol + entryOrderId）── 冲突即「已处理过」，跳过
+该标的是否已有未终结保护？→ 是则跳过并留 warn（不叠第二套 closePosition）
+      ▼
+占坑 risk_bracket（exchange + symbol + entryOrderId）── 冲突即「事件重放」，跳过
       ▼
 quant_data risk-atr（按成交时刻，只用库内已收盘的连续 1m）→ ATR(14)
       ▼
 deriveBracketPlan：SL = 入场 ∓ 2×ATR，TP = 入场 ± 3×ATR，两张都朝远离入场价对齐 tick
       ▼
 挂 TAKE_PROFIT_MARKET，再挂 STOP_MARKET（closePosition=true）→ 回填单号，state=armed
+
+另有一条旁路：ACCOUNT_UPDATE → 覆盖本地净仓位（校正，不参与判定）
 ```
+
+**为什么方向判据是净仓位而不是成交方向**：只做多时「SELL = 减仓」成立，
+支持做空后它就错了——开空仓也是 SELL，而交易所的净仓位才是事实。
+
+**净仓位为什么是「流内增量」而不是每次查接口**：`ORDER_TRADE_UPDATE` 在 USDⓈ-M 上
+不带仓位（仓位在 `ACCOUNT_UPDATE` 里），而两类事件之间**没有顺序保证**，
+所以既不能从成交事件里刨、也不能等账户事件。逐笔累加与交易所净额等价，且不依赖事件顺序、
+不需要每笔出网。完整理由见 AGENTS.md §6.3 第 7 条与 `packages/core/src/net-position.ts`。
+
+`handleFill` 的返回值是**可见的处理结论**（日志与测试都靠它区分「为什么没设单」）：
+`ignored` / `settled` / `external-close` / `skipped-existing-bracket` / `duplicate` /
+`partial-skipped` / `armed` / `failed`。
+
+**启动时先校时钟**：本机时钟与交易所差 1 秒就会让每个私有请求吃 -1021（挂单、撤单、
+对账全在里面）。`/fapi/v1/time` 是无签名的，时钟不准时依然可用，因此用它测量偏移，
+并在启动日志里打出来——补偿不可见就等于没补偿。详见 `packages/core/src/clock-skew.ts`。
 
 - `src/service.ts` — `createExecutorService()`：事件判定、幂等、下单与失败回滚。
   全部依赖（pool / 下单 / ATR）都是注入的，测试用替身，**不连 PG、不出网**。

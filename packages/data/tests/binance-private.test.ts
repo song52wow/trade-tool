@@ -303,15 +303,15 @@ describe('只读查询端点（v0.6.0 对账用）', () => {
   });
 
   it('返回的不是数组就抛错，不返回空数组假装「没有仓位」', async () => {
-    const client = clientWith((async () => jsonResponse({ code: -1, msg: 'nope' })) as unknown as typeof fetch);
+    const client = clientWith((async () =>
+      jsonResponse({ code: -1, msg: 'nope' })) as unknown as typeof fetch);
     await expect(client.positionRisk()).rejects.toThrow();
     await expect(client.openAlgoOrders()).rejects.toThrow();
   });
 
   it('字段缺失 / 类型不对一律抛错带字段名', async () => {
-    const client = clientWith(
-      (async () => jsonResponse([{ symbol: 'ADAUSDT', positionAmt: 'abc' }])) as unknown as typeof fetch,
-    );
+    const client = clientWith((async () =>
+      jsonResponse([{ symbol: 'ADAUSDT', positionAmt: 'abc' }])) as unknown as typeof fetch);
     await expect(client.positionRisk()).rejects.toThrow(/positionAmt/);
   });
 });

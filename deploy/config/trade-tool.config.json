@@ -28,12 +28,7 @@
     "timeoutMs": 60000,
     "batchSize": 5000,
     "maxGapAttempts": 5,
-    "aggregateIntervals": [
-      "15m",
-      "1h",
-      "4h",
-      "1d"
-    ],
+    "aggregateIntervals": ["15m", "1h", "4h", "1d"],
     "aggregateBatchBars": 20000
   },
   "database": {

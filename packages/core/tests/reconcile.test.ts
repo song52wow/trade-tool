@@ -114,7 +114,11 @@ describe('一致的场景', () => {
     expect(result.differences).toEqual([]);
     expect(result.healthy).toBe(true);
     expect(result.counts).toEqual({ critical: 0, warning: 0, total: 0 });
-    expect(result.scope).toEqual({ localUnsettled: 1, exchangePositions: 1, exchangeAlgoOrders: 2 });
+    expect(result.scope).toEqual({
+      localUnsettled: 1,
+      exchangePositions: 1,
+      exchangeAlgoOrders: 2,
+    });
   });
 
   it('已终结的记录不参与对账（它们的两张单本来就该不在交易所）', () => {

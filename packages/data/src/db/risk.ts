@@ -238,19 +238,27 @@ export async function markBracketFailed(
   }
 }
 
-/** 交易所回报成交：另一张单由交易所自动撤销，这里只落最终状态。 */
+/**
+ * 落最终状态。
+ *
+ * **返回实际更新的行数**——调用方据此判断「这次真的收敛了一条」还是
+ * 「别人已经收敛过了」。`ACCOUNT_UPDATE` 的归零收敛与止盈止损成算是两条并发路径，
+ * 两者都会查同一批未终结记录；不返回 rowCount 的话两条路径都会打出
+ * 「1 条置为 cancelled」，而实际只更新了一次——日志会骗人。
+ */
 export async function markBracketSettled(
   pool: Pool,
   key: { exchange: string; symbol: string; entryOrderId: string },
   state: Extract<BracketState, 'take_profit' | 'stop_loss' | 'cancelled'>,
   now: number,
-): Promise<void> {
+): Promise<number> {
   try {
-    await pool.query(
+    const result = await pool.query(
       `UPDATE ${TABLE} SET state = $4, updated_at = $5
        WHERE exchange = $1 AND symbol = $2 AND entry_order_id = $3`,
       [key.exchange, key.symbol, key.entryOrderId, state, now],
     );
+    return result.rowCount ?? 0;
   } catch (caught) {
     throw toSyncError(caught, `更新止盈止损最终状态失败：${key.symbol} ${key.entryOrderId}`);
   }
@@ -312,9 +320,13 @@ function toUnsettledRecord(row: Record<string, unknown>): UnsettledBracketRecord
   if (record.state !== 'armed' && record.state !== 'failed') {
     // WHERE 已经限定了这两态，能走到这里说明约束被绕过或查询被改坏了。
     // 抛错而不是当成 armed —— 那正是上面说的假警报来源（AGENTS.md 约定 9）。
-    throw new SyncError('CONFIG_INVALID', `listUnsettledBrackets 收到非未终结状态：${record.state}`, {
-      state: record.state,
-    });
+    throw new SyncError(
+      'CONFIG_INVALID',
+      `listUnsettledBrackets 收到非未终结状态：${record.state}`,
+      {
+        state: record.state,
+      },
+    );
   }
   if (record.positionSide !== 'LONG' && record.positionSide !== 'SHORT') {
     throw new SyncError(

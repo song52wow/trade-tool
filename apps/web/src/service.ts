@@ -2,6 +2,7 @@ import {
   INTERVAL_MS,
   loadConfigOrDefault,
   parseSecretKey,
+  describeClockSkew,
   SECRET_KEY_ENV,
   STORED_INTERVALS,
   type GapRecord,
@@ -319,6 +320,10 @@ export function createWebRuntime(config: TradeToolConfig): WebRuntime {
         credentials,
         ...exchangeEndpointsFromEnv(config.executor),
       });
+      // 手动对账同样要校时钟：不然这里的每个签名请求都 -1021，
+      // 而「查失败」与「查出差异」在界面上必须能分开说（AGENTS.md §6.5）。
+      const skew = await client.measureClockSkew();
+      console.error(`[web] 手动对账前校时：${describeClockSkew(skew)}`);
       const report = await runReconciliation({
         pool,
         client,

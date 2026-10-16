@@ -308,7 +308,9 @@ export function reconcileBrackets(input: ReconcileInput): ReconcileReport {
   for (const position of positionScope) {
     if (position.positionAmt === 0) continue;
     const covered = localScope.some(
-      (record) => record.symbol === position.symbol && sideMatches(position.positionSide, record.positionSide),
+      (record) =>
+        record.symbol === position.symbol &&
+        sideMatches(position.positionSide, record.positionSide),
     );
     if (covered) continue;
     differences.push({

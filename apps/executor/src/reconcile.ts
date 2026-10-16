@@ -49,7 +49,9 @@ export async function runOnce(deps: PeriodicReconcileDeps): Promise<ReconcileRep
       now,
     });
   } catch (error) {
-    log.error(`对账本轮失败（不影响挂单）：${error instanceof Error ? error.message : String(error)}`);
+    log.error(
+      `对账本轮失败（不影响挂单）：${error instanceof Error ? error.message : String(error)}`,
+    );
     return null;
   }
 
@@ -59,7 +61,9 @@ export async function runOnce(deps: PeriodicReconcileDeps): Promise<ReconcileRep
   try {
     await recordReconciliation(deps.pool, report, now());
   } catch (error) {
-    log.error(`对账结果落库失败（不影响挂单）：${error instanceof Error ? error.message : String(error)}`);
+    log.error(
+      `对账结果落库失败（不影响挂单）：${error instanceof Error ? error.message : String(error)}`,
+    );
   }
 
   if (report.healthy) {
@@ -102,9 +106,11 @@ export function startPeriodicReconcile(deps: PeriodicReconcileDeps): PeriodicRec
   }
 
   const setIntervalImpl =
-    deps.setIntervalImpl ?? ((fn: () => void, ms: number) => setInterval(fn, ms) as unknown as NodeJS.Timeout);
+    deps.setIntervalImpl ??
+    ((fn: () => void, ms: number) => setInterval(fn, ms) as unknown as NodeJS.Timeout);
   const clearIntervalImpl =
-    deps.clearIntervalImpl ?? ((handle: NodeJS.Timeout) => clearInterval(handle as unknown as number));
+    deps.clearIntervalImpl ??
+    ((handle: NodeJS.Timeout) => clearInterval(handle as unknown as number));
 
   void runOnce(deps);
   const handle = setIntervalImpl(() => {

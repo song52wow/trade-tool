@@ -22,6 +22,9 @@ import { createHmac } from 'node:crypto';
 
 import {
   SyncError,
+  computeClockSkew,
+  type ClockSample,
+  type ClockSkew,
   type Credentials,
   type ExecutionType,
   type ExchangeAlgoOrder,
@@ -31,8 +34,13 @@ import {
   type PositionSide,
 } from '@trade-tool/core';
 
-/** 用户数据流事件的两种事件名（只关心第一种）。 */
+/**
+ * 用户数据流的事件名。
+ *
+ * **两个都要处理**：订单事件不带仓位，仓位在账户事件里（详见 `packages/core/src/net-position.ts`）。
+ */
 export const ORDER_TRADE_UPDATE = 'ORDER_TRADE_UPDATE';
+export const ACCOUNT_UPDATE = 'ACCOUNT_UPDATE';
 
 export type { Credentials, ExecutionType, OrderSide, OrderStatus, PositionSide };
 
@@ -180,6 +188,71 @@ export function parseOrderTradeUpdate(payload: unknown): OrderTradeUpdate | null
   };
 }
 
+/** `ACCOUNT_UPDATE` 里的一个仓位条目。 */
+export interface AccountPositionUpdate {
+  symbol: string;
+  positionSide: PositionSide;
+  /** 净仓位。正 = 多，负 = 空，0 = 空仓。 */
+  positionAmt: number;
+  /** 入场价。 */
+  entryPrice: number;
+  /**
+   * 撮合时间（事件根节点的 `T`）。
+   *
+   * **必须带出来**：它划定了「哪些成交的效果已经包含在这条校正里」。
+   * 撮合时间 `<= T` 的成交若再被累加一次，就是把同一笔事实算两遍——
+   * 实测会让平仓凭空变成反向开仓。
+   */
+  transactionTime: number;
+}
+
+/**
+ * 把 `ACCOUNT_UPDATE` 解析成**它这次推了几个标的的仓位**；不是该事件返回 `null`。
+ *
+ * **只包含「本次变动了的标的」**——官方明确「仅当 symbol 仓位有变动时推送」，
+ * 而且资金费的简略事件可能完全不带 `P`。因此返回的是增量视图，**不是账户全量快照**：
+ * 调用方必须按条目逐个覆盖本地净额，绝不能拿它当全量重置。
+ *
+ * 解析失败抛错而不是跳过：`pa` 改名成非数字时静默忽略，症状是
+ * 「本地净仓位悄悄失准，几笔成交之后才开始挂错方向的止损」。
+ */
+export function parseAccountUpdate(payload: unknown): AccountPositionUpdate[] | null {
+  if (typeof payload !== 'object' || payload === null) return null;
+  const root = payload as Record<string, unknown>;
+  if (root['e'] !== ACCOUNT_UPDATE) return null;
+  const account = root['a'];
+  if (typeof account !== 'object' || account === null) return [];
+  const list = (account as Record<string, unknown>)['P'];
+  if (list === undefined || list === null) return [];
+  if (!Array.isArray(list)) {
+    throw new SyncError('EXCHANGE_ERROR', 'ACCOUNT_UPDATE 的 a.P 不是数组', {});
+  }
+
+  const positions: AccountPositionUpdate[] = [];
+  for (const [index, item] of list.entries()) {
+    if (typeof item !== 'object' || item === null) continue;
+    const entry = item as Record<string, unknown>;
+    const symbol = requireString(entry['s'], 'a.P[].s', `ACCOUNT_UPDATE[${index}]`);
+    const rawAmt = entry['pa'];
+    const positionAmt = typeof rawAmt === 'string' ? Number(rawAmt) : rawAmt;
+    if (typeof positionAmt !== 'number' || !Number.isFinite(positionAmt)) {
+      throw new SyncError('EXCHANGE_ERROR', `ACCOUNT_UPDATE ${symbol} 的 a.P[].pa 不是有限数字`, {
+        pa: rawAmt,
+      });
+    }
+    const rawEntryPrice = entry['ep'];
+    const entryPrice = typeof rawEntryPrice === 'string' ? Number(rawEntryPrice) : rawEntryPrice;
+    positions.push({
+      symbol,
+      positionSide: (typeof entry['ps'] === 'string' ? entry['ps'] : 'BOTH') as PositionSide,
+      positionAmt,
+      entryPrice: typeof entryPrice === 'number' && Number.isFinite(entryPrice) ? entryPrice : 0,
+      transactionTime: requireNumber(root['T'], 'T', `ACCOUNT_UPDATE ${symbol}`),
+    });
+  }
+  return positions;
+}
+
 /**
  * 从 exchangeInfo 的原始条目里取最小价格变动（`PRICE_FILTER.tickSize`）。
  *
@@ -236,6 +309,13 @@ export class BinancePrivateClient {
   private readonly baseUrl: string;
   private readonly streamUrl: string;
   private readonly recvWindowMs: number;
+  /**
+   * 时钟补偿量（毫秒）。由 `measureClockSkew()` 写入，签名时从 `Date.now()` 里减掉。
+   *
+   * 默认 0 = 不补偿。这**不是**「认为时钟是准的」，而是「还没测过」——
+   * 因此每个进程入口都必须先 `measureClockSkew()`，否则私有请求会直接 -1021。
+   */
+  private clockOffsetMs = 0;
   private readonly fetchImpl: typeof fetch;
   private readonly webSocketFactory: (url: string) => WebSocket;
 
@@ -260,6 +340,37 @@ export class BinancePrivateClient {
     return `${query}&signature=${signature}`;
   }
 
+  /**
+   * 测量本机时钟与交易所的偏差。
+   *
+   * 调 `/fapi/v1/time`（**无签名**，所以不依赖时钟是否准——它是无签名的，
+   * 恰好是唯一在时钟偏时仍然可用的接口）。
+   *
+   * 调用方**必须**把结果打到日志里：补偿是「拿测量值纠正已知误差」，
+   * 不看见它就等于凭空改写了时间戳（AGENTS.md 约定 9）。
+   */
+  async measureClockSkew(sampleCount = 3): Promise<ClockSkew> {
+    const samples: ClockSample[] = [];
+    for (let i = 0; i < sampleCount; i++) {
+      const sentAt = Date.now();
+      const body = await this.request<{ serverTime?: unknown }>('GET', '/fapi/v1/time');
+      if (typeof body?.serverTime !== 'number') {
+        throw new SyncError('EXCHANGE_ERROR', '/fapi/v1/time 没有返回数字 serverTime', {
+          body: JSON.stringify(body).slice(0, 200),
+        });
+      }
+      samples.push({ sentAt, serverTime: body.serverTime });
+    }
+    const skew = computeClockSkew(samples);
+    this.clockOffsetMs = skew.offsetMs;
+    return skew;
+  }
+
+  /** 当前生效的时钟补偿量（毫秒），未测量时为 0。 */
+  get clockOffset(): number {
+    return this.clockOffsetMs;
+  }
+
   private async request<T>(
     method: 'GET' | 'POST' | 'PUT' | 'DELETE',
     path: string,
@@ -277,7 +388,9 @@ export class BinancePrivateClient {
       const signed = this.sign({
         ...(options.params ?? {}),
         recvWindow: options.params?.['recvWindow'] ?? this.recvWindowMs,
-        timestamp: Date.now(),
+        // 扣掉测量到的时钟偏差。**不要**改成 `Date.now() + …`：
+        // 那是把一个已知的偏移换个方向再叠一次。
+        timestamp: Date.now() - this.clockOffsetMs,
       });
       url += `?${signed}`;
     } else if (options.params && Object.keys(options.params).length > 0) {
@@ -518,7 +631,7 @@ export interface UserDataStreamOptions {
   /** 每条事件回调。返回的 Promise 会被 await：处理失败不该把连接拖垮。 */
   onEvent: (payload: Record<string, unknown>) => void | Promise<void>;
   onError?: (error: Error) => void;
-  /** 连接断开（含服务端关闭）。**重连逻辑挂在��里**——不接就等于静默停推。 */
+  /** 连接断开（含服务端关闭）。**重连逻辑挂在这里**——不接就等于静默停推。 */
   onClose?: (reason: string) => void;
   /** keepalive 回调。listenKey 30 分钟过期，不续期就静默停推。 */
   onKeepAlive?: (listenKey: string) => Promise<void> | void;

@@ -1,10 +1,18 @@
 #!/usr/bin/env node
-import { loadConfigOrDefault, loadProjectEnv, SyncError, type Credentials } from '@trade-tool/core';
+import {
+  NetPositionTracker,
+  loadConfigOrDefault,
+  loadProjectEnv,
+  SyncError,
+  describeClockSkew,
+  type Credentials,
+} from '@trade-tool/core';
 import {
   BinancePrivateClient,
   buildContext,
   createPool,
   openUserDataStream,
+  parseAccountUpdate,
   parseOrderTradeUpdate,
   resolveActiveCredentials,
   resolvePolicy,
@@ -55,6 +63,27 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+/**
+ * 按 key 串行化任务：同一 key 的任务严格按进入顺序依次跑完。
+ *
+ * 前一个任务**失败不阻断**后一个（`then(task, task)`）——一笔成交处理失败不该让
+ * 后续成交永远排不上队。链上只保留「跑完的那个 Promise」，处理完即从表里移除，
+ * 否则 key 会随成交笔数无限增长。
+ */
+function createSerialRunner(): (key: string, task: () => Promise<unknown>) => Promise<unknown> {
+  const chains = new Map<string, Promise<unknown>>();
+  return function serial(key: string, task: () => Promise<unknown>) {
+    const previous = chains.get(key) ?? Promise.resolve();
+    const next = previous.then(task, task);
+    const settled: Promise<unknown> = next.catch(() => undefined);
+    chains.set(key, settled);
+    void settled.then(() => {
+      if (chains.get(key) === settled) chains.delete(key);
+    });
+    return next;
+  };
+}
+
 async function main(): Promise<void> {
   const config = await loadConfigOrDefault();
 
@@ -74,6 +103,11 @@ async function main(): Promise<void> {
     ...exchangeEndpointsFromEnv(config.executor),
     recvWindowMs: config.executor.recvWindowMs,
   });
+  // **先校时钟再做任何私有调用**：本机时钟与交易所差几百毫秒就会让每个签名请求
+  // 吃 -1021（挂单、撤单、对账全在里面）。测量走的是无签名的 /fapi/v1/time，
+  // 所以时钟不准时它仍然可用。补偿量必须打出来，不可见的补偿等于没补偿。
+  const skew = await client.measureClockSkew();
+  console.error(`[executor] ${describeClockSkew(skew)}`);
   const atr = createAtrProvider({
     runtime: ctx.runtime,
     dsn: ctx.dsn,
@@ -82,18 +116,79 @@ async function main(): Promise<void> {
   });
   // 策略按标的解析：标的覆盖 > 全局默认 > 配置文件。优先级只有 resolvePolicy 一份实现，
   // 控制面预览与这里用的是同一个函数，避免「页面显示的」和「实际挂单的」分叉。
+  const tracker = new NetPositionTracker();
+
+  /**
+   * 播种净仓位。
+   *
+   * 启动与**每次重连**后都要调：用户数据流不重放断线期间的事件，
+   * 不重新播种的话本地净额会从断线那一刻开始一路错下去，而错的方向决定
+   * 下一笔成交被当成开仓还是减仓——那会挂出一整套方向相反的止盈止损。
+   *
+   * 播种失败**不让进程退出**：用户数据流仍要连着，否则连「对账发现仓位没保护」
+   * 这条退路都没了。此时表是空的，净额按 0 起算，并留下一条明确的错误日志。
+   */
+  async function seedNetPositions(): Promise<void> {
+    try {
+      const rows = await client.positionRisk();
+      // 双向持仓模式（同标的有 LONG / SHORT 两行）直接拒绝：两行相消得到 0，
+      // 会把「仍有仓位」误判成「已平仓」，进而把未终结记录收敛成 cancelled。
+      const bySymbol = new Map<string, typeof rows>();
+      for (const row of rows) {
+        const list = bySymbol.get(row.symbol) ?? [];
+        list.push(row);
+        bySymbol.set(row.symbol, list);
+      }
+      const multiSided = [...bySymbol].filter(
+        ([, list]) => list.filter((r) => r.positionAmt !== 0).length > 1,
+      );
+      if (multiSided.length > 0) {
+        throw new SyncError(
+          'CONFIG_INVALID',
+          `双向持仓模式无法跟踪净仓位（${multiSided
+            .map(([symbol, list]) => `${symbol}=${list.map((r) => r.positionAmt).join('/')}`)
+            .join('、')}）：` + `两侧净额相消得到 0，会被误判成已平仓。单向持仓模式下本服务可用。`,
+          { symbols: multiSided.map(([s]) => s) },
+        );
+      }
+      tracker.reset();
+      const open = rows.filter((r) => r.positionAmt !== 0);
+      for (const row of rows) tracker.seed(row.symbol, row.positionAmt);
+      console.error(
+        `[executor] 净仓位已播种（${rows.length} 个标的，其中 ${open.length} 个有仓位：` +
+          `${open.map((r) => `${r.symbol}=${r.positionAmt}`).join('、') || '无'}）`,
+      );
+      // 此刻**没有任何在途事件**，是唯一适合兜底收敛的时刻：接住
+      // 「断线期间成交事件整个丢了」——仓位已空而记录还停在 armed。
+      // 事件流里不做这件事，因为那里会与止盈止损的 settle() 并发抢同一行。
+      await service.convergeFlatPositions(
+        rows.filter((r) => r.positionAmt === 0).map((r) => ({ symbol: r.symbol })),
+      );
+    } catch (error) {
+      tracker.reset();
+      console.error(`[executor] 净仓位播种失败：${(error as Error).message}`);
+      console.error('[executor] 暂按空仓起算——在播种成功前，本服务判定的开仓 / 减仓可能是错的');
+    }
+  }
+
   const service = createExecutorService({
     pool,
     config,
     placer: client,
     atr,
     resolvePolicy: async (symbol) => resolvePolicy(pool, ctx.exchange, symbol, config.executor),
+    positions: tracker,
   });
+
+  await seedNetPositions();
 
   // 自动对账与用户数据流**并行**：它跑得慢或挂掉都不影响挂单（见 reconcile.ts）。
   reconcileTimer = startPeriodicReconcile({ pool, client, config });
 
   let delay = config.executor.reconnectBaseMs;
+  const serial = createSerialRunner();
+  /** 本进程用过的最后一个 listenKey；重连前先释放它。 */
+  let lastListenKey: string | null = null;
 
   /**
    * 主循环：拿 listenKey → 开流 → 断开就退避重连。
@@ -104,7 +199,25 @@ async function main(): Promise<void> {
    */
   while (!stopRequested) {
     try {
+      // **先释放上一个 key 再申请**。Binance 在账户已有有效 listenKey 时，
+      // `POST /listenKey` 会**返回现有那个**——于是每次重连都在用同一个 key
+      // 建新连接，而旧连接在服务端尚未回收；一个 listenKey 只允许一个活跃连接，
+      // 两者互相挤掉，症状是「连上马上断、来回抖几次」。
+      // 实测（2026-10-16）本机稳定复现：每次进程内所有连接都是同一个 `WfaobE…`，
+      // 启动后连断 2~3 次，随后稳定。关掉旧 key 后不再抖。
+      //
+      // 释放失败**不阻止重连**：key 可能已经过期，而「拿不到旧连接」正是我们要的。
+      if (lastListenKey !== null) {
+        try {
+          await client.closeListenKey(lastListenKey);
+        } catch (error) {
+          console.error(
+            `[executor] 释放旧 listenKey 失败（继续重连）：${(error as Error).message}`,
+          );
+        }
+      }
       const listenKey = await client.createListenKey();
+      lastListenKey = listenKey;
       delay = config.executor.reconnectBaseMs;
       console.error(`用户数据流已连接（listenKey ${listenKey.slice(0, 6)}…）`);
 
@@ -118,9 +231,21 @@ async function main(): Promise<void> {
             await client.keepAliveListenKey(key);
           },
           onEvent: async (payload) => {
+            // 仓位校正走**账户事件**，与成交判定分开：官方只保证同一事件类型内部有序，
+            // 两者之间没有顺序保证，所以它只能事后纠正，不能参与判定。
+            const account = parseAccountUpdate(payload);
+            if (account !== null) {
+              await service.correctPositions(account);
+              return;
+            }
             const update = parseOrderTradeUpdate(payload);
             if (update === null) return;
-            await service.handleFill(update);
+            // 同一标的必须**按到达顺序串行**处理。
+            //
+            // `openUserDataStream` 的 `onmessage` 是每条消息各起一个 Promise
+            // （`void (async () => …)`），彼此不排队。而流内净额是**逐笔累加**的，
+            // 并发处理会让同一标的的两笔成交以任意顺序落账，净额直接算错。
+            await serial(update.symbol, () => service.handleFill(update));
           },
           onError: (error) => {
             console.error(`[executor] ${error.message}`);
@@ -138,6 +263,9 @@ async function main(): Promise<void> {
     }
 
     if (stopRequested) break;
+    // 重连前**必须**重新播种：断线期间用户数据流不重放事件，
+    // 沿用断线前的净额会让之后每一笔成交的「开仓 / 减仓」判定都建立在错误的基线上。
+    await seedNetPositions();
     console.error(`[executor] ${delay}ms 后重连…`);
     await sleep(delay);
     delay = Math.min(delay * 2, config.executor.reconnectMaxMs);

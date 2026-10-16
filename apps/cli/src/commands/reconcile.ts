@@ -15,7 +15,13 @@
  * `--json` 输出纯 JSON 到 stdout（对账结果），一切提示走 stderr。
  */
 
-import { parseSecretKey, SECRET_KEY_ENV, SyncError, type ReconcileReport } from '@trade-tool/core';
+import {
+  describeClockSkew,
+  parseSecretKey,
+  SECRET_KEY_ENV,
+  SyncError,
+  type ReconcileReport,
+} from '@trade-tool/core';
 import {
   BinancePrivateClient,
   resolveActiveCredentials,
@@ -99,6 +105,10 @@ export async function runReconcile(options: ReconcileCommandOptions = {}): Promi
       ...exchangeEndpointsFromEnv(config.executor),
       recvWindowMs: config.executor.recvWindowMs,
     });
+    // 与 executor 同一件事：不校时钟的话下面每个签名请求都会 -1021，
+    // 报错会长得跟「查失败」一模一样，而它其实是本机时钟偏了。
+    const skew = await client.measureClockSkew();
+    console.error(`[reconcile] ${describeClockSkew(skew)}`);
 
     const report = await runReconciliation({
       pool,

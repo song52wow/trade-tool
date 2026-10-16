@@ -8,7 +8,7 @@ trade-tool/
 │   ├── cli/                     @trade-tool/cli        命令行入口（一次性命令）
 │   ├── sync/                    @trade-tool/sync       常驻同步守护进程 + 控制原语
 │   ├── web/                     @trade-tool/web        控制面：HTTP API + 看板（直接 import 原语）
-│   └── executor/                @trade-tool/executor   止盈止损：买入成交 → ATR → 条件单（会真实下单）
+│   └── executor/                @trade-tool/executor   止盈止损：成交 → 净仓位 → ATR → 条件单（会真实下单）
 ├── packages/
 │   ├── tsconfig/                @trade-tool/tsconfig   共享 tsconfig 预设
 │   ├── core/                    @trade-tool/core       领域模型 / 配置 / 错误码（**无指标实现**）
@@ -120,8 +120,8 @@ pnpm --filter @trade-tool/cli start -- data indicators -s <SYMBOL> --check    # 
 
 ## 止盈止损（`apps/executor`，v0.4.0）
 
-监听 Binance U 本位永续的成交事件，**只在买入成交**上按成交时刻算 ATR(14)，用对称倍数
-换算成止盈止损，并交给交易所挂着：
+监听 Binance U 本位永续的成交事件，按**净仓位**判定开仓（BUY 开多 / SELL 开空），
+在成交时刻算 ATR(14)，用对称倍数换算成止盈止损，并交给交易所挂着：
 
 ```
 SL = 入场价 − stopAtrMult × ATR        （缺省 2 倍）

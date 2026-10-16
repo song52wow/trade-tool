@@ -17,11 +17,18 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${REPO_ROOT}"
 
 echo "==> 构建 ${IMAGE} (${PLATFORM})"
+# 透传给 docker build 的额外参数。Dockerfile 声明了构建期代理
+# （http_proxy / https_proxy / no_proxy），但这个脚本原先并不转发它们：
+# 网络受限时装依赖会慢到几十分钟，而 Dockerfile 明明为此留了口子。
+# 用法：EXTRA_BUILD_ARGS="--build-arg http_proxy=… --build-arg https_proxy=…" ./deploy/build-image.sh
+read -r -a EXTRA_ARGS <<< "${EXTRA_BUILD_ARGS:-}"
+
 # 从仓库根构建，Dockerfile 里的 `COPY . /app` 才包含 pnpm workspace 与 uv workspace。
 docker build \
   --platform "${PLATFORM}" \
   -f deploy/Dockerfile \
   -t "${IMAGE}" \
+  "${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"}" \
   .
 
 echo "==> 导出到 ${OUT}/${IMAGE//[:\/]/-}.tar"
