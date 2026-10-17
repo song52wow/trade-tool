@@ -283,6 +283,16 @@ def _build_parser() -> argparse.ArgumentParser:
         help="成交时刻（epoch ms）。只用该时刻**已收盘**的 bar",
     )
     risk.add_argument(
+        "--entry-time",
+        dest="entry_time_ms",
+        type=int,
+        required=True,
+        help=(
+            "持仓期起点（epoch ms，必填）。极值按 [entry-time, as-of-ms] 求；"
+            "缺它就没有极值，因此不给默认值（R-6.3）"
+        ),
+    )
+    risk.add_argument(
         "--window-bars",
         dest="window_bars",
         type=int,
@@ -468,6 +478,7 @@ def _cmd_risk_atr(args: argparse.Namespace) -> int:
             interval=args.interval,
             period=args.period,
             as_of_ms=args.as_of_ms,
+            entry_time_ms=args.entry_time_ms,
             window_bars=args.window_bars,
             dsn=None,
         )

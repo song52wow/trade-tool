@@ -49,6 +49,10 @@ export type SyncErrorCode =
   // 单列而不复用 CONFIG_INVALID：这是「数据还没同步上来」，不是「参数写错了」，
   // 两者的处置完全不同（前者去 start 标的，后者改配置）。
   | 'RISK_ATR_UNAVAILABLE'
+  // 风控（v0.7.0）：持仓期极值取不到（持仓段内一根连续 K 线都没有）。
+  // 与 RISK_ATR_UNAVAILABLE 分开：前者要拒绝下单，这个只是「本轮不移动止损、
+  // 保留上一档」。两者严重度不同，合码会让处置方式跟着混掉（R-6.5）。
+  | 'RISK_TRAIL_EXTREME_UNAVAILABLE'
   // 数据库（R-21.6 / R-1.3）
   | 'DB_CONNECTION_FAILED'
   | 'DB_UNIQUE_VIOLATION'

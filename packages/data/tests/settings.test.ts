@@ -194,6 +194,10 @@ describe('策略：优先级只有一份实现', () => {
       atrInterval: '1h',
       stopAtrMult: 2.5,
       takeProfitAtrMult: 4,
+      takeProfit1Ratio: 0,
+      takeProfit1AtrMult: 3,
+      trailAtrMult: 2,
+      breakevenAfterTp1: true,
       now: T0,
     });
     expect(await resolvePolicy(schema.pool, EXCHANGE, SYMBOL, CONFIG_FALLBACK)).toMatchObject({
@@ -211,6 +215,10 @@ describe('策略：优先级只有一份实现', () => {
       atrInterval: '1h',
       stopAtrMult: 2.5,
       takeProfitAtrMult: 4,
+      takeProfit1Ratio: 0,
+      takeProfit1AtrMult: 3,
+      trailAtrMult: 2,
+      breakevenAfterTp1: true,
       now: T0,
     });
     await writeRiskPolicy(schema.pool, {
@@ -221,6 +229,10 @@ describe('策略：优先级只有一份实现', () => {
       atrInterval: '4h',
       stopAtrMult: 1.5,
       takeProfitAtrMult: 6,
+      takeProfit1Ratio: 0,
+      takeProfit1AtrMult: 3,
+      trailAtrMult: 2,
+      breakevenAfterTp1: true,
       now: T0,
     });
     expect(await resolvePolicy(schema.pool, EXCHANGE, SYMBOL, CONFIG_FALLBACK)).toMatchObject({
@@ -246,6 +258,10 @@ describe('策略：优先级只有一份实现', () => {
       atrInterval: '1h',
       stopAtrMult: 2.5,
       takeProfitAtrMult: 4,
+      takeProfit1Ratio: 0,
+      takeProfit1AtrMult: 3,
+      trailAtrMult: 2,
+      breakevenAfterTp1: true,
       now: T0,
     });
     await writeRiskPolicy(schema.pool, {
@@ -256,6 +272,10 @@ describe('策略：优先级只有一份实现', () => {
       atrInterval: '4h',
       stopAtrMult: 1.5,
       takeProfitAtrMult: 6,
+      takeProfit1Ratio: 0,
+      takeProfit1AtrMult: 3,
+      trailAtrMult: 2,
+      breakevenAfterTp1: true,
       now: T0,
     });
     await deleteRiskPolicy(schema.pool, 'symbol', EXCHANGE, SYMBOL);
@@ -274,6 +294,10 @@ describe('策略：优先级只有一份实现', () => {
       atrInterval: '1h',
       stopAtrMult: 2.5,
       takeProfitAtrMult: 4,
+      takeProfit1Ratio: 0,
+      takeProfit1AtrMult: 3,
+      trailAtrMult: 2,
+      breakevenAfterTp1: true,
       now: T0,
     });
     await writeRiskPolicy(schema.pool, {
@@ -284,6 +308,10 @@ describe('策略：优先级只有一份实现', () => {
       atrInterval: '4h',
       stopAtrMult: 1.5,
       takeProfitAtrMult: 6,
+      takeProfit1Ratio: 0,
+      takeProfit1AtrMult: 3,
+      trailAtrMult: 2,
+      breakevenAfterTp1: true,
       now: T0,
     });
     const rows = await listRiskPolicies(schema.pool, EXCHANGE);
@@ -304,6 +332,10 @@ describe('策略：schema 挡住脏数据', () => {
         atrInterval: '1h',
         stopAtrMult: 2,
         takeProfitAtrMult: 3,
+        takeProfit1Ratio: 0,
+        takeProfit1AtrMult: 3,
+        trailAtrMult: 2,
+        breakevenAfterTp1: true,
         now: T0,
       }),
     ).rejects.toThrow(/全局默认策略不能带标的/);
@@ -319,6 +351,10 @@ describe('策略：schema 挡住脏数据', () => {
         atrInterval: '1h',
         stopAtrMult: 0,
         takeProfitAtrMult: 3,
+        takeProfit1Ratio: 0,
+        takeProfit1AtrMult: 3,
+        trailAtrMult: 2,
+        breakevenAfterTp1: true,
         now: T0,
       }),
     ).rejects.toThrow();
@@ -334,6 +370,10 @@ describe('策略：schema 挡住脏数据', () => {
         atrInterval: '5m',
         stopAtrMult: 2,
         takeProfitAtrMult: 3,
+        takeProfit1Ratio: 0,
+        takeProfit1AtrMult: 3,
+        trailAtrMult: 2,
+        breakevenAfterTp1: true,
         now: T0,
       }),
     ).rejects.toThrow();

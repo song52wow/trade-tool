@@ -55,6 +55,10 @@ KNOWN_MIGRATION_VERSIONS: frozenset[str] = frozenset(
         # v0.6.0：交易对账的观测快照。Python 侧不读写该表，但版本闸门两个方向都要校，
         # 漏登记会让**所有**碰 PG 的用例报「库比代码新」。
         "009_reconcile_run",
+        # v0.7.0：两段止盈的阶段（partial_armed / trailing）与移动止损档位。
+        # Python 侧不读写 risk_bracket，但版本闸门两个方向都要校，漏登记会让
+        # **所有**碰 PG 的用例报「库比代码新」。
+        "010_risk_trailing",
     }
 )
 

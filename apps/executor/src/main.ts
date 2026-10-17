@@ -24,6 +24,7 @@ import type { Pool } from '@trade-tool/data';
 
 import { createAtrProvider } from './atr.js';
 import { startPeriodicReconcile, type PeriodicReconcile } from './reconcile.js';
+import { startTrailingTimer } from './trailing.js';
 import { createExecutorService } from './service.js';
 
 // 必须在 loadConfigOrDefault / createPool 之前：配置路径、数据库密码与 API 密钥
@@ -35,6 +36,8 @@ let stopRequested = false;
 let closeStream: (() => void) | undefined;
 /** 周期对账的定时器。退出时必须停掉，否则进程挂着一个 setInterval 不会结束。 */
 let reconcileTimer: PeriodicReconcile | undefined;
+/** 移动止损定时器（v0.7.0）。同样必须停掉。 */
+let trailTimer: { stop(): void } | undefined;
 
 /**
  * 凭据解析：走 `resolveActiveCredentials()`（**库里优先、环境变量兜底**）。
@@ -185,6 +188,10 @@ async function main(): Promise<void> {
   // 自动对账与用户数据流**并行**：它跑得慢或挂掉都不影响挂单（见 reconcile.ts）。
   reconcileTimer = startPeriodicReconcile({ pool, client, config });
 
+  // 移动止损定时器与对账定时器**必须分开**（v0.7.0 / AGENTS.md §6.8）：对账是只读的，
+  // 而移动止损要下单，合并会让「对账绝不动手」这条保证失守。
+  trailTimer = startTrailingTimer(service, config.executor.trailIntervalMs);
+
   let delay = config.executor.reconnectBaseMs;
   const serial = createSerialRunner();
   /** 本进程用过的最后一个 listenKey；重连前先释放它。 */
@@ -273,6 +280,7 @@ async function main(): Promise<void> {
 
   closeStream?.();
   reconcileTimer?.stop();
+  trailTimer?.stop();
   await pool.end().catch(() => undefined);
 }
 
@@ -283,6 +291,7 @@ for (const signal of ['SIGINT', 'SIGTERM'] as const) {
     closeStream?.();
     // 定时器也要停：挂着的 setInterval 会让进程在「已收到停止信号」之后继续不退出。
     reconcileTimer?.stop();
+    trailTimer?.stop();
   });
 }
 

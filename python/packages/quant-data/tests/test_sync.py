@@ -1122,6 +1122,8 @@ def test_migrations_are_idempotent(conn: DbConn, pg_dsn: str) -> None:
         "008_algo_order_ids",
         # v0.6.0：交易对账的观测快照
         "009_reconcile_run",
+        # v0.7.0：两段止盈的阶段（partial_armed / trailing）与移动止损档位
+        "010_risk_trailing",
     ]
     pg.ensure_schema(conn)
 

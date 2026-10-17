@@ -30,9 +30,30 @@ const TABLE = 'risk_bracket';
 
 const COLUMNS = `exchange, symbol, entry_order_id, entry_price, entry_time, filled_qty,
   position_side, atr, atr_period, atr_interval, atr_window_from, atr_window_to,
-  stop_price, take_profit, tp_algo_id, sl_algo_id, state, last_error, created_at, updated_at`;
+  stop_price, take_profit, tp_algo_id, sl_algo_id, state, last_error, created_at, updated_at,
+  tp1_algo_id, tp1_qty, tp1_price, tp1_filled_qty, tp1_filled_at,
+  trail_extreme, trail_stop_price, trail_atr, trail_atr_from, trail_atr_to,
+  trail_updated_at, trail_last_error`;
 
-export type BracketState = 'armed' | 'take_profit' | 'stop_loss' | 'cancelled' | 'failed';
+/**
+ * 七个状态。**未终结**的四个：`armed` / `partial_armed` / `trailing` / `failed`。
+ *
+ * v0.7.0 追加的两个阶段：
+ *   * `partial_armed` —— 第一段（带数量）止盈 + `closePosition` 止损都已挂上；
+ *   * `trailing`      —— 第一段已成交，剩余仓位只剩一张止损，且它正在移动。
+ *
+ * 为什么要有 `trailing` 而不是给 `armed` 加个布尔位：它在交易所上的形态是
+ * 「**只剩一张单**」，与 `armed`（两张）不同——判据（对账）必须能分开这两种形态，
+ * 否则就会每轮报出一条「止盈单不见了」的假警报。
+ */
+export type BracketState =
+  'armed' | 'partial_armed' | 'trailing' | 'take_profit' | 'stop_loss' | 'cancelled' | 'failed';
+
+/** 仍然受保护的（尚未终结的）状态。收窄点只有 `toUnsettledRecord` 一处。 */
+export type UnsettledBracketState = Extract<
+  BracketState,
+  'armed' | 'partial_armed' | 'trailing' | 'failed'
+>;
 
 /** 一次待挂止盈止损的意图：只描述「发生了什么成交、算出什么价」。 */
 export interface BracketClaim {
@@ -50,6 +71,13 @@ export interface BracketClaim {
   atrWindowTo: number;
   stopPrice: number;
   takeProfit: number;
+  /**
+   * 第一段止盈（v0.7.0）。**只有分批形态才带**：三项必须同时给全，
+   * 表上的 `risk_bracket_staged_check` 会挡住缺项的 `partial_armed` 行。
+   */
+  tp1AlgoId?: number;
+  tp1Qty?: number;
+  tp1Price?: number;
   /** 下单时刻（epoch ms），落 created_at / updated_at。 */
   now: number;
 }
@@ -74,6 +102,22 @@ export interface BracketRecord {
   slAlgoId: number | null;
   state: BracketState;
   lastError: string | null;
+  // ---- v0.7.0：第一段止盈与移动止损档位。NULL 语义是「未进入该阶段」，不是 0。
+  tp1AlgoId: number | null;
+  tp1Qty: number | null;
+  tp1Price: number | null;
+  tp1FilledQty: number | null;
+  tp1FilledAt: number | null;
+  /** 持仓期极值：多头是最高 high，空头是最低 low。移动止损的基准。 */
+  trailExtreme: number | null;
+  /** 当前生效的那一档止损价。`trailing` 阶段必有值。 */
+  trailStopPrice: number | null;
+  trailAtr: number | null;
+  trailAtrFrom: number | null;
+  trailAtrTo: number | null;
+  trailUpdatedAt: number | null;
+  /** 本轮没有移动（或移动失败）的原因。常驻可见，不静默跳过。 */
+  trailLastError: string | null;
   createdAt: number;
   updatedAt: number;
 }
@@ -106,6 +150,13 @@ function optionalBigint(row: Record<string, unknown>, field: string, where: stri
   return bigint(row, field, where);
 }
 
+/** 可空的有限数字。NULL 语义是「未进入该阶段」，不是 0。 */
+function optionalNum(row: Record<string, unknown>, field: string, where: string): number | null {
+  const value = row[field];
+  if (value === null || value === undefined) return null;
+  return num(row, field, where);
+}
+
 function optionalStr(row: Record<string, unknown>, field: string, where: string): string | null {
   const value = row[field];
   if (value === null || value === undefined) return null;
@@ -133,6 +184,18 @@ function toRecord(row: Record<string, unknown>): BracketRecord {
     slAlgoId: optionalBigint(row, 'sl_algo_id', where),
     state: str(row, 'state', where) as BracketState,
     lastError: optionalStr(row, 'last_error', where),
+    tp1AlgoId: optionalBigint(row, 'tp1_algo_id', where),
+    tp1Qty: optionalNum(row, 'tp1_qty', where),
+    tp1Price: optionalNum(row, 'tp1_price', where),
+    tp1FilledQty: optionalNum(row, 'tp1_filled_qty', where),
+    tp1FilledAt: optionalBigint(row, 'tp1_filled_at', where),
+    trailExtreme: optionalNum(row, 'trail_extreme', where),
+    trailStopPrice: optionalNum(row, 'trail_stop_price', where),
+    trailAtr: optionalNum(row, 'trail_atr', where),
+    trailAtrFrom: optionalBigint(row, 'trail_atr_from', where),
+    trailAtrTo: optionalBigint(row, 'trail_atr_to', where),
+    trailUpdatedAt: optionalBigint(row, 'trail_updated_at', where),
+    trailLastError: optionalStr(row, 'trail_last_error', where),
     createdAt: bigint(row, 'created_at', where),
     updatedAt: bigint(row, 'updated_at', where),
   };
@@ -159,6 +222,9 @@ export async function claimBracket(pool: Pool, claim: BracketClaim): Promise<Bra
     claim.atrWindowTo,
     claim.stopPrice,
     claim.takeProfit,
+    claim.tp1AlgoId ?? null,
+    claim.tp1Qty ?? null,
+    claim.tp1Price ?? null,
     claim.now,
     claim.now,
   ];
@@ -166,8 +232,8 @@ export async function claimBracket(pool: Pool, claim: BracketClaim): Promise<Bra
     const result = await pool.query<Record<string, unknown>>(
       `INSERT INTO ${TABLE} (exchange, symbol, entry_order_id, entry_price, entry_time, filled_qty,
          position_side, atr, atr_period, atr_interval, atr_window_from, atr_window_to,
-         stop_price, take_profit, state, created_at, updated_at)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, 'failed', $15, $16)
+         stop_price, take_profit, tp1_algo_id, tp1_qty, tp1_price, state, created_at, updated_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, 'failed', $18, $19)
        ON CONFLICT (exchange, symbol, entry_order_id) DO NOTHING
        RETURNING ${COLUMNS}`,
       values,
@@ -202,6 +268,175 @@ export async function markBracketArmed(
     }
   } catch (error) {
     throw toSyncError(error, `回填止盈止损订单号失败：${key.symbol} ${key.entryOrderId}`);
+  }
+}
+
+/** 已挂上第一段（带数量）与止损两张单。置为 `partial_armed`。 */
+export async function markBracketPartialArmed(
+  pool: Pool,
+  key: { exchange: string; symbol: string; entryOrderId: string },
+  orderIds: { slAlgoId: number; tp1AlgoId: number },
+  now: number,
+): Promise<void> {
+  try {
+    const result = await pool.query(
+      `UPDATE ${TABLE} SET sl_algo_id = $4, tp1_algo_id = $5, state = 'partial_armed',
+         last_error = NULL, updated_at = $6
+       WHERE exchange = $1 AND symbol = $2 AND entry_order_id = $3`,
+      [key.exchange, key.symbol, key.entryOrderId, orderIds.slAlgoId, orderIds.tp1AlgoId, now],
+    );
+    if (result.rowCount !== 1) {
+      throw new SyncError(
+        'SYNC_ALREADY_RUNNING',
+        `止盈止损记录不存在，无法标记为已挂上第一段：${key.symbol} ${key.entryOrderId}`,
+        key as unknown as Record<string, unknown>,
+      );
+    }
+  } catch (error) {
+    throw toSyncError(error, `回填第一段止盈订单号失败：${key.symbol} ${key.entryOrderId}`);
+  }
+}
+
+/**
+ * 第一段已成交：进入 `trailing`，同时落**意图**（极值、这一轮算出的档位与 ATR 快照）。
+ *
+ * 为什么先落库再动交易所（AGENTS.md §6.3 第 4 条 / v0.7.0 R-5.4）：进程死在
+ * 「已置 `trailing`、还没挂新止损」时，对账会看到 `trailing` 却查不到止损单，
+ * 报 `missing-stop-order`（紧急）；定时器下一轮补挂。反过来（先挂单后落库），
+ * 崩在中间就是「止损已经换了但库里还是旧档位」，账面与交易所永久对不上。
+ *
+ * ⚠️ `WHERE … AND state = 'partial_armed'`：**只有**还停在这一态才推进。
+ * 事件重放（listenKey 续期、断线重连）会让 TP1 成交事件再来一次，
+ * 而不带这个条件，第二次会把止损**重挂一遍**——止盈止损是会真实下单的动作。
+ *
+ * **返回 rowCount**：调用方据此判断「这次真的推进了」还是「已经被推进过了」。
+ */
+export async function markBracketTrailing(
+  pool: Pool,
+  key: { exchange: string; symbol: string; entryOrderId: string },
+  trail: {
+    extreme: number;
+    stopPrice: number;
+    atr: number;
+    atrFrom: number;
+    atrTo: number;
+    slAlgoId?: number;
+  },
+  now: number,
+): Promise<number> {
+  try {
+    const result = await pool.query(
+      `UPDATE ${TABLE} SET state = 'trailing',
+         trail_extreme = $4, trail_stop_price = $5, trail_atr = $6,
+         trail_atr_from = $7, trail_atr_to = $8, trail_updated_at = $9,
+         sl_algo_id = COALESCE($10, sl_algo_id),
+         last_error = NULL, trail_last_error = NULL, updated_at = $9
+       WHERE exchange = $1 AND symbol = $2 AND entry_order_id = $3
+         AND state = 'partial_armed'`,
+      [
+        key.exchange,
+        key.symbol,
+        key.entryOrderId,
+        trail.extreme,
+        trail.stopPrice,
+        trail.atr,
+        trail.atrFrom,
+        trail.atrTo,
+        now,
+        trail.slAlgoId ?? null,
+      ],
+    );
+    return result.rowCount ?? 0;
+  } catch (caught) {
+    throw toSyncError(caught, `推进到移动止损阶段失败：${key.symbol} ${key.entryOrderId}`);
+  }
+}
+
+/**
+ * 记一次「本轮没有移动」或「移动没能完成」，`trail_stop_price` 与止损单号都**不变**。
+ *
+ * 「没有移动」不是失败：价没变、止损位越过现价、极值取不到，都属于「本轮不动」，
+ * 而它们必须**常驻可见**（AGENTS.md 约定 9）。写成 NULL 或清空原因，
+ * 就会退化成「看起来一切正常，而追踪其实已经停了三天」。
+ *
+ * ⚠️ `WHERE` 同时接受 `partial_armed`：第一段刚成交、推进 `trailing` 就失败时，
+ * 记录还停在 `partial_armed`。只接受 `trailing` 的话，那次失败的原因会被**静默丢弃**
+ * ——正是「看起来正常、而移动止损其实没启动」的那一类。
+ */
+export async function markBracketTrailNotMoved(
+  pool: Pool,
+  key: { exchange: string; symbol: string; entryOrderId: string },
+  reason: string,
+  now: number,
+  observed?: { extreme: number; atr: number; atrFrom: number; atrTo: number },
+): Promise<void> {
+  try {
+    await pool.query(
+      `UPDATE ${TABLE} SET trail_last_error = $4, trail_updated_at = $5, updated_at = $5,
+         trail_extreme = COALESCE($6, trail_extreme),
+         trail_atr = COALESCE($7, trail_atr),
+         trail_atr_from = COALESCE($8, trail_atr_from),
+         trail_atr_to = COALESCE($9, trail_atr_to)
+       WHERE exchange = $1 AND symbol = $2 AND entry_order_id = $3
+         AND state IN ('partial_armed', 'trailing')`,
+      [
+        key.exchange,
+        key.symbol,
+        key.entryOrderId,
+        reason,
+        now,
+        observed?.extreme ?? null,
+        observed?.atr ?? null,
+        observed?.atrFrom ?? null,
+        observed?.atrTo ?? null,
+      ],
+    );
+  } catch (caught) {
+    throw toSyncError(caught, `记录移动止损未调整原因时出错：${key.symbol} ${key.entryOrderId}`);
+  }
+}
+
+/**
+ * 移动止损**成功换档**：先挂新止损、再撤旧单，两件事都做完后才写这里。
+ *
+ * 顺序由调用方保证（R-4.1），本函数只负责「落新的档位」。
+ * 因此 `slAlgoId` 必填：没有它就说明新止损还没挂上，而把档位写成新价、
+ * 却让交易所挂着旧价的单，是最坏的一种不一致。
+ */
+export async function markBracketTrailMoved(
+  pool: Pool,
+  key: { exchange: string; symbol: string; entryOrderId: string },
+  moved: {
+    stopPrice: number;
+    extreme: number;
+    atr: number;
+    atrFrom: number;
+    atrTo: number;
+    slAlgoId: number;
+  },
+  now: number,
+): Promise<void> {
+  try {
+    await pool.query(
+      `UPDATE ${TABLE} SET trail_stop_price = $4, trail_extreme = $5, trail_atr = $6,
+         trail_atr_from = $7, trail_atr_to = $8, trail_updated_at = $9, sl_algo_id = $10,
+         trail_last_error = NULL, updated_at = $9
+       WHERE exchange = $1 AND symbol = $2 AND entry_order_id = $3 AND state = 'trailing'`,
+      [
+        key.exchange,
+        key.symbol,
+        key.entryOrderId,
+        moved.stopPrice,
+        moved.extreme,
+        moved.atr,
+        moved.atrFrom,
+        moved.atrTo,
+        now,
+        moved.slAlgoId,
+      ],
+    );
+  } catch (caught) {
+    throw toSyncError(caught, `回填移动止损新档位失败：${key.symbol} ${key.entryOrderId}`);
   }
 }
 
@@ -303,22 +538,24 @@ export async function listBrackets(
 }
 
 /**
- * 未终结记录的返回类型：`state` **窄化**为两态。
+ * 未终结记录的返回类型：`state` **窄化**为四态。
  *
- * 窄化不是洁癖：`state` 若是完整的五态类型，`reconcileBrackets` 里那个
+ * 窄化不是洁癖：`state` 若是完整的七态类型，`reconcileBrackets` 里那个
  * 「不是 failed 就当 armed」的分支就会在运行时悄悄把一条已终结记录当成未终结的，
  * 凭空报出「止损单不见了」。这里用同一个取值函数把类型收窄，转换点只有一处。
  */
 export type UnsettledBracketRecord = Omit<BracketRecord, 'state' | 'positionSide'> & {
-  state: Extract<BracketState, 'armed' | 'failed'>;
+  state: UnsettledBracketState;
   /** 表上的 CHECK 约束只允许 LONG / SHORT，这里把它显式收窄而不是靠调用方相信。 */
   positionSide: Extract<PositionSide, 'LONG' | 'SHORT'>;
 };
 
+const UNSETTLED_STATES = ['armed', 'partial_armed', 'trailing', 'failed'] as const;
+
 function toUnsettledRecord(row: Record<string, unknown>): UnsettledBracketRecord {
   const record = toRecord(row);
-  if (record.state !== 'armed' && record.state !== 'failed') {
-    // WHERE 已经限定了这两态，能走到这里说明约束被绕过或查询被改坏了。
+  if (!UNSETTLED_STATES.includes(record.state as UnsettledBracketState)) {
+    // WHERE 已经限定了这几态，能走到这里说明约束被绕过或查询被改坏了。
     // 抛错而不是当成 armed —— 那正是上面说的假警报来源（AGENTS.md 约定 9）。
     throw new SyncError(
       'CONFIG_INVALID',
@@ -335,14 +572,24 @@ function toUnsettledRecord(row: Record<string, unknown>): UnsettledBracketRecord
       { positionSide: record.positionSide },
     );
   }
-  return { ...record, state: record.state, positionSide: record.positionSide };
+  // 上面那个 includes 检查已经把取值范围钉死了，但 TS 不会从 `includes` 反推窄化，
+  // 所以这里的断言是**检查过之后**的收窄，不是绕过检查。
+  return {
+    ...record,
+    state: record.state as UnsettledBracketState,
+    positionSide: record.positionSide,
+  };
 }
 
 /**
- * 未终结的记录（`armed` + `failed`），对账用。
+ * 未终结的记录（`armed` / `partial_armed` / `trailing` / `failed`），对账与定时器都用。
  *
- * 为什么只取这两态：`take_profit` / `stop_loss` / `cancelled` 的单**本来就该不在**
- * 交易所，把它们一起拉进对账会凭空造出一堆「少了止损单」的假警报。
+ * 为什么只取这几态：`take_profit` / `stop_loss` / `cancelled` 的单**本来就该不在**
+ * 交易所，把它们一起拉进来会凭空造出一堆「少了止损单」的假警报。
+ *
+ * ⚠️ `trailing` 与 `partial_armed` 在交易所上的**形态不同**（一张 vs 两张单），
+ * 判据必须按形态分流（v0.7.0 R-10）——把四态当一态处理，报告就会同时漏真问题、
+ * 报一堆假警报。
  *
  * `symbol` 为空串时查全部标的（对账要支持全账户扫描）。表名仍是常量，绝不拼 symbol。
  */
@@ -353,7 +600,8 @@ export async function listUnsettledBrackets(
 ): Promise<UnsettledBracketRecord[]> {
   try {
     const result = await pool.query<Record<string, unknown>>(
-      `SELECT ${COLUMNS} FROM ${TABLE} WHERE exchange = $1 AND state IN ('armed', 'failed')
+      `SELECT ${COLUMNS} FROM ${TABLE} WHERE exchange = $1
+         AND state IN ('armed', 'partial_armed', 'trailing', 'failed')
          ${symbol === undefined ? '' : 'AND symbol = $2'}
        ORDER BY updated_at DESC`,
       symbol === undefined ? [exchange] : [exchange, symbol],
@@ -364,14 +612,26 @@ export async function listUnsettledBrackets(
   }
 }
 
-/** 五态计数，**五项永远都在**，没有的态是 0。
+/** 只取正在移动止损中的记录——移动止损定时器的工作集合。 */
+export async function listTrailingBrackets(
+  pool: Pool,
+  exchange: string,
+  now: number,
+): Promise<UnsettledBracketRecord[]> {
+  const all = await listUnsettledBrackets(pool, exchange);
+  // 定时器可能正在补挂一条刚置为 trailing 的记录（含 sl_algo_id 还没回填的那种）。
+  // **不按 updated_at 过滤**：崩溃后重启时，旧记录当然很旧，而它正是要补的对象。
+  return all.filter((record) => record.state === 'trailing' && record.entryTime <= now);
+}
+
+/** 七态计数，**七项永远都在**，没有的态是 0。
  *
  * 为什么要一份独立的统计而不是从 `listBrackets` 的结果里数：控制面只回最近 N 条，
  * 而 `failed` 恰恰是最老、最容易被挤出这个窗口的状态——库里有一条「占坑成功但保护单
  * 没挂上」的记录，页面上却因为它不在前 20 条而显示一切正常。用截断过的列表反推完整
  * 状态，正是 v0.4.0 要防的那种「看上去没事」。
  *
- * `state` 在 DDL 里是 CHECK 约束列，这里仍按已知五态建桶：真出现未知值说明约束被绕过
+ * `state` 在 DDL 里是 CHECK 约束列，这里仍按已知七态建桶：真出现未知值说明约束被绕过
  * 了，那属于要暴露的问题，因此直接抛错而不是悄悄归到某个态里（AGENTS.md 约定 9）。
  */
 export async function countBracketsByState(
@@ -387,6 +647,8 @@ export async function countBracketsByState(
     );
     const counts: Record<BracketState, number> = {
       armed: 0,
+      partial_armed: 0,
+      trailing: 0,
       take_profit: 0,
       stop_loss: 0,
       cancelled: 0,

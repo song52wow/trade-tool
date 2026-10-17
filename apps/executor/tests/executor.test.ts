@@ -8,7 +8,12 @@
  *   * ATR 取不到 → 留 failed 记录，不回退到别的周期或 0。
  */
 
-import { NetPositionTracker, configSchema, type TradeToolConfig } from '@trade-tool/core';
+import {
+  NetPositionTracker,
+  SyncError,
+  configSchema,
+  type TradeToolConfig,
+} from '@trade-tool/core';
 import type { OrderTradeUpdate, Pool } from '@trade-tool/data';
 import type { OrderPlacer } from '../src/service.js';
 import {
@@ -19,20 +24,37 @@ import {
 import type { AtrProvider } from '../src/atr.js';
 import { describe, expect, it, vi } from 'vitest';
 
+/** 假库里一行止盈止损记录。字段名跟真表一致（`state` 已是七态之一）。 */
+interface FakeClaim {
+  symbol: string;
+  positionSide: string;
+  tpOrderId: number | null;
+  /** v0.7.0：移动止损换档时新挂的那张止损单号。 */
+  slAlgoId?: number;
+  slOrderId: number | null;
+  state: string;
+  lastError: string | null;
+  tp1AlgoId?: number | null;
+  tp1Qty?: number | null;
+  tp1Price?: number | null;
+  trailStopPrice?: number | null;
+  trailExtreme?: number | null;
+  trailAtr?: number | null;
+  trailLastError?: string | null;
+  updatedAt?: number;
+}
+
 /** 记录调用顺序的 PG 替身：把 claimBracket 的幂等语义原样模拟出来。 */
 function fakePool() {
   const state = {
-    claims: new Map<
-      string,
-      {
-        symbol: string;
-        positionSide: string;
-        tpOrderId: number | null;
-        slOrderId: number | null;
-        state: string;
-        lastError: string | null;
-      }
-    >(),
+    claims: new Map<string, FakeClaim>(),
+  };
+  const key2 = (symbol: unknown, entryOrderId: unknown): string =>
+    `binance/${String(symbol)}/${String(entryOrderId)}`;
+  /** 更新一行；不存在就忽略（真库会 rowCount=0，而替身不需要区分）。 */
+  const patch = (key: string, fields: Partial<FakeClaim>): void => {
+    const row = state.claims.get(key);
+    if (row) Object.assign(row, fields);
   };
   const query = vi.fn(async (sql: string, params: unknown[]) => {
     if (sql.includes('INSERT INTO risk_bracket')) {
@@ -42,7 +64,12 @@ function fakePool() {
       )[];
       const [positionSide, atr, atrPeriod, atrInterval, windowFrom, windowTo, stop, takeProfit] =
         p.slice(6, 14) as (string | number)[];
-      const now = p[14] as number;
+      // v0.7.0：占坑时插入 tp1_algo_id / tp1_qty / tp1_price 三列，
+      // 因此 created_at / updated_at 的位置后移了 3。索引与 INSERT 的列顺序一一对应。
+      const tp1AlgoId = p[14] as number | null;
+      const tp1Qty = p[15] as number | null;
+      const tp1Price = p[16] as number | null;
+      const now = p[17] as number;
       const key = `${exchange}/${symbol}/${entryOrderId}`;
       if (state.claims.has(key)) return { rows: [], rowCount: 0 };
       state.claims.set(key, {
@@ -52,6 +79,9 @@ function fakePool() {
         slOrderId: null,
         state: 'failed',
         lastError: null,
+        tp1AlgoId,
+        tp1Qty,
+        tp1Price,
       });
       // RETURNING 的是完整一行，读侧会逐列校验（NULL_NOT_ALLOWED），因此必须给全
       return {
@@ -73,6 +103,18 @@ function fakePool() {
             take_profit: takeProfit,
             tp_algo_id: null,
             sl_algo_id: null,
+            tp1_algo_id: tp1AlgoId,
+            tp1_qty: tp1Qty,
+            tp1_price: tp1Price,
+            tp1_filled_qty: null,
+            tp1_filled_at: null,
+            trail_extreme: null,
+            trail_stop_price: null,
+            trail_atr: null,
+            trail_atr_from: null,
+            trail_atr_to: null,
+            trail_updated_at: null,
+            trail_last_error: null,
             state: 'failed',
             last_error: null,
             created_at: now,
@@ -89,7 +131,10 @@ function fakePool() {
         .filter(
           ([key, row]) =>
             key.startsWith(`${exchange}/${row.symbol}/`) &&
-            (row.state === 'armed' || row.state === 'failed') &&
+            (row.state === 'armed' ||
+              row.state === 'partial_armed' ||
+              row.state === 'trailing' ||
+              row.state === 'failed') &&
             (maybeSymbol === undefined || row.symbol === maybeSymbol),
         )
         .map(([key, row]) => {
@@ -111,6 +156,18 @@ function fakePool() {
             take_profit: 60_300,
             tp_algo_id: row.tpOrderId,
             sl_algo_id: row.slOrderId,
+            tp1_algo_id: row.tp1AlgoId ?? null,
+            tp1_qty: row.tp1Qty ?? null,
+            tp1_price: row.tp1Price ?? null,
+            tp1_filled_qty: null,
+            tp1_filled_at: null,
+            trail_extreme: row.trailExtreme ?? null,
+            trail_stop_price: row.trailStopPrice ?? null,
+            trail_atr: row.trailAtr ?? null,
+            trail_atr_from: null,
+            trail_atr_to: null,
+            trail_updated_at: null,
+            trail_last_error: row.trailLastError ?? null,
             state: row.state,
             last_error: row.lastError,
             created_at: 1_000,
@@ -134,9 +191,64 @@ function fakePool() {
     if (sql.includes("SET state = 'failed'")) {
       return { rows: [], rowCount: 1 };
     }
+    // v0.7.0 的阶段流转：把 state 推进并把单号回填，让后续读得到正确形态。
+    if (sql.includes("state = 'partial_armed'")) {
+      const [, symbol, entryOrderId, slAlgoId, tp1AlgoId, now] = params as unknown[];
+      patch(key2(symbol, entryOrderId), {
+        state: 'partial_armed',
+        slOrderId: slAlgoId as number,
+        tp1AlgoId: tp1AlgoId as number,
+        updatedAt: now as number,
+      });
+      return { rows: [], rowCount: 1 };
+    }
+    if (sql.includes("state = 'trailing'")) {
+      // from / to 是取数窗口的回传，本替身只记账用得到的字段。
+      const [, symbol, entryOrderId, extreme, stopPrice, atr, , , now, slAlgoId] =
+        params as unknown[];
+      patch(key2(symbol, entryOrderId), {
+        state: 'trailing',
+        trailExtreme: extreme as number,
+        trailStopPrice: stopPrice as number,
+        trailAtr: atr as number,
+        slOrderId: (slAlgoId as number | null) ?? null,
+        updatedAt: now as number,
+      });
+      return { rows: [], rowCount: 1 };
+    }
+    if (sql.includes('trail_stop_price = $4, trail_extreme = $5')) {
+      const [, symbol, entryOrderId, stopPrice, extreme, atr, , , now, slAlgoId] =
+        params as unknown[];
+      patch(key2(symbol, entryOrderId), {
+        trailStopPrice: stopPrice as number,
+        trailExtreme: extreme as number,
+        trailAtr: atr as number,
+        slOrderId: slAlgoId as number,
+        updatedAt: now as number,
+      });
+      return { rows: [], rowCount: 1 };
+    }
+    if (sql.includes('trail_last_error = $4')) {
+      const [, symbol, entryOrderId, reason, now] = params as unknown[];
+      patch(key2(symbol, entryOrderId), {
+        trailLastError: String(reason),
+        updatedAt: now as number,
+      });
+      return { rows: [], rowCount: 1 };
+    }
     if (sql.includes('FROM contract_spec')) {
       return {
-        rows: [{ raw: { filters: [{ filterType: 'PRICE_FILTER', tickSize: '0.10' }] } }],
+        rows: [
+          {
+            raw: {
+              filters: [
+                { filterType: 'PRICE_FILTER', tickSize: '0.10' },
+                // v0.7.0 分批止盈要按数量对齐，缺了 LOT_SIZE 会在算价时就报错。
+                { filterType: 'LOT_SIZE', stepSize: '0.001' },
+              ],
+            },
+          },
+        ],
         rowCount: 1,
       };
     }
@@ -163,6 +275,10 @@ const ATR = {
   segmentFrom: 1,
   segmentTo: 2,
   asOfMs: 1_000,
+  /** 持仓期极值（v0.7.0）。夹具里取「一路涨上去」，于是移动止损只会上移。 */
+  extreme: { high: 500, low: 400, from: 1, to: 2 },
+  /** 取数范围内最后一根已收盘 K 线的收盘价。 */
+  lastClose: 480,
 };
 
 function fill(overrides: Partial<OrderTradeUpdate> = {}): OrderTradeUpdate {
@@ -187,33 +303,67 @@ function fill(overrides: Partial<OrderTradeUpdate> = {}): OrderTradeUpdate {
   };
 }
 
-function fakeAtr(): AtrProvider & { calls: [string, number][] } {
-  const calls: [string, number][] = [];
+function fakeAtr(overrides: Partial<typeof ATR> = {}): AtrProvider & {
+  calls: { symbol: string; asOfMs: number; entryTimeMs: number }[];
+} {
+  const calls: { symbol: string; asOfMs: number; entryTimeMs: number }[] = [];
   return {
     calls,
-    async atrAt(symbol: string, asOfMs: number) {
-      calls.push([symbol, asOfMs]);
-      return { ...ATR, symbol, asOfMs };
+    async atrAt(symbol: string, asOfMs: number, entryTimeMs: number) {
+      calls.push({ symbol, asOfMs, entryTimeMs });
+      return { ...ATR, ...overrides, symbol, asOfMs };
     },
   };
 }
 
+interface PlacedOrder {
+  type: string;
+  stopPrice: number;
+  clientAlgoId: string;
+  /** 带数量的单才有：分批止盈的第一段。 */
+  quantity?: number;
+  closePosition: boolean;
+}
+
 function fakePlacer(overrides: Partial<OrderPlacer> = {}): OrderPlacer & {
-  placed: { type: string; stopPrice: number; clientAlgoId: string }[];
+  placed: PlacedOrder[];
   cancelled: number[];
+  /** 动作发生顺序，用来断言「先挂新、再撤旧」。 */
+  actions: string[];
 } {
-  const placed: { type: string; stopPrice: number; clientAlgoId: string }[] = [];
+  const placed: PlacedOrder[] = [];
   const cancelled: number[] = [];
+  const actions: string[] = [];
   let seq = 900;
   return {
     placed,
     cancelled,
+    actions,
     async placeClosePositionOrder(request) {
       placed.push({
         type: request.type,
         stopPrice: request.stopPrice,
         clientAlgoId: request.clientAlgoId,
+        closePosition: true,
       });
+      actions.push(`place:${request.type}:${request.stopPrice}`);
+      seq += 1;
+      return {
+        algoId: seq,
+        clientAlgoId: request.clientAlgoId,
+        symbol: request.symbol,
+        status: 'NEW',
+      };
+    },
+    async placeQuantityOrder(request) {
+      placed.push({
+        type: request.type,
+        stopPrice: request.stopPrice,
+        clientAlgoId: request.clientAlgoId,
+        quantity: request.quantity,
+        closePosition: false,
+      });
+      actions.push(`placeQuantity:${request.type}:${request.stopPrice}:${request.quantity}`);
       seq += 1;
       return {
         algoId: seq,
@@ -224,6 +374,7 @@ function fakePlacer(overrides: Partial<OrderPlacer> = {}): OrderPlacer & {
     },
     async cancelAlgoOrder(algoId: number) {
       cancelled.push(algoId);
+      actions.push(`cancel:${algoId}`);
     },
     ...overrides,
   };
@@ -617,5 +768,89 @@ describe('取不到 ATR', () => {
     expect(await service.handleFill(fill())).toBe('failed');
     expect(placer.placed).toHaveLength(0);
     expect(pool.state.claims.has('binance/BTCUSDT/42')).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// v0.7.0 两段止盈 + 移动止损
+// ---------------------------------------------------------------------------
+
+/** 造一份带新策略字段的 resolvePolicy 替身。 */
+function stagedPolicy(over: Record<string, number | boolean> = {}) {
+  return async () => ({
+    atrPeriod: 14,
+    atrInterval: '1m',
+    stopAtrMult: 2,
+    takeProfitAtrMult: 3,
+    takeProfit1Ratio: 0.5,
+    takeProfit1AtrMult: 1,
+    trailAtrMult: 2,
+    breakevenAfterTp1: true,
+    source: 'symbol',
+    ...over,
+  });
+}
+
+describe('v0.7.0 两段形态', () => {
+  /** 每个用例一份独立依赖：共用假池会让同一笔成交被下一次当成事件重放。 */
+  const deps = (
+    executor: Record<string, unknown> = {},
+    policy: Record<string, number | boolean> = {},
+  ) => ({
+    pool: fakePool().pool,
+    config: makeConfig(executor),
+    placer: fakePlacer(),
+    atr: fakeAtr(),
+    resolvePolicy: stagedPolicy(policy),
+  });
+
+  it('比例 0（缺省）：两张 closePosition 单，与 v0.4.0 逐字一致', async () => {
+    const d = deps({}, { takeProfit1Ratio: 0 });
+    const service = createExecutorService(d);
+    expect(await service.handleFill(fill())).toBe('armed');
+    const cp = d.placer;
+    expect(cp.placed).toHaveLength(2);
+    expect(cp.placed.every((o) => o.closePosition)).toBe(true);
+    expect(cp.placed.some((o) => o.quantity !== undefined)).toBe(false);
+  });
+
+  it('比例 100%：一次性全平，仍用 closePosition（交易所继续自动撤单）', async () => {
+    const d = deps({ takeProfit1Ratio: 1 }, { takeProfit1Ratio: 1 });
+    const { placer } = d;
+    const service = createExecutorService(d);
+    expect(await service.handleFill(fill())).toBe('armed');
+    expect(placer.placed).toHaveLength(2);
+    // 关键：100% **不**用带数量的单，因此自动撤单的保证一分不丢
+    expect(placer.placed.every((o) => o.closePosition)).toBe(true);
+    expect(placer.placed.some((o) => o.quantity !== undefined)).toBe(false);
+  });
+
+  it('比例 50%：止盈带数量 + reduceOnly，止损仍是 closePosition 且不带数量', async () => {
+    const d = deps();
+    const { placer } = d;
+    const service = createExecutorService(d);
+    expect(await service.handleFill(fill())).toBe('armed');
+    expect(placer.placed).toHaveLength(2);
+    const tp = placer.placed.find((o) => o.type === 'TAKE_PROFIT_MARKET');
+    const sl = placer.placed.find((o) => o.type === 'STOP_MARKET');
+    expect(tp?.closePosition).toBe(false);
+    expect(tp?.quantity).toBeGreaterThan(0);
+    expect(sl?.closePosition).toBe(true);
+    expect(sl?.quantity).toBeUndefined();
+  });
+
+  it('两张单要么都挂上要么都不挂：分批形态下第一张失败就回滚', async () => {
+    const d = deps();
+    const placer = d.placer;
+    const service = createExecutorService({
+      ...d,
+      placer: fakePlacer({
+        async placeQuantityOrder() {
+          throw new SyncError('EXCHANGE_ERROR', '模拟第一段挂单失败');
+        },
+      }),
+    });
+    expect(await service.handleFill(fill())).toBe('failed');
+    expect(placer.cancelled).toEqual([]);
   });
 });

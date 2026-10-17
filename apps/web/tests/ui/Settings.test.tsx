@@ -319,7 +319,7 @@ describe('设置页 · 止盈止损策略', () => {
     expect((del as HTMLButtonElement).disabled).toBe(true);
   });
 
-  it('保存全局默认带上全部四个字段', async () => {
+  it('保存全局默认带上全部策略字段（含第一段比例）', async () => {
     const stub = stubFetch(handlers());
     render(<App />);
     await waitFor(() => expect(screen.getByLabelText('全局默认 ATR 周期')).toBeTruthy());
@@ -328,6 +328,14 @@ describe('设置页 · 止盈止损策略', () => {
     fireEvent.change(screen.getByLabelText('全局默认 ATR 周期口径'), { target: { value: '4h' } });
     fireEvent.change(screen.getByLabelText('全局默认 止损倍数'), { target: { value: '2.5' } });
     fireEvent.change(screen.getByLabelText('全局默认 止盈倍数'), { target: { value: '4' } });
+    // 比例以 **百分数** 提交：页面填 80，body 里应是 0.8（换算只有 core 一处实现）
+    fireEvent.change(screen.getByLabelText('全局默认 第一段止盈减仓百分比'), {
+      target: { value: '80' },
+    });
+    fireEvent.change(screen.getByLabelText('全局默认 第一段止盈倍数'), {
+      target: { value: '1.5' },
+    });
+    fireEvent.change(screen.getByLabelText('全局默认 移动止损倍数'), { target: { value: '2.5' } });
     fireEvent.click(screen.getByRole('button', { name: '保存全局默认' }));
 
     await waitFor(() => {
@@ -339,6 +347,11 @@ describe('设置页 · 止盈止损策略', () => {
         atrInterval: '4h',
         stopAtrMult: 2.5,
         takeProfitAtrMult: 4,
+        // 页面填 80，body 里就是 80（换算在服务端做，core 里只有一份实现）
+        takeProfit1Percent: 80,
+        takeProfit1AtrMult: 1.5,
+        trailAtrMult: 2.5,
+        breakevenAfterTp1: true,
       });
     });
   });

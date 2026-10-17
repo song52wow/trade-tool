@@ -133,7 +133,15 @@ function fakeDeps(overrides: Partial<WebDeps> = {}): WebDeps & { calls: string[]
         symbol,
         limit: options.limit,
         items: [],
-        countsByState: { armed: 0, take_profit: 0, stop_loss: 0, cancelled: 0, failed: 0 },
+        countsByState: {
+          armed: 0,
+          partial_armed: 0,
+          trailing: 0,
+          take_profit: 0,
+          stop_loss: 0,
+          cancelled: 0,
+          failed: 0,
+        },
       };
     },
     latestReconciliation: async () => {
@@ -182,6 +190,10 @@ function fakeDeps(overrides: Partial<WebDeps> = {}): WebDeps & { calls: string[]
         atrInterval: '1h',
         stopAtrMult: 2,
         takeProfitAtrMult: 3,
+        takeProfit1Percent: 0,
+        takeProfit1AtrMult: 3,
+        trailAtrMult: 2,
+        breakevenAfterTp1: true,
         source: 'config' as const,
       },
     }),
@@ -193,6 +205,10 @@ function fakeDeps(overrides: Partial<WebDeps> = {}): WebDeps & { calls: string[]
       atrInterval: body.atrInterval,
       stopAtrMult: body.stopAtrMult,
       takeProfitAtrMult: body.takeProfitAtrMult,
+      takeProfit1Percent: body.takeProfit1Percent,
+      takeProfit1AtrMult: body.takeProfit1AtrMult,
+      trailAtrMult: body.trailAtrMult,
+      breakevenAfterTp1: body.breakevenAfterTp1,
       updatedAt: NOW,
     }),
     deleteRiskPolicy: async () => ({ ok: true as const }),
@@ -684,8 +700,10 @@ describe('POST /api/symbols/:symbol/aggregate', () => {
       'armed',
       'cancelled',
       'failed',
+      'partial_armed',
       'stop_loss',
       'take_profit',
+      'trailing',
     ]);
   });
 
@@ -751,6 +769,10 @@ describe('POST /api/symbols/:symbol/aggregate', () => {
               takeProfit: 108,
               tpAlgoId: 1,
               slAlgoId: 2,
+              tp1AlgoId: null,
+              tp1Price: null,
+              trailStopPrice: null,
+              trailLastError: null,
               state: 'armed' as const,
               lastError: null,
               createdAt: NOW - 3_600_000,
@@ -760,6 +782,8 @@ describe('POST /api/symbols/:symbol/aggregate', () => {
           // 有 2 笔 failed，但当前 items 里一条都没有——这正是 countsByState 存在的理由。
           countsByState: {
             armed: 1,
+            partial_armed: 0,
+            trailing: 0,
             take_profit: 0,
             stop_loss: 0,
             cancelled: 0,

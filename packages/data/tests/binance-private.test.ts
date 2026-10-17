@@ -7,6 +7,7 @@
  *   3. 交易所报错一律抛错带 code，不返回空对象假装成功。
  */
 
+import { SyncError } from '@trade-tool/core';
 import {
   BinancePrivateClient,
   ORDER_TRADE_UPDATE,
@@ -71,6 +72,86 @@ describe('私有 REST', () => {
     expect(seenUrl).not.toMatch(/[?&]quantity=/);
     expect(seenUrl).not.toMatch(/[?&]reduceOnly=/);
     expect(seenUrl).toContain('closePosition=true');
+  });
+
+  // v0.7.0 的契约断言：分批止盈靠的是**另一组参数**。按 AGENTS.md §10.1 第 1 条，
+  // 这些「值」必须有对着契约写的断言——今天 listenKeyUrl 从对变错时 122 个测试全绿，
+  // 就是因为没有任何用例断言过那个地址。
+  it('带数量的条件单：发 quantity 与 reduceOnly，且绝不发 closePosition', async () => {
+    let seenUrl = '';
+    const client = clientWith(async (url: string) => {
+      seenUrl = String(url);
+      return jsonResponse({
+        algoId: 555,
+        clientAlgoId: 'rsk-tp-1',
+        algoType: 'CONDITIONAL',
+        orderType: 'TAKE_PROFIT_MARKET',
+        symbol: 'BNBUSDT',
+        side: 'SELL',
+        positionSide: 'BOTH',
+        algoStatus: 'NEW',
+        triggerPrice: '750.000',
+        closePosition: false,
+        quantity: '0.5',
+        createTime: 1750514941540,
+        updateTime: 1750514941540,
+      });
+    });
+    const placed = await client.placeQuantityOrder({
+      symbol: 'BNBUSDT',
+      side: 'SELL',
+      type: 'TAKE_PROFIT_MARKET',
+      stopPrice: 750,
+      quantity: 0.5,
+      reduceOnly: true,
+      clientAlgoId: 'rsk-tp-1',
+    });
+
+    expect(seenUrl).toContain('/fapi/v1/algoOrder?');
+    expect(seenUrl).toContain('algoType=CONDITIONAL');
+    expect(seenUrl).toMatch(/[?&]quantity=0\.5(&|$)/);
+    expect(seenUrl).toMatch(/[?&]reduceOnly=true(&|$)/);
+    // 互斥：`quantity` 与 `closePosition` 不能并存（官方明确，同时发是 -1106）
+    expect(seenUrl).not.toMatch(/[?&]closePosition=/);
+    // 回执：条件单走的是 algoId 编号空间，不是普通 orderId
+    expect(placed.algoId).toBe(555);
+  });
+
+  // 2026-10-17 实测：撤单**成功**时回的就是 `{"code":200,"msg":"success"}`。
+  // 旧判定「有 code 键就是错误」会把每一次成功撤单报成失败——而 v0.7.0 的移动止损
+  // 规定「撤旧失败就不推进档位」，那会让档位永远不推进。这条用例锁住修复。
+  it('撤单成功（回 {code:200,msg:success}）不算失败', async () => {
+    let seenUrl = '';
+    const client = clientWith(async (url: string) => {
+      seenUrl = String(url);
+      return jsonResponse({ code: 200, msg: 'success' });
+    });
+    await expect(client.cancelAlgoOrder(123456)).resolves.toBeUndefined();
+    expect(seenUrl).toContain('/fapi/v1/algoOrder?');
+  });
+
+  it('撤单失败（负数码）仍然要报错，且错误信息带上交易所的 msg', async () => {
+    const client = clientWith(async () => jsonResponse({ code: -2011, msg: 'Unknown order' }, 400));
+    await expect(client.cancelAlgoOrder(123456)).rejects.toThrow(/Unknown order/);
+  });
+
+  it('数量非正直接报错，不把 0 发到交易所', async () => {
+    let called = false;
+    const client = clientWith(async () => {
+      called = true;
+      return jsonResponse({});
+    });
+    await expect(
+      client.placeQuantityOrder({
+        symbol: 'BNBUSDT',
+        side: 'SELL',
+        type: 'TAKE_PROFIT_MARKET',
+        stopPrice: 750,
+        quantity: 0,
+        clientAlgoId: 'rsk-tp-1',
+      }),
+    ).rejects.toThrow(SyncError);
+    expect(called).toBe(false);
   });
 
   it('listenKey 请求不签名但仍带 API key 头', async () => {
@@ -244,6 +325,8 @@ describe('只读查询端点（v0.6.0 对账用）', () => {
       algoStatus: 'NEW',
       triggerPrice: '750.000',
       closePosition: true,
+      // 带数量的条件单才有这个字段（v0.7.0）；closePosition 单解析成 null。
+      quantity: null,
       createTime: 1750514941540,
       updateTime: 1750514941540,
     },

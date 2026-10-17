@@ -96,6 +96,37 @@ export interface ClosePositionOrderRequest {
   recvWindowMs?: number;
 }
 
+/**
+ * **带数量**的条件单（v0.7.0 的第一段止盈）。
+ *
+ * 与 {@link ClosePositionOrderRequest} 的区别就是这一个字段：官方参数表明确
+ * `quantity` 与 `closePosition=true` **互斥**（同时发是 `-1106`），因此
+ * 「只平一部分」只能走这个形态。
+ *
+ * 代价必须写在这里而不是藏在别处：`closePosition` 的两个好处里，**仓位归零时自动撤销**
+ * 这一条没有了——带数量的单只认数量，仓位已经是 0 时它不会自己消失。
+ * 止损单仍然是 `closePosition` 形态，所以减仓不需要重挂它（AGENTS.md §6.8 第 1 条）。
+ */
+export interface QuantityOrderRequest {
+  symbol: string;
+  /** 平多 = SELL，平空 = BUY。 */
+  side: OrderSide;
+  type: 'STOP_MARKET' | 'TAKE_PROFIT_MARKET';
+  stopPrice: number;
+  /** 数量，必须已按 `LOT_SIZE.stepSize` 对齐。 */
+  quantity: number;
+  /**
+   * 只减不开。单向持仓下官方允许（双向模式明确禁止，而本仓库拒绝双向模式）。
+   *
+   * 它只是保险：把这条去掉，第一段止盈的语义靠 `quantity` 本身依然成立。
+   */
+  reduceOnly?: boolean;
+  clientAlgoId: string;
+  workingType?: 'MARK_PRICE' | 'CONTRACT_PRICE';
+  priceProtect?: boolean;
+  recvWindowMs?: number;
+}
+
 /** 条件单挂成之后的回执。**是 algoId，不是普通 orderId**——两套编号互不通用。 */
 export interface PlacedAlgoOrder {
   algoId: number;
@@ -108,14 +139,34 @@ export interface PlacedAlgoOrder {
   status: string;
 }
 
-/** 交易所的错误体：`{ code, msg }`。code < 0 一定是错误。 */
+/**
+ * 交易所的错误体：`{ code, msg }`。
+ *
+ * 判定**只看 code 的值**，不看「有没有 code 这个键」。
+ *
+ * 为什么不能只看键的存在（2026-10-17 实测踩到）：`DELETE /fapi/v1/algoOrder` **成功**时
+ * 回的就是 `{"code": 200, "msg": "success"}`——带 `code` 键。于是「有 code 就是错误」的写法
+ * 会把**每一次成功的撤单都报成失败**。后果不是「多一行难看的日志」：
+ *   * v0.4.0 的回滚（「撤掉先挂上的那张」）会永远走进失败分支；
+ *   * v0.7.0 的移动止损规定「撤旧失败就不推进档位」，于是**档位永远不推进**，
+ *     而交易所上早已换成新止损单——账面与实际永久对不上。
+ *
+ * 真正的错误码一律是**负数**（-1106 / -1121 / -1021 …），成功码是非负（200 / 0）。
+ */
 interface BinanceErrorBody {
-  code?: number;
+  code?: number | string;
   msg?: string;
 }
 
 function isErrorBody(value: unknown): value is BinanceErrorBody {
-  return typeof value === 'object' && value !== null && 'code' in value;
+  if (typeof value !== 'object' || value === null || !('code' in value)) return false;
+  const code = (value as { code?: unknown }).code;
+  // 没有 code 值、或 code 是拿不到数字的字符串：无法判定为错误，交给上层按缺字段处理
+  // （那会让错误信息指向「响应缺字段」而不是「撤单失败」，是更准确的指向）。
+  if (typeof code !== 'number' && typeof code !== 'string') return false;
+  const numeric = typeof code === 'number' ? code : Number(code);
+  if (!Number.isFinite(numeric)) return false;
+  return numeric < 0;
 }
 
 function requirePositive(value: unknown, field: string, where: string): number {
@@ -261,20 +312,7 @@ export function parseAccountUpdate(payload: unknown): AccountPositionUpdate[] | 
  * 用「猜一个 0.01」去对齐，止损位会被交易所按自己的规则否掉，而本地看起来毫无异常。
  */
 export function parseTickSize(rawExchangeInfoEntry: unknown, symbol: string): number {
-  if (typeof rawExchangeInfoEntry !== 'object' || rawExchangeInfoEntry === null) {
-    throw new SyncError(
-      'CONFIG_INVALID',
-      `${symbol} 没有 exchangeInfo 快照，无法确定最小价格变动（tickSize）`,
-      { symbol },
-    );
-  }
-  const filters = (rawExchangeInfoEntry as Record<string, unknown>)['filters'];
-  if (!Array.isArray(filters)) {
-    throw new SyncError('CONFIG_INVALID', `${symbol} 的 exchangeInfo 快照里没有 filters`, {
-      symbol,
-    });
-  }
-  for (const filter of filters) {
+  for (const filter of requireFilters(rawExchangeInfoEntry, symbol)) {
     if (typeof filter !== 'object' || filter === null) continue;
     const entry = filter as Record<string, unknown>;
     if (entry['filterType'] !== 'PRICE_FILTER') continue;
@@ -299,11 +337,71 @@ export function parseTickSize(rawExchangeInfoEntry: unknown, symbol: string): nu
 }
 
 /**
+ * 从 exchangeInfo 的原始条目里取最小下单数量（`LOT_SIZE.stepSize`）。
+ *
+ * v0.7.0 的分批止盈要按数量挂单，而数量必须对齐 `stepSize`——不对齐的单会被交易所
+ * 按自己的规则否掉，本地看起来毫无异常（同 `parseTickSize` 的道理）。
+ *
+ * 与 `parseTickSize` 共用同一份遍历：`filters` 的形状只有一个理解，
+ * 两处各写一遍 JSON 查找，交易所改字段名时只会漏掉其中一处。
+ */
+export function parseStepSize(rawExchangeInfoEntry: unknown, symbol: string): number {
+  for (const filter of requireFilters(rawExchangeInfoEntry, symbol)) {
+    if (typeof filter !== 'object' || filter === null) continue;
+    const entry = filter as Record<string, unknown>;
+    if (entry['filterType'] !== 'LOT_SIZE') continue;
+    const step = entry['stepSize'];
+    if (typeof step !== 'string' || step.trim() === '' || !Number.isFinite(Number(step))) {
+      throw new SyncError('CONFIG_INVALID', `${symbol} 的 stepSize 不是合法数字：${String(step)}`, {
+        symbol,
+        stepSize: String(step),
+      });
+    }
+    if (Number(step) <= 0) {
+      throw new SyncError('CONFIG_INVALID', `${symbol} 的 stepSize 必须为正：${step}`, {
+        symbol,
+        stepSize: step,
+      });
+    }
+    return Number(step);
+  }
+  throw new SyncError('CONFIG_INVALID', `${symbol} 的 exchangeInfo 快照里没有 LOT_SIZE`, {
+    symbol,
+  });
+}
+
+/** `parseTickSize` / `parseStepSize` 共用：取到 `filters` 数组，或明确报错。 */
+function requireFilters(rawExchangeInfoEntry: unknown, symbol: string): unknown[] {
+  if (typeof rawExchangeInfoEntry !== 'object' || rawExchangeInfoEntry === null) {
+    throw new SyncError(
+      'CONFIG_INVALID',
+      `${symbol} 没有 exchangeInfo 快照，无法确定最小价格变动（tickSize）`,
+      { symbol },
+    );
+  }
+  const filters = (rawExchangeInfoEntry as Record<string, unknown>)['filters'];
+  if (!Array.isArray(filters)) {
+    throw new SyncError('CONFIG_INVALID', `${symbol} 的 exchangeInfo 快照里没有 filters`, {
+      symbol,
+    });
+  }
+  return filters;
+}
+
+/**
  * 私有 REST 客户端。
  *
  * 签名 = HMAC-SHA256(queryString, apiSecret) 的 hex。查询串里的键按字典序拼接，
  * `timestamp` / `recvWindow` 一起参与签名——少一个就是 -1021 签名错误。
  */
+/** 数量字段的可选解析。空串 / 0 / 非有限数字一律记 `null`，不记 0 冒充。 */
+function parseOptionalQty(raw: unknown, where: string): number | null {
+  if (raw === undefined || raw === null || raw === '') return null;
+  const value = typeof raw === 'string' ? Number(raw) : raw;
+  if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0) return null;
+  return value;
+}
+
 export class BinancePrivateClient {
   private readonly credentials: Credentials;
   private readonly baseUrl: string;
@@ -482,9 +580,8 @@ export class BinancePrivateClient {
    * 混用会在撤单时拿到「订单不存在」。
    */
   async placeClosePositionOrder(request: ClosePositionOrderRequest): Promise<PlacedAlgoOrder> {
-    const body = await this.request<Record<string, unknown>>('POST', '/fapi/v1/algoOrder', {
-      signed: true,
-      params: {
+    return this.placeAlgoOrder(
+      {
         algoType: 'CONDITIONAL',
         symbol: request.symbol,
         side: request.side,
@@ -497,8 +594,62 @@ export class BinancePrivateClient {
         clientAlgoId: request.clientAlgoId,
         recvWindow: request.recvWindowMs ?? this.recvWindowMs,
       },
+      `placeClosePositionOrder ${request.symbol}`,
+    );
+  }
+
+  /**
+   * 挂一张**带数量**的条件单（分批止盈用）。
+   *
+   * 刻意不发 `closePosition`：官方明确 `quantity` 与它互斥。也不要在这里偷偷补
+   * `closePosition`「万一填了」，那会让两种形态在请求里混起来，
+   * 而它们在交易所侧是**不同的撤销语义**（见 {@link QuantityOrderRequest}）。
+   *
+   * 口径核对：**2026-10-17** 官方参数表 `New UM Algo Order (TRADE)`，
+   * `quantity` / `reduceOnly` 均为合法参数，`quantity` 只禁与 `closePosition=true` 并存。
+   */
+  async placeQuantityOrder(request: QuantityOrderRequest): Promise<PlacedAlgoOrder> {
+    if (!Number.isFinite(request.quantity) || request.quantity <= 0) {
+      throw new SyncError(
+        'CONFIG_INVALID',
+        `带数量的条件单数量必须为正：${String(request.quantity)}`,
+        { symbol: request.symbol, quantity: request.quantity },
+      );
+    }
+    return this.placeAlgoOrder(
+      {
+        algoType: 'CONDITIONAL',
+        symbol: request.symbol,
+        side: request.side,
+        type: request.type,
+        triggerPrice: request.stopPrice,
+        quantity: String(request.quantity),
+        reduceOnly: String(request.reduceOnly ?? true),
+        workingType: request.workingType ?? 'MARK_PRICE',
+        priceProtect: String(request.priceProtect ?? true),
+        clientAlgoId: request.clientAlgoId,
+        recvWindow: request.recvWindowMs ?? this.recvWindowMs,
+      },
+      `placeQuantityOrder ${request.symbol}`,
+    );
+  }
+
+  /**
+   * 两个下单形态的**唯一**实现：拼参数、发请求、解析回执。
+   *
+   * 回执解析只有一份，是因为 `orderType` 的取值差异（查询侧 `TAKE_PROFIT` / `STOP`，
+   * 下单侧 `TAKE_PROFIT_MARKET` / `STOP_MARKET`）必须原样透传给 `algoOrderTag()`——
+   * 两处各解析一次，早晚会有一处「顺手统一」掉那个差异，而差异正是判据的依据
+   * （AGENTS.md §6.3）。
+   */
+  private async placeAlgoOrder(
+    params: Record<string, string | number>,
+    where: string,
+  ): Promise<PlacedAlgoOrder> {
+    const body = await this.request<Record<string, unknown>>('POST', '/fapi/v1/algoOrder', {
+      signed: true,
+      params,
     });
-    const where = `placeClosePositionOrder ${request.symbol}`;
     return {
       algoId: requireNumber(body['algoId'], 'algoId', where),
       clientAlgoId: requireString(body['clientAlgoId'], 'clientAlgoId', where),
@@ -618,6 +769,8 @@ export class BinancePrivateClient {
         algoStatus: requireString(row['algoStatus'], 'algoStatus', where),
         triggerPrice: requirePositive(row['triggerPrice'], 'triggerPrice', where),
         closePosition: row['closePosition'] === true,
+        // 带数量的单才有；closePosition 单回的是 0/缺省，按「没有数量」记 null 而不是 0。
+        quantity: parseOptionalQty(row['quantity'], where),
         createTime: requireNumber(row['createTime'], 'createTime', where),
         updateTime: requireNumber(row['updateTime'], 'updateTime', where),
       };

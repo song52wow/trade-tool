@@ -12,6 +12,12 @@ type PolicyForm = {
   atrInterval: string;
   stopAtrMult: string;
   takeProfitAtrMult: string;
+  /** 第一段减仓的**百分数**（0–100），不是 0–1。 */
+  takeProfit1Percent: string;
+  takeProfit1AtrMult: string;
+  trailAtrMult: string;
+  /** 复选框用字符串存，因为表单整体是「非空字符串 = 可提交」。 */
+  breakevenAfterTp1: string;
 };
 
 const EMPTY_FORM: PolicyForm = {
@@ -19,6 +25,10 @@ const EMPTY_FORM: PolicyForm = {
   atrInterval: '15m',
   stopAtrMult: '',
   takeProfitAtrMult: '',
+  takeProfit1Percent: '0',
+  takeProfit1AtrMult: '3',
+  trailAtrMult: '2',
+  breakevenAfterTp1: 'true',
 };
 
 function toForm(p: RiskPolicyDto): PolicyForm {
@@ -27,6 +37,11 @@ function toForm(p: RiskPolicyDto): PolicyForm {
     atrInterval: p.atrInterval,
     stopAtrMult: String(p.stopAtrMult),
     takeProfitAtrMult: String(p.takeProfitAtrMult),
+    // 百分数由服务端换算好（core 那边只有一份实现），前端不自己 `× 100`。
+    takeProfit1Percent: String(p.takeProfit1Percent),
+    takeProfit1AtrMult: String(p.takeProfit1AtrMult),
+    trailAtrMult: String(p.trailAtrMult),
+    breakevenAfterTp1: String(p.breakevenAfterTp1),
   };
 }
 
@@ -98,15 +113,26 @@ export function RiskPolicyPanel(props: {
       atrInterval: form.atrInterval,
       stopAtrMult: Number(form.stopAtrMult),
       takeProfitAtrMult: Number(form.takeProfitAtrMult),
+      takeProfit1Percent: Number(form.takeProfit1Percent),
+      takeProfit1AtrMult: Number(form.takeProfit1AtrMult),
+      trailAtrMult: Number(form.trailAtrMult),
+      breakevenAfterTp1: form.breakevenAfterTp1 === 'true',
     };
     // 本地只拦「空 / 非数字」这种必然失败的提交；**范围校验交给服务端**并在页面上显示它回的错误，
     // 不在前端复制一份规则（复制一份就会与服务端漂移，届时两边给出不同的答案）。
     if (
       !Number.isFinite(body.atrPeriod) ||
       !Number.isFinite(body.stopAtrMult) ||
-      !Number.isFinite(body.takeProfitAtrMult)
+      !Number.isFinite(body.takeProfitAtrMult) ||
+      !Number.isFinite(body.takeProfit1Percent) ||
+      !Number.isFinite(body.takeProfit1AtrMult) ||
+      !Number.isFinite(body.trailAtrMult)
     ) {
-      setError('[CONFIG_INVALID] 三个数值字段都必须是数字');
+      setError('[CONFIG_INVALID] 数值字段都必须是数字');
+      return;
+    }
+    if (body.takeProfit1Percent < 0 || body.takeProfit1Percent > 100) {
+      setError('[CONFIG_INVALID] 第一段减仓的百分比必须在 0 与 100 之间');
       return;
     }
     if (scope === 'symbol' && symbol === '') {
@@ -350,6 +376,68 @@ function PolicyFormBlock(props: {
           />
         </label>
       </div>
+
+      {/* v0.7.0 两段止盈。三个取值走三种形态，提示必须写清，否则用户会把
+          「0」误读成「不分批也不止盈」。 */}
+      <div className="row" style={{ marginTop: 10 }}>
+        <label>
+          <span className="label">第一段止盈减仓（%）</span>
+          <input
+            type="number"
+            inputMode="decimal"
+            step="1"
+            min={0}
+            max={100}
+            aria-label={`${props.title} 第一段止盈减仓百分比`}
+            value={form.takeProfit1Percent}
+            disabled={disabled}
+            onChange={(e) => set({ takeProfit1Percent: e.target.value })}
+          />
+        </label>
+        <label>
+          <span className="label">第一段止盈倍数（× ATR）</span>
+          <input
+            type="number"
+            inputMode="decimal"
+            step="0.1"
+            aria-label={`${props.title} 第一段止盈倍数`}
+            value={form.takeProfit1AtrMult}
+            disabled={disabled}
+            onChange={(e) => set({ takeProfit1AtrMult: e.target.value })}
+          />
+        </label>
+        <label>
+          <span className="label">移动止损倍数（× ATR）</span>
+          <input
+            type="number"
+            inputMode="decimal"
+            step="0.1"
+            aria-label={`${props.title} 移动止损倍数`}
+            value={form.trailAtrMult}
+            disabled={disabled}
+            onChange={(e) => set({ trailAtrMult: e.target.value })}
+          />
+        </label>
+      </div>
+      <div className="row" style={{ marginTop: 6, alignItems: 'center' }}>
+        <label className="row" style={{ gap: 6, alignItems: 'center' }}>
+          <input
+            type="checkbox"
+            style={{ width: 'auto' }}
+            aria-label={`${props.title} 第一段兑现后止损上移到保本位`}
+            checked={form.breakevenAfterTp1 === 'true'}
+            disabled={disabled}
+            onChange={(e) => set({ breakevenAfterTp1: String(e.target.checked) })}
+          />
+          <span className="label">第一段兑现后，剩余仓位止损上移到保本位</span>
+        </label>
+      </div>
+      <p className="hint">
+        0% = 不分批（到价一次全平，与旧行为一致）；1–99% = 先按「第一段止盈倍数」
+        卖掉这个比例，剩余仓位交给移动止损（止损 = 持仓期最高价 − 移动止损倍数 × 当前
+        ATR，只上移不放宽）；100% = 到价一次全平，用「第一段止盈倍数」算。
+      </p>
+
       <div className="row" style={{ marginTop: 10 }}>
         <button className="primary" disabled={disabled} onClick={props.onSubmit}>
           {props.submitLabel}

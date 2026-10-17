@@ -20,6 +20,7 @@ const KIND_LABEL: Record<ReconcileKind, string> = {
   'unprotected-position': '有一笔入场成交没挂上任何保护单',
   'position-without-record': '交易所有仓位，本地没有对应记录',
   'missing-take-profit-order': '止盈单已不在交易所',
+  'unexpected-take-profit-order': '已进移动止损阶段，交易所却还挂着止盈单',
   'price-mismatch': '触发价与本地记录不一致',
   'record-without-position': '本地记为已挂单，但交易所已无仓位',
   'orphan-algo-order': '交易所挂着我方单，但本地没有记录引用它',

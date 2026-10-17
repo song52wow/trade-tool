@@ -248,6 +248,41 @@ export const executorSchema = z.object({
   stopAtrMult: z.number().positive().max(20).default(2),
   /** 止盈 = 入场价 ± 该倍数 × ATR。 */
   takeProfitAtrMult: z.number().positive().max(50).default(3),
+  /**
+   * 第一段止盈减仓的比例（v0.7.0），`[0, 1]`。**0 = 关闭分批**，此时行为与 v0.4.0
+   * 逐字一致。
+   *
+   * 三个取值走三种形态，只有 `(0, 1)` 会启用剩余仓位的移动止损：
+   *   * `0`      整段止盈用 `takeProfitAtrMult`，全平；
+   *   * `(0, 1)` 第一段按 `takeProfit1AtrMult` 平掉这个比例，剩余交给移动止损；
+   *   * `1`      一次性止盈用 `takeProfit1AtrMult`，全平（不需要移动止损，更简单）。
+   *
+   * 控制面上以 **0–100 的百分数**呈现，换算只有一处实现（`ratioToPercent` /
+   * `percentToRatio`），前端不许自己 `÷ 100` 了事。
+   */
+  takeProfit1Ratio: z.number().min(0).max(1).default(0),
+  /** 第一段止盈 = 入场价 ± 该倍数 × ATR。 */
+  takeProfit1AtrMult: z.number().positive().max(50).default(3),
+  /**
+   * 移动止损的 Chandelier 倍数：`止损 = 持仓期极值 ∓ 该倍数 × ATR(最新)`，
+   * **只朝有利方向移动、永不放宽**。
+   *
+   * 为什么不跟着 `stopAtrMult` 走：两者是**不同阶段**的参数（进场保护 vs 移动止损），
+   * 让它们联动就会出现「改了进场止损倍数、移动止损悄悄跟着变」这种查不出来的行为。
+   * 配置里没写时由 `resolvePolicy` 显式取 `stopAtrMult` 的值（同一个参数的两个名字），
+   * 库里的 `risk_policy` 永远存具体数值。
+   */
+  trailAtrMult: z.number().positive().max(20).default(2),
+  /** 第一段兑现后，剩余仓位的止损是否上移到保本位。 */
+  breakevenAfterTp1: z.boolean().default(true),
+  /**
+   * 移动止损的重算周期（毫秒）。**0 = 关闭自动重算**。
+   *
+   * 缺省 60 秒的依据不是「越快越好」，而是限频：一轮里每条 `trailing` 记录最多
+   * 1 挂 + 1 撤，而「价未变就不动」让绝大多数轮次是零动作。取值再小也只是让
+   * 同一批单反复撤挂，对保护效果没有额外收益。
+   */
+  trailIntervalMs: z.number().int().min(0).default(60_000),
   /** 只服务这些标的；空数组 = 全部（**含库里出现但集合外的标的**）。 */
   symbols: z.array(z.string().min(1)).default([]),
   /** 买入成交只部分成交时怎么办。`ignore` = 等它全成交再设一次止盈止损。 */

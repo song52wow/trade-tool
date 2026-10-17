@@ -21,6 +21,22 @@ export interface AtrSnapshot {
   segmentFrom: number;
   segmentTo: number;
   asOfMs: number;
+  /**
+   * 持仓期极值（v0.7.0）：移动止损的基准。
+   *
+   * `from` / `to` 是**实际取数的那段**的起止，**可能短于整个持仓期**——
+   * 因为极值不许跨缺口，取的是 `asOf` 侧那个极大连续段。短了就如实回传，
+   * 让调用方知道「这个极值只覆盖到这里」，而不是猜一个覆盖全程的值。
+   */
+  extreme: { high: number; low: number; from: number; to: number };
+  /**
+   * 取数范围内最后一根已收盘 K 线的收盘价（与 `extreme` 同一段数据、同一次取数）。
+   *
+   * 用来判断「算出来的新止损位是不是已经越过现价」——越过了挂上去会立刻触发，
+   * 等于用市价平仓。**必须**跟 ATR / 极值同一次返回：分两次取，中间会落进一根新 K 线，
+   * 两者来自不同时刻，判断随即失去意义；另开 REST 取价则会给服务凭空加一条出网路径。
+   */
+  lastClose: number;
 }
 
 export interface AtrProvider {
@@ -33,6 +49,12 @@ export interface AtrProvider {
   atrAt(
     symbol: string,
     asOfMs: number,
+    /**
+     * 持仓起点。**必填**：极值是「持仓期内」的极值，没有起点就算不出来。
+     * 刻意不给缺省值——默认成 0 或 `asOf` 都会算出一个看似正常的极值，
+     * 而它其实没有意义（AGENTS.md 约定 8）。
+     */
+    entryTimeMs: number,
     override?: { interval?: string; period?: number },
   ): Promise<AtrSnapshot>;
 }
@@ -43,6 +65,18 @@ export interface CreateAtrProviderOptions {
   dsn: string;
   config: ExecutorConfig;
   timeoutMs?: number;
+}
+
+/** 收一个「必须是有限数字」的字段，否则明确报错。 */
+function finite(value: unknown, field: string, symbol: string): number {
+  if (typeof value !== 'number' || !Number.isFinite(value)) {
+    throw new SyncError('INTERNAL_ERROR', `risk-atr 返回的 ${field} 不是有限数字：${symbol}`, {
+      symbol,
+      field,
+      value: String(value),
+    });
+  }
+  return value;
 }
 
 /**
@@ -57,17 +91,25 @@ function validate(raw: unknown, symbol: string): AtrSnapshot {
     throw new SyncError('INTERNAL_ERROR', `risk-atr 没有返回 JSON 对象：${symbol}`, { symbol });
   }
   const r = raw as Record<string, unknown>;
-  const need = (field: string): number => {
-    const value = r[field];
-    if (typeof value !== 'number' || !Number.isFinite(value)) {
-      throw new SyncError('INTERNAL_ERROR', `risk-atr 返回的 ${field} 不是有限数字：${symbol}`, {
-        symbol,
-        field,
-        value: String(value),
-      });
-    }
-    return value;
+  const need = (field: string): number => finite(r[field], field, symbol);
+  const rawExtreme = r['extreme'];
+  if (typeof rawExtreme !== 'object' || rawExtreme === null) {
+    // 极值缺字段时**不静默补 0**：补 0 会让 Chandelier 算出一个「止损 = −k×ATR」
+    // 的怪价，而它要到价格反向运行时才显形（v0.7.0 R-6.3）。
+    throw new SyncError(
+      'INTERNAL_ERROR',
+      `risk-atr 返回的摘要里没有 extreme 字段：${symbol}（Python 侧可能还没升级到 v0.7.0 的摘要形状）`,
+      { symbol },
+    );
+  }
+  const e = rawExtreme as Record<string, unknown>;
+  const extreme = {
+    high: finite(e['high'], 'extreme.high', symbol),
+    low: finite(e['low'], 'extreme.low', symbol),
+    from: finite(e['from'], 'extreme.from', symbol),
+    to: finite(e['to'], 'extreme.to', symbol),
   };
+
   const snapshot: AtrSnapshot = {
     symbol: typeof r['symbol'] === 'string' ? r['symbol'] : symbol,
     interval: typeof r['interval'] === 'string' ? r['interval'] : String(r['interval']),
@@ -78,6 +120,8 @@ function validate(raw: unknown, symbol: string): AtrSnapshot {
     segmentFrom: need('segmentFrom'),
     segmentTo: need('segmentTo'),
     asOfMs: need('asOfMs'),
+    extreme,
+    lastClose: need('lastClose'),
   };
   if (snapshot.atr <= 0) {
     throw new SyncError('RISK_ATR_UNAVAILABLE', `risk-atr 返回了非正的 ATR：${snapshot.atr}`, {
@@ -94,6 +138,7 @@ export function createAtrProvider(options: CreateAtrProviderOptions): AtrProvide
     async atrAt(
       symbol: string,
       asOfMs: number,
+      entryTimeMs: number,
       override?: { interval?: string; period?: number },
     ): Promise<AtrSnapshot> {
       // 参数一律来自「本次解析出的那份策略」，不在这里兜底：调用方已经决定过优先级，
@@ -113,6 +158,9 @@ export function createAtrProvider(options: CreateAtrProviderOptions): AtrProvide
           String(period),
           '--as-of-ms',
           String(asOfMs),
+          // 持仓起点：极值按「持仓期内」算，缺了它就没有极值。
+          '--entry-time',
+          String(entryTimeMs),
           '--window-bars',
           String(config.atrWindowBars),
         ],
