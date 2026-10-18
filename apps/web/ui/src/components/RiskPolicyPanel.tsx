@@ -74,11 +74,21 @@ function reason(error: unknown): string {
 }
 
 export function RiskPolicyPanel(props: {
-  /** 运行时发现的标的集合（不含硬编码合约名）。 */
+  /** 运行时发现的标的集合（不含硬编码合约名）。设置页用它填下拉框。 */
   symbols: string[];
   notify: (text: string, kind?: 'ok' | 'err') => void;
+  /**
+   * 锁定到某一个标的（**标的详情页用**）。给了它就没有下拉框，
+   * 并且**只显示这个标的的覆盖表单**。
+   *
+   * 为什么不显示「全局默认」那一栏：在单标的的页面上摆一个「保存全局默认」的按钮，
+   * 是最容易被误按的地方——按下去影响的是**所有**标的，而用户以为自己只改了当前这个。
+   * 全局那层仍然以「当前生效」的只读形式显示在上面。
+   */
+  fixedSymbol?: string;
 }) {
-  const [symbol, setSymbol] = useState('');
+  const [pickedSymbol, setPickedSymbol] = useState('');
+  const symbol = props.fixedSymbol ?? pickedSymbol;
   const [view, setView] = useState<RiskPolicyViewDto | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
@@ -195,26 +205,42 @@ export function RiskPolicyPanel(props: {
         </div>
       ) : null}
 
-      <div className="row" style={{ marginBottom: 12 }}>
-        <label className="row" style={{ gap: 6 }}>
+      {props.fixedSymbol !== undefined ? (
+        <div className="row" style={{ marginBottom: 12 }}>
           <span className="muted" style={{ fontSize: 12 }}>
-            查看标的
+            当前标的
           </span>
-          <select aria-label="选择标的" value={symbol} onChange={(e) => setSymbol(e.target.value)}>
-            <option value="">（不指定，看全局默认）</option>
-            {props.symbols.map((s) => (
-              <option key={s} value={s}>
-                {s}
-              </option>
-            ))}
-          </select>
-        </label>
-        {props.symbols.length === 0 ? (
+          <span className="mono">{props.fixedSymbol}</span>
           <span className="muted" style={{ fontSize: 12 }}>
-            标的集合为空——先用首页的输入框添加标的。
+            （这一栏改的是该标的的覆盖；全局默认在「设置」页改）
           </span>
-        ) : null}
-      </div>
+        </div>
+      ) : (
+        <div className="row" style={{ marginBottom: 12 }}>
+          <label className="row" style={{ gap: 6 }}>
+            <span className="muted" style={{ fontSize: 12 }}>
+              查看标的
+            </span>
+            <select
+              aria-label="选择标的"
+              value={symbol}
+              onChange={(e) => setPickedSymbol(e.target.value)}
+            >
+              <option value="">（不指定，看全局默认）</option>
+              {props.symbols.map((s) => (
+                <option key={s} value={s}>
+                  {s}
+                </option>
+              ))}
+            </select>
+          </label>
+          {props.symbols.length === 0 ? (
+            <span className="muted" style={{ fontSize: 12 }}>
+              标的集合为空——先用首页的输入框添加标的。
+            </span>
+          ) : null}
+        </div>
+      )}
 
       {view !== null && source !== null ? (
         <div className="resolved">
@@ -235,6 +261,21 @@ export function RiskPolicyPanel(props: {
             <dd className="mono">{view.resolved.stopAtrMult} × ATR</dd>
             <dt>止盈倍数</dt>
             <dd className="mono">{view.resolved.takeProfitAtrMult} × ATR</dd>
+            <dt>第一段减仓</dt>
+            <dd className="mono">
+              {/* 服务端已经把比例换算成百分数（浏览器端不引 core，见 apps/web/src/service.ts） */}
+              {view.resolved.takeProfit1Percent}%
+              {view.resolved.takeProfit1Percent === 0
+                ? '（不分批）'
+                : view.resolved.takeProfit1Percent >= 100
+                  ? '（到价全平）'
+                  : `（余下 ${Number((100 - view.resolved.takeProfit1Percent).toFixed(4))}% 交给移动止损）`}
+            </dd>
+            <dt>移动止损倍数</dt>
+            <dd className="mono">
+              {view.resolved.trailAtrMult} × ATR
+              {view.resolved.breakevenAfterTp1 ? ' · 兑现后上移到保本' : ''}
+            </dd>
           </dl>
           <p className="muted" style={{ fontSize: 12, margin: '6px 0 0' }}>
             {source.hint}
@@ -246,19 +287,22 @@ export function RiskPolicyPanel(props: {
       )}
 
       <div className="grid2" style={{ marginTop: 16 }}>
-        <PolicyFormBlock
-          title="全局默认"
-          subtitle={
-            view?.global === null || view === null
-              ? '尚未设置：新建的标的会落到配置文件那一档'
-              : `更新于 ${fmtTime(view.global.updatedAt)}`
-          }
-          form={globalForm}
-          disabled={busy}
-          onChange={setGlobalForm}
-          onSubmit={() => submit('global')}
-          submitLabel="保存全局默认"
-        />
+        {/* 单标的页不渲染全局那栏（见 fixedSymbol 的注释） */}
+        {props.fixedSymbol === undefined ? (
+          <PolicyFormBlock
+            title="全局默认"
+            subtitle={
+              view?.global === null || view === null
+                ? '尚未设置：新建的标的会落到配置文件那一档'
+                : `更新于 ${fmtTime(view.global.updatedAt)}`
+            }
+            form={globalForm}
+            disabled={busy}
+            onChange={setGlobalForm}
+            onSubmit={() => submit('global')}
+            submitLabel="保存全局默认"
+          />
+        ) : null}
         <PolicyFormBlock
           title={symbol === '' ? '标的覆盖' : `${symbol} 的覆盖`}
           subtitle={

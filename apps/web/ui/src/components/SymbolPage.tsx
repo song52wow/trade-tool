@@ -28,6 +28,8 @@ export function SymbolPage(props: {
   aggregating: boolean;
   onAggregate: () => void;
   tick: number;
+  /** 保存提示走同一套横幅。 */
+  notify: (text: string, kind?: 'ok' | 'err') => void;
 }) {
   const [detail, setDetail] = useState<SymbolDetailDto | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -124,6 +126,7 @@ export function SymbolPage(props: {
             aggregating={props.aggregating}
             onAggregate={props.onAggregate}
             tick={props.tick}
+            notify={props.notify}
           />
         )}
       </div>
