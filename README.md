@@ -176,15 +176,16 @@ pnpm --filter @trade-tool/cli start -- reconcile -s BTCUSDT      # 单标的
 判据只有一份实现（`packages/core/src/reconcile.ts`，纯函数），CLI 与控制面共用，因此两个
 出口不可能给出不同结论。差异分两档而不是「有异常 / 没异常」：
 
-| 差异                        | 严重度 | 含义                                                 |
-| --------------------------- | ------ | ---------------------------------------------------- |
-| `missing-stop-order`        | 紧急   | 本地记为已挂单，交易所没有止损单——**仓位当前是裸的** |
-| `unprotected-position`      | 紧急   | 一笔入场成交占坑成功但没挂上单，而仓位还在           |
-| `position-without-record`   | 紧急   | 交易所有仓位，本地没有任何未终结记录                 |
-| `missing-take-profit-order` | 注意   | 止损还在，止盈没了                                   |
-| `price-mismatch`            | 注意   | 单还在，但触发价与本地记录不一致                     |
-| `record-without-position`   | 注意   | 本地记为已挂单，交易所已无仓位（平仓事件多半没收到） |
-| `orphan-algo-order`         | 注意   | 交易所挂着我方单，但本地没有记录引用它               |
+| 差异                           | 严重度 | 含义                                                 |
+| ------------------------------ | ------ | ---------------------------------------------------- |
+| `missing-stop-order`           | 紧急   | 本地记为已挂单，交易所没有止损单——**仓位当前是裸的** |
+| `unprotected-position`         | 紧急   | 一笔入场成交占坑成功但没挂上单，而仓位还在           |
+| `position-without-record`      | 紧急   | 交易所有仓位，本地没有任何未终结记录                 |
+| `missing-take-profit-order`    | 注意   | 止损还在，止盈没了                                   |
+| `price-mismatch`               | 注意   | 单还在，但触发价与本地记录不一致                     |
+| `record-without-position`      | 注意   | 本地记为已挂单，交易所已无仓位（平仓事件多半没收到） |
+| `orphan-algo-order`            | 注意   | 交易所挂着我方单，但本地没有记录引用它               |
+| `unexpected-take-profit-order` | 注意   | 本地已进入移动止损阶段，交易所却还挂着止盈单         |
 
 「有止盈没止损」是紧急，「只有止损没止盈」只是注意——合成「有没有问题」会让最要紧的
 那种被淹掉。

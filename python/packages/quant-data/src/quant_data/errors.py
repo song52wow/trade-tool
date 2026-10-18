@@ -41,6 +41,11 @@ ErrorCode = Literal[
     # 单列而不复用 CONFIG_INVALID：这是「数据还没同步上来」，处置是 start 标的，
     # 而 CONFIG_INVALID 的处置是改配置，两者混在一起会让人查错方向。
     "RISK_ATR_UNAVAILABLE",
+    # 风控（v0.7.0）：持仓期极值取不到——持仓段内一根连续 K 线都没有。
+    # **不与 RISK_ATR_UNAVAILABLE 合并**：ATR 取不到要拒绝下单，极值取不到只是
+    # 「本轮不移动止损、保留上一档」。合并成一个码会把两种严重度不同的处置方式
+    # 一起改掉，而且事后没法从错误行判断当初拒的是哪一件事（R-6.5）。
+    "RISK_TRAIL_EXTREME_UNAVAILABLE",
     # 数据库（R-21.6 / R-1.3）
     "DB_CONNECTION_FAILED",
     "DB_UNIQUE_VIOLATION",

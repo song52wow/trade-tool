@@ -38,6 +38,9 @@ const STATUS_BY_CODE = {
   // 处置方式是先补 K 线而不是重试同一个请求——与上面几个 MISMATCH 同构，因此是 409。
   // 绝不能降级成 200 兜底出一个 ATR=0：止损会正好落在入场价上（v0.4.0 规则 3）。
   RISK_ATR_UNAVAILABLE: 409,
+  // 「持仓期极值取不到」：与 ATR 不可用同属 409，但处置不同——
+  // 它只让本轮**不移动止损**，仓位仍受旧档保护（v0.7.0 R-6.5）。
+  RISK_TRAIL_EXTREME_UNAVAILABLE: 409,
   // 数据库
   DB_CONNECTION_FAILED: 503,
   DB_DEADLOCK: 503,

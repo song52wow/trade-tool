@@ -21,10 +21,19 @@
    也**绝不**拿 0 或 NaN 当 ATR——止损位会因此变成入场价，账户当场归零。
 4. **表名与周期不可参数化**：周期先过 :data:`ATR_TABLES` / :data:`BUCKET_WIDTHS`
    白名单再进 SQL。
+
+v0.7.0 追加第五条（Chandelier 移动止损）：
+
+5. **极值与 ATR 同一次取数**。``atr_at`` 一次调用同时回 ``atr`` / ``extreme`` /
+   ``lastClose``：分两次读，中间会落进一根新 bar，「极值」与「现价」就来自两个时刻，
+   「新止损位有没有越过现价」的判断随之失去意义。``entryTime`` 是**必填**——
+   拿不到持仓期起点就算不出极值，**不许**默认成 0 或拿窗口起点顶替（R-6.3）。
+   极值与 ATR 各用自己的段（极值走持仓期、ATR 走窗口），互不影响。
 """
 
 from __future__ import annotations
 
+from bisect import bisect_left
 from collections.abc import Mapping
 from dataclasses import dataclass
 
@@ -116,6 +125,25 @@ def closed_upper_bound(as_of_ms: int, width_ms: int) -> int:
 
 
 @dataclass(frozen=True, slots=True)
+class PositionExtreme:
+    """持仓期极值（v0.7.0）：Chandelier 移动止损的基准。
+
+    ``from_ms`` / ``to_ms`` 是**实际取到的那段**的起止，**如实回传**：持仓期中间有缺口时
+    极值段必然短于持仓期，调用方只有看到这两个边界才知道「这个极值不是全程的极值」。
+    缺口**不许插值**补齐——凭空造出来的极值会把止损挂在一个从未成交过的价位上（R-6.4）。
+    """
+
+    high: float
+    low: float
+    from_ms: int
+    to_ms: int
+    bars_used: int
+
+    def to_dict(self) -> dict[str, object]:
+        return {"high": self.high, "low": self.low, "from": self.from_ms, "to": self.to_ms}
+
+
+@dataclass(frozen=True, slots=True)
 class AtrSnapshot:
     """一次「按成交时刻算 ATR」的结果。
 
@@ -131,6 +159,8 @@ class AtrSnapshot:
     segment_from: int
     segment_to: int
     as_of_ms: int
+    extreme: PositionExtreme
+    last_close: float
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -143,6 +173,10 @@ class AtrSnapshot:
             "segmentFrom": self.segment_from,
             "segmentTo": self.segment_to,
             "asOfMs": self.as_of_ms,
+            "extreme": self.extreme.to_dict(),
+            # 移动止损要判断「算出来的新止损位有没有越过现价」，而这必须与极值取自**同一时刻**
+            # （同一次读库的连续段末根），因此跟 ATR 一起回，绝不另开一次取数。
+            "lastClose": self.last_close,
         }
 
 
@@ -159,13 +193,33 @@ class Window:
         return len(self.times)
 
 
+def required_bars_between(from_ms: int, upper_ms: int, width_ms: int) -> int:
+    """``[from_ms, upper_ms]`` 至少要覆盖多少根桶（不预热、不留余量）。
+
+    差一格就是「极值段短了一根」，而这种偏差**看不出来**——数值仍然是合法的高低价。
+    因此宁可多读一根（由下游按连续段裁剪），也不要少读。
+    """
+    if upper_ms < from_ms:
+        return 0
+    return (upper_ms - from_ms) // width_ms + 1
+
+
 def read_closed_window(
-    conn: DbConn, symbol: str, interval: str, as_of_ms: int, window_bars: int
+    conn: DbConn,
+    symbol: str,
+    interval: str,
+    as_of_ms: int,
+    window_bars: int,
+    entry_time_ms: int | None = None,
 ) -> Window:
-    """取 ``as_of`` 时刻最近的一段**连续且已收盘**的 K 线（最多 ``window_bars`` 根）。
+    """取 ``as_of`` 时刻最近的一段**连续且已收盘**的 K 线。
 
     一次 ``ORDER BY time DESC LIMIT n`` 取回再翻正，与 ``readLatestBars`` 同思路：
     要的是**最近**这一端，而不是区间最早的那 n 根。
+
+    ``entry_time_ms`` 给了就把读取范围放大到覆盖整个持仓期：极值必须与 ATR 来自
+    **同一次取数**（R-6.2），而极值要覆盖 ``[entryTime, asOf]``。放大后返回的窗口可能
+    长于 ``window_bars``，ATR 那一侧由调用方裁尾部——两段各用自己的范围。
     """
     table = table_of(interval)
     width = width_of(interval)
@@ -176,10 +230,13 @@ def read_closed_window(
             f"{symbol} 在 {as_of_ms} 之前还没有一根已收盘的 {interval} K 线",
             {"symbol": symbol, "interval": interval, "asOfMs": as_of_ms},
         )
+    limit = window_bars
+    if entry_time_ms is not None:
+        limit = max(limit, required_bars_between(entry_time_ms, upper, width))
     rows = conn.execute(
         f"SELECT time, high, low, close FROM {table}"
         " WHERE symbol = %s AND time <= %s ORDER BY time DESC LIMIT %s",
-        (symbol, upper, window_bars),
+        (symbol, upper, limit),
     ).fetchall()
     if not rows:
         raise SyncError(
@@ -200,12 +257,23 @@ def read_closed_window(
     # 只要最近那一段：更早的段与 asOf 之间的缺口意味着「这段历史不完整」，
     # 跨过去算出来的 ATR 描述的不是这段行情（规则 2）。
     segment = segments[-1]
-    lo = max(segment.lo, segment.hi - window_bars)
+    lo = max(segment.lo, segment.hi - limit)
     return Window(
         times=times[lo : segment.hi],
         high=np.array([float(r["high"]) for r in rows[lo : segment.hi]], dtype=np.float64),
         low=np.array([float(r["low"]) for r in rows[lo : segment.hi]], dtype=np.float64),
         close=np.array([float(r["close"]) for r in rows[lo : segment.hi]], dtype=np.float64),
+    )
+
+
+def tail_window(window: Window, window_bars: int) -> Window:
+    """取窗口**尾部** ``window_bars`` 根：ATR 只用自己那一段，不吃持仓期多出来的部分。"""
+    lo = max(0, len(window) - window_bars)
+    return Window(
+        times=window.times[lo:],
+        high=window.high[lo:],
+        low=window.low[lo:],
+        close=window.close[lo:],
     )
 
 
@@ -234,16 +302,65 @@ def compute_atr(window: Window, period: int) -> float:
     return last
 
 
+def compute_position_extreme(
+    window: Window, entry_time_ms: int, *, symbol: str, interval: str
+) -> PositionExtreme:
+    """在 ``[entry_time_ms, as_of]`` ∩ 窗口 的交集上求 high 最大值与 low 最小值。
+
+    ``window`` 已经是 ``asOf`` 侧的**极大连续段**（规则 2），因此这里只需按入场时刻切一刀；
+    取交集而不是「借窗口起点」是 R-6.3 的硬要求——借来的极值描述的是入场之前的价格。
+
+    交集为空一律抛 ``RISK_TRAIL_EXTREME_UNAVAILABLE`` 而**不**返回空值：调用方要靠这个码
+    走「本轮不移动止损、保留上一档」，返回一个 0 顶替的极值会让它以为止损该挪到 0 去。
+    """
+    lo = bisect_left(window.times, entry_time_ms)
+    if lo >= len(window):
+        raise SyncError(
+            "RISK_TRAIL_EXTREME_UNAVAILABLE",
+            f"{symbol} 持仓期 [{entry_time_ms}, {window.times[-1]}] 内没有一根连续的 "
+            f"{interval} 已收盘 K 线，无法求持仓期极值；"
+            "先让 apps/sync 把入场时刻之后的行情补上来（缺口不许插值补齐）",
+            {
+                "symbol": symbol,
+                "interval": interval,
+                "entryTimeMs": entry_time_ms,
+                "segmentFrom": window.times[0],
+                "segmentTo": window.times[-1],
+                "hint": "pnpm --filter @trade-tool/sync start（并在控制面 start 该标的）",
+            },
+        )
+    highs = window.high[lo:]
+    lows = window.low[lo:]
+    high = float(np.max(highs))
+    low = float(np.min(lows))
+    # 非有限值当成「取不到」：NaN 一路进 JSON 会让 TS 侧解析成 null，
+    # 而移动止损会拿着 null 当价格算出 -Infinity 的止损位。
+    if not np.isfinite(high) or not np.isfinite(low):
+        raise SyncError(
+            "RISK_TRAIL_EXTREME_UNAVAILABLE",
+            f"{symbol} 持仓期极值算出无效值：high={high} low={low}",
+            {"symbol": symbol, "high": high, "low": low, "bars": len(window) - lo},
+        )
+    return PositionExtreme(
+        high=high,
+        low=low,
+        from_ms=window.times[lo],
+        to_ms=window.times[-1],
+        bars_used=len(window) - lo,
+    )
+
+
 def atr_at(
     conn: DbConn,
     symbol: str,
     *,
+    entry_time_ms: int,
     interval: str | None = None,
     period: object = DEFAULT_ATR_PERIOD,
     as_of_ms: int,
     window_bars: object = DEFAULT_WINDOW_BARS,
 ) -> AtrSnapshot:
-    """**本模块的主入口**：按成交时刻算 ATR。"""
+    """**本模块的主入口**：按成交时刻算 ATR，并同时回持仓期极值与末根收盘价。"""
     iv = parse_interval(interval)
     per = parse_period(period)
     if isinstance(window_bars, bool) or not isinstance(window_bars, int) or window_bars < 1:
@@ -252,17 +369,32 @@ def atr_at(
             f"ATR 窗口根数必须为正整数：{window_bars!r}",
             {"windowBars": window_bars},
         )
-    window = read_closed_window(conn, symbol, iv, as_of_ms, window_bars)
-    value = compute_atr(window, per)
+    # 上面的 isinstance 已经把 window_bars 收窄成 int，这里取个短名免得下面读起来像两件事。
+    bars = window_bars
+    if isinstance(entry_time_ms, bool) or not isinstance(entry_time_ms, int) or entry_time_ms <= 0:
+        raise SyncError(
+            "CONFIG_INVALID",
+            f"持仓期起点必须是正的 epoch 毫秒：{entry_time_ms!r}",
+            {"entryTimeMs": entry_time_ms},
+        )
+    # 一次读覆盖两种需要（极值要整个持仓期，ATR 只要尾部一段）：
+    # 分两次读会让极值与 ATR 来自两个时刻，Chandelier 公式随之失去意义（R-6.2）。
+    window = read_closed_window(conn, symbol, iv, as_of_ms, bars, entry_time_ms)
+    # ATR 先算：取不到 ATR 要拒绝下单（RISK_ATR_UNAVAILABLE），
+    # 比「本轮不移动止损」严重，码必须先于极值抛出去。
+    value = compute_atr(tail_window(window, bars), per)
+    extreme = compute_position_extreme(window, entry_time_ms, symbol=symbol, interval=iv)
     return AtrSnapshot(
         symbol=symbol,
         interval=iv,
         period=per,
         atr=value,
-        bars_used=len(window),
+        bars_used=min(len(window), bars),
         segment_from=window.times[0],
         segment_to=window.times[-1],
         as_of_ms=as_of_ms,
+        extreme=extreme,
+        last_close=float(window.close[-1]),
     )
 
 
@@ -272,6 +404,7 @@ def run_atr(
     interval: str | None,
     period: object,
     as_of_ms: int,
+    entry_time_ms: int,
     window_bars: object,
     dsn: str | None = None,
 ) -> dict[str, object]:
@@ -288,11 +421,18 @@ def run_atr(
             f"--as-of-ms 必须是正的 epoch 毫秒：{as_of_ms}",
             {"asOfMs": as_of_ms},
         )
+    if entry_time_ms <= 0:
+        raise SyncError(
+            "CONFIG_INVALID",
+            f"--entry-time 必须是正的 epoch 毫秒：{entry_time_ms}",
+            {"entryTimeMs": entry_time_ms},
+        )
     conn = pg.connect(dsn)
     try:
         return atr_at(
             conn,
             symbol,
+            entry_time_ms=entry_time_ms,
             interval=interval,
             period=period,
             as_of_ms=as_of_ms,

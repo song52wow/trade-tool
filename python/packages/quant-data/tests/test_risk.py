@@ -1,11 +1,12 @@
-"""``risk-atr`` 的口径测试（v0.4.0）。
+"""``risk-atr`` 的口径测试（v0.4.0 + v0.7.0）。
 
-这些用例锁的是**四条不可协商的规则**，不是某个具体数值：
+这些用例锁的是**五条不可协商的规则**，不是某个具体数值：
 
 1. 只用已收盘的 bar（成交当分钟那根不算）；
 2. 不跨缺口（缺口之前的 ATR 不得被「借来」）；
 3. 取不到就报 ``RISK_ATR_UNAVAILABLE``，绝不返回 0 或回落到更小周期；
-4. 公式来自 :mod:`quant_core`——本模块自己再写一份就分叉了。
+4. 公式来自 :mod:`quant_core`——本模块自己再写一份就分叉了；
+5. 极值 / ``lastClose`` 与 ATR **同一次取数**，且 ``entryTime`` 必填（R-6.2 / R-6.3）。
 """
 
 from __future__ import annotations
@@ -15,15 +16,18 @@ from typing import cast
 import numpy as np
 import pytest
 from quant_core import atr as atr_indicator
-from quant_data.errors import SyncError
+from quant_data.errors import ERROR_CODES, SyncError
 from quant_data.pg import DbConn
 from quant_data.risk import (
     BASE_TABLE,
     Window,
     closed_upper_bound,
     compute_atr,
+    compute_position_extreme,
     parse_interval,
     parse_period,
+    required_bars_between,
+    tail_window,
 )
 
 MINUTE = 60_000
@@ -195,10 +199,185 @@ def test_atr_at_returns_segment_provenance() -> None:
 
     conn = fake_conn(BASE_TABLE, bars(T0, 200))
     # 成交在 T0+200m，那一分钟的 bar 尚未收盘（收盘在 T0+200m），因此窗口是 0..199m 共 200 根
-    snapshot = atr_at(conn, "SYM", interval="1m", period=14, as_of_ms=T0 + 200 * MINUTE)
+    snapshot = atr_at(
+        conn, "SYM", entry_time_ms=T0, interval="1m", period=14, as_of_ms=T0 + 200 * MINUTE
+    )
     payload = snapshot.to_dict()
     assert payload["barsUsed"] == 200
     assert payload["segmentFrom"] == T0
     assert payload["segmentTo"] == T0 + 199 * MINUTE
     assert payload["intervalMs"] == MINUTE
     assert isinstance(payload["atr"], float)
+
+
+# ----------------------------------------------------------------- 持仓期极值
+
+
+def test_required_bars_between_covers_both_ends() -> None:
+    assert required_bars_between(T0, T0, MINUTE) == 1
+    assert required_bars_between(T0, T0 + 9 * MINUTE, MINUTE) == 10
+    assert required_bars_between(T0 + MINUTE, T0, MINUTE) == 0
+
+
+def test_extreme_covers_the_whole_holding_period() -> None:
+    """入场在 T0：极值就是整段 200 根里的最高 / 最低，不是 ATR 窗口那一小段。"""
+    from quant_data.risk import atr_at
+
+    conn = fake_conn(BASE_TABLE, bars(T0, 200, step=0.5))
+    snapshot = atr_at(
+        conn, "SYM", entry_time_ms=T0, interval="1m", period=14, as_of_ms=T0 + 200 * MINUTE
+    )
+    payload = snapshot.to_dict()
+    extreme = cast(dict[str, object], payload["extreme"])
+    # 第 200 根 close=199.5，span=10 → high=204.5 / low=95.0
+    assert extreme["high"] == pytest.approx(204.5)
+    assert extreme["low"] == pytest.approx(95.0)
+    assert extreme["from"] == T0
+    assert extreme["to"] == T0 + 199 * MINUTE
+    assert payload["lastClose"] == pytest.approx(199.5)
+
+
+def test_extreme_starts_at_entry_not_window_start() -> None:
+    """入场在 T0+100m：入场之前的根**不许**进极值（否则是入场前的价格）。"""
+    from quant_data.risk import atr_at
+
+    conn = fake_conn(BASE_TABLE, bars(T0, 200, step=0.5))
+    snapshot = atr_at(
+        conn,
+        "SYM",
+        entry_time_ms=T0 + 100 * MINUTE,
+        interval="1m",
+        period=14,
+        as_of_ms=T0 + 200 * MINUTE,
+    )
+    extreme = snapshot.to_dict()["extreme"]
+    assert isinstance(extreme, dict)
+    assert extreme["from"] == T0 + 100 * MINUTE
+    # 第 200 根（index 199）close=199.5 → high=204.5
+    assert extreme["high"] == pytest.approx(204.5)
+
+
+def test_extreme_does_not_cross_a_gap() -> None:
+    """中间挖掉 10 分钟：极值只能取 asOf 侧那一段，缺口**不许插值**补齐。"""
+    from quant_data.risk import atr_at
+
+    # 缺口前那段的最高点刻意更高（step 很大），一旦跨缺口就会被借进来
+    rows = bars(T0, 60, step=2.0) + bars(T0 + 70 * MINUTE, 60, step=0.1)
+    conn = fake_conn(BASE_TABLE, rows)
+    snapshot = atr_at(
+        conn, "SYM", entry_time_ms=T0, interval="1m", period=14, as_of_ms=T0 + 129 * MINUTE
+    )
+    extreme = snapshot.to_dict()["extreme"]
+    assert isinstance(extreme, dict)
+    assert extreme["from"] == T0 + 70 * MINUTE, "缺口前的那段不许进入极值"
+    # 缺口后那一段只剩到 T0+128m 共 59 根，close 从 100.0 走到 105.8 → high=110.8。
+    # 缺口前那一段的最高点是 223（step=2.0），跨缺口就会取到它——所以这个数字才有用。
+    assert extreme["high"] == pytest.approx(110.8)
+
+
+def test_extreme_reports_the_short_segment_truthfully() -> None:
+    """持仓期比极值段长时 from/to 如实回传，调用方据此知道它短了（R-6.4）。"""
+    from quant_data.risk import atr_at
+
+    rows = bars(T0, 60) + bars(T0 + 70 * MINUTE, 60)
+    conn = fake_conn(BASE_TABLE, rows)
+    snapshot = atr_at(
+        conn, "SYM", entry_time_ms=T0, interval="1m", period=14, as_of_ms=T0 + 129 * MINUTE
+    )
+    extreme = snapshot.to_dict()["extreme"]
+    assert isinstance(extreme, dict)
+    assert extreme["from"] == T0 + 70 * MINUTE
+    assert extreme["to"] == T0 + 128 * MINUTE
+    # 持仓期从 T0 开始，极值却从 T0+70m 开始：没有用「窗口起点」冒充持仓起点
+    assert extreme["from"] != T0
+
+
+def test_extreme_raises_its_own_code_when_empty() -> None:
+    """交集为空用**新码**，且不进 MANUAL_INTERVENTION_CODES（本轮不调整即可恢复）。"""
+    from quant_data.errors import MANUAL_INTERVENTION_CODES
+    from quant_data.risk import atr_at
+
+    conn = fake_conn(BASE_TABLE, bars(T0, 200))
+    # 入场时刻晚于 asOf：持仓期内没有任何已收盘 K 线
+    with pytest.raises(SyncError) as exc:
+        atr_at(
+            conn,
+            "SYM",
+            entry_time_ms=T0 + 500 * MINUTE,
+            interval="1m",
+            period=14,
+            as_of_ms=T0 + 200 * MINUTE,
+        )
+    assert exc.value.code == "RISK_TRAIL_EXTREME_UNAVAILABLE"
+    assert exc.value.code in ERROR_CODES
+    # 两个码都必须在册：合并会让「拒绝下单」与「本轮不调整」共用一个处置方式（R-6.5）。
+    assert "RISK_ATR_UNAVAILABLE" in ERROR_CODES
+    assert exc.value.code not in MANUAL_INTERVENTION_CODES
+
+
+def test_extreme_rejects_non_positive_entry_time() -> None:
+    """entryTime 必填且必须合法：默认成 0 就等于「拿入场前的价格当极值」。"""
+    from quant_data.risk import atr_at
+
+    conn = fake_conn(BASE_TABLE, bars(T0, 200))
+    for bad in (0, -1, True):
+        with pytest.raises(SyncError) as exc:
+            atr_at(
+                conn,
+                "SYM",
+                entry_time_ms=bad,
+                interval="1m",
+                period=14,
+                as_of_ms=T0 + 200 * MINUTE,
+            )
+        assert exc.value.code == "CONFIG_INVALID"
+
+
+def test_compute_position_extreme_guards_non_finite() -> None:
+    """NaN 极值绝不能流到 stdout（TS 侧会读成 null，然后算出 -Infinity 的止损）。"""
+    rows = bars(T0, 10)
+    rows[3]["high"] = float("nan")
+    with pytest.raises(SyncError) as exc:
+        compute_position_extreme(window_of(rows), T0, symbol="SYM", interval="1m")
+    assert exc.value.code == "RISK_TRAIL_EXTREME_UNAVAILABLE"
+
+
+def test_atr_and_extreme_come_from_one_read() -> None:
+    """一次调用只查一次库：两次取数之间会落进一根新 bar，公式随之失去意义（R-6.2）。"""
+    from quant_data.risk import atr_at
+
+    fake = FakeConn(BASE_TABLE, bars(T0, 200))
+    atr_at(
+        cast(DbConn, fake),
+        "SYM",
+        entry_time_ms=T0,
+        interval="1m",
+        period=14,
+        as_of_ms=T0 + 200 * MINUTE,
+    )
+    assert len(fake.calls) == 1, (
+        f"ATR / 极值 / lastClose 必须共用一次取数，实际 {len(fake.calls)} 次"
+    )
+
+
+def test_tail_window_keeps_only_the_latest_bars() -> None:
+    """ATR 只用自己尾部那一段，不吃持仓期多读出来的部分。"""
+    rows = bars(T0, 300)
+    window = tail_window(window_of(rows), 240)
+    assert len(window) == 240
+    assert window.times[0] == T0 + 60 * MINUTE
+    assert window.times[-1] == T0 + 299 * MINUTE
+
+
+def test_snapshot_json_has_no_nan() -> None:
+    """stdout 里不许出现 NaN / Infinity——dump_json 用 allow_nan=False，会直接抛。"""
+    import json
+
+    from quant_data.risk import atr_at
+
+    conn = fake_conn(BASE_TABLE, bars(T0, 200, step=0.5))
+    payload = atr_at(
+        conn, "SYM", entry_time_ms=T0, interval="1m", period=14, as_of_ms=T0 + 200 * MINUTE
+    ).to_dict()
+    text = json.dumps(payload, ensure_ascii=False, allow_nan=False)
+    assert "NaN" not in text and "Infinity" not in text

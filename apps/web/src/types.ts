@@ -145,7 +145,15 @@ export type DerivedIntervalDto =
  * 单独列出 `failed` 是因为它最容易出事故：库里有一条 `failed` 就意味着这次买入成交
  * 的保护单没挂上，而仓位是真实存在的（v0.4.0 规则 3 / 5）。
  */
-export type BracketStateDto = 'armed' | 'take_profit' | 'stop_loss' | 'cancelled' | 'failed';
+/**
+ * 七个状态（v0.7.0 追加 `partial_armed` / `trailing`）。
+ *
+ * 页面必须能分开显示它们：`trailing` 表示「第一段已成交、只剩一张止损且在移动」，
+ * 而 `armed` 是两张单都在——把这两种显示成同一个「已保护」，页面上就看不出
+ * 「止盈已经走了一半」这件要紧事。
+ */
+export type BracketStateDto =
+  'armed' | 'partial_armed' | 'trailing' | 'take_profit' | 'stop_loss' | 'cancelled' | 'failed';
 
 /**
  * 一条止盈止损记录（`risk_bracket` 表的一行）。
@@ -174,6 +182,17 @@ export interface BracketDto {
   takeProfit: number;
   tpAlgoId: number | null;
   slAlgoId: number | null;
+  /**
+   * v0.7.0 第一段与移动止损的档位（NULL = 未进入该阶段）。
+   *
+   * 页面必须能把 `trailing` 行的「当前那一档」显示出来：只显示 `stopPrice`
+   * （入场时的原始止损）会让人以为移动止损根本没动过。
+   */
+  tp1AlgoId: number | null;
+  tp1Price: number | null;
+  trailStopPrice: number | null;
+  /** 本轮没有移动（或移动失败）的原因。常驻可见，不静默跳过。 */
+  trailLastError: string | null;
   state: BracketStateDto;
   lastError: string | null;
   createdAt: number;
@@ -226,6 +245,16 @@ export interface RiskPolicyDto {
   atrInterval: string;
   stopAtrMult: number;
   takeProfitAtrMult: number;
+  /**
+   * 第一段减仓的**百分数**（v0.7.0），`0`–`100`。库里存的是 `[0, 1]` 的比例，
+   * 换算只在服务端用 `@trade-tool/core` 的 `percentToRatio` / `ratioToPercent`
+   * ——**浏览器端不引 core**（它带 node 内置模块，打包进 UI 会炸），
+   * 也不在前端自己 `÷ 100` 了事再让后端与库各存一份口径。
+   */
+  takeProfit1Percent: number;
+  takeProfit1AtrMult: number;
+  trailAtrMult: number;
+  breakevenAfterTp1: boolean;
 }
 
 export interface RiskPolicyEntryDto extends RiskPolicyDto {
@@ -256,6 +285,10 @@ export interface RiskPolicyWriteBody {
   atrInterval: string;
   stopAtrMult: number;
   takeProfitAtrMult: number;
+  takeProfit1Percent: number;
+  takeProfit1AtrMult: number;
+  trailAtrMult: number;
+  breakevenAfterTp1: boolean;
 }
 
 /** exchangeInfo 概览；不返回全量列表，避免每次轮询都传几百个标的。 */

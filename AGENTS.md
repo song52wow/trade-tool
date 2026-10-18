@@ -243,14 +243,15 @@ apps/cli/src/index.ts   apps/sync/src/main.ts   apps/web/src/main.ts   apps/exec
 `R-*` / `AC-*` 编号出自 [`docs/`](docs/README.md) 的需求文档。**引用时带版本前缀**
 （写成「v0.1.0 R-3.3」），因为编号在不同版本文档里各用各的。
 
-| 层               | 版本   | 需求 / 设计文档                                            | 细节                                                                  |
-| ---------------- | ------ | ---------------------------------------------------------- | --------------------------------------------------------------------- |
-| 数据底座与同步   | v0.1.0 | [`docs/v0.1.0-…`](docs/v0.1.0-binance-perp-market-sync.md) | `packages/data/README.md`、`apps/sync/README.md`                      |
-| 派生周期         | v0.2.0 | [`docs/v0.2.0-…`](docs/v0.2.0-multi-timeframe-klines.md)   | §6.1                                                                  |
-| 技术指标         | v0.3.0 | [`docs/v0.3.0-…`](docs/v0.3.0-technical-indicators.md)     | §6.2                                                                  |
-| 止盈止损         | v0.4.0 | **无需求文档**                                             | [`apps/executor/README.md`](apps/executor/README.md)、§6.3            |
-| 凭据与运行期设置 | v0.5.0 | **无需求文档**                                             | [`sql/007`](packages/data/sql/007_executor_settings.sql) 头注释、§6.4 |
-| 交易对账         | v0.6.0 | **无需求文档**                                             | [`README.md`](README.md) 的对账一节、§6.5                             |
+| 层                 | 版本   | 需求 / 设计文档                                                                  | 细节                                                                  |
+| ------------------ | ------ | -------------------------------------------------------------------------------- | --------------------------------------------------------------------- |
+| 数据底座与同步     | v0.1.0 | [`docs/v0.1.0-…`](docs/v0.1.0-binance-perp-market-sync.md)                       | `packages/data/README.md`、`apps/sync/README.md`                      |
+| 派生周期           | v0.2.0 | [`docs/v0.2.0-…`](docs/v0.2.0-multi-timeframe-klines.md)                         | §6.1                                                                  |
+| 技术指标           | v0.3.0 | [`docs/v0.3.0-…`](docs/v0.3.0-technical-indicators.md)                           | §6.2                                                                  |
+| 止盈止损           | v0.4.0 | **无需求文档**                                                                   | [`apps/executor/README.md`](apps/executor/README.md)、§6.3            |
+| 凭据与运行期设置   | v0.5.0 | **无需求文档**                                                                   | [`sql/007`](packages/data/sql/007_executor_settings.sql) 头注释、§6.4 |
+| 交易对账           | v0.6.0 | **无需求文档**                                                                   | [`README.md`](README.md) 的对账一节、§6.5                             |
+| 两段止盈与移动止损 | v0.7.0 | [`docs/v0.7.0-…`](docs/v0.7.0-staged-take-profit-trailing-stop.md)（**已实现**） | §6.8                                                                  |
 
 ### 6.0 迁移与表的索引
 
@@ -268,6 +269,7 @@ schema 的唯一来源是 `packages/data/sql/*.sql`；**每张迁移文件头部
 | `007_executor_settings` | `executor_credentials`（密文 + 末 4 位提示）、`risk_policy`（global / symbol 两作用域）             |
 | `008_algo_order_ids`    | `risk_bracket` 的条件单编号列改名（Algo 编号空间，与普通 orderId 不通）                             |
 | `009_reconcile_run`     | `reconcile_run`（观测快照）                                                                         |
+| `010_risk_trailing`     | 两段止盈的阶段（`partial_armed` / `trailing`）与移动止损档位。**v0.7.0 设计，未落地**               |
 
 ### 6.1 派生周期层（v0.2.0）
 
@@ -448,6 +450,10 @@ Binance U 本位**没有单请求 OCO**（`/fapi/v1/order/oco` 已下架）：�
 `STOP_MARKET`（`closePosition=true`），**下单走 `POST /fapi/v1/algoOrder` +
 `algoType=CONDITIONAL`**（不是 `/fapi/v1/order`），仓位平掉后另一张**由交易所自动撤销**。
 因此本地**不轮询、不盯市**——不要在控制面或守护进程里再实现一套「触发后撤另一张」的逻辑。
+
+⚠️ **v0.7.0 会动这个模型**（分批止盈 + 移动止损）：第一段止盈必须带 `quantity`，
+因而**不再享有自动撤销**。改这个模型前先读 §6.8 与需求文档；上面这段里
+「自动撤销」的说法在分批形态下只对**止损单**成立。
 
 两张单都朝**远离入场价**的方向对齐到标的的最小价格变动（`alignToTick`，按步长整数倍对齐，
 不是按 tickSize 的小数位数——`tickSize = 0.5` 时两者结果不同）。按四舍五入把止损往入场价挪
@@ -631,6 +637,58 @@ v0.5.0 把「密钥只从环境变量读」改成「**也可以从控制面录�
 4. 补 `python/packages/quant-backtest/tests/` 用例；**必须**覆盖「无未来函数」
    （构造只有未来数据才成立的信号，断言不产生交易）与 O(n) 复杂度（旧实现是 O(n²)，
    在 500 根上看不出来）。
+
+### 6.8 两段止盈与移动止损层（v0.7.0，**已实现**）
+
+需求在 [`docs/v0.7.0-staged-take-profit-trailing-stop.md`](docs/v0.7.0-staged-take-profit-trailing-stop.md)，
+证据与 DDL 草案在同名 `-appendix`。**这一节是摘要，不是另一份需求**；实现前先读需求文档。
+
+它要改的形态是 §6.3 的那个模型本身，因此下面五条是 §6.3 的**例外**，其余条款全部继续适用：
+
+1. **第一段止盈不能用 `closePosition`**。`closePosition` 与 `quantity` / `reduceOnly` 互斥，
+   所以「条件单只平一半」必须改成带 `quantity` 的条件单。**放弃的是止盈单那条自动撤单保证，
+   不是止损单**：止损仍用 `closePosition=true`，它保护「当时剩余的全部仓位」，
+   于是第一段减仓之后**止损继续有效，不需要因为减仓而重挂**（这一点让最危险的窗口根本不存在）。
+2. **移动止损只朝有利方向移动，永不放宽**：`stop = max(旧档, 极值 ∓ k×ATR(最新))`，
+   保本位同理。候选价向下对齐、保本位向上对齐（§6.3 的对齐结论在每一档都要重犯，
+   方向反了就是「刚挂上就必被扫」）。**价没变就不动**——这条是限频的主要手段，不是优化。
+3. **重挂顺序固定「先挂新、再撤旧」**。先撤后挂会造出无保护窗口；两张 `closePosition` 单在重叠期内
+   即使都被触发，最坏是一次「无仓可平」的拒绝（`closePosition` 只平不开），**不会反向开仓**。
+   撤旧失败**不许**当成功：不推进档位、记 `trail_last_error`，下一轮重试。
+4. **极值与 ATR 必须一次取数、同一条不跨缺口规则**，各自用自己的段（极值走持仓期、ATR 走窗口）。
+   两次取数之间会落进一根新 bar，公式随即失去意义。`entryTime` 是必填形参——
+   拿不到持仓期起点就算不出极值，**不许默认成 0 或用窗口起点顶替**。
+   两条落地口径**不是笔误**，改动前先想清楚：极值取的是 **ATR 那个周期**的 high/low
+   （要「一次取数」就只能同周期；`atrInterval` 缺省 1m，与「1m 极值」一致），
+   且下界是 `time >= entryTime`，**不含入场那一根**（把入场前的影线算成持仓期高点
+   会让止损一开始就偏宽）。
+   极值取不到只是「本轮不调整、保留上一档 + 可见原因」，它**不是** `RISK_ATR_UNAVAILABLE`
+   （后者要拒绝下单），两者严重度不同，不许混成一个码。
+5. **阶段由 `state` 表达，不新增 `stage` 列**：`armed` / `partial_armed` / `trailing` /
+   `take_profit` / `stop_loss` / `cancelled` / `failed`，迁移只**追加** CHECK 的取值。
+   `trailing` 行**只有一张止损单**；`atr` / `stop_price` / `take_profit` 三列保持入场时的值不变
+   （它们记的是「第一段为什么这么算」），移动中的那一档写在 `trail_stop_price`。
+
+还有两条跨层的硬约束：
+
+- **移动止损定时器与对账定时器必须分开**。对账**只报告不动手**（§6.5 第 1 条），而移动止损要下单。
+  合并会让「只读」这条保证失守。定时器可以重试「已落库的 `trailing` 行」的重挂（那是对**已提交**
+  意图的续做），但**不修复**自己在对账里发现的漂移；仍不新增常驻进程、不引入 markPrice 流。
+- **对账判据必须按阶段分流**：`missing-take-profit-order` 只对 `armed` 生效（`trailing` 本来就没有
+  止盈单，按旧判据会每轮报一条假警报）；`price-mismatch` 对 `trailing` 行要比 `trail_stop_price`
+  而不是 `stop_price`。**对账层第一阶段必须早于移动止损落地**，否则上线当天就在报假警报。
+
+分批形态确实丢掉了「仓位被工具外平掉时止盈单由交易所自动撤销」——它变成由本地
+`closeOutside` 撤、且**进程不在时无人撤**。这是相对 v0.4.0 的实质回退，
+补偿手段是对账新增 `unexpected-take-profit-order`（只报告）。
+`apps/executor/README.md` 里那句「进程崩了也不会留下裸奔仓位」在分批形态下**部分不成立**，
+落地时必须照实改写，不要留着旧句子。
+
+**不要改用交易所原生的 `TRAILING_STOP_MARKET`**：它确实存在（`activatePrice` + `callbackRate`
+0.1–10，1 = 1%，追踪「下单之后的最高/最低价」），挂上就一直在、进程崩了也有效、不吃权重。
+2026-10-17 已评估并**否决**：它的距离是**固定百分比，不随波动率变化**。要的是「距离跟着
+ATR 走」，所以走自建 Chandelier（附录 §F.2 有完整对比）。另外它的 `orderType` 会让
+`packages/core/src/risk-ids.ts` 的 `algoOrderTag` 直接抛错，真要用还得先补那一类。
 
 ## 7 已知漂移与技术债
 

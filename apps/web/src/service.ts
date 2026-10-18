@@ -2,6 +2,8 @@ import {
   INTERVAL_MS,
   loadConfigOrDefault,
   parseSecretKey,
+  percentToRatio,
+  ratioToPercent,
   describeClockSkew,
   SECRET_KEY_ENV,
   STORED_INTERVALS,
@@ -370,11 +372,19 @@ export function createWebRuntime(config: TradeToolConfig): WebRuntime {
         symbol === null
           ? await resolvePolicy(pool, ctx.exchange, '', config.executor)
           : await resolvePolicy(pool, ctx.exchange, symbol, config.executor);
-      return { exchange: ctx.exchange, global, overrides, resolved };
+      // 库里存的是 [0, 1]，对外一律给**百分数**：浏览器端不引 core（它带 node
+      // 内置模块，打包进 UI 会炸），于是换算只能在这侧做——而换算本身仍然只有
+      // core 里的那一份实现，浏览器端一行算术都不写。
+      return {
+        exchange: ctx.exchange,
+        global: global === null ? null : toPolicyDto(global),
+        overrides: overrides.map(toPolicyDto),
+        resolved: { ...toPolicyDto(resolved), source: resolved.source },
+      };
     },
 
     async writeRiskPolicy(body): Promise<RiskPolicyEntryDto> {
-      return writeRiskPolicyRow(pool, {
+      const saved = await writeRiskPolicyRow(pool, {
         scope: body.scope,
         exchange: ctx.exchange,
         symbol: body.symbol ?? '',
@@ -382,8 +392,13 @@ export function createWebRuntime(config: TradeToolConfig): WebRuntime {
         atrInterval: body.atrInterval,
         stopAtrMult: body.stopAtrMult,
         takeProfitAtrMult: body.takeProfitAtrMult,
+        takeProfit1Ratio: percentToRatio(body.takeProfit1Percent),
+        takeProfit1AtrMult: body.takeProfit1AtrMult,
+        trailAtrMult: body.trailAtrMult,
+        breakevenAfterTp1: body.breakevenAfterTp1,
         now: Date.now(),
       });
+      return toPolicyDto(saved);
     },
 
     async deleteRiskPolicy(input): Promise<{ ok: true }> {
@@ -403,3 +418,40 @@ export function createWebRuntime(config: TradeToolConfig): WebRuntime {
 }
 
 export { loadConfigOrDefault };
+
+/**
+ * 库里的策略行 → 对外的 DTO：比例换算成百分数。
+ *
+ * 只有这一处做换算（`ratioToPercent` 在 core 里也只有一份实现）。
+ * 页面拿到的永远是 `0`–`100`，因此页面上不会出现「存 0.8、显示 0.8、以为是 0.8%」
+ * 这种只在某一层发生的换算漂移。
+ */
+function toPolicyDto(row: {
+  atrPeriod: number;
+  atrInterval: string;
+  stopAtrMult: number;
+  takeProfitAtrMult: number;
+  takeProfit1Ratio: number;
+  takeProfit1AtrMult: number;
+  trailAtrMult: number;
+  breakevenAfterTp1: boolean;
+  scope?: 'global' | 'symbol';
+  exchange?: string;
+  symbol?: string;
+  updatedAt?: number;
+}): RiskPolicyEntryDto {
+  return {
+    atrPeriod: row.atrPeriod,
+    atrInterval: row.atrInterval,
+    stopAtrMult: row.stopAtrMult,
+    takeProfitAtrMult: row.takeProfitAtrMult,
+    takeProfit1Percent: ratioToPercent(row.takeProfit1Ratio),
+    takeProfit1AtrMult: row.takeProfit1AtrMult,
+    trailAtrMult: row.trailAtrMult,
+    breakevenAfterTp1: row.breakevenAfterTp1,
+    scope: row.scope ?? 'global',
+    exchange: row.exchange ?? '',
+    symbol: row.symbol ?? '',
+    updatedAt: row.updatedAt ?? 0,
+  };
+}

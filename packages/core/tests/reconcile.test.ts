@@ -30,11 +30,26 @@ function record(overrides: Partial<LocalBracket> = {}): LocalBracket {
     takeProfit: 108,
     tpAlgoId: 11,
     slAlgoId: 12,
+    tp1AlgoId: null,
+    tp1Price: null,
+    trailStopPrice: null,
     state: 'armed',
     lastError: null,
     updatedAt: NOW,
     ...overrides,
   };
+}
+
+/** `trailing` 记录：只剩一张止损，且它已经挪过档。 */
+function trailing(overrides: Partial<LocalBracket> = {}): LocalBracket {
+  return record({
+    state: 'trailing',
+    // 仓位已经只剩第一段剩下的那一半，TP1 成交后交易所不再有止盈单
+    filledQty: 1,
+    trailStopPrice: 104,
+    slAlgoId: 12,
+    ...overrides,
+  });
 }
 
 function algo(overrides: Partial<ExchangeAlgoOrder> = {}): ExchangeAlgoOrder {
@@ -50,6 +65,7 @@ function algo(overrides: Partial<ExchangeAlgoOrder> = {}): ExchangeAlgoOrder {
     algoStatus: 'NEW',
     triggerPrice: 96,
     closePosition: true,
+    quantity: null,
     createTime: NOW - 1000,
     updateTime: NOW - 1000,
     ...overrides,
@@ -300,5 +316,139 @@ describe('输出稳定性与未知类型', () => {
         algoOrders: [algo({ orderType: 'SOMETHING_NEW' })],
       }),
     ).toThrow();
+  });
+});
+
+describe('v0.7.0 两段形态的判据', () => {
+  it('trailing：交易所只剩一张止损时是一致的（不报「止盈单不见了」）', () => {
+    const base = {
+      local: [trailing()],
+      positions: [position({ positionAmt: 1 })],
+      algoOrders: [algo({ algoId: 12, clientAlgoId: 'rsk-sl-1001', triggerPrice: 104 })],
+    };
+    const result = report(base);
+    // 这条断言是 AC-10 的核心：按旧判据这里必然报一条 missing-take-profit-order，
+    // 而它是**假的**——trailing 阶段本来就不该有止盈单。
+    expect(result.differences).toEqual([]);
+    expect(result.healthy).toBe(true);
+  });
+
+  it('trailing：交易所还挂着止盈单 → unexpected-take-profit-order（warning）', () => {
+    const result = report({
+      local: [trailing()],
+      positions: [position({ positionAmt: 1 })],
+      algoOrders: [
+        algo({ algoId: 12, clientAlgoId: 'rsk-sl-1001', triggerPrice: 104 }),
+        algo({
+          algoId: 11,
+          clientAlgoId: 'rsk-tp-1001',
+          orderType: 'TAKE_PROFIT',
+          triggerPrice: 108,
+        }),
+      ],
+    });
+    const item = result.differences.find((d) => d.kind === 'unexpected-take-profit-order');
+    expect(item?.severity).toBe('warning');
+    // 它不该同时被报成 orphan：本地仍引用着 tp1AlgoId
+    expect(result.differences.some((d) => d.kind === 'orphan-algo-order')).toBe(false);
+  });
+
+  it('trailing：比价用 trail_stop_price 而不是入场那一档', () => {
+    // 止损单停在 104（移动后的档位）→ 一致。若判据错拿 stopPrice=96 去比，
+    // 移动止损每调一档就会多报一条价格不符。
+    const ok = report({
+      local: [trailing()],
+      positions: [position({ positionAmt: 1 })],
+      algoOrders: [algo({ triggerPrice: 104 })],
+    });
+    expect(ok.differences).toEqual([]);
+
+    const mismatch = report({
+      local: [trailing()],
+      positions: [position({ positionAmt: 1 })],
+      algoOrders: [algo({ triggerPrice: 103 })],
+    });
+    expect(mismatch.differences.some((d) => d.kind === 'price-mismatch')).toBe(true);
+  });
+
+  it('trailing：止损单不见了仍然是 critical（仓位此刻真的裸了）', () => {
+    const result = report({
+      local: [trailing()],
+      positions: [position({ positionAmt: 1 })],
+      algoOrders: [],
+    });
+    const item = result.differences.find((d) => d.kind === 'missing-stop-order');
+    expect(item?.severity).toBe('critical');
+  });
+
+  it('partial_armed：两张单都在时一致，且 TP1 不被当成 orphan', () => {
+    const result = report({
+      local: [
+        record({
+          state: 'partial_armed',
+          tp1AlgoId: 13,
+          tp1Price: 102,
+          slAlgoId: 12,
+        }),
+      ],
+      positions: [position()],
+      algoOrders: [
+        algo({ algoId: 12, clientAlgoId: 'rsk-sl-1001', triggerPrice: 96 }),
+        algo({
+          algoId: 13,
+          clientAlgoId: 'rsk-tp-1001',
+          orderType: 'TAKE_PROFIT',
+          triggerPrice: 102,
+        }),
+      ],
+    });
+    expect(result.differences).toEqual([]);
+  });
+
+  it('partial_armed：第一段价与本地记录对不上时报价格不符（比 tp1Price 不是 takeProfit）', () => {
+    const result = report({
+      local: [record({ state: 'partial_armed', tp1AlgoId: 13, tp1Price: 102 })],
+      positions: [position()],
+      algoOrders: [
+        algo(),
+        algo({
+          algoId: 13,
+          clientAlgoId: 'rsk-tp-1001',
+          orderType: 'TAKE_PROFIT',
+          triggerPrice: 102,
+        }),
+      ],
+    });
+    // 本地 takeProfit=108 而交易所是 102，正解是**没有**差异（比的是 tp1Price）
+    expect(result.differences).toEqual([]);
+  });
+
+  it('partial_armed：第一段单不见了 → missing-take-profit-order', () => {
+    const result = report({
+      local: [record({ state: 'partial_armed', tp1AlgoId: 13, tp1Price: 102 })],
+      positions: [position()],
+      algoOrders: [algo()],
+    });
+    const item = result.differences.find((d) => d.kind === 'missing-take-profit-order');
+    expect(item?.severity).toBe('warning');
+  });
+
+  it('partial_armed 却缺第一段价 → 抛错，不静默拿整段价顶上', () => {
+    expect(() =>
+      report({
+        local: [record({ state: 'partial_armed', tp1AlgoId: 13, tp1Price: null })],
+        positions: [position()],
+        algoOrders: [algo()],
+      }),
+    ).toThrow(/第一段止盈价/);
+  });
+
+  it('trailing / partial_armed 也要参与「本地记着有仓位」的检查', () => {
+    const result = report({
+      local: [trailing()],
+      positions: [position({ positionAmt: 0 })],
+      algoOrders: [algo({ triggerPrice: 104 })],
+    });
+    expect(result.differences.some((d) => d.kind === 'record-without-position')).toBe(true);
   });
 });

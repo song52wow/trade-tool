@@ -84,6 +84,7 @@ function algo(
     algoStatus: 'NEW',
     triggerPrice: price,
     closePosition: true,
+    quantity: null,
     createTime: NOW - 1000,
     updateTime: NOW - 1000,
   };

@@ -6,6 +6,8 @@ import type { BracketDto, BracketsDto, BracketStateDto } from '../../../src/type
 
 const EMPTY_COUNTS: Record<BracketStateDto, number> = {
   armed: 0,
+  partial_armed: 0,
+  trailing: 0,
   take_profit: 0,
   stop_loss: 0,
   cancelled: 0,
@@ -24,9 +26,11 @@ function reason(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
-/** 五态的中文标签。状态多、含义各不相同，一律带上原值，避免只显示中文时对不上库里的列。 */
+/** 七态的中文标签（v0.7.0 追加两态）。一律带上原值，避免只显示中文时对不上库里的列。 */
 const STATE_LABEL: Record<BracketStateDto, string> = {
-  armed: '已挂单',
+  armed: '已挂单（两张）',
+  partial_armed: '已挂第一段止盈',
+  trailing: '移动止损中',
   take_profit: '止盈成交',
   stop_loss: '止损成交',
   cancelled: '已撤销',
@@ -35,6 +39,8 @@ const STATE_LABEL: Record<BracketStateDto, string> = {
 
 const STATE_CLASS: Record<BracketStateDto, string> = {
   armed: 'tag running',
+  partial_armed: 'tag running',
+  trailing: 'tag running',
   take_profit: 'tag ok',
   stop_loss: 'tag error',
   cancelled: 'tag',
@@ -184,10 +190,25 @@ export function BracketPanel(props: { symbol: string; tick: number }) {
                       </div>
                     </td>
                     <td className="mono">
-                      {fmtPrice(b.stopPrice)}
+                      {/* `trailing` 行要显示**当前生效的那一档**，而不是入场时的原始止损：
+                          显示后者会让人以为移动止损一直没动过。 */}
+                      {fmtPrice(
+                        b.state === 'trailing' && b.trailStopPrice ? b.trailStopPrice : b.stopPrice,
+                      )}
                       <div className="muted" style={{ fontSize: 11 }}>
-                        {pctOf(b.entryPrice, b.stopPrice)}
+                        {pctOf(
+                          b.entryPrice,
+                          b.state === 'trailing' && b.trailStopPrice
+                            ? b.trailStopPrice
+                            : b.stopPrice,
+                        )}
                       </div>
+                      {/* 没移动 / 移动失败的原因必须常驻可见（约定 9），不能只打日志。 */}
+                      {b.trailLastError !== null && (
+                        <div className="muted" style={{ fontSize: 11 }}>
+                          {b.trailLastError}
+                        </div>
+                      )}
                     </td>
                     <td className="mono">
                       {fmtNumber(b.atr)}

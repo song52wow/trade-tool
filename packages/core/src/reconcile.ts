@@ -21,11 +21,26 @@
  * 的输入契约，`packages/data` 的 REST 解析只负责把 payload 变成这里的形状。
  */
 
+import { SyncError } from './market-sync.js';
 import { algoOrderTag, parseBracketClientOrderId, type BracketTag } from './risk-ids.js';
 import type { PositionSide } from './types.js';
 
-/** 本地只关心**未终结**的记录：`armed` 与 `failed`。 */
-export type UnsettledBracketState = 'armed' | 'failed';
+/**
+ * 本地只关心**未终结**的记录。
+ *
+ * 四态的**交易所形态各不相同**，判据必须分开处理（v0.7.0 R-10）：
+ *
+ * | state            | 交易所上应有的单                     |
+ * | ---------------- | ------------------------------------ |
+ * | `armed`          | 止盈（全平）+ 止损（全平）两张       |
+ * | `partial_armed`  | 第一段止盈（带数量）+ 止损两张        |
+ * | `trailing`       | **只有止损一张**                    |
+ * | `failed`         | 一张都没有                           |
+ *
+ * 把 `trailing` 当成 `armed` 处理，会每轮报一条「止盈单不见了」的假警报；
+ * 而假警报是让整份报告失去可信度的最快方式（§6.5 第 2 条）。
+ */
+export type UnsettledBracketState = 'armed' | 'partial_armed' | 'trailing' | 'failed';
 
 /**
  * 对账用到的本地记录。刻意只声明判据要用的字段：
@@ -43,9 +58,57 @@ export interface LocalBracket {
   takeProfit: number;
   tpAlgoId: number | null;
   slAlgoId: number | null;
+  /** 第一段止盈的单号与价（`partial_armed` / `trailing` 行有值）。 */
+  tp1AlgoId: number | null;
+  tp1Price: number | null;
+  /** 当前生效的那一档止损价。`trailing` 行必��用它比价，而不是 `stopPrice`。 */
+  trailStopPrice: number | null;
   state: UnsettledBracketState;
   lastError: string | null;
   updatedAt: number;
+}
+
+/**
+ * 该行当前生效的止损价：`trailing` 用移动中的那一档，其余用入场时那一档。
+ *
+ * 只有这一处决定「拿哪个价去比」：若改成在调用处现选，移动止损每调一档
+ * 就会报一条价格不符——而那正是「判据被抄成第二份」的典型症状。
+ */
+/** 人话阶段名，进告警文案。四个阶段的形态不同，说清楚才用得上。 */
+function describeState(state: UnsettledBracketState): string {
+  switch (state) {
+    case 'armed':
+      return '已挂上止盈止损';
+    case 'partial_armed':
+      return '已挂上第一段止盈与止损';
+    case 'trailing':
+      return '已进入移动止损（第一段应已成交）';
+    case 'failed':
+      return '下单失败';
+  }
+}
+
+/**
+ * `partial_armed` 的第一段价。表上的 `risk_bracket_staged_check` 保证它非空，
+ * 因此这里拿到 null 说明约束被绕过或查询被改坏了——**抛错**，而不是退回
+ * `takeProfit` 继续比。后者会让一条坏数据看起来「只是价对不上」，
+ * 而真实情况是这笔记录压根不该存在（AGENTS.md 约定 9）。
+ */
+function requireTp1Price(record: LocalBracket): number {
+  if (record.tp1Price === null) {
+    throw new SyncError(
+      'CONFIG_INVALID',
+      `${record.symbol} 的记录是 partial_armed，却没有第一段止盈价（tp1Price 为空）`,
+      { entryOrderId: record.entryOrderId, state: record.state },
+    );
+  }
+  return record.tp1Price;
+}
+
+export function effectiveStopPrice(record: LocalBracket): number {
+  return record.state === 'trailing' && record.trailStopPrice !== null
+    ? record.trailStopPrice
+    : record.stopPrice;
 }
 
 /**
@@ -83,6 +146,13 @@ export interface ExchangeAlgoOrder {
   algoStatus: string;
   triggerPrice: number;
   closePosition: boolean;
+  /**
+   * 带数量的条件单才有（v0.7.0 的第一段止盈）。`closePosition` 单恒为 `null`。
+   *
+   * 之前这个字段被整个丢掉了，于是「交易所上那张带数量的单，量是多少」**本地无从得知**——
+   * 分批止盈挂错数量时没有任何一处能发现它（v0.7.0 G-5）。
+   */
+  quantity: number | null;
   createTime: number;
   updateTime: number;
 }
@@ -97,8 +167,17 @@ export type ReconcileKind =
   | 'unprotected-position'
   /** 交易所有仓位，本地没有任何未终结的记录——这笔仓位从来没被这套工具保护过。 */
   | 'position-without-record'
-  /** 本地 `armed`，但交易所只剩一张（缺止盈）。 */
+  /** 本地 `armed` / `partial_armed`，但交易所只剩一张（缺止盈）。 */
   | 'missing-take-profit-order'
+  /**
+   * 本地已进入 `trailing`（第一段已成交，剩余仓位只剩止损），
+   * 而交易所却还挂着一张止盈单。
+   *
+   * 它多半是「成交事件没被本地收到」，于是那笔仓位的账已经错了；
+   * 也可能是「工具外平仓后本地撤单失败」。两种都要人看一眼，因此是 warning
+   * （仓位此刻仍受止损保护，不是裸的）。
+   */
+  | 'unexpected-take-profit-order'
   /** 单还在，但触发价与本地记录的止损/止盈价对不上。 */
   | 'price-mismatch'
   /** 本地 `armed`，交易所已无该标的仓位——多半是平仓事件没收到。 */
@@ -215,6 +294,9 @@ export function reconcileBrackets(input: ReconcileInput): ReconcileReport {
   for (const record of localScope) {
     if (record.tpAlgoId !== null) referencedAlgoIds.add(record.tpAlgoId);
     if (record.slAlgoId !== null) referencedAlgoIds.add(record.slAlgoId);
+    // 第一段的单号必须也算进去：漏了它，第三层会把 TP1 当成「没人引用的我方单」
+    // 报一条 orphan，而那条告警会让人以为回填丢了——实际只是判据没跟上 v0.7.0。
+    if (record.tp1AlgoId !== null) referencedAlgoIds.add(record.tp1AlgoId);
   }
 
   // 第一层：本地记录。
@@ -244,22 +326,25 @@ export function reconcileBrackets(input: ReconcileInput): ReconcileReport {
       continue;
     }
 
-    // state = 'armed'。两张单要么都在，要么就已经漂了。
+    // 止损：三态都该有一张（`trailing` 只有这一张）。缺它就是裸仓，critical。
+    // 比价用 `effectiveStopPrice`：移动止损每次调档都会改 `trail_stop_price`，
+    // 拿入场那一档去比，每次都会报一条假的价格不符。
+    const stopPrice = effectiveStopPrice(record);
     if (sl === undefined) {
       differences.push({
         kind: 'missing-stop-order',
         severity: 'critical',
         symbol: record.symbol,
         entryOrderId: record.entryOrderId,
-        message: `${record.symbol} 本地记为已挂上止盈止损，但交易所没有对应的止损单——仓位当前没有止损保护。`,
+        message: `${record.symbol} 本地记为${describeState(record.state)}，但交易所没有对应的止损单——仓位当前没有止损保护。`,
         evidence: {
           localState: record.state,
           localSlAlgoId: record.slAlgoId,
-          localStopPrice: record.stopPrice,
+          localStopPrice: stopPrice,
           entryPrice: record.entryPrice,
         },
       });
-    } else if (!samePrice(sl.triggerPrice, record.stopPrice)) {
+    } else if (!samePrice(sl.triggerPrice, stopPrice)) {
       differences.push({
         kind: 'price-mismatch',
         severity: 'warning',
@@ -269,11 +354,37 @@ export function reconcileBrackets(input: ReconcileInput): ReconcileReport {
         evidence: {
           exchangeAlgoId: sl.algoId,
           exchangeTriggerPrice: sl.triggerPrice,
-          localStopPrice: record.stopPrice,
+          localStopPrice: stopPrice,
         },
       });
     }
 
+    // 止盈：**按阶段判断「该有什么」，不是「有没有」**。
+    //   * `trailing`  —— 第一段已成交，此刻交易所**不该**再有止盈单。
+    //     仍有就是 `unexpected-take-profit-order`；反过来按旧判据去报
+    //     「止盈单不见了」，会每轮一条假警报。
+    //   * 其余两态  —— 该有一张，没有才是 `missing-take-profit-order`。
+    if (record.state === 'trailing') {
+      if (tp !== undefined) {
+        differences.push({
+          kind: 'unexpected-take-profit-order',
+          severity: 'warning',
+          symbol: record.symbol,
+          entryOrderId: record.entryOrderId,
+          message: `${record.symbol} 本地已进入移动止损阶段（第一段应已成交），交易所却还挂着一张止盈单（${tp.triggerPrice}）——多半是成交事件没被收到，或工具外平仓后撤单失败。`,
+          evidence: {
+            localState: record.state,
+            exchangeAlgoId: tp.algoId,
+            exchangeTriggerPrice: tp.triggerPrice,
+            localTrailStopPrice: stopPrice,
+          },
+        });
+      }
+      continue;
+    }
+
+    const takeProfit =
+      record.state === 'partial_armed' ? requireTp1Price(record) : record.takeProfit;
     if (tp === undefined) {
       differences.push({
         kind: 'missing-take-profit-order',
@@ -283,11 +394,11 @@ export function reconcileBrackets(input: ReconcileInput): ReconcileReport {
         message: `${record.symbol} 止损单还在，但止盈单已不在交易所（另一张多半是被成交后由交易所自动撤销的，需要确认本地状态是否漏记）。`,
         evidence: {
           localState: record.state,
-          localTpAlgoId: record.tpAlgoId,
-          localTakeProfit: record.takeProfit,
+          localTpAlgoId: record.state === 'partial_armed' ? record.tp1AlgoId : record.tpAlgoId,
+          localTakeProfit: takeProfit,
         },
       });
-    } else if (!samePrice(tp.triggerPrice, record.takeProfit)) {
+    } else if (!samePrice(tp.triggerPrice, takeProfit)) {
       differences.push({
         kind: 'price-mismatch',
         severity: 'warning',
@@ -297,7 +408,7 @@ export function reconcileBrackets(input: ReconcileInput): ReconcileReport {
         evidence: {
           exchangeAlgoId: tp.algoId,
           exchangeTriggerPrice: tp.triggerPrice,
-          localTakeProfit: record.takeProfit,
+          localTakeProfit: takeProfit,
         },
       });
     }
@@ -352,7 +463,11 @@ export function reconcileBrackets(input: ReconcileInput): ReconcileReport {
   // 「本地记着 armed、交易所已无仓位」：反过来由仓位侧查不出来（positionAmt=0 的行
   // 不构成一条 position 记录），因此必须在这里按标的补一次。
   for (const record of localScope) {
-    if (record.state !== 'armed') continue;
+    // `failed` 不参与：它的含义是「什么都没挂上」，由第一层的
+    // `unprotected-position` 报（critical）。这里再报一条 record-without-position
+    // 会把一个裸仓显示成两个问题。
+    if (record.state !== 'armed' && record.state !== 'partial_armed' && record.state !== 'trailing')
+      continue;
     const stillOpen = positionScope.some(
       (position) =>
         position.symbol === record.symbol &&

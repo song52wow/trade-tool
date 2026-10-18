@@ -7,7 +7,17 @@
  *   * ATR = 0 / 倍数为 0 / tick 比 ATR 还大 —— 必须报错，不得算出怪价格。
  */
 
-import { SyncError, alignToTick, decimalsOf, deriveBracketPlan } from '@trade-tool/core';
+import {
+  SyncError,
+  alignToQty,
+  alignToTick,
+  decimalsOf,
+  deriveBracketPlan,
+  deriveStagedPlan,
+  deriveTrailingPlan,
+  percentToRatio,
+  ratioToPercent,
+} from '@trade-tool/core';
 import { describe, expect, it } from 'vitest';
 
 const base = {
@@ -120,5 +130,209 @@ describe('deriveBracketPlan', () => {
   it('确定性：同一组输入永远给出同一组价格', () => {
     const input = { ...base, entryPrice: 63_412.7, atr: 231.55, tickSize: 0.1 };
     expect(deriveBracketPlan(input)).toEqual(deriveBracketPlan(input));
+  });
+});
+
+// ---------------------------------------------------------------------------
+// v0.7.0 两段止盈 + 移动止损
+// ---------------------------------------------------------------------------
+
+const staged = {
+  side: 'BUY' as const,
+  entryPrice: 100,
+  atr: 2,
+  atrPeriod: 14,
+  tickSize: 0.01,
+  stepSize: 0.001,
+  filledQty: 1,
+  stopAtrMult: 2,
+  takeProfitAtrMult: 3,
+  takeProfit1AtrMult: 1,
+  takeProfit1Ratio: 0.5,
+};
+
+describe('alignToQty', () => {
+  it('按步长整数倍向下取整，且不吃掉浮点尾数', () => {
+    expect(alignToQty(0.5, 0.001, 'down')).toBe(0.5);
+    expect(alignToQty(0.56789, 0.01, 'down')).toBe(0.56);
+    // 取整到 0 是「这个数量压根不存在」，必须报错而不是返回 0 冒充合法数量
+    expect(() => alignToQty(0.0001, 0.001, 'down')).toThrow(SyncError);
+  });
+
+  it('非正数量 / 非正步长直接报错', () => {
+    expect(() => alignToQty(0, 0.001, 'down')).toThrow(SyncError);
+    expect(() => alignToQty(1, 0, 'down')).toThrow(SyncError);
+  });
+});
+
+describe('deriveStagedPlan', () => {
+  it('比例 0：与 v0.4.0 同一形态，止盈用整段倍数', () => {
+    const plan = deriveStagedPlan({ ...staged, takeProfit1Ratio: 0 });
+    expect(plan.mode).toBe('single');
+    expect(plan.tp1Qty).toBeNull();
+    expect(plan.tp1Price).toBe(plan.takeProfitPrice);
+    // 止损与 v0.4.0 逐字一致：入场 ∓ 2×ATR
+    expect(plan.stopPrice).toBe(96);
+  });
+
+  it('比例 1：全平但没有数量，也不需要移动止损', () => {
+    const plan = deriveStagedPlan({ ...staged, takeProfit1Ratio: 1 });
+    expect(plan.mode).toBe('full');
+    expect(plan.tp1Qty).toBeNull();
+    expect(plan.tp1Price).toBe(102); // 100 + 1×ATR
+  });
+
+  it('比例落在 (0,1)：减仓量按步长向下取整，止损不变', () => {
+    const plan = deriveStagedPlan({ ...staged, filledQty: 0.3, takeProfit1Ratio: 0.8 });
+    expect(plan.mode).toBe('partial');
+    // 0.3 × 0.8 = 0.24… 浮点上落到步长下界之外时必须落到最近的合法步长
+    expect(plan.tp1Qty).toBeGreaterThan(0);
+    expect(plan.tp1Qty!).toBeLessThan(0.3);
+    expect(Number.isInteger(Math.round(plan.tp1Qty! / 0.001))).toBe(true);
+    expect(plan.stopPrice).toBe(96);
+  });
+
+  it('第一段比整段还远 → 拒绝这种自相矛盾的配置', () => {
+    expect(() =>
+      deriveStagedPlan({ ...staged, takeProfit1AtrMult: 4, takeProfit1Ratio: 0.5 }),
+    ).toThrow(/更靠近入场价/);
+  });
+
+  it('取整后数量不合法 → 拒绝，不退化成全平或不减仓', () => {
+    // 0.001 × 0.5 = 0.0005 → 向下取整到步长 0.001 就是 0
+    expect(() => deriveStagedPlan({ ...staged, filledQty: 0.001, takeProfit1Ratio: 0.5 })).toThrow(
+      /拒绝这一段/,
+    );
+  });
+
+  it('空头完全镜像', () => {
+    const plan = deriveStagedPlan({ ...staged, side: 'SELL', takeProfit1Ratio: 0.5 });
+    expect(plan.exitSide).toBe('BUY');
+    expect(plan.stopPrice).toBe(104);
+    expect(plan.tp1Price).toBe(98);
+    expect(plan.tp1Qty).toBe(0.5);
+  });
+
+  it('比例越界直接报错', () => {
+    expect(() => deriveStagedPlan({ ...staged, takeProfit1Ratio: 1.5 })).toThrow(SyncError);
+    expect(() => deriveStagedPlan({ ...staged, takeProfit1Ratio: -0.1 })).toThrow(SyncError);
+  });
+
+  it('确定性', () => {
+    expect(deriveStagedPlan(staged)).toEqual(deriveStagedPlan(staged));
+  });
+});
+
+const trailing = {
+  side: 'BUY' as const,
+  prevStop: 96,
+  extreme: 110,
+  atr: 2,
+  entryPrice: 100,
+  tickSize: 0.01,
+  trailAtrMult: 2,
+  applyBreakeven: false,
+  // 参考现价要高于新算出的档位（110 − 2×2 = 106），否则会走「越过现价就不动」那条
+  referencePrice: 108,
+};
+
+describe('deriveTrailingPlan', () => {
+  it('候选价向下对齐，且只上移不放宽', () => {
+    const plan = deriveTrailingPlan(trailing);
+    // 110 − 2×2 = 106 → 向下对齐仍是 106 > 96，上移
+    expect(plan.stopPrice).toBe(106);
+    expect(plan.changed).toBe(true);
+    expect(plan.reason).toBe('moved');
+  });
+
+  it('波动变小算出的档位更松 → 不动，且必须 changed=false', () => {
+    const plan = deriveTrailingPlan({ ...trailing, prevStop: 107 });
+    expect(plan.stopPrice).toBe(107);
+    expect(plan.changed).toBe(false);
+    expect(plan.reason).toBe('unchanged');
+  });
+
+  it('对齐方向是向下：105.999 得 105.99 而不是 106', () => {
+    const plan = deriveTrailingPlan({ ...trailing, extreme: 108, atr: 1 });
+    // 108 − 2×1 = 106 → 恰好在 tick 上；用 105.999 验证向下取整
+    expect(plan.stopPrice).toBe(106);
+    const down = deriveTrailingPlan({ ...trailing, extreme: 107.999, atr: 1 });
+    expect(down.stopPrice).toBe(105.99);
+  });
+
+  it('保本档位朝有利方向对齐：多头向上，不会低于入场价', () => {
+    const plan = deriveTrailingPlan({
+      ...trailing,
+      prevStop: 96,
+      extreme: 101,
+      atr: 2,
+      applyBreakeven: true,
+    });
+    // 极值 101 − 4 = 97 < 100，保本 100 胜出
+    expect(plan.stopPrice).toBe(100);
+    expect(plan.reason).toBe('breakeven');
+    expect(plan.stopPrice).toBeGreaterThanOrEqual(trailing.entryPrice);
+  });
+
+  it('止损位越过现价 → 不动，保留旧档并给出原因', () => {
+    const plan = deriveTrailingPlan({
+      ...trailing,
+      prevStop: 96,
+      extreme: 106,
+      atr: 1,
+      referencePrice: 105,
+    });
+    // 106 − 2 = 104 < 105，能挂；再抬高极值让它越过
+    expect(plan.changed).toBe(true);
+    const crossed = deriveTrailingPlan({
+      ...trailing,
+      prevStop: 96,
+      extreme: 130,
+      atr: 1,
+      referencePrice: 105,
+    });
+    expect(crossed.stopPrice).toBe(96);
+    expect(crossed.changed).toBe(false);
+    expect(crossed.reason).toBe('beyond-price');
+  });
+
+  it('空头完全镜像：候选价向上对齐、只下移', () => {
+    const plan = deriveTrailingPlan({
+      ...trailing,
+      side: 'SELL',
+      prevStop: 104,
+      extreme: 90,
+      // 空头是「止损 <= 现价才算越过」，所以参考现价必须低于新档位 94
+      referencePrice: 92,
+    });
+    // 90 + 4 = 94 < 104，下移
+    expect(plan.stopPrice).toBe(94);
+    expect(plan.changed).toBe(true);
+  });
+
+  it('非正 ATR / 极值 / 旧档直接报错', () => {
+    expect(() => deriveTrailingPlan({ ...trailing, atr: 0 })).toThrow(SyncError);
+    expect(() => deriveTrailingPlan({ ...trailing, extreme: 0 })).toThrow(SyncError);
+    expect(() => deriveTrailingPlan({ ...trailing, prevStop: 0 })).toThrow(SyncError);
+    expect(() => deriveTrailingPlan({ ...trailing, trailAtrMult: -1 })).toThrow(SyncError);
+  });
+
+  it('确定性', () => {
+    expect(deriveTrailingPlan(trailing)).toEqual(deriveTrailingPlan(trailing));
+  });
+});
+
+describe('比例与百分数的换算', () => {
+  it('双向可逆，且抹掉浮点尾数', () => {
+    expect(ratioToPercent(0.8)).toBe(80);
+    expect(percentToRatio(80)).toBe(0.8);
+    expect(ratioToPercent(0.5)).toBe(50);
+    expect(percentToRatio(33.3)).toBeCloseTo(0.333, 10);
+  });
+
+  it('越界直接报错', () => {
+    expect(() => ratioToPercent(1.2)).toThrow(SyncError);
+    expect(() => percentToRatio(101)).toThrow(SyncError);
+    expect(() => percentToRatio(-1)).toThrow(SyncError);
   });
 });
