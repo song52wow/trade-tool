@@ -4,6 +4,7 @@ import type { SymbolDetailDto } from '../../../src/types';
 import { ALL_INTERVALS } from './gaps.js';
 import { BracketPanel } from './BracketPanel.js';
 import { ReconcilePanel } from './ReconcilePanel.js';
+import { RiskPolicyPanel } from './RiskPolicyPanel.js';
 import { PriceChart } from './PriceChart.js';
 
 export function SymbolDetail(props: {
@@ -17,6 +18,8 @@ export function SymbolDetail(props: {
   onAggregate: () => void;
   /** 随全局刷新递增，K 线图跟着它更新 */
   tick: number;
+  /** 保存提示走同一套横幅，不在详情页另开一套。 */
+  notify: (text: string, kind?: 'ok' | 'err') => void;
 }) {
   const { state, contract, gaps, exchange, desiredState, inCollection, hasHistory, derived } =
     props.detail;
@@ -115,6 +118,15 @@ export function SymbolDetail(props: {
 
       {/* 交易对账（v0.6.0）紧跟止盈止损：那个面板回答「我们记了什么」，这个回答
           「交易所现在到底是什么」。key 让换标的时整个面板重挂载，从而清掉上一份快照。 */}
+      {/* 这个标的的止盈止损策略：锁定到当前标的，只显示「覆盖」那一栏。
+          全局默认仍在设置页改——单标的页上摆一个「保存全局默认」太容易被误按。 */}
+      <RiskPolicyPanel
+        key={`policy-${props.detail.symbol}`}
+        fixedSymbol={props.detail.symbol}
+        symbols={[]}
+        notify={props.notify}
+      />
+
       <ReconcilePanel key={props.detail.symbol} symbol={props.detail.symbol} tick={props.tick} />
 
       <h2 style={{ fontSize: 13, color: 'var(--muted)', fontWeight: 500, marginTop: 18 }}>

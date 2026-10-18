@@ -6,7 +6,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { App } from '../../ui/src/App';
 import type { CredentialStatusDto, RiskPolicyViewDto } from '../../src/types';
-import { baseHandlers, stubFetch, symbolRow } from './fixtures';
+import { navigate } from '../../ui/src/router';
+import { baseHandlers, stubFetch, symbolHandlers, symbolRow } from './fixtures';
 
 const NOW = 1_760_000_000_000;
 
@@ -31,6 +32,10 @@ function policy(overrides: Partial<RiskPolicyViewDto> = {}): RiskPolicyViewDto {
       atrInterval: '1h',
       stopAtrMult: 2,
       takeProfitAtrMult: 3,
+      takeProfit1Percent: 0,
+      takeProfit1AtrMult: 3,
+      trailAtrMult: 2,
+      breakevenAfterTp1: true,
       source: 'config',
     },
     ...overrides,
@@ -393,5 +398,96 @@ describe('设置页 · 止盈止损策略', () => {
     stubFetch(handlers());
     render(<App />);
     await waitFor(() => expect(screen.getByText(/只影响之后的新买入成交/)).toBeTruthy());
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 标的详情页内设置该标的的止盈止损（v0.7.0 之后）
+// ---------------------------------------------------------------------------
+
+describe('标的详情页内的止盈止损策略', () => {
+  beforeEach(() => {
+    // 用 navigate 而不是直接改 hash：路由里有个**模块级快照缓存**，直接改 hash
+    // 不会让它失效，于是这个文件里上一个用例渲染出来的页面会「粘」下来。
+    navigate('#/symbol/AAAUSDT');
+  });
+
+  afterEach(() => {
+    // 还原：否则缓存停在详情页，后面（以及别的）用例会渲染错的页面。
+    navigate('#/settings');
+  });
+
+  function detailHandlers() {
+    return handlers({
+      ...symbolHandlers('AAAUSDT'),
+      '/api/settings/risk-policy': policy({
+        overrides: [
+          {
+            scope: 'symbol',
+            exchange: 'binance',
+            symbol: 'AAAUSDT',
+            atrPeriod: 14,
+            atrInterval: '1m',
+            stopAtrMult: 2.5,
+            takeProfitAtrMult: 4,
+            takeProfit1Percent: 80,
+            takeProfit1AtrMult: 1.5,
+            trailAtrMult: 3,
+            breakevenAfterTp1: true,
+            updatedAt: NOW,
+          },
+        ],
+        resolved: {
+          atrPeriod: 14,
+          atrInterval: '1m',
+          stopAtrMult: 2.5,
+          takeProfitAtrMult: 4,
+          takeProfit1Percent: 80,
+          takeProfit1AtrMult: 1.5,
+          trailAtrMult: 3,
+          breakevenAfterTp1: true,
+          source: 'symbol' as const,
+        },
+      }),
+    });
+  }
+
+  it('详情页里出现该标的的策略表单，并显示分批比例', async () => {
+    stubFetch(detailHandlers());
+    render(<App />);
+    await waitFor(() => expect(screen.getByText('合约与状态')).toBeTruthy());
+    await waitFor(() => expect(screen.getByText('AAAUSDT 的覆盖')).toBeTruthy());
+    // 分批比例与「余下多少交给移动止损」都要看得见
+    expect(screen.getByLabelText('AAAUSDT 的覆盖 第一段止盈减仓百分比').value).toBe('80');
+    expect(screen.getByText(/余下 20% 交给移动止损/)).toBeTruthy();
+  });
+
+  it('详情页**不**出现「保存全局默认」——单标的页上改全局是最容易误按的地方', async () => {
+    stubFetch(detailHandlers());
+    render(<App />);
+    await waitFor(() => expect(screen.getByText('AAAUSDT 的覆盖')).toBeTruthy());
+    expect(screen.queryByRole('button', { name: '保存全局默认' })).toBeNull();
+    expect(screen.queryByLabelText('选择标的')).toBeNull();
+  });
+
+  it('详情页保存的是该标的的覆盖（scope=symbol，带上该 symbol）', async () => {
+    const stub = stubFetch(detailHandlers());
+    render(<App />);
+    await waitFor(() => expect(screen.getByText('AAAUSDT 的覆盖')).toBeTruthy());
+
+    fireEvent.change(screen.getByLabelText('AAAUSDT 的覆盖 第一段止盈减仓百分比'), {
+      target: { value: '60' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: '保存覆盖' }));
+
+    await waitFor(() => {
+      const put = stub.calls.find((c) => c.method === 'PUT');
+      expect(put?.url).toBe('/api/settings/risk-policy');
+      expect(put?.body).toMatchObject({
+        scope: 'symbol',
+        symbol: 'AAAUSDT',
+        takeProfit1Percent: 60,
+      });
+    });
   });
 });

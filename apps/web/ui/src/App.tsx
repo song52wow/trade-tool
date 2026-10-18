@@ -489,6 +489,7 @@ export function App() {
       {route.kind === 'symbol' ? (
         <SymbolPage
           symbol={route.symbol}
+          notify={notify}
           symbols={symbols}
           now={now}
           verifying={verifyingSymbol === route.symbol}

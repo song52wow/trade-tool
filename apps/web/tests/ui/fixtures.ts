@@ -161,7 +161,15 @@ export function symbolHandlers(
       symbol,
       limit: 20,
       items: [],
-      countsByState: { armed: 0, take_profit: 0, stop_loss: 0, cancelled: 0, failed: 0 },
+      countsByState: {
+        armed: 0,
+        partial_armed: 0,
+        trailing: 0,
+        take_profit: 0,
+        stop_loss: 0,
+        cancelled: 0,
+        failed: 0,
+      },
     },
     [`/api/symbols/${symbol}`]: {
       ...symbolRow(symbol),
