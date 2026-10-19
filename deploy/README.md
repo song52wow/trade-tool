@@ -1,4 +1,4 @@
-# 部署到 192.168.1.90
+# 部署到 192.168.1.90（目录是 `~/trade-tool`）
 
 本机（darwin x86_64）构建镜像 → `docker save` → 目标机 `docker load` → compose 起四个服务。
 
@@ -19,7 +19,7 @@ Python venv，拆成四个镜像只会让 save/load 的传输量翻倍。
 - 目标机上这个目录结构是最终形态：
 
 ```
-/opt/trade-tool/
+~/trade-tool/
 ├── compose.yaml
 ├── .env                    # 由 .env.example 复制并按目标机改
 ├── config/
@@ -47,10 +47,10 @@ Dockerfile 刻意不用 BuildKit 的 cache mount——那会让没装 buildx 组
 ## 2. 搬运
 
 ```bash
-ssh admin@192.168.1.90 'sudo mkdir -p /opt/trade-tool/{config,images}'
-scp dist-deploy/trade-tool-deploy.tar        admin@192.168.1.90:/opt/trade-tool/images/
-scp deploy/compose.yaml deploy/.env.example  admin@192.168.1.90:/opt/trade-tool/
-ssh admin@192.168.1.90 'cd /opt/trade-tool && docker load -i images/trade-tool-deploy.tar'
+ssh admin@192.168.1.90 'mkdir -p ~/trade-tool/{config,images}'
+scp dist-deploy/trade-tool-deploy.tar        admin@192.168.1.90:~/trade-tool/images/
+scp deploy/compose.yaml deploy/.env.example  admin@192.168.1.90:~/trade-tool/
+ssh admin@192.168.1.90 'cd ~/trade-tool && docker load -i images/trade-tool-deploy.tar'
 ```
 
 `docker load` 应输出 `Loaded image: trade-tool:deploy`。标签与 `.env` 里的
@@ -61,7 +61,7 @@ ssh admin@192.168.1.90 'cd /opt/trade-tool && docker load -i images/trade-tool-d
 
 ```bash
 ssh admin@192.168.1.90
-cd /opt/trade-tool
+cd ~/trade-tool
 cp .env.example .env
 openssl rand -hex 32            # 写进 .env 的 TRADE_TOOL_SECRET_KEY
 vi .env                         # 至少改 TRADE_TOOL_PG_PASSWORD
@@ -92,7 +92,7 @@ vi .env                         # 至少改 TRADE_TOOL_PG_PASSWORD
 ## 4. 启动
 
 ```bash
-cd /opt/trade-tool
+cd ~/trade-tool
 docker compose up -d
 docker compose ps
 docker compose logs -f web sync
