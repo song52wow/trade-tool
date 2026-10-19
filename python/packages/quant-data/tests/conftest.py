@@ -14,7 +14,7 @@ from __future__ import annotations
 import json
 import os
 import threading
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -293,18 +293,44 @@ def _json_response(payload: object) -> HttpResponse:
 
 
 @contextmanager
-def local_http_server(status: int, headers: dict[str, str]) -> Iterator[str]:
-    """起一个本地 mock HTTP server（仅回环，不出网），验证 stdlib urllib 真实通路。"""
+def local_http_server(
+    status: int,
+    headers: dict[str, str],
+    *,
+    handler: Callable[[str], tuple[int, dict[str, str], bytes]] | None = None,
+) -> Iterator[str]:
+    """起一个本地 mock HTTP server（仅回环，不出网），验证 stdlib urllib 真实通路。
+
+    ``handler`` 让调用方自己决定回什么（代理转发测试要用）；不给时保持原行为，
+    回固定的 ``status`` + ``headers`` + ``{"symbols": []}``。
+    """
     body = json.dumps({"symbols": []}).encode("utf-8")
 
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self) -> None:
+            if handler is not None:
+                resp_status, resp_headers, resp_body = handler(self.path)
+                self.send_response(resp_status)
+                for key, value in resp_headers.items():
+                    self.send_header(key, value)
+                self.send_header("Content-Length", str(len(resp_body)))
+                self.end_headers()
+                self.wfile.write(resp_body)
+                return
             self.send_response(status)
             for key, value in headers.items():
                 self.send_header(key, value)
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
+
+        def do_CONNECT(self) -> None:
+            # CONNECT 隧道测试用。默认回 407：代理拒绝认证时的真实形态，
+            # 用来断言「报错说清是代理 407」而不是一个谜之的网络错误。
+            self.send_response(407)
+            self.send_header("Proxy-Authenticate", 'Basic realm="test"')
+            self.send_header("Content-Length", "0")
+            self.end_headers()
 
         def log_message(self, format: str, *args: object) -> None:
             return

@@ -90,10 +90,26 @@ COPY . /app
 # 代价是每次重建都重跑一次依赖安装（几分钟），换来的是「只有基础 docker 的机器也能构建」。
 RUN pnpm install --frozen-lockfile --store-dir /pnpm/store
 RUN pnpm build
+# 构建期拉 Python 依赖的网络余量。
+#
+# 为什么要这两个参数（2026-10-19 实测踩到）：`uv` 会**并发**下载，numpy（16MB）这类大包
+# 在慢链路���会把带宽占满，排在它后面的小请求（`hatchling-*.whl.metadata`，几 KB）
+# 就会在 uv 的默认超时内拿不到响应，整次构建以「operation timed out」失败——
+# 而同一个 URL 用 curl 在容器里量只要 0.4 秒，看起来像「网络不通」，其实是超时太紧。
+# 调大超时与重试次数即可，不需要换源。
+ARG UV_HTTP_TIMEOUT=120
+ARG UV_HTTP_RETRIES=10
+# 需要时（PyPI 被墙 / 极慢）可换源：`--build-arg PYPI_INDEX_URL=https://…`。
+# uv.lock 里带哈希，换源只在**分发同一份文件**时成立，因此这是可选项而不是默认。
+ARG PYPI_INDEX_URL=""
+
 # --frozen：严格按 uv.lock 解析，不重新解依赖。
 # --no-dev：不装 pytest/ruff/mypy，它们只在仓库里跑测试时需要。
 # --no-editable：装进 site-packages，运行期不依赖 /app/python 源码路径。
-RUN uv sync --project python --frozen --no-dev --no-editable \
+RUN UV_HTTP_TIMEOUT="${UV_HTTP_TIMEOUT}" \
+    UV_HTTP_RETRIES="${UV_HTTP_RETRIES}" \
+    UV_DEFAULT_INDEX="${PYPI_INDEX_URL}" \
+    uv sync --project python --frozen --no-dev --no-editable \
     && /app/python/.venv/bin/python -c "import quant_data, quant_core, quant_backtest"
 
 # ---- 运行层 -------------------------------------------------------------

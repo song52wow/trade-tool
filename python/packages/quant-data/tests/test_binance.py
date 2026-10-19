@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import json
+import os
 
 import pytest
 from conftest import FakeExchange, SymbolCase, bar_row, bar_row_numeric, local_http_server
+from quant_data import http as http_module
 from quant_data.binance import (
     KLINE_LIMIT_MAX,
     ONE_MINUTE_MS,
@@ -14,7 +16,14 @@ from quant_data.binance import (
     parse_klines,
 )
 from quant_data.errors import SyncError
-from quant_data.http import BASE_URL_ENV, UrllibTransport, binance_base_url
+from quant_data.http import (
+    BASE_URL_ENV,
+    UrllibTransport,
+    binance_base_url,
+    describe_proxy,
+    ensure_no_proxy_env,
+    read_proxy_config,
+)
 from quant_data.ratelimit import DEFAULT_BUDGET_PER_MINUTE
 from quant_data.sync import plan_estimate
 
@@ -268,3 +277,137 @@ def test_urllib_transport_raises_network_error_for_unreachable_host() -> None:
 def test_default_budget_leaves_headroom_under_exchange_quota() -> None:
     """预算上限是配额的 80%，留余量给人工排查（R-20.3 / 附录 A.3）。"""
     assert DEFAULT_BUDGET_PER_MINUTE == 1920 < 2400
+
+
+# --------------------------------------------------------------- 出网代理
+#
+# 这组用例锁的是 2026-10-19 在目标机上定位到的那个坑：`urllib` 只认名字**恰好**是
+# `https_proxy` 的变量，仓库约定的 `TRADE_TOOL_HTTPS_PROXY` 会被它归到
+# `trade_tool_https` 而静默失效，于是所有 https 请求直连、全军覆没。
+
+
+def _clear_proxy_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    for name in (
+        "TRADE_TOOL_HTTP_PROXY",
+        "TRADE_TOOL_HTTPS_PROXY",
+        "TRADE_TOOL_NO_PROXY",
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "NO_PROXY",
+        "http_proxy",
+        "https_proxy",
+        "no_proxy",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    # opener 是按代理配置缓存的，换了环境变量必须让它重建
+    monkeypatch.setattr(http_module, "_opener", None)
+    monkeypatch.setattr(http_module, "_opener_key", None)
+
+
+def test_repo_proxy_env_is_used(monkeypatch: pytest.MonkeyPatch) -> None:
+    """仓库约定的 TRADE_TOOL_HTTPS_PROXY 必须被认成 https 的代理。"""
+    _clear_proxy_env(monkeypatch)
+    assert read_proxy_config() == {}
+
+    monkeypatch.setenv("TRADE_TOOL_HTTPS_PROXY", "http://192.168.1.79:7890")
+    config = read_proxy_config()
+    assert config["https"].host_port == "192.168.1.79:7890"
+    assert config["https"].username is None
+    assert "http" not in config
+
+    # 标准变量仍然兼容（本机 shell 里设的是它）
+    monkeypatch.delenv("TRADE_TOOL_HTTPS_PROXY")
+    monkeypatch.setenv("HTTPS_PROXY", "http://10.0.0.1:3128")
+    assert read_proxy_config()["https"].host_port == "10.0.0.1:3128"
+
+
+def test_proxy_credentials_are_stripped_from_url(monkeypatch: pytest.MonkeyPatch) -> None:
+    """带账号密码的代理：凭据单独取出，不留在 host_port 里。
+
+    urllib 建 CONNECT 隧道时不会把 userinfo 变成 Proxy-Authorization 头，
+    凭据留在 URL 里等于没填（实测会被 407 顶回来）。
+    """
+    _clear_proxy_env(monkeypatch)
+    monkeypatch.setenv("TRADE_TOOL_HTTPS_PROXY", "http://Clash:s3cr3t@192.168.1.79:7890")
+    item = read_proxy_config()["https"]
+    assert item.host_port == "192.168.1.79:7890"
+    assert item.username == "Clash"
+    assert item.password == "s3cr3t"
+
+    # 凭据没被留在 URL 里——留着的话 CONNECT 时不会带 Proxy-Authorization，实测被 407 顶回。
+    assert "@" not in item.host_port
+    # 真正的认证行为由下面那条「经代理打通」的用例覆盖。
+
+
+def test_opener_actually_routes_through_the_configured_proxy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """端到端：本地 server 扮演代理，检查请求**确实**经过它。
+
+    只断言配置被读到是不够的——原来的 bug 正是「配置读到了但没被用上」。
+    代理 server 收到请求就回 418，因此断言的是**代理收到了**，而不是目标站收到了。
+    """
+    _clear_proxy_env(monkeypatch)
+    seen: list[str] = []
+
+    def handler(path: str) -> tuple[int, dict[str, str], bytes]:
+        seen.append(path)
+        return 418, {}, b'{"proxy":"hit"}'
+
+    with local_http_server(200, {}, handler=handler) as proxy_base:
+        # 配 **http** 代理并请求 **http** 地址：这样不需要 CONNECT 隧道，
+        # 而 mock server 也实现不了 CONNECT。https over proxy 走的是同一条
+        # ProxyHandler 通路，只是多一层 CONNECT，本用例断言的是「有没有走代理」。
+        monkeypatch.setenv("TRADE_TOOL_HTTP_PROXY", proxy_base)
+        # 目标地址故意指向一个**不存在**的域名：只要它被穿过代理成功，
+        # 就说明请求没有走直连。
+        response = UrllibTransport().get("http://unreachable.invalid/x", timeout_ms=2000)
+
+    assert response.status == 418
+    assert seen, "请求没有被送进代理"
+
+
+def test_no_proxy_is_mirrored_for_bypass(monkeypatch: pytest.MonkeyPatch) -> None:
+    """仓库约定的 no_proxy 要映射成 urllib 认的那个名字，否则「库不走代理」失效。"""
+    _clear_proxy_env(monkeypatch)
+    monkeypatch.setenv("TRADE_TOOL_NO_PROXY", "postgres,127.0.0.1")
+    ensure_no_proxy_env()
+    assert os.environ["no_proxy"] == "postgres,127.0.0.1"
+
+
+def test_bad_proxy_url_fails_loudly(monkeypatch: pytest.MonkeyPatch) -> None:
+    """代理地址写错必须明确报错，而不是变成一个谜之的「网络不通」。"""
+    _clear_proxy_env(monkeypatch)
+    monkeypatch.setenv("TRADE_TOOL_HTTPS_PROXY", "http://只有主机没有端口")
+    with pytest.raises(SyncError) as excinfo:
+        read_proxy_config()
+    assert excinfo.value.code == "CONFIG_INVALID"
+
+
+def test_describe_proxy_has_no_credentials(monkeypatch: pytest.MonkeyPatch) -> None:
+    """这行会进日志，绝不能带上密码。"""
+    _clear_proxy_env(monkeypatch)
+    monkeypatch.setenv("TRADE_TOOL_HTTPS_PROXY", "http://Clash:s3cr3t@192.168.1.79:7890")
+    text = describe_proxy()
+    assert "192.168.1.79:7890" in text
+    assert "需认证" in text
+    assert "s3cr3t" not in text
+    assert "Clash" not in text
+
+
+def test_proxy_407_is_reported_as_such(monkeypatch: pytest.MonkeyPatch) -> None:
+    """代理回 407 时，报错必须写明「代理拒绝 CONNECT」，而不是一个谜之的网络错误。
+
+    这条锁的是「人能不能从日志里看出该改代理认证还是该改网络」。
+    """
+    _clear_proxy_env(monkeypatch)
+    with local_http_server(200, {}) as proxy_base:
+        monkeypatch.setenv(
+            "TRADE_TOOL_HTTPS_PROXY", proxy_base.replace("http://", "http://Clash:pw@")
+        )
+        with pytest.raises(SyncError) as excinfo:
+            UrllibTransport().get("https://fapi.binance.com/fapi/v1/ping", timeout_ms=2000)
+
+    assert excinfo.value.code == "NETWORK_ERROR"
+    assert "代理拒绝 CONNECT" in str(excinfo.value)
+    assert excinfo.value.details["hasCredentials"] is True
