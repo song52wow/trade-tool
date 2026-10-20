@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 
 import { configSchema, defaultConfig } from '../src/config.js';
-import { RECONCILE_KINDS } from '../src/reconcile.js';
+import { NOTIFY_KINDS } from '../src/notify.js';
 import { loadConfig } from '../src/config-io.js';
 import { MANUAL_INTERVENTION_CODES, isSyncError } from '../src/market-sync.js';
 import { intervalToMs } from '../src/types.js';
@@ -154,7 +154,7 @@ describe('notify', () => {
     expect(notify.webhookEnv).toBe('TRADE_TOOL_FEISHU_WEBHOOK_URL');
     expect(notify.secretEnv).toBe('TRADE_TOOL_FEISHU_WEBHOOK_SECRET');
     // 缺省 = 全部内容都要通知（用户可以逐项取消）
-    expect(notify.kinds).toEqual([...RECONCILE_KINDS]);
+    expect(notify.kinds).toEqual([...NOTIFY_KINDS]);
     expect(notify.repeatCooldownMs).toBe(30 * 60_000);
   });
 

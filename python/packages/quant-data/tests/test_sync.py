@@ -1126,6 +1126,10 @@ def test_migrations_are_idempotent(conn: DbConn, pg_dsn: str) -> None:
         "010_risk_trailing",
         # v0.8.0：飞书通知通道的运行期设置
         "011_notify_settings",
+        # v0.8.0：盈亏的事实列
+        "012_trade_pnl",
+        # v0.9.0：LLM 决策的记录列
+        "013_llm_decision",
     ]
     pg.ensure_schema(conn)
 

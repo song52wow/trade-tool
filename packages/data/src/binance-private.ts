@@ -66,6 +66,15 @@ export interface OrderTradeUpdate {
   /** 成交时间（毫秒）。ATR 的「成交时刻」取的就是它。 */
   tradeTime: number;
   positionSide: PositionSide;
+  /**
+   * 本笔成交的手续费（`n`）。
+   *
+   * **单位与计价币一致**（USDⓈ-M 永续即 USDT），因此可以直接从毛利里扣。
+   * 少了它，「实际盈亏」就只是毛盈亏——那笔账会永远偏乐观。
+   */
+  commission: number;
+  /** 手续费币种（`N`）。不是计价币时**不能**直接扣（汇率未知），必须报出来。 */
+  commissionAsset: string;
 }
 
 export interface PrivateClientOptions {
@@ -236,6 +245,10 @@ export function parseOrderTradeUpdate(payload: unknown): OrderTradeUpdate | null
     status: requireString(o['X'], 'o.X', where) as OrderStatus,
     tradeTime: requireNumber(o['T'], 'o.T', where),
     positionSide: (typeof o['ps'] === 'string' ? o['ps'] : 'BOTH') as PositionSide,
+    // 手续费是**必返**字段（官方 ORDER_TRADE_UPDATE 的 `n` / `N`）。
+    // 缺了就报错，不要当成 0——「假装没收手续费」的盈亏正是最不能出错的那个数。
+    commission: requireNumber(o['n'], 'o.n', where),
+    commissionAsset: requireString(o['N'], 'o.N', where),
   };
 }
 

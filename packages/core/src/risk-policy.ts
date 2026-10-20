@@ -43,7 +43,12 @@ export interface BracketPlanInput extends BracketPolicy {
 }
 
 export interface BracketPlan {
-  positionSide: PositionSide;
+  /**
+   * 仓位方向。**只有 LONG / SHORT**：方向由入场成交的买卖决定，`BOTH` 是账户的
+   * 持仓模式（双向模式），不是仓位方向。收窄它，下游算盈亏时就不必再处理
+   * 一个永远不会出现的取值。
+   */
+  positionSide: 'LONG' | 'SHORT';
   /** 平仓方向：平多是 SELL，平空是 BUY。 */
   exitSide: OrderSide;
   entryPrice: number;
@@ -276,7 +281,8 @@ export interface StagedPlanInput {
 
 export interface StagedPlan {
   mode: StagedMode;
-  positionSide: PositionSide;
+  /** 仓位方向。同 `BracketPlan.positionSide`：只有 LONG / SHORT。 */
+  positionSide: 'LONG' | 'SHORT';
   /** 平仓方向：平多是 SELL，平空是 BUY。 */
   exitSide: OrderSide;
   entryPrice: number;

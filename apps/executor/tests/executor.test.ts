@@ -9,9 +9,13 @@
  */
 
 import {
+  NOTIFY_KINDS,
   NetPositionTracker,
   SyncError,
   configSchema,
+  type AlertChannel,
+  type AlertDispatcher,
+  type AlertItem,
   type TradeToolConfig,
 } from '@trade-tool/core';
 import type { OrderTradeUpdate, Pool } from '@trade-tool/data';
@@ -42,6 +46,12 @@ interface FakeClaim {
   trailAtr?: number | null;
   trailLastError?: string | null;
   updatedAt?: number;
+  /** v0.8.0：入场那笔的手续费。 */
+  entryFee?: number;
+  /** v0.8.0：平仓事实的累计量。 */
+  closedQty?: number;
+  exitNotional?: number;
+  feeAmount?: number;
 }
 
 /** 记录调用顺序的 PG 替身：把 claimBracket 的幂等语义原样模拟出来。 */
@@ -64,12 +74,17 @@ function fakePool() {
       )[];
       const [positionSide, atr, atrPeriod, atrInterval, windowFrom, windowTo, stop, takeProfit] =
         p.slice(6, 14) as (string | number)[];
-      // v0.7.0：占坑时插入 tp1_algo_id / tp1_qty / tp1_price 三列，
-      // 因此 created_at / updated_at 的位置后移了 3。索引与 INSERT 的列顺序一一对应。
+      // v0.7.0：占坑时插入 tp1_algo_id / tp1_qty / tp1_price 三列；
+      // v0.8.0：再插入 fee_amount（入场那笔的手续费）一列。
+      // 因此 created_at / updated_at 的位置又后移了 1。索引与 INSERT 的列顺序一一对应。
       const tp1AlgoId = p[14] as number | null;
       const tp1Qty = p[15] as number | null;
       const tp1Price = p[16] as number | null;
-      const now = p[17] as number;
+      const entryFee = p[17] as number;
+      // created_at / updated_at 是**最后**两个参数：后面还会加列（v0.9.0 的决策列），
+      // 按固定下标取会在每次加列时错位——错位的样子是「created_at 不是整数」。
+      const now = p[p.length - 1] as number;
+      void entryFee;
       const key = `${exchange}/${symbol}/${entryOrderId}`;
       if (state.claims.has(key)) return { rows: [], rowCount: 0 };
       state.claims.set(key, {
@@ -82,7 +97,10 @@ function fakePool() {
         tp1AlgoId,
         tp1Qty,
         tp1Price,
+        entryFee,
       });
+      // 入场那笔的手续费也是这一轮的成本。
+      state.claims.get(key)!.feeAmount = entryFee;
       // RETURNING 的是完整一行，读侧会逐列校验（NULL_NOT_ALLOWED），因此必须给全
       return {
         rows: [
@@ -115,6 +133,22 @@ function fakePool() {
             trail_atr_to: null,
             trail_updated_at: null,
             trail_last_error: null,
+            // v0.8.0：盈亏的事实（累计）。盈亏金额本身不存，由 core 现算。
+            closed_qty: 0,
+            exit_notional: 0,
+            fee_amount: 0,
+            // v0.9.0：LLM 决策的记录列（本用例走的是「没有决策」的路径）。
+            decision_source: 'config',
+            decision_stop_atr_mult: null,
+            decision_take_profit_atr_mult: null,
+            decision_take_profit1_ratio: null,
+            decision_take_profit1_atr_mult: null,
+            decision_trail_atr_mult: null,
+            decision_breakeven_after_tp1: null,
+            decision_rationale: null,
+            decision_fallback_reason: null,
+            decision_raw: null,
+            decision_at: null,
             state: 'failed',
             last_error: null,
             created_at: now,
@@ -126,6 +160,66 @@ function fakePool() {
     }
     // listUnsettledBrackets：只取 armed / failed，形状与 INSERT 的 RETURNING 保持一致。
     if (sql.includes('FROM risk_bracket')) {
+      // 三个参数 = 按 entry_order_id 读**一行**（readBracket）：任何状态都要读得到——
+      // 结算之后读的是「已终结」的那一行，它正是要算实际盈亏的那一行。
+      if (params.length >= 3) {
+        const [exchange, symbol, entryOrderId] = params as string[];
+        const row = state.claims.get(`${exchange}/${symbol}/${entryOrderId}`);
+        if (row === undefined) return { rows: [], rowCount: 0 };
+        return {
+          rows: [
+            {
+              exchange,
+              symbol: row.symbol,
+              entry_order_id: entryOrderId,
+              entry_price: 60_000,
+              entry_time: 1_000,
+              filled_qty: 0.1,
+              position_side: row.positionSide,
+              atr: 100,
+              atr_period: 14,
+              atr_interval: '1m',
+              atr_window_from: 1,
+              atr_window_to: 2,
+              stop_price: 59_800,
+              take_profit: 60_300,
+              tp_algo_id: row.tpOrderId,
+              sl_algo_id: row.slOrderId,
+              tp1_algo_id: row.tp1AlgoId ?? null,
+              tp1_qty: row.tp1Qty ?? null,
+              tp1_price: row.tp1Price ?? null,
+              tp1_filled_qty: null,
+              tp1_filled_at: null,
+              trail_extreme: row.trailExtreme ?? null,
+              trail_stop_price: row.trailStopPrice ?? null,
+              trail_atr: row.trailAtr ?? null,
+              trail_atr_from: null,
+              trail_atr_to: null,
+              trail_updated_at: null,
+              trail_last_error: row.trailLastError ?? null,
+              closed_qty: row.closedQty ?? 0,
+              exit_notional: row.exitNotional ?? 0,
+              fee_amount: row.feeAmount ?? 0,
+              decision_source: 'config',
+              decision_stop_atr_mult: null,
+              decision_take_profit_atr_mult: null,
+              decision_take_profit1_ratio: null,
+              decision_take_profit1_atr_mult: null,
+              decision_trail_atr_mult: null,
+              decision_breakeven_after_tp1: null,
+              decision_rationale: null,
+              decision_fallback_reason: null,
+              decision_raw: null,
+              decision_at: null,
+              state: row.state,
+              last_error: row.lastError,
+              created_at: 1_000,
+              updated_at: 1_000,
+            },
+          ],
+          rowCount: 1,
+        };
+      }
       const [exchange, maybeSymbol] = params as string[];
       const rows = [...state.claims.entries()]
         .filter(
@@ -168,6 +262,20 @@ function fakePool() {
             trail_atr_to: null,
             trail_updated_at: null,
             trail_last_error: row.trailLastError ?? null,
+            closed_qty: row.closedQty ?? 0,
+            exit_notional: row.exitNotional ?? 0,
+            fee_amount: row.feeAmount ?? 0,
+            decision_source: 'config',
+            decision_stop_atr_mult: null,
+            decision_take_profit_atr_mult: null,
+            decision_take_profit1_ratio: null,
+            decision_take_profit1_atr_mult: null,
+            decision_trail_atr_mult: null,
+            decision_breakeven_after_tp1: null,
+            decision_rationale: null,
+            decision_fallback_reason: null,
+            decision_raw: null,
+            decision_at: null,
             state: row.state,
             last_error: row.lastError,
             created_at: 1_000,
@@ -183,9 +291,17 @@ function fakePool() {
       return { rows: [], rowCount: 1 };
     }
     if (sql.includes('SET state = $4')) {
-      const [exchange, symbol, entryOrderId, nextState] = params as (string | number)[];
+      const [exchange, symbol, entryOrderId, nextState, , qty, notional, fee] = params as (
+        string | number
+      )[];
       const row = state.claims.get(`${exchange}/${symbol}/${entryOrderId}`);
-      if (row) row.state = String(nextState);
+      if (row) {
+        row.state = String(nextState);
+        // v0.8.0：平仓的事实要**累加**（实际盈亏从它算）。
+        row.closedQty = (row.closedQty ?? 0) + Number(qty ?? 0);
+        row.exitNotional = (row.exitNotional ?? 0) + Number(notional ?? 0);
+        row.feeAmount = (row.feeAmount ?? 0) + Number(fee ?? 0);
+      }
       return { rows: [], rowCount: 1 };
     }
     if (sql.includes("SET state = 'failed'")) {
@@ -298,6 +414,9 @@ function fill(overrides: Partial<OrderTradeUpdate> = {}): OrderTradeUpdate {
     executionType: 'TRADE',
     status: 'FILLED',
     tradeTime: 1_000,
+    // 手续费（必返字段）：实际盈亏要从毛利里扣它。
+    commission: 0.04,
+    commissionAsset: 'USDT',
     positionSide: 'BOTH',
     ...overrides,
   };
@@ -323,6 +442,31 @@ interface PlacedOrder {
   /** 带数量的单才有：分批止盈的第一段。 */
   quantity?: number;
   closePosition: boolean;
+}
+
+/**
+ * 记录派发出去的告警条目（派发器替身）。
+ *
+ * 真实的派发器会去解析通道、过滤、去重、推送；这里只关心**「发了什么」**，
+ * 过滤与去重的行为由 core 的用例守住。
+ */
+function fakeAlerts(kinds: string[] = [...NOTIFY_KINDS]): {
+  alerts: AlertDispatcher;
+  items: AlertItem[];
+} {
+  const items: AlertItem[] = [];
+  const alerts = {
+    dispatch: async (build: (channel: AlertChannel) => readonly AlertItem[]) => {
+      const channel: AlertChannel = {
+        notifier: { enabled: true, notify: async () => undefined },
+        kinds,
+        repeatCooldownMs: 30 * 60_000,
+      };
+      items.push(...build(channel));
+      return { sent: items.length, suppressed: 0, failed: 0, recovered: 0 };
+    },
+  } as unknown as AlertDispatcher;
+  return { alerts, items };
 }
 
 function fakePlacer(overrides: Partial<OrderPlacer> = {}): OrderPlacer & {
@@ -379,6 +523,74 @@ function fakePlacer(overrides: Partial<OrderPlacer> = {}): OrderPlacer & {
     ...overrides,
   };
 }
+
+describe('通知：止盈止损挂上与一轮完成（v0.8.0）', () => {
+  it('挂上止盈止损 → 通知带预估收益与预估亏损（计价币）', async () => {
+    const { alerts, items } = fakeAlerts();
+    const service = createExecutorService({
+      pool: fakePool().pool,
+      config: makeConfig(),
+      placer: fakePlacer(),
+      atr: fakeAtr(),
+      alerts,
+    });
+
+    await service.handleFill(fill());
+
+    expect(items).toHaveLength(1);
+    expect(items[0]?.title).toContain('止盈止损已挂上');
+    const text = (items[0]?.lines ?? []).join('\n');
+    // ATR=100，止损 2 倍、止盈 3 倍，入场 60000 × 0.1 → 收益 30 USDT / 亏损 20 USDT
+    expect(text).toContain('预估收益 +30.00 USDT');
+    expect(text).toContain('预估亏损 -20.00 USDT');
+  });
+
+  it('一轮完成 → 通知带实际盈亏，且**已扣手续费**', async () => {
+    const { alerts, items } = fakeAlerts();
+    const pool = fakePool();
+    const service = createExecutorService({
+      pool: pool.pool,
+      config: makeConfig(),
+      placer: fakePlacer(),
+      atr: fakeAtr(),
+      alerts,
+    });
+
+    await service.handleFill(fill());
+    // 我们的止损成交：59800 × 0.1，手续费 0.04
+    await service.handleFill(
+      fill({
+        clientOrderId: bracketClientOrderId('sl', '42'),
+        side: 'SELL',
+        lastFilledPrice: 59_800,
+        lastFilledQty: 0.1,
+        commission: 0.04,
+      }),
+    );
+
+    const settled = items.find((item) => item.title.includes('一轮完成'));
+    expect(settled).toBeDefined();
+    const text = (settled?.lines ?? []).join('\n');
+    // 毛利 (59800−60000)×0.1 = −20；手续费 0.04（入场）+ 0.04（出场）= 0.08
+    expect(text).toContain('毛利 -20.00 USDT');
+    expect(text).toContain('手续费 0.08 USDT');
+    expect(text).toContain('净盈亏 -20.08 USDT');
+  });
+
+  it('没勾的内容类型不推（过滤用的是这一轮生效的设置）', async () => {
+    const { alerts, items } = fakeAlerts(['missing-stop-order']);
+    const service = createExecutorService({
+      pool: fakePool().pool,
+      config: makeConfig(),
+      placer: fakePlacer(),
+      atr: fakeAtr(),
+      alerts,
+    });
+
+    await service.handleFill(fill());
+    expect(items).toHaveLength(0);
+  });
+});
 
 describe('clientOrderId 往返', () => {
   it('认得出自己挂的单与它属于哪一笔入场', () => {

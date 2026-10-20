@@ -16,6 +16,8 @@ import { describe, expect, it } from 'vitest';
 import {
   AlertDispatcher,
   DISABLED_NOTIFIER,
+  NOTIFY_KINDS,
+  NOTIFY_KIND_INFO,
   type AlertChannel,
   FeishuNotifier,
   createNotifierFromEnv,
@@ -415,6 +417,23 @@ describe('AlertDispatcher', () => {
     expect((await dispatcher.dispatch(() => [item])).sent).toBe(1);
   });
 
+  it('事件型告警推过即忘：不参与「已恢复」判定', async () => {
+    // 「止盈止损挂上了」「这一轮走完了」都是一次性事件，不是持续状态——
+    // 下一轮它们不在了，不代表「问题恢复了」。
+    const rec = recorder();
+    const dispatcher = new AlertDispatcher({
+      channel: channelOf(rec.notifier),
+      now: () => 1_000,
+    });
+
+    const event = { ...item, oneShot: true };
+    await dispatcher.dispatch(() => [event]);
+    const result = await dispatcher.dispatch(() => []);
+
+    expect(result.recovered).toBe(0);
+    expect(rec.events).toHaveLength(1);
+  });
+
   it('条目由通道参数构造：过滤用的就是这一轮生效的设置', async () => {
     // 构造条目的那一步必须拿到**这一轮**的设置（要通知哪些内容），
     // 否则过滤与发送会看到两份不同的「哪一份在生效」。
@@ -430,5 +449,22 @@ describe('AlertDispatcher', () => {
       return channel.kinds.includes('missing-stop-order') ? [item] : [];
     });
     expect(result.sent).toBe(1);
+  });
+});
+
+describe('通知内容类型的清单', () => {
+  it('包含交易对账的差异类型，也包含两类交易事件', () => {
+    // 清单只有一份（NOTIFY_KINDS）：用户在一个列表里勾，页面也只有一份可显示。
+    expect(NOTIFY_KINDS).toContain('missing-stop-order');
+    expect(NOTIFY_KINDS).toContain('bracket-armed');
+    expect(NOTIFY_KINDS).toContain('bracket-settled');
+    expect(new Set(NOTIFY_KINDS).size).toBe(NOTIFY_KINDS.length);
+  });
+
+  it('每一项都有中文名与说明（页面不自己编文案）', () => {
+    for (const kind of NOTIFY_KINDS) {
+      expect(NOTIFY_KIND_INFO[kind].label.length).toBeGreaterThan(0);
+      expect(NOTIFY_KIND_INFO[kind].hint.length).toBeGreaterThan(0);
+    }
   });
 });

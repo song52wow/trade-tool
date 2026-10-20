@@ -17,13 +17,20 @@
  * `sql/006_risk_bracket.sql`，本模块不另持影子定义。
  */
 
-import { SyncError, type PositionSide } from '@trade-tool/core';
+import {
+  SyncError,
+  type DecisionSource,
+  type LlmDecision,
+  type PositionSide,
+} from '@trade-tool/core';
 
 import { toSyncError } from './errors.js';
 import type { Pool } from './pool.js';
 
 // 方向 / 仓位类型只有 core 那一份定义，这里只转出去（AGENTS.md 约定 5）。
 export type { PositionSide } from '@trade-tool/core';
+// 决策相关类型同样只有 core 那一份（v0.9.0）。
+export type { DecisionSource, LlmDecision } from '@trade-tool/core';
 
 /** 固定表名。绝不把 symbol / state 之类拼进 SQL。 */
 const TABLE = 'risk_bracket';
@@ -33,7 +40,12 @@ const COLUMNS = `exchange, symbol, entry_order_id, entry_price, entry_time, fill
   stop_price, take_profit, tp_algo_id, sl_algo_id, state, last_error, created_at, updated_at,
   tp1_algo_id, tp1_qty, tp1_price, tp1_filled_qty, tp1_filled_at,
   trail_extreme, trail_stop_price, trail_atr, trail_atr_from, trail_atr_to,
-  trail_updated_at, trail_last_error`;
+  trail_updated_at, trail_last_error,
+  decision_source, decision_stop_atr_mult, decision_take_profit_atr_mult,
+  decision_take_profit1_ratio, decision_take_profit1_atr_mult, decision_trail_atr_mult,
+  decision_breakeven_after_tp1, decision_rationale, decision_fallback_reason,
+  decision_raw, decision_at,
+  closed_qty, exit_notional, fee_amount`;
 
 /**
  * 七个状态。**未终结**的四个：`armed` / `partial_armed` / `trailing` / `failed`。
@@ -63,7 +75,12 @@ export interface BracketClaim {
   entryPrice: number;
   entryTime: number;
   filledQty: number;
-  positionSide: PositionSide;
+  /**
+   * 仓位方向。**只有 LONG / SHORT**——表上的 CHECK 也只允许这两个
+   * （`BOTH` 是账户模式，不是仓位方向）。跟着 schema 收窄，
+   * 免得下游拿到一个「永远不可能出现」的方向值还照样算盈亏。
+   */
+  positionSide: 'LONG' | 'SHORT';
   atr: number;
   atrPeriod: number;
   atrInterval: string;
@@ -78,8 +95,58 @@ export interface BracketClaim {
   tp1AlgoId?: number;
   tp1Qty?: number;
   tp1Price?: number;
+  /**
+   * **入场那笔成交的手续费**（计价币）。
+   *
+   * 一轮的手续费是「入场 + 各段平仓」的总和——只扣出场那笔，收益会算虚高。
+   */
+  entryFeeAmount?: number;
+  /**
+   * 决策留痕（v0.9.0）。**整组可不带**——不带时 `decision_source` 落默认值
+   * `'config'`，也就是「按配置挂的」，这与 v0.9.0 之前的行为逐字一致。
+   *
+   * 带了的时候必须给全 `decision`：表上的 CHECK 会挡住 `source='llm'` 却
+   * 缺参数的半截行（那样「模型定的」这句话就是空的，而查档位恰恰靠这些列）。
+   */
+  decision?: BracketDecision;
   /** 下单时刻（epoch ms），落 created_at / updated_at。 */
   now: number;
+}
+
+/**
+ * 一段平仓：成交价、数量、手续费。
+ *
+ * 一轮可能有多段（v0.7.0 的两段模型：先止盈一部分，剩下由移动止损了结），
+ * 因此这些量都是**累加**的，不能用「最后一笔覆盖前一笔」——
+ * 只算最后一段，净盈亏就只算了一半。
+ */
+export interface CloseLeg {
+  /** 成交价（合约价）。 */
+  price: number;
+  /** 成交数量（基础币）。 */
+  qty: number;
+  /** 这一段的手续费（计价币，正数）。 */
+  fee: number;
+}
+
+/**
+ * 一次决策的留痕（v0.9.0）。
+ *
+ * `source` 决定其余字段的语义，三种取值的差别见 `sql/012_llm_decision.sql` 的注释。
+ */
+export interface BracketDecision {
+  /** 这份档位是从哪来的。 */
+  source: DecisionSource;
+  /** 实际生效的六个参数。`source='llm'` 时**必填**。 */
+  decision?: LlmDecision;
+  /** 模型给的理由（人可读）。 */
+  rationale?: string;
+  /** 降级原因。`source='config-fallback'` 时**必填**。 */
+  fallbackReason?: string;
+  /** 模型原始返回的正文，原样存。 */
+  raw?: string;
+  /** 决策时刻（epoch ms）。 */
+  at: number;
 }
 
 /** 库里的一行。与 `BracketClaim` 分开：`now` 是入参，库里存的是两个时间戳。 */
@@ -90,7 +157,12 @@ export interface BracketRecord {
   entryPrice: number;
   entryTime: number;
   filledQty: number;
-  positionSide: PositionSide;
+  /**
+   * 仓位方向。**只有 LONG / SHORT**——表上的 CHECK 也只允许这两个
+   * （`BOTH` 是账户模式，不是仓位方向）。跟着 schema 收窄，
+   * 免得下游拿到一个「永远不可能出现」的方向值还照样算盈亏。
+   */
+  positionSide: 'LONG' | 'SHORT';
   atr: number;
   atrPeriod: number;
   atrInterval: string;
@@ -118,6 +190,31 @@ export interface BracketRecord {
   trailUpdatedAt: number | null;
   /** 本轮没有移动（或移动失败）的原因。常驻可见，不静默跳过。 */
   trailLastError: string | null;
+  // ---- v0.8.0：盈亏的**事实**（累计）。盈亏金额本身不存，由 core 的 realizedPnl() 现算。
+  /** 累计平仓量。 */
+  closedQty: number;
+  /** 累计平仓成交额（计价币）。 */
+  exitNotional: number;
+  /** 累计手续费（计价币）：入场 + 各段平仓。 */
+  feeAmount: number;
+  // ---- v0.9.0：决策留痕。回答「这次挂单用的档位是模型定的还是人配的」。
+  /** 决策来源。`'llm'` = 模型定的，`'config'` = 按配置，`'config-fallback'` = 降级兜底。 */
+  decisionSource: DecisionSource;
+  /** 实际生效的倍数。`decisionSource='llm'` 时必有值。 */
+  decisionStopAtrMult: number | null;
+  decisionTakeProfitAtrMult: number | null;
+  decisionTakeProfit1Ratio: number | null;
+  decisionTakeProfit1AtrMult: number | null;
+  decisionTrailAtrMult: number | null;
+  decisionBreakevenAfterTp1: boolean | null;
+  /** 模型给的理由（人可读）。 */
+  decisionRationale: string | null;
+  /** 降级原因。`decisionSource='config-fallback'` 时必有值。 */
+  decisionFallbackReason: string | null;
+  /** 模型原始返回的正文，原样存。 */
+  decisionRaw: string | null;
+  /** 决策时刻（epoch ms）。 */
+  decisionAt: number | null;
   createdAt: number;
   updatedAt: number;
 }
@@ -163,6 +260,17 @@ function optionalStr(row: Record<string, unknown>, field: string, where: string)
   return str(row, field, where);
 }
 
+/** 可空的布尔。NULL 语义是「没这项信息」，不是 `false`。 */
+function optionalBool(row: Record<string, unknown>, field: string, where: string): boolean | null {
+  const value = row[field];
+  if (value === null || value === undefined) return null;
+  if (typeof value === 'boolean') return value;
+  throw new SyncError('NULL_NOT_ALLOWED', `${where} 的 ${field} 不是布尔值`, {
+    field,
+    value,
+  });
+}
+
 function toRecord(row: Record<string, unknown>): BracketRecord {
   const where = `${String(row['exchange'])}/${String(row['symbol'])}/${String(row['entry_order_id'])}`;
   return {
@@ -172,7 +280,7 @@ function toRecord(row: Record<string, unknown>): BracketRecord {
     entryPrice: num(row, 'entry_price', where),
     entryTime: bigint(row, 'entry_time', where),
     filledQty: num(row, 'filled_qty', where),
-    positionSide: str(row, 'position_side', where) as PositionSide,
+    positionSide: str(row, 'position_side', where) as 'LONG' | 'SHORT',
     atr: num(row, 'atr', where),
     atrPeriod: num(row, 'atr_period', where),
     atrInterval: str(row, 'atr_interval', where),
@@ -196,6 +304,20 @@ function toRecord(row: Record<string, unknown>): BracketRecord {
     trailAtrTo: optionalBigint(row, 'trail_atr_to', where),
     trailUpdatedAt: optionalBigint(row, 'trail_updated_at', where),
     trailLastError: optionalStr(row, 'trail_last_error', where),
+    closedQty: num(row, 'closed_qty', where),
+    exitNotional: num(row, 'exit_notional', where),
+    feeAmount: num(row, 'fee_amount', where),
+    decisionSource: str(row, 'decision_source', where) as DecisionSource,
+    decisionStopAtrMult: optionalNum(row, 'decision_stop_atr_mult', where),
+    decisionTakeProfitAtrMult: optionalNum(row, 'decision_take_profit_atr_mult', where),
+    decisionTakeProfit1Ratio: optionalNum(row, 'decision_take_profit1_ratio', where),
+    decisionTakeProfit1AtrMult: optionalNum(row, 'decision_take_profit1_atr_mult', where),
+    decisionTrailAtrMult: optionalNum(row, 'decision_trail_atr_mult', where),
+    decisionBreakevenAfterTp1: optionalBool(row, 'decision_breakeven_after_tp1', where),
+    decisionRationale: optionalStr(row, 'decision_rationale', where),
+    decisionFallbackReason: optionalStr(row, 'decision_fallback_reason', where),
+    decisionRaw: optionalStr(row, 'decision_raw', where),
+    decisionAt: optionalBigint(row, 'decision_at', where),
     createdAt: bigint(row, 'created_at', where),
     updatedAt: bigint(row, 'updated_at', where),
   };
@@ -207,6 +329,9 @@ function toRecord(row: Record<string, unknown>): BracketRecord {
  * 抛错而不是静默跳过：DB_UNIQUE_VIOLATION 之类的问题必须暴露（AGENTS.md 约定 9）。
  */
 export async function claimBracket(pool: Pool, claim: BracketClaim): Promise<BracketRecord | null> {
+  // 决策留痕（v0.9.0）。不带 `decision` 时落默认的 'config'——也就是
+  // 「按配置挂的」，与 v0.9.0 之前逐字一致。
+  const decision = claim.decision;
   const values = [
     claim.exchange,
     claim.symbol,
@@ -225,6 +350,18 @@ export async function claimBracket(pool: Pool, claim: BracketClaim): Promise<Bra
     claim.tp1AlgoId ?? null,
     claim.tp1Qty ?? null,
     claim.tp1Price ?? null,
+    claim.entryFeeAmount ?? 0,
+    decision?.source ?? 'config',
+    decision?.decision?.stopAtrMult ?? null,
+    decision?.decision?.takeProfitAtrMult ?? null,
+    decision?.decision?.takeProfit1Ratio ?? null,
+    decision?.decision?.takeProfit1AtrMult ?? null,
+    decision?.decision?.trailAtrMult ?? null,
+    decision?.decision?.breakevenAfterTp1 ?? null,
+    decision?.rationale ?? null,
+    decision?.fallbackReason ?? null,
+    decision?.raw ?? null,
+    decision?.at ?? null,
     claim.now,
     claim.now,
   ];
@@ -232,8 +369,13 @@ export async function claimBracket(pool: Pool, claim: BracketClaim): Promise<Bra
     const result = await pool.query<Record<string, unknown>>(
       `INSERT INTO ${TABLE} (exchange, symbol, entry_order_id, entry_price, entry_time, filled_qty,
          position_side, atr, atr_period, atr_interval, atr_window_from, atr_window_to,
-         stop_price, take_profit, tp1_algo_id, tp1_qty, tp1_price, state, created_at, updated_at)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, 'failed', $18, $19)
+         stop_price, take_profit, tp1_algo_id, tp1_qty, tp1_price, fee_amount, state,
+         decision_source, decision_stop_atr_mult, decision_take_profit_atr_mult,
+         decision_take_profit1_ratio, decision_take_profit1_atr_mult, decision_trail_atr_mult,
+         decision_breakeven_after_tp1, decision_rationale, decision_fallback_reason,
+         decision_raw, decision_at, created_at, updated_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, 'failed',
+               $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31)
        ON CONFLICT (exchange, symbol, entry_order_id) DO NOTHING
        RETURNING ${COLUMNS}`,
       values,
@@ -323,6 +465,13 @@ export async function markBracketTrailing(
     slAlgoId?: number;
   },
   now: number,
+  /**
+   * 第一段止盈成交的事实（成交价 / 数量 / 手续费）。
+   *
+   * 两段模型下，一轮会平两段：**这一段 + 移动止损了结的那一段**。
+   * 不把这一段累加进去，最后算出来的净盈亏就只算了一半——比不报还危险。
+   */
+  leg?: CloseLeg,
 ): Promise<number> {
   try {
     const result = await pool.query(
@@ -330,6 +479,9 @@ export async function markBracketTrailing(
          trail_extreme = $4, trail_stop_price = $5, trail_atr = $6,
          trail_atr_from = $7, trail_atr_to = $8, trail_updated_at = $9,
          sl_algo_id = COALESCE($10, sl_algo_id),
+         closed_qty = closed_qty + $11,
+         exit_notional = exit_notional + $12,
+         fee_amount = fee_amount + $13,
          last_error = NULL, trail_last_error = NULL, updated_at = $9
        WHERE exchange = $1 AND symbol = $2 AND entry_order_id = $3
          AND state = 'partial_armed'`,
@@ -344,6 +496,9 @@ export async function markBracketTrailing(
         trail.atrTo,
         now,
         trail.slAlgoId ?? null,
+        leg?.qty ?? 0,
+        leg === undefined ? 0 : leg.price * leg.qty,
+        leg?.fee ?? 0,
       ],
     );
     return result.rowCount ?? 0;
@@ -480,18 +635,43 @@ export async function markBracketFailed(
  * 「别人已经收敛过了」。`ACCOUNT_UPDATE` 的归零收敛与止盈止损成算是两条并发路径，
  * 两者都会查同一批未终结记录；不返回 rowCount 的话两条路径都会打出
  * 「1 条置为 cancelled」，而实际只更新了一次——日志会骗人。
+ *
+ * ⚠️ **`WHERE` 带上「只结算未终结的行」这道闸**：用户数据流会重放事件（续期、重连），
+ * 而平仓的量与成交额是**累加**的——重放一次就多算一次，净盈亏直接错一半。
+ * 已经终结的行不再被更新，返回的 rowCount 也就是 0，调用方据此不重复通知。
  */
 export async function markBracketSettled(
   pool: Pool,
   key: { exchange: string; symbol: string; entryOrderId: string },
   state: Extract<BracketState, 'take_profit' | 'stop_loss' | 'cancelled'>,
   now: number,
+  /**
+   * 这一段平仓的事实（成交价 / 数量 / 手续费）。
+   *
+   * **没有它就没有实际盈亏**：实际盈亏 = 累计成交额 − 入场成本 − 累计手续费，
+   * 三个数都得从平仓的事实里来。工具外平仓（`cancelled`）没有我们的成交，
+   * 传 `undefined` 即可——那笔盈亏**算不出来**，如实不算，不拿 0 冒充。
+   */
+  leg?: CloseLeg,
 ): Promise<number> {
   try {
     const result = await pool.query(
-      `UPDATE ${TABLE} SET state = $4, updated_at = $5
-       WHERE exchange = $1 AND symbol = $2 AND entry_order_id = $3`,
-      [key.exchange, key.symbol, key.entryOrderId, state, now],
+      `UPDATE ${TABLE} SET state = $4, updated_at = $5,
+         closed_qty = closed_qty + $6,
+         exit_notional = exit_notional + $7,
+         fee_amount = fee_amount + $8
+       WHERE exchange = $1 AND symbol = $2 AND entry_order_id = $3
+         AND state IN ('armed', 'partial_armed', 'trailing', 'failed')`,
+      [
+        key.exchange,
+        key.symbol,
+        key.entryOrderId,
+        state,
+        now,
+        leg?.qty ?? 0,
+        leg === undefined ? 0 : leg.price * leg.qty,
+        leg?.fee ?? 0,
+      ],
     );
     return result.rowCount ?? 0;
   } catch (caught) {

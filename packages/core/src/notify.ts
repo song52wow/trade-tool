@@ -23,6 +23,43 @@
 import { createHmac } from 'node:crypto';
 
 import { SyncError, type SyncErrorCode } from './market-sync.js';
+import { RECONCILE_KIND_INFO, RECONCILE_KINDS } from './reconcile.js';
+
+/**
+ * **要通知哪些内容**的完整清单。
+ *
+ * 两类来源合成一份：
+ *   * 交易对账的差异类型（`RECONCILE_KINDS`，8 种）——「哪种异常要我知道了」；
+ *   * 交易生命周期事件（2 种）——「止盈止损挂上了」「这一轮走完了」。
+ *
+ * 合成一份而不是两套机制：用户在一个列表里勾，页面也只有一份清单可显示。
+ * 清单与文案都由服务端下发（`NOTIFY_KIND_INFO`），页面不自己抄一份——抄了就会漂。
+ */
+export const NOTIFY_KINDS = [
+  ...RECONCILE_KINDS,
+  'bracket-armed',
+  'bracket-settled',
+  'llm-fallback',
+] as const;
+
+export type NotifyKind = (typeof NOTIFY_KINDS)[number];
+
+/** 每个内容类型的**中文名与一句话说明**（页面的勾选项文案）。 */
+export const NOTIFY_KIND_INFO: Record<NotifyKind, { label: string; hint: string }> = {
+  ...RECONCILE_KIND_INFO,
+  'bracket-armed': {
+    label: '止盈止损挂单成功',
+    hint: '成交后两张条件单都挂上了，附预估收益与预估亏损（计价币）',
+  },
+  'bracket-settled': {
+    label: '一轮买卖完成',
+    hint: '这一轮平掉了，附实际盈亏（已扣手续费，计价币）',
+  },
+  'llm-fallback': {
+    label: 'LLM 决策降级',
+    hint: '模型这一轮没给出可用档位，本次按 risk_policy 的配置挂单（仓位仍受保护）',
+  },
+};
 
 /** 通知的严重度。顺序即优先级：`critical` 最要紧。 */
 export type NotifySeverity = 'critical' | 'warning' | 'info';
@@ -375,6 +412,14 @@ export interface AlertItem {
   lines?: readonly string[];
   /** 问题消失时推送的标题（缺省用「已恢复：<原标题>」）。 */
   resolvedTitle?: string;
+  /**
+   * **事件型**告警：推过就算，不参与「已恢复」判定。
+   *
+   * 「止盈止损挂上了」「这一轮走完了」都是**一次性事件**，不是持续状态——
+   * 下一轮它们不在了，不等于「问题消失了」，因此不能推「已恢复」。
+   * 状态型告警（对账差异）不设这个字段。
+   */
+  oneShot?: boolean;
 }
 
 /** 一轮派发的结果。调用方据此打日志，让「推了什么 / 压了什么」可见。 */
@@ -542,6 +587,8 @@ export class AlertDispatcher {
     for (const [fingerprint, previous] of [...this.sent.entries()]) {
       if (seen.has(fingerprint)) continue;
       this.sent.delete(fingerprint);
+      // 事件型告警推过即忘：它不在了**不代表**问题恢复了（下一轮本来就没有它）。
+      if (previous.item.oneShot === true) continue;
       const title = previous.item.resolvedTitle ?? `已恢复：${previous.item.title}`;
       try {
         await notifier.notify({ title, severity: 'info' });

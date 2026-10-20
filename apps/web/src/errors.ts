@@ -41,6 +41,13 @@ const STATUS_BY_CODE = {
   // 「持仓期极值取不到」：与 ATR 不可用同属 409，但处置不同——
   // 它只让本轮**不移动止损**，仓位仍受旧档保护（v0.7.0 R-6.5）。
   RISK_TRAIL_EXTREME_UNAVAILABLE: 409,
+  // LLM 决策（v0.9.0）——都是**服务端**的问题，不是用户请求写错了：
+  //   * LLM_DECISION_INVALID 模型这一轮说了句不合法的话（越界 / 不是 JSON）；
+  //   * LLM_CALL_FAILED          调用模型本身失败（超时 / 网络 / 服务端错误）。
+  // 两者都 502：上游（模型服务）有问题，而 executor 会降级到配置档位继续挂单，
+  // 仓位始终受保护。绝不能降级成 200——那会让调用方以为「决策成功了」。
+  LLM_DECISION_INVALID: 502,
+  LLM_CALL_FAILED: 502,
   // 数据库
   DB_CONNECTION_FAILED: 503,
   DB_DEADLOCK: 503,

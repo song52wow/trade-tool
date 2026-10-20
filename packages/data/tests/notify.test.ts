@@ -10,7 +10,7 @@
  * 跑在随机命名的独立 schema 上（helpers/pg.ts），**绝不连生产库**。
  */
 
-import { RECONCILE_KINDS, SyncError, type NotifyConfig } from '@trade-tool/core';
+import { NOTIFY_KINDS, SyncError, type NotifyConfig } from '@trade-tool/core';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import {
@@ -29,7 +29,7 @@ const OTHER_KEY = Buffer.from('d'.repeat(64), 'hex');
 const WEBHOOK = 'https://open.feishu.cn/open-apis/bot/v2/hook/abcdef123456';
 const ENV_WEBHOOK = 'https://open.feishu.cn/open-apis/bot/v2/hook/envtoken9999';
 
-const ALL_KINDS = [...RECONCILE_KINDS];
+const ALL_KINDS = [...NOTIFY_KINDS];
 
 const CONFIG_OFF: NotifyConfig = {
   enabled: false,

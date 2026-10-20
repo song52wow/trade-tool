@@ -227,12 +227,18 @@ describe('parseOrderTradeUpdate', () => {
       z: '0.1',
       T: 1_700_000_000_002,
       ps: 'BOTH',
+      // 手续费是必返字段（官方 ORDER_TRADE_UPDATE 的 n / N）。
+      n: '0.04',
+      N: 'USDT',
     },
   };
 
   it('解析出完整成交', () => {
     const update = parseOrderTradeUpdate(payload);
     expect(update).toMatchObject({
+      // 手续费要能被算进实际盈亏：单位与计价币一致（USDT）
+      commission: 0.04,
+      commissionAsset: 'USDT',
       symbol: 'SYM',
       orderId: 42,
       side: 'BUY',

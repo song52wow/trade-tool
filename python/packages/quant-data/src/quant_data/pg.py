@@ -63,6 +63,13 @@ KNOWN_MIGRATION_VERSIONS: frozenset[str] = frozenset(
         # Python 侧不读写这张表，但版本闸门两个方向都要校，漏登记会让
         # **所有**碰 PG 的用例报「库比代码新」。
         "011_notify_settings",
+        # v0.8.0：盈亏的事实列（risk_bracket 增三列）。
+        # 同样不读写，但版本闸门两个方向都要校。
+        "012_trade_pnl",
+        # v0.9.0：LLM 决策的留痕（risk_bracket 增列 + decision_source）。
+        # Python 侧不读写 risk_bracket，但版本闸门两个方向都要校，漏登记会让
+        # **所有**碰 PG 的用例报「库比代码新」。
+        "013_llm_decision",
     }
 )
 

@@ -1,7 +1,7 @@
 import { z } from 'zod';
 
 import { EXCHANGE_ENVIRONMENTS } from './exchange-endpoints.js';
-import { RECONCILE_KINDS } from './reconcile.js';
+import { NOTIFY_KINDS } from './notify.js';
 import { INTERVALS } from './types.js';
 
 export const marketSchema = z.object({
@@ -228,6 +228,73 @@ export const syncSchema = z.object({
 });
 
 /**
+ * LLM 参与止盈止损决策的配置（v0.9.0）。
+ *
+ * ## 为什么整段默认关闭
+ *
+ * 开启它意味着**每一笔买入成交**都会先问一次模型，而模型的输出会变成真实的
+ * 平仓指令（止损价、止盈价）。这是一个「不确定的输入 → 不可逆的动作」的通道，
+ * 默认打开等于默认接受这个风险。
+ *
+ * 关闭时（缺省）行为与 v0.9.0 之前**逐字一致**：档位来自 `risk_policy` 表或配置文件。
+ *
+ * ## 降级是默认行为，不是例外
+ *
+ * `fallbackToPolicy = true`（缺省）时，模型超时 / 报错 / 输出越界都**降级**到
+ * `risk_policy` 的档位，而不是拒绝下单。
+ *
+ * 为什么不拒绝：仓位已经成交了，此时不挂止损单就是**裸仓**——价格反向运行时
+ * 没有任何保护。「模型没说好」比「按配置挂上」危险得多。
+ *
+ * 但降级**必须可见**：`risk_bracket` 会记下 `decision_source='config-fallback'`
+ * 与降级原因，对账与飞书告警都能查到。约定 9 忌讳的是「静默兜底」——
+ * 兜底本身不犯规，**不留痕迹**才犯规。
+ */
+export const llmSchema = z
+  .object({
+    /** 是否让模型参与决策。缺省 false。 */
+    enabled: z.boolean().default(false),
+    /**
+     * API 基址。OpenAI 兼容协议，如 `https://api.openai.com/v1`。
+     *
+     * **不给默认值**：各家地址不同，给了默认值就等于「忘了配也能跑」，
+     * 而它会真的去某个地方发请求。开启时缺它必须报错（见 `llmSchema` 的 refine）。
+     */
+    baseUrl: z.string().default(''),
+    /** 模型名。同样不给默认值。 */
+    model: z.string().default(''),
+    /** API 密钥所在的**环境变量名**。配置文件里不写密钥本身（约定 2）。 */
+    apiKeyEnv: z.string().min(1).default('TRADE_TOOL_LLM_API_KEY'),
+    /**
+     * 单次调用的硬超时（毫秒）。
+     *
+     * 缺省 8000。**这个值是裸仓窗口的上限**——从成交到挂出止损单之间，
+     * 模型最多占用这么久。上限之内模型没给出结果就降级。
+     */
+    timeoutMs: z.number().int().positive().max(60_000).default(8_000),
+    /**
+     * 模型失败时降级到 `risk_policy` 的档位（而不是拒绝下单）。
+     *
+     * 缺省 true。关掉它意味着模型失败 → 这笔成交不挂任何单 → 裸仓，
+     * 除非你确信模型不可用时**宁可裸仓也不要按旧档位挂**（极少见，但存在这种用法）。
+     */
+    fallbackToPolicy: z.boolean().default(true),
+    /**
+     * 喂给模型的近期 K 线根数（用于算收益率序列）。
+     *
+     * 缺省 20：约等于给模型看一眼最近半小时的走势。太少则看不出趋势，
+     * 太多则白白增加 token 与延迟。
+     */
+    contextBars: z.number().int().min(0).max(200).default(20),
+  })
+  .refine((cfg) => !cfg.enabled || (cfg.baseUrl.trim() !== '' && cfg.model.trim() !== ''), {
+    message:
+      'executor.llm.enabled 为 true 时必须同时给出 executor.llm.baseUrl 与 executor.llm.model：' +
+      '它们决定请求发到哪里、用哪个模型。缺任一项都不许静默用默认值',
+    path: ['enabled'],
+  });
+
+/**
  * 止盈止损执行服务配置（v0.4.0 `executor` 段）。
  *
  * 每一项都会变成**真实的平仓指令**，因此默认值取保守的一侧：
@@ -338,6 +405,16 @@ export const executorSchema = z.object({
    * 跑在虚拟资金上，不是把生产环境改成安全的。
    */
   environment: z.enum(EXCHANGE_ENVIRONMENTS).default('live'),
+  /**
+   * LLM 参与止盈止损决策（v0.9.0）。
+   *
+   * **默认关闭**。理由与 `executor.enabled` 同一类：开启它意味着每一笔买入成交
+   * 都会先问一次模型，而模型的输出会变成真实的平仓指令。
+   *
+   * 关闭时的行为与 v0.9.0 之前**逐字一致**：档位全部来自 `risk_policy` 表或配置文件，
+   * 决策来源记为 `'policy'`。
+   */
+  llm: llmSchema.default({}),
 });
 
 /**
@@ -360,15 +437,16 @@ export const notifySchema = z.object({
   /**
    * **要通知哪些内容**（v0.8.0）。
    *
-   * 取值是交易对账的**差异类型**（`RECONCILE_KINDS`），也就是「哪种事发生时才
-   * 叫我」。缺省 = 全部都要。
+   * 取值是**通知内容类型**（`NOTIFY_KINDS`），也就是「哪种事发生时才叫我」——
+   * 交易对账的差异类型（8 种）加上交易生命周期事件（止盈止损挂上、一轮走完）。
+   * 缺省 = 全部都要。
    *
    * 为什么不用「最低严重度」一刀切：严重度对同一个类型是固定的，粗暴的阈值等于
    * 「全都要」或「只要三个紧急的」，用户真正想做的是「我只想知道哪几种事」——
    * 比如「止盈单没了」这种噪音就别烦我了，但「仓位没有止损保护」一定要说。
    * 逐项勾选能表达，而阈值表达不了。
    */
-  kinds: z.array(z.enum(RECONCILE_KINDS)).default([...RECONCILE_KINDS]),
+  kinds: z.array(z.enum(NOTIFY_KINDS)).default([...NOTIFY_KINDS]),
   /**
    * 同一条告警的重复推送冷却时间（毫秒）。
    *
@@ -400,6 +478,7 @@ export type DataConfig = z.infer<typeof dataSchema>;
 export type DatabaseConfig = z.infer<typeof databaseSchema>;
 export type SyncConfig = z.infer<typeof syncSchema>;
 export type ExecutorConfig = z.infer<typeof executorSchema>;
+export type LlmConfig = z.infer<typeof llmSchema>;
 export type NotifyConfig = z.infer<typeof notifySchema>;
 // 注意：`RemovePolicy` 这个类型名归 market-sync.ts 所有，config 只导出 zod schema，
 // 避免同一概念在两个模块各有一个类型名。

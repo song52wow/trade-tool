@@ -34,9 +34,15 @@
  */
 
 import {
+  QUOTE_ASSET,
   SyncError,
   NetPositionTracker,
   bracketClientOrderId,
+  estimateBracketPnl,
+  realizedPnl,
+  type AlertChannel,
+  type AlertDispatcher,
+  type AlertItem,
   type FillApplication,
   classifyFill,
   createLogger,
@@ -71,6 +77,7 @@ import {
 } from '@trade-tool/data';
 
 import type { AtrProvider, AtrSnapshot } from './atr.js';
+import { applyDecision, type DecideOutput, type RiskDecider } from './decision.js';
 
 const log = createLogger('executor');
 
@@ -165,6 +172,27 @@ export interface ExecutorServiceDeps {
    * 那会平掉真实仓位，不可逆。
    */
   resolvePolicy?: (symbol: string) => Promise<RiskPolicy & { source: string }>;
+  /**
+   * LLM 决策器（v0.9.0）。
+   *
+   * **不传就不参与决策**：档位全部来自 `resolvePolicy`，行为与 v0.9.0 之前逐字一致。
+   * 传了就由它决定这一笔成交用哪套档位，模型失败时按 `llm.fallbackToPolicy` 降级。
+   */
+  decider?: RiskDecider;
+  /**
+   * 读最近若干根 K 线的收益率（给模型看走势）。
+   *
+   * 与 `decider` 配套：没有它就没有喂给模型的近期行情。
+   * 缺了不报错——决策器会把 `recentReturns` 留空，模型少一个参考维度而已。
+   */
+  readRecentReturns?: (symbol: string, limit: number) => Promise<readonly number[]>;
+  /**
+   * 告警派发器（v0.8.0）。**可选**：不传就只记日志。
+   *
+   * 与周期对账共用**同一个实例**——去重与冷却的记账因此是同一份，
+   * 不会出现「同一件事，对账那边压住了、这边又推一遍」。
+   */
+  alerts?: AlertDispatcher;
 }
 
 /** 从库里解析出来的一份策略参数。字段名与 `deriveStagedPlan` 入参一一对应。 */
@@ -228,6 +256,11 @@ function reasonOf(error: unknown): string {
   return String(error);
 }
 
+/** 金额一律用计价币（USDT）呈现，四舍五入到两位。 */
+function money(amount: number): string {
+  return `${amount.toFixed(2)} ${QUOTE_ASSET}`;
+}
+
 export function createExecutorService(deps: ExecutorServiceDeps): ExecutorService {
   const { pool, config, placer, atr } = deps;
   const settings: ExecutorConfig = config.executor;
@@ -288,8 +321,15 @@ export function createExecutorService(deps: ExecutorServiceDeps): ExecutorServic
 
     const state: BracketState = tag === TP_TAG ? 'take_profit' : 'stop_loss';
     try {
-      await markBracketSettled(pool, key, state, now());
+      const settled = await markBracketSettled(pool, key, state, now(), {
+        price: update.lastFilledPrice,
+        qty: update.lastFilledQty,
+        fee: update.commission,
+      });
       log.info(`${update.symbol} 止盈止损成交（${tag}），记录置为 ${state}`);
+      // 只有**真的**结算了那一行才通知：事件重放时行早已终结（settled = 0），
+      // 再推一次就会把同一轮的战报发两遍。
+      if (settled > 0) await notifySettled(update, record, state);
       return 'settled';
     } catch (error) {
       // 状态回填失败**不能**反过来影响交易结果：单已经成交了，
@@ -297,6 +337,45 @@ export function createExecutorService(deps: ExecutorServiceDeps): ExecutorServic
       log.error(`${update.symbol} 条件单成交但状态回填失败：${reasonOf(error)}`);
       return 'settled';
     }
+  }
+
+  /**
+   * 一轮走完 → 通知（附**实际盈亏**，已扣手续费，计价币）。
+   *
+   * 盈亏由 `core` 的 `realizedPnl()` 算，公式只有一份；库里存的是**事实**
+   * （累计平了多少、累计成交额、累计手续费），不是算好的金额。
+   *
+   * 「工具外平仓」（`cancelled`）**不通知**：那笔平仓没有我们的成交价，
+   * 算不出盈亏——如实不算，比报一个假数字强。
+   */
+  async function notifySettled(
+    update: OrderTradeUpdate,
+    record: BracketRecord,
+    state: 'take_profit' | 'stop_loss',
+  ): Promise<void> {
+    const after = await readBracket(pool, exchange, record.symbol, record.entryOrderId);
+    if (after === null) return;
+    const pnl = realizedPnl({
+      positionSide: after.positionSide,
+      entryPrice: after.entryPrice,
+      closedQty: after.closedQty,
+      exitNotional: after.exitNotional,
+      feeAmount: after.feeAmount,
+    });
+    await pushAlert('bracket-settled', () => ({
+      fingerprint: `settled|${after.symbol}|${after.entryOrderId}`,
+      // 亏了比赚了更值得看一眼——用「注意」而不是「提示」。
+      severity: pnl.net >= 0 ? 'info' : 'warning',
+      oneShot: true,
+      title: `${after.symbol} 一轮完成（${state === 'take_profit' ? '止盈成交' : '止损成交'}）`,
+      lines: [
+        `入场 ${after.entryPrice} → 出场 ${update.lastFilledPrice}`,
+        `已平 ${after.closedQty}（均价 ${(after.exitNotional / after.closedQty).toFixed(2)}）`,
+        `毛利 ${money(pnl.gross)}`,
+        `手续费 ${money(pnl.fee)}`,
+        `净盈亏 ${money(pnl.net)}`,
+      ],
+    }));
   }
 
   /**
@@ -337,6 +416,13 @@ export function createExecutorService(deps: ExecutorServiceDeps): ExecutorServic
           atrTo: snapshot.extreme.to,
         },
         now(),
+        // 第一段成交的事实：两段模型下这一轮会平两段，不累加它，
+        // 最后算出来的净盈亏就只算了一半。
+        {
+          price: update.lastFilledPrice,
+          qty: update.lastFilledQty,
+          fee: update.commission,
+        },
       );
       if (moved === 0) {
         log.info(`${record.symbol} 第一段止盈已在处理中（记录已被推进过），不重复执行`);
@@ -435,6 +521,31 @@ export function createExecutorService(deps: ExecutorServiceDeps): ExecutorServic
       signedFillDelta(update.side, update.lastFilledQty),
       update.tradeTime,
     );
+  }
+
+  /**
+   * 推一条告警。
+   *
+   * **绝不抛错**：通知是辅助出口，它挂了不许影响下单与记账（AGENTS.md 约定 9）。
+   * 失败只记日志——但要**看得见**，不静默吞掉。
+   *
+   * 「推不推」由**当前生效的设置**决定（`channel.kinds`）：用户没勾的内容类型
+   * 一律不推，过滤与周期对账走的是同一套机制。
+   */
+  async function pushAlert(
+    topic: 'bracket-armed' | 'bracket-settled' | 'llm-fallback',
+    build: () => AlertItem,
+  ): Promise<void> {
+    const alerts = deps.alerts;
+    if (alerts === undefined) return;
+    try {
+      await alerts.dispatch((channel: AlertChannel) => {
+        if (!channel.kinds.includes(topic)) return [];
+        return [build()];
+      });
+    } catch (error) {
+      log.error(`告警推送失败（不影响下单）：${reasonOf(error)}`);
+    }
   }
 
   /**
@@ -558,7 +669,133 @@ export function createExecutorService(deps: ExecutorServiceDeps): ExecutorServic
       );
     }
     log.info(`${update.symbol} 止盈止损已挂上：${describeStaged(plan)}`);
+
+    // 通知：挂上了。附**预估**收益与预估亏损（计价币）。
+    //
+    // 预估口径随形态而变：`single` / `full` 是整段打到止盈；`partial` 只有第一段
+    // 有确定的价格，剩余仓位由移动止损了结——那一段的价格会随行情上移，因此
+    // 这里只报「第一段的收益」与「整段打到当前止损的亏损」。
+    const takeProfitPrice = plan.mode === 'single' ? plan.takeProfitPrice : plan.tp1Price;
+    const takeProfitQty = plan.mode === 'partial' ? (plan.tp1Qty ?? 0) : update.cumulativeQty;
+    const estimate = estimateBracketPnl({
+      positionSide: plan.positionSide,
+      entryPrice: update.averagePrice,
+      quantity: takeProfitQty,
+      takeProfitPrice,
+      stopPrice: plan.stopPrice,
+    });
+    const stopEstimate = estimateBracketPnl({
+      positionSide: plan.positionSide,
+      entryPrice: update.averagePrice,
+      quantity: update.cumulativeQty,
+      takeProfitPrice,
+      stopPrice: plan.stopPrice,
+    });
+    await pushAlert('bracket-armed', () => ({
+      fingerprint: `armed|${update.symbol}|${entryOrderId}`,
+      severity: 'info',
+      // 一次性事件：下一轮它不在了，**不代表**「问题恢复了」，因此不参与恢复判定。
+      oneShot: true,
+      title: `${update.symbol} 止盈止损已挂上`,
+      lines: [
+        `入场 ${update.averagePrice} × ${update.cumulativeQty}（${
+          plan.positionSide === 'LONG' ? '多头' : '空头'
+        }）`,
+        `止损 ${plan.stopPrice} ｜ 止盈 ${takeProfitPrice}`,
+        `预估收益 +${money(estimate.expectedProfit)}`,
+        `预估亏损 -${money(stopEstimate.expectedLoss)}`,
+        ...(plan.mode === 'partial' ? ['剩余仓位由移动止损了结，止损位只上移不放宽'] : []),
+      ],
+    }));
+
     return 'armed';
+  }
+
+  /**
+   * LLM 决策（v0.9.0）。返回 `null` 表示「按用户要求，不挂单」。
+   *
+   * 三条路径：
+   *   * 没配 `decider` → 返回 `source='config'` 的结果，**不做任何 IO**，
+   *     行为与 v0.9.0 之前逐字一致。
+   *   * 模型给出可用档位 → `source='llm'`。
+   *   * 模型失败 / 越界 / 自相矛盾 → `source='config-fallback'` + 原因。
+   *     降级时**同时**告警，让「模型连续不生效」这件事不必翻日志才能发现。
+   */
+  async function decideForBracket(
+    update: OrderTradeUpdate,
+    policy: RiskPolicy,
+    snapshot: AtrSnapshot,
+  ): Promise<DecideOutput> {
+    if (deps.decider === undefined) {
+      return {
+        decision: {
+          stopAtrMult: policy.stopAtrMult,
+          takeProfitAtrMult: policy.takeProfitAtrMult,
+          takeProfit1Ratio: policy.takeProfit1Ratio,
+          takeProfit1AtrMult: policy.takeProfit1AtrMult,
+          trailAtrMult: policy.trailAtrMult,
+          breakevenAfterTp1: policy.breakevenAfterTp1,
+        },
+        source: 'config',
+        refuse: false,
+      };
+    }
+
+    // 近期收益率：喂给模型看走势。读不到**不影响**决策——
+    // 它只是一个参考维度，不是必需输入（AGENTS.md 约定 8 的边界：
+    // 缺的是「必需输入」，不是「锦上添花的上下文」）。
+    //
+    // LLM 没开时**不去读**：那是一次白费的数据库查询，而没有模型要喂。
+    let recentReturns: readonly number[] = [];
+    if (deps.readRecentReturns !== undefined && settings.llm.enabled) {
+      try {
+        recentReturns = await deps.readRecentReturns(update.symbol, settings.llm.contextBars);
+      } catch (error) {
+        log.warn(`${update.symbol} 读近期 K 线失败，模型少一个参考维度：${reasonOf(error)}`);
+        recentReturns = [];
+      }
+    }
+
+    const outcome = await deps.decider.decide({
+      symbol: update.symbol,
+      side: update.side,
+      entryPrice: update.averagePrice,
+      atr: snapshot.atr,
+      atrPeriod: snapshot.period,
+      atrInterval: snapshot.interval,
+      baseline: {
+        stopAtrMult: policy.stopAtrMult,
+        takeProfitAtrMult: policy.takeProfitAtrMult,
+        takeProfit1Ratio: policy.takeProfit1Ratio,
+        takeProfit1AtrMult: policy.takeProfit1AtrMult,
+        trailAtrMult: policy.trailAtrMult,
+        breakevenAfterTp1: policy.breakevenAfterTp1,
+      },
+      recentReturns,
+    });
+
+    // 降级必须可见：除了落库（`decision_fallback_reason`），还要能被告警看到。
+    if (outcome.source === 'config-fallback') {
+      // 两种降级的**后果完全不同**，告警文案必须说清是哪一种：
+      //   * 兜底挂单 → 仓位仍受保护（降级成功）；
+      //   * 拒绝挂单 → **仓位是裸的**（`fallbackToPolicy=false`）。
+      // 混成一句话就等于没告警——读到「仓位仍受保护」的人不会去查仓位。
+      await pushAlert('llm-fallback', () => ({
+        fingerprint: `llm-fallback|${update.symbol}`,
+        severity: outcome.refuse ? 'critical' : 'warning',
+        title: outcome.refuse
+          ? `${update.symbol} LLM 决策失败且不降级：本次没有挂任何保护单`
+          : `${update.symbol} LLM 决策降级到配置档位`,
+        lines: [
+          `原因：${outcome.fallbackReason ?? '未知'}`,
+          outcome.refuse
+            ? '按配置 llm.fallbackToPolicy=false，本次**没有挂单**——仓位当前是裸的，需要人工处理。'
+            : '本次止盈止损按 risk_policy 的档位挂出，仓位仍受保护。',
+        ],
+      }));
+    }
+
+    return outcome;
   }
 
   async function openBracket(update: OrderTradeUpdate): Promise<HandleOutcome> {
@@ -573,7 +810,7 @@ export function createExecutorService(deps: ExecutorServiceDeps): ExecutorServic
      *（AGENTS.md 约定 9）。`atr` 落占位值是因为表上有 `atr > 0` 的 CHECK——
      * 没有 ATR 就不能声称算出了止盈止损，权威信息在 `last_error` 里。
      */
-    async function recordRejected(reason: string): Promise<HandleOutcome> {
+    async function recordRejected(reason: string, decision?: DecideOutput): Promise<HandleOutcome> {
       const claimed = await claimBracket(pool, {
         exchange,
         symbol: update.symbol,
@@ -589,6 +826,21 @@ export function createExecutorService(deps: ExecutorServiceDeps): ExecutorServic
         atrWindowTo: update.tradeTime,
         stopPrice: update.averagePrice,
         takeProfit: update.averagePrice,
+        // v0.9.0：把**这次为什么没挂上**也记下来。拒绝下单时那次决策的来源与
+        // 原因要一起落库，否则「模型失败导致裸仓」这件事在库里看不出来。
+        ...(decision === undefined
+          ? {}
+          : {
+              decision: {
+                source: decision.source,
+                ...(decision.rationale === undefined ? {} : { rationale: decision.rationale }),
+                ...(decision.fallbackReason === undefined
+                  ? {}
+                  : { fallbackReason: decision.fallbackReason }),
+                ...(decision.raw === undefined ? {} : { raw: decision.raw }),
+                at: now(),
+              },
+            }),
         now: now(),
       });
       if (claimed === null) return 'duplicate';
@@ -638,6 +890,33 @@ export function createExecutorService(deps: ExecutorServiceDeps): ExecutorServic
     const raw = await readContractSpecRaw(pool, exchange, update.symbol);
     const tickSize = parseTickSize(raw, update.symbol);
 
+    /**
+     * LLM 决策（v0.9.0）。**在算价之前**，因为它决定的是「用哪几个倍数」。
+     *
+     * 位置很要紧：这个调用会占用「成交 → 挂单」之间的裸仓窗口（模型响应时间）。
+     * 它必须发生在**算价之前**（算价要用倍数），也必须发生在**占坑之前**——
+     * 占坑是幂等锚点，在那之前出岔子还可以干净地失败重试。
+     *
+     * 没配 `decider` 时整段跳过，行为与 v0.9.0 之前逐字一致。
+     */
+    const decision = await decideForBracket(update, policy, snapshot);
+    if (decision.refuse) {
+      // `fallbackToPolicy=false` 且模型这一轮没给出可用档位：
+      // 用户明确选择了「宁可不挂也不要按配置挂」。照做，留一条看得见的 failed 行，
+      // 并把这次失败的决策也记进去（否则事后查不出「是模型失败导致没挂单」）。
+      const reason =
+        decision.fallbackReason !== undefined
+          ? `LLM 决策未产出可用档位，且配置要求不降级（llm.fallbackToPolicy=false）：${
+              decision.fallbackReason
+            }`
+          : 'LLM 决策未产出可用档位，且配置要求不降级（llm.fallbackToPolicy=false）';
+      const outcome = await recordRejected(reason, decision);
+      log.error(`${update.symbol} ${reason}`);
+      return outcome;
+    }
+    // 把决策合并进策略：模型覆盖倍数，方法与取数口径保持不变。
+    const effective = applyDecision(policy, decision);
+
     // 分批形态要按 `stepSize` 对齐数量，而止损/止盈价仍按 `tickSize`。
     // 两个步长取自**同一份** exchangeInfo 快照（`raw`），不做两次查询。
     const plan = deriveStagedPlan({
@@ -645,13 +924,13 @@ export function createExecutorService(deps: ExecutorServiceDeps): ExecutorServic
       entryPrice: update.averagePrice,
       atr: snapshot.atr,
       atrPeriod: snapshot.period,
-      stopAtrMult: policy.stopAtrMult,
-      takeProfitAtrMult: policy.takeProfitAtrMult,
-      takeProfit1AtrMult: policy.takeProfit1AtrMult,
-      takeProfit1Ratio: policy.takeProfit1Ratio,
+      stopAtrMult: effective.stopAtrMult,
+      takeProfitAtrMult: effective.takeProfitAtrMult,
+      takeProfit1AtrMult: effective.takeProfit1AtrMult,
+      takeProfit1Ratio: effective.takeProfit1Ratio,
       tickSize,
       // 只在分批形态才读 LOT_SIZE；不分批时止盈单不带数量，不需要这个步长。
-      ...(policy.takeProfit1Ratio > 0 && policy.takeProfit1Ratio < 1
+      ...(effective.takeProfit1Ratio > 0 && effective.takeProfit1Ratio < 1
         ? { stepSize: parseStepSize(raw, update.symbol) }
         : {}),
       filledQty: update.cumulativeQty,
@@ -697,6 +976,8 @@ export function createExecutorService(deps: ExecutorServiceDeps): ExecutorServic
       entryTime: update.tradeTime,
       filledQty: update.cumulativeQty,
       positionSide: plan.positionSide,
+      // 入场这笔的手续费也是这一轮的成本：只扣出场那笔，收益会算虚高。
+      entryFeeAmount: update.commission,
       atr: snapshot.atr,
       atrPeriod: snapshot.period,
       atrInterval: snapshot.interval,
@@ -704,6 +985,19 @@ export function createExecutorService(deps: ExecutorServiceDeps): ExecutorServic
       atrWindowTo: snapshot.segmentTo,
       stopPrice: plan.stopPrice,
       takeProfit: plan.takeProfitPrice,
+      // 决策留痕（v0.9.0）：这次挂单用的档位是从哪来的、具体是哪些倍数。
+      // 落了它，事后才能回答「当时为什么止损在那个价」——而 `risk_policy`
+      // 是可变的，不留这份快照就永远答不出来。
+      decision: {
+        source: decision.source,
+        decision: decision.decision,
+        ...(decision.rationale === undefined ? {} : { rationale: decision.rationale }),
+        ...(decision.fallbackReason === undefined
+          ? {}
+          : { fallbackReason: decision.fallbackReason }),
+        ...(decision.raw === undefined ? {} : { raw: decision.raw }),
+        at: now(),
+      },
       // 分批形态才带；其余形态这三项保持 undefined → 落库 NULL，
       // 而 `partial_armed` 的 CHECK 会要求它们齐全（漏了写不进去）。
       ...(plan.mode === 'partial' && plan.tp1Qty !== null

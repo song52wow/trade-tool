@@ -23,11 +23,14 @@ import {
   resolveNotifySettings,
   resolvePolicy,
   exchangeEndpointsFromEnv,
+  createLlmClient,
+  readBars,
 } from '@trade-tool/data';
 
 import type { Pool } from '@trade-tool/data';
 
 import { createAtrProvider } from './atr.js';
+import { createRiskDecider } from './decision.js';
 import { startPeriodicReconcile, type PeriodicReconcile } from './reconcile.js';
 import { startTrailingTimer } from './trailing.js';
 import { createExecutorService } from './service.js';
@@ -169,6 +172,57 @@ async function main(): Promise<void> {
     config: config.executor,
     timeoutMs: config.data.timeoutMs,
   });
+
+  /**
+   * LLM 决策器（v0.9.0）。**不开就不建**——没开时 executor 的行为与 v0.9.0
+   * 之前逐字一致，连一次多余的出网都没有。
+   *
+   * 建的时候要密钥：读不到就抛 `CONFIG_INVALID`，**不建一个会失败的客户端**
+   * 留着以后每笔成交都失败一次（那等于把止盈止损整体搞挂）。
+   */
+  const decider = config.executor.llm.enabled
+    ? createRiskDecider({
+        llm: createLlmClient({
+          baseUrl: config.executor.llm.baseUrl,
+          model: config.executor.llm.model,
+          apiKeyEnv: config.executor.llm.apiKeyEnv,
+          timeoutMs: config.executor.llm.timeoutMs,
+        }),
+        config: config.executor.llm,
+      })
+    : undefined;
+  if (decider !== undefined) {
+    console.error(
+      `[executor] LLM 决策已开启：${config.executor.llm.model} @ ${config.executor.llm.baseUrl}` +
+        `（超时 ${String(config.executor.llm.timeoutMs)}ms，` +
+        `${config.executor.llm.fallbackToPolicy ? '失败降级到配置档位' : '失败不挂单'}）`,
+    );
+  }
+
+  /**
+   * 读近期 K 线的收益率（喂给模型看走势）。
+   *
+   * 收益率而不是原始价：模型的输入越接近「人能读懂的形式」越有用，
+   * 而一串裸价格对它来说只是数字。
+   *
+   * 用 `klines_1m`：它是**最细**的周期，也是所有派生周期的来源，因此永远
+   * 是最新鲜的那一份——用 15m 的话，最近半小时可能还没收盘一根。
+   */
+  async function readRecentReturns(symbol: string, limit: number): Promise<readonly number[]> {
+    if (limit <= 0) return [];
+    const bars = await readBars(pool, symbol, { limit: limit + 1, interval: '1m' });
+    // 需要前一根的收盘价才能算第一根的收益率，所以多取一根。
+    if (bars.length < 2) return [];
+    const returns: number[] = [];
+    for (let i = 1; i < bars.length; i += 1) {
+      const prev = bars[i - 1];
+      const curr = bars[i];
+      if (prev === undefined || curr === undefined) continue;
+      if (prev.close <= 0) continue;
+      returns.push(((curr.close - prev.close) / prev.close) * 100);
+    }
+    return returns;
+  }
   // 策略按标的解析：标的覆盖 > 全局默认 > 配置文件。优先级只有 resolvePolicy 一份实现，
   // 控制面预览与这里用的是同一个函数，避免「页面显示的」和「实际挂单的」分叉。
   const tracker = new NetPositionTracker();
@@ -231,8 +285,15 @@ async function main(): Promise<void> {
     config,
     placer: client,
     atr,
+    // 与周期对账共用**同一个**派发器：去重与冷却的记账因此是同一份，
+    // 不会出现「同一件事，对账那边压住了、这边又推一遍」。
+    alerts,
     resolvePolicy: async (symbol) => resolvePolicy(pool, ctx.exchange, symbol, config.executor),
     positions: tracker,
+    // LLM 决策（v0.9.0）。没开时 `decider` 是 undefined，service 整段跳过，
+    // 行为与 v0.9.0 之前逐字一致。
+    ...(decider === undefined ? {} : { decider }),
+    readRecentReturns,
   });
 
   await seedNetPositions();

@@ -20,14 +20,14 @@
  */
 
 import {
-  RECONCILE_KINDS,
+  NOTIFY_KINDS,
   SyncError,
   keyHint,
   openNotifyTarget,
   sealNotifyTarget,
   type NotifyConfig,
+  type NotifyKind,
   type NotifySettings,
-  type ReconcileKind,
   type SecretNotifyTarget,
 } from '@trade-tool/core';
 
@@ -116,7 +116,7 @@ function asKinds(value: unknown): string[] {
     throw new SyncError('CONFIG_INVALID', '通知设置里的 kinds 不是数组', { value });
   }
   for (const item of value) {
-    if (typeof item !== 'string' || !RECONCILE_KINDS.includes(item as ReconcileKind)) {
+    if (typeof item !== 'string' || !NOTIFY_KINDS.includes(item as NotifyKind)) {
       throw new SyncError('CONFIG_INVALID', `库里出现了未知的内容种类：${String(item)}`, { value });
     }
   }

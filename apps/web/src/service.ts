@@ -1,7 +1,7 @@
 import {
   INTERVAL_MS,
-  RECONCILE_KIND_INFO,
-  RECONCILE_KINDS,
+  NOTIFY_KIND_INFO,
+  NOTIFY_KINDS,
   SyncError,
   createNotifier,
   loadConfigOrDefault,
@@ -389,7 +389,7 @@ export function createWebRuntime(config: TradeToolConfig): WebRuntime {
       return {
         ...status,
         // 可勾选的内容目录：**由 core 的那一份派生**，页面不自己抄。
-        topics: RECONCILE_KINDS.map((kind) => ({ kind, ...RECONCILE_KIND_INFO[kind] })),
+        topics: NOTIFY_KINDS.map((kind) => ({ kind, ...NOTIFY_KIND_INFO[kind] })),
         masterKeyReady: masterKeyStatus().ok,
       };
     },

@@ -1,10 +1,10 @@
 import { Hono } from 'hono';
 import {
   INTERVAL_MS,
-  RECONCILE_KINDS,
+  NOTIFY_KINDS,
   SyncError,
   type GapRecord,
-  type ReconcileKind,
+  type NotifyKind,
   type RemovePolicy,
   type StoredInterval,
 } from '@trade-tool/core';
@@ -380,9 +380,10 @@ export function buildApp(deps: WebDeps): Hono {
     if (!Array.isArray(body.kinds)) {
       throw new SyncError('CONFIG_INVALID', '缺少 kinds（要通知哪些内容）');
     }
-    // 取值必须是已知的差异类型：页面只能从服务端下发的目录里勾。
+    // 取值必须是已知的**通知内容类型**（差异类型 + 交易事件）：页面只能从服务端
+    // 下发的目录里勾，目录外的取值一律拒——不静默丢掉一个不认识的项。
     for (const kind of body.kinds) {
-      if (typeof kind !== 'string' || !RECONCILE_KINDS.includes(kind as ReconcileKind)) {
+      if (typeof kind !== 'string' || !NOTIFY_KINDS.includes(kind as NotifyKind)) {
         throw new SyncError('CONFIG_INVALID', `未知的通知内容：${String(kind)}`, { kind });
       }
     }
