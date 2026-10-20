@@ -299,7 +299,13 @@ export interface NotifySettings {
   enabled: boolean;
   webhookUrl: string;
   secret: string;
-  minSeverity: NotifySeverity;
+  /**
+   * **要通知哪些内容**（交易对账的差异类型）。
+   *
+   * 空数组 = 一样都不推。判定发生在「把报告变成告警」那一步（executor），
+   * 派发器只拿它来知道「用户改了勾选」——那是「换口味」，不是「问题解决了」。
+   */
+  kinds: readonly string[];
   repeatCooldownMs: number;
 }
 
@@ -386,14 +392,21 @@ export interface AlertDispatchResult {
 /**
  * 一轮要用的**通道与它的参数**。
  *
- * 三个东西必须一起取：通道（往哪儿推）、最低严重度（推哪一档）、冷却时间
+ * 三个东西必须一起取：通道（往哪儿推）、要通知哪些内容、冷却时间
  * （同一件事多久推一次）。它们都由**同一份生效设置**决定，因此打成一个对象，
  * 免得出现「地址是新的、阈值还是旧的」这种半更新状态。
  */
 export interface AlertChannel {
   notifier: Notifier;
-  /** 低于这个严重度的告警不推。 */
-  minSeverity: NotifySeverity;
+  /**
+   * 这一轮**启用**的内容种类（交易对账的差异类型）。
+   *
+   * 它不参与「这条要不要发」的判定（那一步在把报告变成告警时就已经做完了），
+   * 而是用来发现「用户改了勾选」：那是**换口味**，不是「问题解决了」——
+   * 两种情况在派发器看来都表现为「上一轮的内容不见了」，不区分就会误报一条
+   * 「已恢复」。
+   */
+  kinds: readonly string[];
   /** 同一条告警的重复推送冷却时间（毫秒）。`0` = 每轮都推。 */
   repeatCooldownMs: number;
 }
@@ -443,6 +456,8 @@ export class AlertDispatcher {
     string,
     { severity: NotifySeverity; at: number; item: AlertItem }
   >();
+  /** 上一轮启用的是哪些内容种类。用来区分「问题解决了」与「用户改了勾选」。 */
+  private lastKinds: string | null = null;
 
   constructor(options: AlertDispatcherOptions) {
     this.channel = options.channel;
@@ -459,7 +474,19 @@ export class AlertDispatcher {
     return channel;
   }
 
-  async dispatch(items: readonly AlertItem[]): Promise<AlertDispatchResult> {
+  /**
+   * 派发一轮。
+   *
+   * @param build 由**这一轮生效的通道**构造告警条目。
+   *
+   * 为什么不是一个现成的条目数组：「要通知哪些内容」（`channel.kinds`）就写在通道
+   * 里，而**过滤必须在构造条目时做**——没勾的差异不该进条目（否则它们会混进指纹、
+   * 触发一条内容相同的新消息）。把构造交给通道参数，就只解析一次设置，
+   * 过滤与发送看到的必然是同一份「哪一份在生效」。
+   */
+  async dispatch(
+    build: (channel: AlertChannel) => readonly AlertItem[],
+  ): Promise<AlertDispatchResult> {
     const result: AlertDispatchResult = { sent: 0, suppressed: 0, failed: 0, recovered: 0 };
     const channel = await this.resolve();
 
@@ -468,15 +495,26 @@ export class AlertDispatcher {
     // 等通道重新打开时，同一件事还得再等一个冷却期才推得出去。
     if (channel === null) {
       this.sent.clear();
+      this.lastKinds = null;
       return result;
     }
 
+    // **用户改了勾选** ≠ **问题解决了**。
+    // 两种情况在这里长得一样（上一轮的内容这一轮不见了），不区分就会在用户
+    // 取消勾选时凭空推一条「已恢复」。所以：勾选一变，上一轮的记账整个作废
+    // （不推「已恢复」），按新设置从头开始。
+    const kindsKey = [...channel.kinds].sort().join(',');
+    if (this.lastKinds !== null && this.lastKinds !== kindsKey) {
+      this.sent.clear();
+    }
+    this.lastKinds = kindsKey;
+
+    const items = build(channel);
     const notifier = channel.notifier;
     const now = this.now();
     const seen = new Set<string>();
 
     for (const item of items) {
-      if (severityRank(item.severity) < severityRank(channel.minSeverity)) continue;
       seen.add(item.fingerprint);
 
       const previous = this.sent.get(item.fingerprint);

@@ -112,8 +112,8 @@ async function main(): Promise<void> {
   // 优先级只有 `resolveNotifySettings` 一份实现，两处各判一次的话，
   // 「哪一份在生效」就有两个答案。
   //
-  // 地址、阈值、冷却时间**一次取全**（同一个 AlertChannel）：只换地址却留着旧阈值，
-  // 那种「半更新」比不改更难查。
+  // 地址、**要通知哪些内容**、冷却时间一次取全（同一个 AlertChannel）：
+  // 只换地址却留着旧的勾选，那种「半更新」比不改更难查。
   const resolveChannel = async (): Promise<AlertChannel | null> => {
     const resolved = await resolveNotifySettings({
       pool,
@@ -134,7 +134,7 @@ async function main(): Promise<void> {
         webhookUrl: resolved.settings.webhookUrl,
         secret: resolved.settings.secret,
       }),
-      minSeverity: resolved.settings.minSeverity,
+      kinds: resolved.settings.kinds,
       repeatCooldownMs: resolved.settings.repeatCooldownMs,
     };
   };

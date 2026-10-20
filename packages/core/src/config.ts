@@ -1,7 +1,7 @@
 import { z } from 'zod';
 
 import { EXCHANGE_ENVIRONMENTS } from './exchange-endpoints.js';
-import { NOTIFY_SEVERITIES } from './notify.js';
+import { RECONCILE_KINDS } from './reconcile.js';
 import { INTERVALS } from './types.js';
 
 export const marketSchema = z.object({
@@ -358,12 +358,17 @@ export const notifySchema = z.object({
   /** 签名密钥所在的**环境变量名**。机器人的「安全设置」选了「签名校验」时才需要。 */
   secretEnv: z.string().min(1).default('TRADE_TOOL_FEISHU_WEBHOOK_SECRET'),
   /**
-   * 低于这个严重度的告警不推。
+   * **要通知哪些内容**（v0.8.0）。
    *
-   * 缺省 `warning` = 紧急与注意都推。改成 `critical` 就只推「仓位当前没有止损保护」
-   * 这一类，噪音最小的极端。
+   * 取值是交易对账的**差异类型**（`RECONCILE_KINDS`），也就是「哪种事发生时才
+   * 叫我」。缺省 = 全部都要。
+   *
+   * 为什么不用「最低严重度」一刀切：严重度对同一个类型是固定的，粗暴的阈值等于
+   * 「全都要」或「只要三个紧急的」，用户真正想做的是「我只想知道哪几种事」——
+   * 比如「止盈单没了」这种噪音就别烦我了，但「仓位没有止损保护」一定要说。
+   * 逐项勾选能表达，而阈值表达不了。
    */
-  minSeverity: z.enum(NOTIFY_SEVERITIES).default('warning'),
+  kinds: z.array(z.enum(RECONCILE_KINDS)).default([...RECONCILE_KINDS]),
   /**
    * 同一条告警的重复推送冷却时间（毫秒）。
    *

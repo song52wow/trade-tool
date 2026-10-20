@@ -160,15 +160,21 @@ export interface ExchangeAlgoOrder {
 /** 差异的严重度。`critical` = 仓位当前没有任何止损保护。 */
 export type ReconcileSeverity = 'critical' | 'warning';
 
-export type ReconcileKind =
+/**
+ * 全部差异类型。`ReconcileKind` **从它派生**。
+ *
+ * 这样「代码认的类型」与「配置能填的值」只有这一份来源：加一个新类型却忘了
+ * 在别处登记，编译期就会报错，而不是运行时才发现某个入口不认它。
+ */
+export const RECONCILE_KINDS = [
   /** 本地 `armed`，交易所没有对应的止损单。仓位当前是裸的。 */
-  | 'missing-stop-order'
+  'missing-stop-order',
   /** 本地 `failed`（占坑成功但下单失败），而仓位还在。 */
-  | 'unprotected-position'
+  'unprotected-position',
   /** 交易所有仓位，本地没有任何未终结的记录——这笔仓位从来没被这套工具保护过。 */
-  | 'position-without-record'
+  'position-without-record',
   /** 本地 `armed` / `partial_armed`，但交易所只剩一张（缺止盈）。 */
-  | 'missing-take-profit-order'
+  'missing-take-profit-order',
   /**
    * 本地已进入 `trailing`（第一段已成交，剩余仓位只剩止损），
    * 而交易所却还挂着一张止盈单。
@@ -177,13 +183,61 @@ export type ReconcileKind =
    * 也可能是「工具外平仓后本地撤单失败」。两种都要人看一眼，因此是 warning
    * （仓位此刻仍受止损保护，不是裸的）。
    */
-  | 'unexpected-take-profit-order'
+  'unexpected-take-profit-order',
   /** 单还在，但触发价与本地记录的止损/止盈价对不上。 */
-  | 'price-mismatch'
+  'price-mismatch',
   /** 本地 `armed`，交易所已无该标的仓位——多半是平仓事件没收到。 */
-  | 'record-without-position'
+  'record-without-position',
   /** 交易所挂着我方条件单，但没有任何未终结的本地记录引用它的 algoId。 */
-  | 'orphan-algo-order';
+  'orphan-algo-order',
+] as const;
+
+export type ReconcileKind = (typeof RECONCILE_KINDS)[number];
+
+/**
+ * 每个差异类型的**中文名与一句话说明**。
+ *
+ * 它是控制面「勾选要通知哪些内容」那份清单的**唯一来源**：勾选项的文案只有
+ * 这一份，免得页面上写一套、告警文案里又是另一套。
+ *
+ * ⚠️ **这里刻意不写严重度**：严重度由判据（`reconcileBrackets`）决定，而且对同一个
+ * 类型是固定的。在这里再抄一份就等于「判据的第二份实现」——那种漂移的症状是
+ * 「页面说紧急、消息说注意」。紧急与否写进说明文字里就够了。
+ */
+export const RECONCILE_KIND_INFO: Record<ReconcileKind, { label: string; hint: string }> = {
+  'missing-stop-order': {
+    label: '仓位没有止损保护',
+    hint: '本地记着已挂上止盈止损，交易所却没有那张止损单——仓位当前是裸的',
+  },
+  'unprotected-position': {
+    label: '挂单失败但仓位还在',
+    hint: '一笔入场成交占坑成功却没挂上任何保护单，仓位可能仍然存在',
+  },
+  'position-without-record': {
+    label: '交易所有仓位、本地不知道',
+    hint: '交易所有仓位，本地没有任何未终结记录——多半是在交易所 App 上手动开的仓',
+  },
+  'missing-take-profit-order': {
+    label: '止盈单没了',
+    hint: '止损还在，但止盈单已不在交易所（另一张多半是被成交后自动撤销的）',
+  },
+  'unexpected-take-profit-order': {
+    label: '移动止损阶段还有止盈单',
+    hint: '本地已进入移动止损阶段（第一段应已成交），交易所却还挂着一张止盈单',
+  },
+  'price-mismatch': {
+    label: '触发价对不上',
+    hint: '单还在，但触发价与本地记录的止损 / 止盈价不一致',
+  },
+  'record-without-position': {
+    label: '本地记着单、交易所已无仓位',
+    hint: '本地记着已挂单，交易所已无该仓位——多半是平仓事件没被收到',
+  },
+  'orphan-algo-order': {
+    label: '有我方挂单但没有记录引用',
+    hint: '交易所挂着我方条件单，但本地没有任何未终结记录引用它',
+  },
+};
 
 export interface ReconcileDifference {
   kind: ReconcileKind;

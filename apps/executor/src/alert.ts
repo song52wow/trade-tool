@@ -8,28 +8,43 @@
  * 价格、证据那些每次都可能变，掺进指纹会让每轮都算「新告警」，冷却就形同虚设。
  */
 
-import { severityLabel, type AlertItem, type ReconcileReport } from '@trade-tool/core';
+import {
+  RECONCILE_KINDS,
+  severityLabel,
+  type AlertItem,
+  type ReconcileReport,
+} from '@trade-tool/core';
 
 /**
- * 把一份对账报告变成一条告警；没有差异时返回 `null`。
+ * 把一份对账报告变成一条告警；没有**要通知的**差异时返回 `null`。
+ *
+ * @param kinds 启用了哪些内容种类（交易对账的差异类型）。**空数组 = 一样都不推**。
  *
  * 一次对账的**所有**差异合成一条消息，而不是一条差异一条消息：
  * 一个裸仓往往同时命中好几条判据（「没有止损单」+「有仓位没记录」），
  * 拆开推就成了「一个问题推了三遍」，反而让人以为有三件事。
  */
-export function buildReconcileAlert(report: ReconcileReport): AlertItem | null {
-  if (report.differences.length === 0) return null;
+export function buildReconcileAlert(
+  report: ReconcileReport,
+  kinds: readonly string[] = RECONCILE_KINDS,
+): AlertItem | null {
+  // **只保留用户勾选了的那些内容**。没勾的不推，但**仍然参与指纹**吗？不参与——
+  // 指纹只由「被推出去的那些差异」决定，这样「新增一条没勾的差异」不会触发
+  // 一条内容完全相同的新消息（那种重复比不报还烦人）。
+  const enabled = new Set(kinds);
+  const differences = report.differences.filter((item) => enabled.has(item.kind));
+  if (differences.length === 0) return null;
 
-  const severity = report.differences.some((item) => item.severity === 'critical')
+  const severity = differences.some((item) => item.severity === 'critical')
     ? 'critical'
     : 'warning';
 
-  const lines = report.differences.map((item) => {
+  const lines = differences.map((item) => {
     const entry = item.entryOrderId === null ? '' : `（入场 ${item.entryOrderId}）`;
     return `[${severityLabel(item.severity)}] ${item.symbol}${entry}：${item.message}`;
   });
 
-  const fingerprint = report.differences
+  const fingerprint = differences
     .map((item) => `${item.kind}|${item.symbol}|${item.entryOrderId ?? '-'}`)
     .sort()
     .join(',');
@@ -38,8 +53,9 @@ export function buildReconcileAlert(report: ReconcileReport): AlertItem | null {
     fingerprint: `reconcile|${fingerprint}`,
     severity,
     title:
-      `交易对账发现 ${String(report.counts.total)} 处差异` +
-      `（紧急 ${String(report.counts.critical)} / 注意 ${String(report.counts.warning)}）`,
+      `交易对账发现 ${String(differences.length)} 处差异` +
+      `（紧急 ${String(differences.filter((i) => i.severity === 'critical').length)} / ` +
+      `注意 ${String(differences.filter((i) => i.severity === 'warning').length)}）`,
     lines,
     resolvedTitle: '交易对账已恢复正常',
   };

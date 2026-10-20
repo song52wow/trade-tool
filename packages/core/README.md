@@ -18,6 +18,7 @@
 | `clock-skew.ts`         | 进程启动时测量与交易所的时钟偏移                                      |
 | `exchange-endpoints.ts` | REST 基址与用户数据流地址的**同源**解析（live / demo）                |
 | `notify.ts`             | 通知层（v0.8.0）：飞书 webhook 通道 + 告警去重 / 冷却 / 恢复通知      |
+| `reconcile.ts`          | 交易对账判据 + 差异类型的清单与中文名（页面的「要通知哪些内容」来源） |
 
 约定：
 

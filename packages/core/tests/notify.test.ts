@@ -17,7 +17,6 @@ import {
   AlertDispatcher,
   DISABLED_NOTIFIER,
   type AlertChannel,
-  type NotifySeverity,
   FeishuNotifier,
   createNotifierFromEnv,
   feishuSign,
@@ -240,16 +239,16 @@ describe('AlertDispatcher', () => {
   }
 
   /**
-   * 组一个通道。地址、阈值、冷却时间**一起**取——只换地址却留着旧阈值，
-   * 那种「半更新」比不改更难查。
+   * 组一个通道。地址、**要通知哪些内容**、冷却时间**一起**取——只换地址却留着
+   * 旧的勾选，那种「半更新」比不改更难查。
    */
   function channelOf(
     notifier: { enabled: boolean; notify(event: NotifyEvent): Promise<void> },
-    overrides: { minSeverity?: NotifySeverity; repeatCooldownMs?: number } = {},
+    overrides: { kinds?: string[]; repeatCooldownMs?: number } = {},
   ): AlertChannel {
     return {
       notifier,
-      minSeverity: overrides.minSeverity ?? 'info',
+      kinds: overrides.kinds ?? ['missing-stop-order'],
       repeatCooldownMs: overrides.repeatCooldownMs ?? 30 * 60_000,
     };
   }
@@ -270,10 +269,10 @@ describe('AlertDispatcher', () => {
       now: () => now,
     });
 
-    const first = await dispatcher.dispatch([item]);
+    const first = await dispatcher.dispatch(() => [item]);
     expect(first.sent).toBe(1);
 
-    const second = await dispatcher.dispatch([item]);
+    const second = await dispatcher.dispatch(() => [item]);
     expect(second.sent).toBe(0);
     expect(second.suppressed).toBe(1);
     expect(rec.events).toHaveLength(1);
@@ -287,9 +286,9 @@ describe('AlertDispatcher', () => {
       now: () => now,
     });
 
-    await dispatcher.dispatch([item]);
+    await dispatcher.dispatch(() => [item]);
     now += 60_001;
-    const again = await dispatcher.dispatch([item]);
+    const again = await dispatcher.dispatch(() => [item]);
     expect(again.sent).toBe(1);
     expect(rec.events).toHaveLength(2);
   });
@@ -301,8 +300,8 @@ describe('AlertDispatcher', () => {
       now: () => 1_000,
     });
 
-    await dispatcher.dispatch([item]);
-    const result = await dispatcher.dispatch([{ ...item, severity: 'warning' }]);
+    await dispatcher.dispatch(() => [item]);
+    const result = await dispatcher.dispatch(() => [{ ...item, severity: 'warning' }]);
     expect(result.sent).toBe(1);
   });
 
@@ -313,8 +312,8 @@ describe('AlertDispatcher', () => {
       now: () => 1_000,
     });
 
-    await dispatcher.dispatch([item]);
-    const result = await dispatcher.dispatch([]);
+    await dispatcher.dispatch(() => [item]);
+    const result = await dispatcher.dispatch(() => []);
     expect(result.recovered).toBe(1);
     expect(rec.events[1]?.title).toBe('交易对账已恢复正常');
     expect(rec.events[1]?.severity).toBe('info');
@@ -329,26 +328,41 @@ describe('AlertDispatcher', () => {
       onError: (error) => errors.push(error),
     });
 
-    const first = await dispatcher.dispatch([item]);
+    const first = await dispatcher.dispatch(() => [item]);
     expect(first.failed).toBe(1);
     expect(first.sent).toBe(0);
     expect(errors).toHaveLength(1);
 
-    const second = await dispatcher.dispatch([item]);
+    const second = await dispatcher.dispatch(() => [item]);
     expect(second.failed).toBe(1);
     expect(second.suppressed).toBe(0);
   });
 
-  it('低于 minSeverity 的告警不推，也不记账', async () => {
+  it('用户改了勾选 → 不误报「已恢复」，并按新设置从头开始', async () => {
+    // 取消勾选与「问题真的解决了」在派发器看来长得一样（上一轮的内容不见了）。
+    // 不区分的话，用户只是取消了一个勾选就会收到一条莫名其妙的「已恢复」。
     const rec = recorder();
+    let kinds = ['missing-stop-order'];
     const dispatcher = new AlertDispatcher({
-      channel: channelOf(rec.notifier, { minSeverity: 'critical' }),
+      channel: () => channelOf(rec.notifier, { kinds }),
       now: () => 1_000,
     });
 
-    const result = await dispatcher.dispatch([{ ...item, severity: 'warning' }]);
-    expect(result.sent).toBe(0);
-    expect(rec.events).toHaveLength(0);
+    await dispatcher.dispatch(() => [item]);
+    expect(rec.events).toHaveLength(1);
+
+    // 用户取消勾选 → 那一类不再推，也不该有「已恢复」
+    kinds = [];
+    const changed = await dispatcher.dispatch(() => []);
+    expect(changed.recovered).toBe(0);
+    expect(rec.events).toHaveLength(1);
+
+    // 重新勾上：按新设置从头来（上一轮的记账已作废，不受冷却压制）
+    kinds = ['missing-stop-order'];
+    const again = await dispatcher.dispatch(() => [item]);
+    expect(again.sent).toBe(1);
+    expect(again.recovered).toBe(0);
+    expect(rec.events).toHaveLength(2);
   });
 
   it('通道关着时什么都不发，也不记账（否则通道重新打开后要再等一个冷却期）', async () => {
@@ -362,24 +376,24 @@ describe('AlertDispatcher', () => {
           },
           notify: rec.notifier.notify,
         },
-        minSeverity: 'info',
+        kinds: ['missing-stop-order'],
         repeatCooldownMs: 60_000,
       }),
       now: () => 1_000,
     });
 
-    await dispatcher.dispatch([item]);
+    await dispatcher.dispatch(() => [item]);
     expect(rec.events).toHaveLength(1);
 
     // 通道关掉的那几轮：什么都不推，也不记账
     enabled = false;
-    const off = await dispatcher.dispatch([item]);
+    const off = await dispatcher.dispatch(() => [item]);
     expect(off.sent).toBe(0);
     expect(rec.events).toHaveLength(1);
 
     // 重新打开：同一件事要**立刻**推一次，而不是「刚才推过了」
     enabled = true;
-    const on = await dispatcher.dispatch([item]);
+    const on = await dispatcher.dispatch(() => [item]);
     expect(on.sent).toBe(1);
     expect(rec.events).toHaveLength(2);
   });
@@ -392,12 +406,29 @@ describe('AlertDispatcher', () => {
       now: () => 1_000,
     });
 
-    await dispatcher.dispatch([item]);
+    await dispatcher.dispatch(() => [item]);
     // 冷却期内：被压下
-    expect((await dispatcher.dispatch([item])).suppressed).toBe(1);
+    expect((await dispatcher.dispatch(() => [item])).suppressed).toBe(1);
 
     // 页面把冷却改成 0 → 下一轮就照新值走
     cooldownMs = 0;
-    expect((await dispatcher.dispatch([item])).sent).toBe(1);
+    expect((await dispatcher.dispatch(() => [item])).sent).toBe(1);
+  });
+
+  it('条目由通道参数构造：过滤用的就是这一轮生效的设置', async () => {
+    // 构造条目的那一步必须拿到**这一轮**的设置（要通知哪些内容），
+    // 否则过滤与发送会看到两份不同的「哪一份在生效」。
+    const rec = recorder();
+    let kinds = ['missing-stop-order'];
+    const dispatcher = new AlertDispatcher({
+      channel: () => channelOf(rec.notifier, { kinds }),
+      now: () => 1_000,
+    });
+
+    const result = await dispatcher.dispatch((channel) => {
+      expect(channel.kinds).toEqual(kinds);
+      return channel.kinds.includes('missing-stop-order') ? [item] : [];
+    });
+    expect(result.sent).toBe(1);
   });
 });

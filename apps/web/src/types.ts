@@ -246,7 +246,8 @@ export interface CredentialWriteBody {
 export interface NotifyStatusDto {
   /** 生效的那一档是否启用推送。 */
   enabled: boolean;
-  minSeverity: 'critical' | 'warning' | 'info';
+  /** 生效的那一档**要通知哪些内容**（交易对账的差异类型 id）。 */
+  kinds: readonly string[];
   repeatCooldownMs: number;
   /** 生效的那一档有没有地址。 */
   configured: boolean;
@@ -260,6 +261,13 @@ export interface NotifyStatusDto {
   webhookEnv: string;
   secretEnv: string;
   /**
+   * **可勾选的内容目录**（服务端下发的唯一来源）。
+   *
+   * 页面**不自己抄一份**差异类型的清单：抄了就会漂——服务端加了新类型而页面
+   * 没跟上，用户就永远勾不到它。
+   */
+  topics: NotifyKindDto[];
+  /**
    * 面板那一档的状态。**无论它是否生效都在这里**——
    * 「面板里配过、但当前生效的是配置文件那一档」必须看得见。
    */
@@ -267,7 +275,7 @@ export interface NotifyStatusDto {
     configured: boolean;
     hint: string | null;
     enabled: boolean;
-    minSeverity: 'critical' | 'warning' | 'info';
+    kinds: readonly string[];
     repeatCooldownMs: number;
     updatedAt: number | null;
     /** `null` = 读不到（主密钥没注入，解不开密文）——不是「没配」。 */
@@ -278,6 +286,18 @@ export interface NotifyStatusDto {
   masterKeyReady: boolean;
 }
 
+/**
+ * 一项「要通知的内容」。
+ *
+ * `kind` 是交易对账的差异类型（机器值，落库用）；`label` / `hint` 是给人看的
+ * 文案——**由服务端下发**，页面不自己抄一份（抄一份就会漂）。
+ */
+export interface NotifyKindDto {
+  kind: string;
+  label: string;
+  hint: string;
+}
+
 export interface NotifyWriteBody {
   enabled: boolean;
   /** 空 = 保持原样（第一次保存时必填）。 */
@@ -286,7 +306,8 @@ export interface NotifyWriteBody {
   secret?: string;
   /** 显式清除签名密钥。 */
   clearSecret?: boolean;
-  minSeverity: 'critical' | 'warning' | 'info';
+  /** 要通知哪些内容。空数组 = 一样都不推。 */
+  kinds: string[];
   repeatCooldownMs: number;
 }
 

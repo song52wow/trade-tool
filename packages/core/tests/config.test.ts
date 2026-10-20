@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 
 import { configSchema, defaultConfig } from '../src/config.js';
+import { RECONCILE_KINDS } from '../src/reconcile.js';
 import { loadConfig } from '../src/config-io.js';
 import { MANUAL_INTERVENTION_CODES, isSyncError } from '../src/market-sync.js';
 import { intervalToMs } from '../src/types.js';
@@ -152,7 +153,8 @@ describe('notify', () => {
     expect(notify.enabled).toBe(false);
     expect(notify.webhookEnv).toBe('TRADE_TOOL_FEISHU_WEBHOOK_URL');
     expect(notify.secretEnv).toBe('TRADE_TOOL_FEISHU_WEBHOOK_SECRET');
-    expect(notify.minSeverity).toBe('warning');
+    // 缺省 = 全部内容都要通知（用户可以逐项取消）
+    expect(notify.kinds).toEqual([...RECONCILE_KINDS]);
     expect(notify.repeatCooldownMs).toBe(30 * 60_000);
   });
 
@@ -166,12 +168,28 @@ describe('notify', () => {
     expect(Object.keys(notify)).not.toContain('webhookUrl');
   });
 
-  it('非法严重度一律拒绝（不许静默回落成某个默认值）', () => {
+  it('未知的通知内容一律拒绝（不许静默丢掉一个不认识的取值）', () => {
     const result = configSchema.safeParse({
       market: { symbol: 'ETHUSDT', interval: '1h' },
-      notify: { minSeverity: 'fatal' },
+      notify: { kinds: ['fatal'] },
     });
     expect(result.success).toBe(false);
+  });
+
+  it('可以只勾一部分内容（用户只想被告知关心的事）', () => {
+    const notify = configSchema.parse({
+      market: { symbol: 'ETHUSDT', interval: '1h' },
+      notify: { kinds: ['missing-stop-order', 'position-without-record'] },
+    }).notify;
+    expect(notify.kinds).toEqual(['missing-stop-order', 'position-without-record']);
+  });
+
+  it('空数组 = 一样都不推（是合法取值，不是缺省）', () => {
+    const notify = configSchema.parse({
+      market: { symbol: 'ETHUSDT', interval: '1h' },
+      notify: { kinds: [] },
+    }).notify;
+    expect(notify.kinds).toEqual([]);
   });
 });
 

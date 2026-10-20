@@ -74,7 +74,16 @@
     "enabled": false,
     "webhookEnv": "TRADE_TOOL_FEISHU_WEBHOOK_URL",
     "secretEnv": "TRADE_TOOL_FEISHU_WEBHOOK_SECRET",
-    "minSeverity": "warning",
+    "kinds": [
+      "missing-stop-order",
+      "unprotected-position",
+      "position-without-record",
+      "missing-take-profit-order",
+      "unexpected-take-profit-order",
+      "price-mismatch",
+      "record-without-position",
+      "orphan-algo-order"
+    ],
     "repeatCooldownMs": 1800000
   }
 }

@@ -735,6 +735,39 @@ button.link.current {
   width: auto;
 }
 
+/* 「要通知哪些内容」的勾选清单 */
+.topics {
+  margin-top: 14px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--panel-2);
+  padding: 12px 14px;
+}
+
+.topics .label {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.topics label.topic {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 5px 0;
+  cursor: pointer;
+  line-height: 1.5;
+}
+
+.topics label.topic input {
+  width: auto;
+  margin-top: 3px;
+  flex: none;
+}
+
+.topics label.topic .muted {
+  font-size: 12px;
+}
+
 .form-block {
   border: 1px solid var(--line);
   border-radius: var(--radius);

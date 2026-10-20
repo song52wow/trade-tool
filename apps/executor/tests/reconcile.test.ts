@@ -14,7 +14,12 @@
 
 import { describe, expect, it } from 'vitest';
 
-import { AlertDispatcher, type NotifyEvent, type TradeToolConfig } from '@trade-tool/core';
+import {
+  AlertDispatcher,
+  RECONCILE_KINDS,
+  type NotifyEvent,
+  type TradeToolConfig,
+} from '@trade-tool/core';
 import type { BinancePrivateClient, Pool } from '@trade-tool/data';
 
 import { runOnce, startPeriodicReconcile } from '../src/reconcile.js';
@@ -217,7 +222,7 @@ describe('对账告警', () => {
     alerts: AlertDispatcher;
   }
 
-  function recorder(): Recorder {
+  function recorder(kinds: string[] = [...RECONCILE_KINDS]): Recorder {
     const events: NotifyEvent[] = [];
     const alerts = new AlertDispatcher({
       channel: {
@@ -228,7 +233,7 @@ describe('对账告警', () => {
             return Promise.resolve();
           },
         },
-        minSeverity: 'info',
+        kinds,
         repeatCooldownMs: 30 * 60_000,
       },
       now: () => NOW,
@@ -307,5 +312,19 @@ describe('对账告警', () => {
     expect(events).toHaveLength(2);
     expect(events[1]?.title).toBe('交易对账已恢复正常');
     expect(events[1]?.severity).toBe('info');
+  });
+
+  it('没勾的差异不推（用户只想被告知关心的事）', async () => {
+    const { events, alerts } = recorder(['missing-take-profit-order']);
+    await runOnce({
+      pool: fakePool().pool,
+      client: clientWithPosition(true),
+      config: configWith(60_000),
+      now: () => NOW,
+      alerts,
+    });
+
+    // 这次差异是 position-without-record（没勾）→ 什么都不推
+    expect(events).toHaveLength(0);
   });
 });

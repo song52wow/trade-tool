@@ -1,8 +1,10 @@
 import { Hono } from 'hono';
 import {
   INTERVAL_MS,
+  RECONCILE_KINDS,
   SyncError,
   type GapRecord,
+  type ReconcileKind,
   type RemovePolicy,
   type StoredInterval,
 } from '@trade-tool/core';
@@ -375,15 +377,14 @@ export function buildApp(deps: WebDeps): Hono {
     if (body.secret !== undefined && typeof body.secret !== 'string') {
       throw new SyncError('CONFIG_INVALID', 'secret 必须是字符串');
     }
-    if (
-      body.minSeverity !== 'critical' &&
-      body.minSeverity !== 'warning' &&
-      body.minSeverity !== 'info'
-    ) {
-      throw new SyncError(
-        'CONFIG_INVALID',
-        `minSeverity 必须是 critical / warning / info，收到：${String(body.minSeverity)}`,
-      );
+    if (!Array.isArray(body.kinds)) {
+      throw new SyncError('CONFIG_INVALID', '缺少 kinds（要通知哪些内容）');
+    }
+    // 取值必须是已知的差异类型：页面只能从服务端下发的目录里勾。
+    for (const kind of body.kinds) {
+      if (typeof kind !== 'string' || !RECONCILE_KINDS.includes(kind as ReconcileKind)) {
+        throw new SyncError('CONFIG_INVALID', `未知的通知内容：${String(kind)}`, { kind });
+      }
     }
     if (!Number.isInteger(body.repeatCooldownMs) || body.repeatCooldownMs < 0) {
       throw new SyncError(

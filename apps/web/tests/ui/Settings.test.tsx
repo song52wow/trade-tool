@@ -22,11 +22,21 @@ function credential(overrides: Partial<CredentialStatusDto> = {}): CredentialSta
   };
 }
 
+const TOPICS = [
+  {
+    kind: 'missing-stop-order',
+    label: '仓位没有止损保护',
+    hint: '本地记着已挂单，交易所却没有止损单',
+  },
+  { kind: 'missing-take-profit-order', label: '止盈单没了', hint: '止损还在，止盈单已不在交易所' },
+];
+
 /** 通知设置状态。默认「没配、走配置文件那一档」。 */
 function notify(overrides: Partial<NotifyStatusDto> = {}): NotifyStatusDto {
   return {
     enabled: false,
-    minSeverity: 'warning',
+    kinds: TOPICS.map((t) => t.kind),
+    topics: TOPICS,
     repeatCooldownMs: 1_800_000,
     configured: false,
     hint: null,
@@ -224,7 +234,7 @@ describe('设置页 · 飞书通知', () => {
             configured: true,
             hint: 'KLMN',
             enabled: true,
-            minSeverity: 'warning',
+            kinds: TOPICS.map((t) => t.kind),
             repeatCooldownMs: 1_800_000,
             updatedAt: NOW,
             secretConfigured: true,
@@ -282,7 +292,8 @@ describe('设置页 · 飞书通知', () => {
         webhookUrl: 'https://open.feishu.cn/open-apis/bot/v2/hook/token',
         secret: '',
         clearSecret: false,
-        minSeverity: 'warning',
+        // 勾了哪些内容（清单由服务端下发，页面只负责勾）
+        kinds: TOPICS.map((t) => t.kind),
         // 页面填的是分钟，服务端收的是毫秒（换算只在这一处）
         repeatCooldownMs: 900_000,
       });
@@ -290,6 +301,36 @@ describe('设置页 · 飞书通知', () => {
     await waitFor(() =>
       expect((screen.getByLabelText('webhook 地址') as HTMLInputElement).value).toBe(''),
     );
+  });
+
+  it('勾选/取消勾选决定推哪些内容（逐项，不是笼统的一档）', async () => {
+    const stub = stubFetch(handlers({ '/api/settings/notify': notify() }));
+    render(<App />);
+    await waitFor(() => expect(screen.getByLabelText('通知：止盈单没了')).toBeTruthy());
+
+    // 取消勾选「止盈单没了」，其余不动
+    fireEvent.click(screen.getByLabelText('通知：止盈单没了'));
+
+    fireEvent.click(screen.getByRole('button', { name: '保存设置' }));
+
+    await waitFor(() => {
+      const put = stub.calls.find((c) => c.method === 'PUT' && c.url === '/api/settings/notify');
+      expect((put?.body as { kinds: string[] }).kinds).toEqual(['missing-stop-order']);
+    });
+  });
+
+  it('「全不选」= 一样都不推（是合法选择，不是缺省）', async () => {
+    const stub = stubFetch(handlers({ '/api/settings/notify': notify() }));
+    render(<App />);
+    await waitFor(() => expect(screen.getByRole('button', { name: '全不选' })).toBeTruthy());
+
+    fireEvent.click(screen.getByRole('button', { name: '全不选' }));
+    fireEvent.click(screen.getByRole('button', { name: '保存设置' }));
+
+    await waitFor(() => {
+      const put = stub.calls.find((c) => c.method === 'PUT' && c.url === '/api/settings/notify');
+      expect((put?.body as { kinds: string[] }).kinds).toEqual([]);
+    });
   });
 
   it('服务端拒绝时错误常驻显示在页面上', async () => {
@@ -333,7 +374,7 @@ describe('设置页 · 飞书通知', () => {
             configured: true,
             hint: 'KLMN',
             enabled: true,
-            minSeverity: 'warning',
+            kinds: TOPICS.map((t) => t.kind),
             repeatCooldownMs: 1_800_000,
             updatedAt: NOW,
             secretConfigured: false,

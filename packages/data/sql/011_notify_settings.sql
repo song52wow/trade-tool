@@ -32,15 +32,38 @@ CREATE TABLE IF NOT EXISTS notify_settings (
     -- 代价是泄露了地址的后 4 位（token 前半段仍然不可知）。
     -- 空串 = 用户主动清空了通知配置（与「从未配置」必须分开，见下）。
     key_hint            text            NOT NULL DEFAULT '',
-    -- 低于这个严重度的告警不推。取值范围照抄 `notifySchema`（packages/core/src/config.ts），
-    -- 不在这里另立一套：页面能填、schema 存得下、纯函数算得出，三处必须一致。
-    min_severity        text            NOT NULL DEFAULT 'warning',
+    -- **要通知哪些内容**（交易对账的差异类型，见 core 的 `RECONCILE_KINDS`）。
+    --
+    -- 空数组 = 一样都不推。取值范围直接照抄 core 的那一份，不在这里另立一套：
+    -- 页面能勾、schema 存得下、过滤时认得出，三处必须一致。
+    kinds                text[]          NOT NULL DEFAULT ARRAY[
+        'missing-stop-order',
+        'unprotected-position',
+        'position-without-record',
+        'missing-take-profit-order',
+        'unexpected-take-profit-order',
+        'price-mismatch',
+        'record-without-position',
+        'orphan-algo-order'
+    ]::text[],
     -- 同一条告警的重复推送冷却时间（毫秒）。0 = 每轮都推。
     repeat_cooldown_ms  integer         NOT NULL DEFAULT 1800000,
     updated_at          bigint          NOT NULL,
     PRIMARY KEY (id),
     CONSTRAINT notify_settings_singleton_check CHECK (id = 1),
-    CONSTRAINT notify_settings_min_severity_check CHECK (min_severity IN ('critical', 'warning', 'info')),
+    -- 每个元素都必须是已知的差异类型（`kinds <@` = 「全部元素都在允许集合里」）
+    CONSTRAINT notify_settings_kinds_check CHECK (
+        kinds <@ ARRAY[
+            'missing-stop-order',
+            'unprotected-position',
+            'position-without-record',
+            'missing-take-profit-order',
+            'unexpected-take-profit-order',
+            'price-mismatch',
+            'record-without-position',
+            'orphan-algo-order'
+        ]::text[]
+    ),
     CONSTRAINT notify_settings_cooldown_check CHECK (repeat_cooldown_ms >= 0),
     CONSTRAINT notify_settings_hint_len CHECK (char_length(key_hint) <= 4)
 );

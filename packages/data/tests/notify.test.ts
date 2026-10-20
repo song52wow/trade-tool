@@ -10,7 +10,7 @@
  * 跑在随机命名的独立 schema 上（helpers/pg.ts），**绝不连生产库**。
  */
 
-import { SyncError, type NotifyConfig } from '@trade-tool/core';
+import { RECONCILE_KINDS, SyncError, type NotifyConfig } from '@trade-tool/core';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import {
@@ -29,11 +29,13 @@ const OTHER_KEY = Buffer.from('d'.repeat(64), 'hex');
 const WEBHOOK = 'https://open.feishu.cn/open-apis/bot/v2/hook/abcdef123456';
 const ENV_WEBHOOK = 'https://open.feishu.cn/open-apis/bot/v2/hook/envtoken9999';
 
+const ALL_KINDS = [...RECONCILE_KINDS];
+
 const CONFIG_OFF: NotifyConfig = {
   enabled: false,
   webhookEnv: 'TRADE_TOOL_FEISHU_WEBHOOK_URL',
   secretEnv: 'TRADE_TOOL_FEISHU_WEBHOOK_SECRET',
-  minSeverity: 'warning',
+  kinds: ALL_KINDS,
   repeatCooldownMs: 1_800_000,
 };
 
@@ -69,7 +71,7 @@ describe('通知设置：控制面读路径拿不到明文', () => {
       {
         enabled: true,
         webhookUrl: WEBHOOK,
-        minSeverity: 'warning',
+        kinds: ALL_KINDS,
         repeatCooldownMs: 1_800_000,
         now: T0,
       },
@@ -97,7 +99,7 @@ describe('通知设置：控制面读路径拿不到明文', () => {
         enabled: true,
         webhookUrl: WEBHOOK,
         secret: 'sign-secret',
-        minSeverity: 'warning',
+        kinds: ALL_KINDS,
         repeatCooldownMs: 1_800_000,
         now: T0,
       },
@@ -133,7 +135,7 @@ describe('通知设置：哪一份在生效', () => {
       {
         enabled: true,
         webhookUrl: WEBHOOK,
-        minSeverity: 'critical',
+        kinds: ALL_KINDS,
         repeatCooldownMs: 60_000,
         now: T0,
       },
@@ -149,7 +151,7 @@ describe('通知设置：哪一份在生效', () => {
     expect(resolved.source).toBe('panel');
     expect(resolved.settings.webhookUrl).toBe(WEBHOOK);
     // 面板那一档是**整体**的：参数也一起跟着走，不拆开用。
-    expect(resolved.settings.minSeverity).toBe('critical');
+    expect(resolved.settings.kinds).toEqual(ALL_KINDS);
     expect(resolved.settings.repeatCooldownMs).toBe(60_000);
   });
 
@@ -160,7 +162,7 @@ describe('通知设置：哪一份在生效', () => {
       {
         enabled: true,
         webhookUrl: WEBHOOK,
-        minSeverity: 'warning',
+        kinds: ALL_KINDS,
         repeatCooldownMs: 1_800_000,
         now: T0,
       },
@@ -196,7 +198,7 @@ describe('通知设置：哪一份在生效', () => {
         enabled: true,
         webhookUrl: WEBHOOK,
         secret: 'sign-secret',
-        minSeverity: 'warning',
+        kinds: ALL_KINDS,
         repeatCooldownMs: 1_800_000,
         now: T0,
       },
@@ -221,7 +223,7 @@ describe('通知设置：哪一份在生效', () => {
       {
         enabled: true,
         webhookUrl: WEBHOOK,
-        minSeverity: 'warning',
+        kinds: ALL_KINDS,
         repeatCooldownMs: 1_800_000,
         now: T0,
       },
@@ -252,7 +254,7 @@ describe('通知设置：写入语义', () => {
         enabled: true,
         webhookUrl: WEBHOOK,
         secret: 'sign-secret',
-        minSeverity: 'warning',
+        kinds: ALL_KINDS,
         repeatCooldownMs: 1_800_000,
         now: T0,
       },
@@ -266,7 +268,7 @@ describe('通知设置：写入语义', () => {
       {
         enabled: false,
         webhookUrl: '',
-        minSeverity: 'critical',
+        kinds: ALL_KINDS,
         repeatCooldownMs: 60_000,
         now: T0 + 1,
       },
@@ -280,7 +282,7 @@ describe('通知设置：写入语义', () => {
       env: {},
     });
     expect(resolved.settings.enabled).toBe(false);
-    expect(resolved.settings.minSeverity).toBe('critical');
+    expect(resolved.settings.kinds).toEqual(ALL_KINDS);
     expect(resolved.settings.webhookUrl).toBe(WEBHOOK);
     expect(resolved.settings.secret).toBe('sign-secret');
   });
@@ -293,7 +295,7 @@ describe('通知设置：写入语义', () => {
         enabled: true,
         webhookUrl: WEBHOOK,
         secret: 'sign-secret',
-        minSeverity: 'warning',
+        kinds: ALL_KINDS,
         repeatCooldownMs: 1_800_000,
         now: T0,
       },
@@ -307,7 +309,7 @@ describe('通知设置：写入语义', () => {
       {
         enabled: true,
         webhookUrl: other,
-        minSeverity: 'warning',
+        kinds: ALL_KINDS,
         repeatCooldownMs: 1_800_000,
         now: T0 + 1,
       },
@@ -324,6 +326,31 @@ describe('通知设置：写入语义', () => {
     expect(resolved.settings.secret).toBe('sign-secret');
   });
 
+  it('只勾一部分内容时，读回来就是那几项', async () => {
+    const picked = ['missing-stop-order', 'position-without-record'];
+    await writeNotifySettings(
+      schema.pool,
+      KEY,
+      {
+        enabled: true,
+        webhookUrl: WEBHOOK,
+        kinds: picked,
+        repeatCooldownMs: 1_800_000,
+        now: T0,
+      },
+      null,
+    );
+
+    const status = await readNotifyStatus({
+      pool: schema.pool,
+      masterKey: KEY,
+      config: CONFIG_OFF,
+      env: {},
+    });
+    expect(status.kinds).toEqual(picked);
+    expect(status.panel?.kinds).toEqual(picked);
+  });
+
   it('勾了「清除签名密钥」就把签名清掉，地址照旧', async () => {
     await writeNotifySettings(
       schema.pool,
@@ -332,7 +359,7 @@ describe('通知设置：写入语义', () => {
         enabled: true,
         webhookUrl: WEBHOOK,
         secret: 'sign-secret',
-        minSeverity: 'warning',
+        kinds: ALL_KINDS,
         repeatCooldownMs: 1_800_000,
         now: T0,
       },
@@ -346,7 +373,7 @@ describe('通知设置：写入语义', () => {
         enabled: true,
         webhookUrl: '',
         clearSecret: true,
-        minSeverity: 'warning',
+        kinds: ALL_KINDS,
         repeatCooldownMs: 1_800_000,
         now: T0 + 1,
       },
@@ -371,7 +398,7 @@ describe('通知设置：写入语义', () => {
         {
           enabled: true,
           webhookUrl: '',
-          minSeverity: 'warning',
+          kinds: ALL_KINDS,
           repeatCooldownMs: 1_800_000,
           now: T0,
         },
@@ -388,7 +415,7 @@ describe('通知设置：写入语义', () => {
         {
           enabled: true,
           webhookUrl: 'https://open.feishu.cn/document/home/index',
-          minSeverity: 'warning',
+          kinds: ALL_KINDS,
           repeatCooldownMs: 1_800_000,
           now: T0,
         },
@@ -404,7 +431,7 @@ describe('通知设置：写入语义', () => {
       {
         enabled: true,
         webhookUrl: WEBHOOK,
-        minSeverity: 'warning',
+        kinds: ALL_KINDS,
         repeatCooldownMs: 1_800_000,
         now: T0,
       },
@@ -423,12 +450,12 @@ describe('通知设置：写入语义', () => {
 });
 
 describe('通知设置：schema 闸门', () => {
-  it('非法严重度写不进库', async () => {
+  it('未知的通知内容写不进库（schema 的 CHECK 挡住了）', async () => {
     await expect(
       schema.pool.query(
         `INSERT INTO notify_settings (id, enabled, iv, auth_tag, ciphertext, key_hint,
-                                    min_severity, repeat_cooldown_ms, updated_at)
-         VALUES (1, false, ''::bytea, ''::bytea, ''::bytea, '', 'fatal', 1000, 1)`,
+                                    kinds, repeat_cooldown_ms, updated_at)
+         VALUES (1, false, ''::bytea, ''::bytea, ''::bytea, '', ARRAY['fatal']::text[], 1000, 1)`,
       ),
     ).rejects.toThrow();
   });
@@ -437,8 +464,8 @@ describe('通知设置：schema 闸门', () => {
     await expect(
       schema.pool.query(
         `INSERT INTO notify_settings (id, enabled, iv, auth_tag, ciphertext, key_hint,
-                                    min_severity, repeat_cooldown_ms, updated_at)
-         VALUES (1, false, ''::bytea, ''::bytea, ''::bytea, '', 'warning', -1, 1)`,
+                                    kinds, repeat_cooldown_ms, updated_at)
+         VALUES (1, false, ''::bytea, ''::bytea, ''::bytea, '', ARRAY[]::text[], -1, 1)`,
       ),
     ).rejects.toThrow();
   });
@@ -447,8 +474,8 @@ describe('通知设置：schema 闸门', () => {
     await expect(
       schema.pool.query(
         `INSERT INTO notify_settings (id, enabled, iv, auth_tag, ciphertext, key_hint,
-                                    min_severity, repeat_cooldown_ms, updated_at)
-         VALUES (2, false, ''::bytea, ''::bytea, ''::bytea, '', 'warning', 1000, 1)`,
+                                    kinds, repeat_cooldown_ms, updated_at)
+         VALUES (2, false, ''::bytea, ''::bytea, ''::bytea, '', ARRAY[]::text[], 1000, 1)`,
       ),
     ).rejects.toThrow();
   });
@@ -462,7 +489,7 @@ describe('通知设置：测试发送用的地址', () => {
       {
         enabled: false,
         webhookUrl: WEBHOOK,
-        minSeverity: 'warning',
+        kinds: ALL_KINDS,
         repeatCooldownMs: 1_800_000,
         now: T0,
       },

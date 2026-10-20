@@ -20,13 +20,14 @@
  */
 
 import {
+  RECONCILE_KINDS,
   SyncError,
   keyHint,
   openNotifyTarget,
   sealNotifyTarget,
   type NotifyConfig,
-  type NotifySeverity,
   type NotifySettings,
+  type ReconcileKind,
   type SecretNotifyTarget,
 } from '@trade-tool/core';
 
@@ -43,7 +44,8 @@ export interface NotifyPanelState {
   /** 地址末 4 位，纯展示用，不是机密。 */
   hint: string | null;
   enabled: boolean;
-  minSeverity: NotifySeverity;
+  /** 要通知哪些内容（交易对账的差异类型）。空数组 = 一样都不推。 */
+  kinds: readonly string[];
   repeatCooldownMs: number;
   updatedAt: number | null;
   /**
@@ -59,7 +61,8 @@ export interface NotifyPanelState {
 export interface NotifyStatus {
   /** 生效的那一档：开关、参数、地址在不在。 */
   enabled: boolean;
-  minSeverity: NotifySeverity;
+  /** 生效的那一档**要通知哪些内容**（交易对账的差异类型）。 */
+  kinds: readonly string[];
   repeatCooldownMs: number;
   /** 生效的那一档有没有地址。 */
   configured: boolean;
@@ -86,7 +89,7 @@ interface NotifyRow {
   auth_tag: Buffer;
   ciphertext: Buffer;
   key_hint: string;
-  min_severity: string;
+  kinds: string[];
   repeat_cooldown_ms: number;
   updated_at: string | number;
 }
@@ -101,19 +104,29 @@ function asTimestamp(value: string | number): number {
   return typeof value === 'number' ? value : Number(value);
 }
 
-function asSeverity(value: string): NotifySeverity {
-  // 取值范围由 schema 的 CHECK 钉住（critical / warning / info）；
-  // 真出现了别的值，说明库被改过——暴露出来，而不是悄悄当成 warning。
-  if (value !== 'critical' && value !== 'warning' && value !== 'info') {
-    throw new SyncError('CONFIG_INVALID', `库里出现了未知的告警严重度：${value}`, { value });
+/**
+ * 库里那一列的取值。
+ *
+ * 取值范围由 schema 的 CHECK 钉住（`kinds <@ 允许集合`），但**这里仍要再查一遍**：
+ * 库里出现了未知的内容种类，说明表被改过或迁移漏了一步——暴露出来，
+ * 而不是悄悄把它当成「不通知」。
+ */
+function asKinds(value: unknown): string[] {
+  if (!Array.isArray(value)) {
+    throw new SyncError('CONFIG_INVALID', '通知设置里的 kinds 不是数组', { value });
   }
-  return value;
+  for (const item of value) {
+    if (typeof item !== 'string' || !RECONCILE_KINDS.includes(item as ReconcileKind)) {
+      throw new SyncError('CONFIG_INVALID', `库里出现了未知的内容种类：${String(item)}`, { value });
+    }
+  }
+  return value as string[];
 }
 
 async function readRow(pool: Pool): Promise<NotifyRow | null> {
   try {
     const result = await pool.query<NotifyRow>(
-      `SELECT id, enabled, iv, auth_tag, ciphertext, key_hint, min_severity,
+      `SELECT id, enabled, iv, auth_tag, ciphertext, key_hint, kinds,
               repeat_cooldown_ms, updated_at
          FROM ${TABLE} WHERE id = $1`,
       [SINGLETON_ID],
@@ -142,7 +155,7 @@ interface Resolution {
   /** 生效那一档的地址；没有地址时是 null（不是空串，也不是一个假地址）。 */
   target: SecretNotifyTarget | null;
   enabled: boolean;
-  minSeverity: NotifySeverity;
+  kinds: readonly string[];
   repeatCooldownMs: number;
   panel: NotifyPanelState | null;
   updatedAt: number | null;
@@ -164,13 +177,13 @@ async function resolveAll(options: {
       source: 'panel',
       target,
       enabled: row.enabled,
-      minSeverity: asSeverity(row.min_severity),
+      kinds: asKinds(row.kinds),
       repeatCooldownMs: row.repeat_cooldown_ms,
       panel: {
         configured: true,
         hint: row.key_hint,
         enabled: row.enabled,
-        minSeverity: asSeverity(row.min_severity),
+        kinds: asKinds(row.kinds),
         repeatCooldownMs: row.repeat_cooldown_ms,
         updatedAt: asTimestamp(row.updated_at),
         secretConfigured: target.secret !== '',
@@ -186,7 +199,7 @@ async function resolveAll(options: {
     source: 'config',
     target: webhookUrl === '' ? null : { webhookUrl, secret },
     enabled: config.enabled,
-    minSeverity: config.minSeverity,
+    kinds: config.kinds,
     repeatCooldownMs: config.repeatCooldownMs,
     panel:
       row === null
@@ -195,7 +208,7 @@ async function resolveAll(options: {
             configured: hasAddress,
             hint: hasAddress ? row.key_hint : null,
             enabled: row.enabled,
-            minSeverity: asSeverity(row.min_severity),
+            kinds: asKinds(row.kinds),
             repeatCooldownMs: row.repeat_cooldown_ms,
             updatedAt: asTimestamp(row.updated_at),
             // 主密钥没注入就读不出签名密钥有没有配——如实说「不知道」，
@@ -238,7 +251,7 @@ export async function resolveNotifySettings(options: {
       enabled: resolved.enabled,
       webhookUrl: resolved.target?.webhookUrl ?? '',
       secret: resolved.target?.secret ?? '',
-      minSeverity: resolved.minSeverity,
+      kinds: resolved.kinds,
       repeatCooldownMs: resolved.repeatCooldownMs,
     },
   };
@@ -262,7 +275,7 @@ export async function readNotifyStatus(options: {
 
   return {
     enabled: resolved.enabled,
-    minSeverity: resolved.minSeverity,
+    kinds: resolved.kinds,
     repeatCooldownMs: resolved.repeatCooldownMs,
     configured: target !== null,
     hint: target === null ? null : keyHint(target.webhookUrl),
@@ -300,7 +313,8 @@ export interface NotifyWriteInput {
   secret?: string | undefined;
   /** 显式清除签名密钥。 */
   clearSecret?: boolean;
-  minSeverity: NotifySeverity;
+  /** 要通知哪些内容（交易对账的差异类型）。空数组 = 一样都不推。 */
+  kinds: readonly string[];
   repeatCooldownMs: number;
   now: number;
 }
@@ -381,7 +395,7 @@ export async function writeNotifySettings(
   try {
     const result = await pool.query<{ key_hint: string; updated_at: string | number }>(
       `INSERT INTO ${TABLE}
-         (id, enabled, iv, auth_tag, ciphertext, key_hint, min_severity, repeat_cooldown_ms, updated_at)
+         (id, enabled, iv, auth_tag, ciphertext, key_hint, kinds, repeat_cooldown_ms, updated_at)
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
        ON CONFLICT (id) DO UPDATE
          SET enabled = EXCLUDED.enabled,
@@ -389,7 +403,7 @@ export async function writeNotifySettings(
              auth_tag = EXCLUDED.auth_tag,
              ciphertext = EXCLUDED.ciphertext,
              key_hint = EXCLUDED.key_hint,
-             min_severity = EXCLUDED.min_severity,
+             kinds = EXCLUDED.kinds,
              repeat_cooldown_ms = EXCLUDED.repeat_cooldown_ms,
              updated_at = EXCLUDED.updated_at
        RETURNING key_hint, updated_at`,
@@ -400,7 +414,7 @@ export async function writeNotifySettings(
         sealed.authTag,
         sealed.ciphertext,
         keyHint(target.webhookUrl),
-        input.minSeverity,
+        input.kinds,
         input.repeatCooldownMs,
         input.now,
       ],

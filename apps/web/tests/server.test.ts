@@ -183,7 +183,8 @@ function fakeDeps(overrides: Partial<WebDeps> = {}): WebDeps & { calls: string[]
     }),
     getNotifyStatus: async () => ({
       enabled: false,
-      minSeverity: 'warning' as const,
+      kinds: [] as string[],
+      topics: [{ kind: 'missing-stop-order', label: '仓位没有止损保护', hint: '示例说明' }],
       repeatCooldownMs: 1_800_000,
       configured: false,
       hint: null,
@@ -197,7 +198,8 @@ function fakeDeps(overrides: Partial<WebDeps> = {}): WebDeps & { calls: string[]
     }),
     writeNotifySettings: async () => ({
       enabled: true,
-      minSeverity: 'warning' as const,
+      kinds: ['missing-stop-order'] as string[],
+      topics: [{ kind: 'missing-stop-order', label: '仓位没有止损保护', hint: '示例说明' }],
       repeatCooldownMs: 1_800_000,
       configured: true,
       hint: 'beef',
@@ -209,7 +211,7 @@ function fakeDeps(overrides: Partial<WebDeps> = {}): WebDeps & { calls: string[]
         configured: true,
         hint: 'beef',
         enabled: true,
-        minSeverity: 'warning' as const,
+        kinds: ['missing-stop-order'] as string[],
         repeatCooldownMs: 1_800_000,
         updatedAt: NOW,
         secretConfigured: false,
@@ -219,7 +221,8 @@ function fakeDeps(overrides: Partial<WebDeps> = {}): WebDeps & { calls: string[]
     }),
     clearNotifySettings: async () => ({
       enabled: false,
-      minSeverity: 'warning' as const,
+      kinds: [] as string[],
+      topics: [{ kind: 'missing-stop-order', label: '仓位没有止损保护', hint: '示例说明' }],
       repeatCooldownMs: 1_800_000,
       configured: false,
       hint: null,
@@ -866,13 +869,14 @@ describe('POST /api/symbols/:symbol/aggregate', () => {
       'configured',
       'enabled',
       'hint',
+      'kinds',
       'masterKeyReady',
-      'minSeverity',
       'panel',
       'repeatCooldownMs',
       'secretConfigured',
       'secretEnv',
       'source',
+      'topics',
       'updatedAt',
       'webhookEnv',
     ]);
@@ -886,7 +890,7 @@ describe('POST /api/symbols/:symbol/aggregate', () => {
       body: JSON.stringify({
         enabled: true,
         webhookUrl: 'https://open.feishu.cn/open-apis/bot/v2/hook/secret-token',
-        minSeverity: 'warning',
+        kinds: ['missing-stop-order'],
         repeatCooldownMs: 1_800_000,
       }),
       headers: { 'content-type': 'application/json' },
@@ -897,14 +901,14 @@ describe('POST /api/symbols/:symbol/aggregate', () => {
     expect(text).not.toContain('secret-token');
   });
 
-  it('非法严重度被拒（不许静默回落成默认值）', async () => {
+  it('未知的通知内容被拒（不许静默丢掉一个不认识的取值）', async () => {
     const app = buildApp(fakeDeps());
     const res = await app.request('/api/settings/notify', {
       method: 'PUT',
       body: JSON.stringify({
         enabled: true,
         webhookUrl: '',
-        minSeverity: 'fatal',
+        kinds: ['fatal'],
         repeatCooldownMs: 1_800_000,
       }),
       headers: { 'content-type': 'application/json' },
@@ -919,7 +923,7 @@ describe('POST /api/symbols/:symbol/aggregate', () => {
       body: JSON.stringify({
         enabled: true,
         webhookUrl: '',
-        minSeverity: 'warning',
+        kinds: [],
         repeatCooldownMs: -1,
       }),
       headers: { 'content-type': 'application/json' },
@@ -934,7 +938,7 @@ describe('POST /api/symbols/:symbol/aggregate', () => {
       body: JSON.stringify({
         enabled: true,
         webhookUrl: '',
-        minSeverity: 'warning',
+        kinds: [],
         repeatCooldownMs: 1_800_000,
       }),
       headers: { 'content-type': 'application/json', origin: 'http://evil.example' },

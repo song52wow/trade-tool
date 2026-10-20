@@ -10,15 +10,6 @@ function reason(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
-/** 最低严重度的三个档。服务端只接受这三个值，下拉里也不给出别的。 */
-const SEVERITIES = [
-  { value: 'critical', label: '紧急 —— 只推「仓位当前没有止损保护」这一类' },
-  { value: 'warning', label: '注意 —— 紧急与注意都推（默认）' },
-  { value: 'info', label: '提示 —— 全部都推' },
-] as const;
-
-type Severity = 'critical' | 'warning' | 'info';
-
 interface Form {
   enabled: boolean;
   /** 留空 = 沿用当前生效的地址。 */
@@ -26,7 +17,8 @@ interface Form {
   /** 留空 = 沿用当前生效的签名密钥。 */
   secret: string;
   clearSecret: boolean;
-  minSeverity: Severity;
+  /** 要通知哪些内容（差异类型 id）。 */
+  kinds: string[];
   /** 冷却时间以**分钟**呈现，提交时换算成毫秒（换算只在这一处）。 */
   cooldownMinutes: string;
 }
@@ -36,23 +28,24 @@ const EMPTY_FORM: Form = {
   webhookUrl: '',
   secret: '',
   clearSecret: false,
-  minSeverity: 'warning',
+  kinds: [],
   cooldownMinutes: '30',
 };
 
 /**
  * 飞书通知设置（v0.8.0）。
  *
- * 这个区块的**核心是「哪一份在生效」**，因此它把来源摆在最上面：
- * 地址可能来自控制面录入（密文落库），也可能来自配置文件 + 环境变量。
- * 两者都存在时，**控制面录入的那一份说了算**——这条优先级只有服务端一份实现，
- * 页面只是如实显示它告诉我们的结果，不自己再判一次。
+ * 这个区块的**核心是「要通知什么」**：用户逐项勾选关心的事（哪种差异要告诉我），
+ * 而不是挑一个笼统的严重度门槛——同一类差异的严重度是固定的，门槛只能「全要」或
+ * 「只要三种紧急的」，表达不了「止盈单没了这种别烦我，但仓位没止损保护一定要说」。
  *
- * 三条硬约束，都写在代码里：
+ * 勾选项的清单**由服务端下发**（`status.topics`），页面不自己抄一份：抄了就会漂。
+ *
+ * 另外三条硬约束，都写在代码里：
  *
  * 1. **不回填。** `GET /api/settings/notify` 的回包里没有地址、没有密文，
- *    只有「配没配 / 末 4 位 / 生效来源」。所以输入框在读到状态后一律保持空：
- *    把一个空框显示成「已填」比显示「已配置（末 4 位 xxxx）」危险得多。
+ *    只有「配没配 / 末 4 位 / 生效来源 / 勾了哪些」。所以地址输入框在读到状态后
+ *    一律保持空：把一个空框显示成「已填」比显示「已配置（末 4 位 xxxx）」危险得多。
  * 2. **主密钥没就绪就禁用表单。** 没有它就没有加密密钥，填了也存不下来。
  * 3. **不留副本。** 输入只流向 `PUT` 那一次提交，提交完立刻清空。
  */
@@ -77,7 +70,7 @@ export function NotifyPanel(props: { notify: (text: string, kind?: 'ok' | 'err')
           webhookUrl: '',
           secret: '',
           clearSecret: false,
-          minSeverity: s.minSeverity,
+          kinds: [...s.kinds],
           cooldownMinutes: String(Math.round(s.repeatCooldownMs / 60_000)),
         });
       })
@@ -94,6 +87,13 @@ export function NotifyPanel(props: { notify: (text: string, kind?: 'ok' | 'err')
   const disabled = busy || !masterKeyReady;
   const fromPanel = status?.source === 'panel';
 
+  const toggleKind = (kind: string, on: boolean) => {
+    setForm((f) => ({
+      ...f,
+      kinds: on ? [...f.kinds, kind] : f.kinds.filter((k) => k !== kind),
+    }));
+  };
+
   const submit = () => {
     const minutes = Number(form.cooldownMinutes);
     if (!Number.isFinite(minutes) || minutes < 0) {
@@ -108,7 +108,7 @@ export function NotifyPanel(props: { notify: (text: string, kind?: 'ok' | 'err')
         webhookUrl: form.webhookUrl.trim(),
         secret: form.secret.trim(),
         clearSecret: form.clearSecret,
-        minSeverity: form.minSeverity,
+        kinds: form.kinds,
         repeatCooldownMs: Math.round(minutes * 60_000),
       })
       .then((next) => {
@@ -287,22 +287,6 @@ export function NotifyPanel(props: { notify: (text: string, kind?: 'ok' | 'err')
         </label>
 
         <label>
-          <span className="label">最低严重度</span>
-          <select
-            aria-label="最低严重度"
-            value={form.minSeverity}
-            disabled={disabled}
-            onChange={(e) => setForm((f) => ({ ...f, minSeverity: e.target.value as Severity }))}
-          >
-            {SEVERITIES.map((s) => (
-              <option key={s.value} value={s.value}>
-                {s.label}
-              </option>
-            ))}
-          </select>
-        </label>
-
-        <label>
           <span className="label">重复提醒间隔（分钟）</span>
           <input
             type="number"
@@ -314,6 +298,53 @@ export function NotifyPanel(props: { notify: (text: string, kind?: 'ok' | 'err')
             onChange={(e) => setForm((f) => ({ ...f, cooldownMinutes: e.target.value }))}
           />
         </label>
+      </div>
+
+      {/* 要通知哪些内容：逐项勾。清单由服务端下发，页面不自己抄。 */}
+      <div className="topics">
+        <div className="row" style={{ marginBottom: 6 }}>
+          <span className="label">要通知哪些内容</span>
+          <span className="muted" style={{ fontSize: 12 }}>
+            勾上的才推；没勾的差异照样记在日志里，只是不来烦你。
+          </span>
+          <button
+            type="button"
+            disabled={disabled || status === null}
+            onClick={() =>
+              setForm((f) => ({ ...f, kinds: (status?.topics ?? []).map((t) => t.kind) }))
+            }
+          >
+            全选
+          </button>
+          <button
+            type="button"
+            disabled={disabled || status === null}
+            onClick={() => setForm((f) => ({ ...f, kinds: [] }))}
+          >
+            全不选
+          </button>
+        </div>
+        {status === null ? (
+          <div className="muted" style={{ fontSize: 12 }}>
+            读取中…
+          </div>
+        ) : (
+          status.topics.map((topic) => (
+            <label className="topic" key={topic.kind}>
+              <input
+                type="checkbox"
+                aria-label={`通知：${topic.label}`}
+                checked={form.kinds.includes(topic.kind)}
+                disabled={disabled}
+                onChange={(e) => toggleKind(topic.kind, e.target.checked)}
+              />
+              <span>
+                <b>{topic.label}</b>
+                <span className="muted"> —— {topic.hint}</span>
+              </span>
+            </label>
+          ))
+        )}
       </div>
 
       <div className="row" style={{ marginTop: 12 }}>
@@ -342,7 +373,8 @@ export function NotifyPanel(props: { notify: (text: string, kind?: 'ok' | 'err')
       <p className="muted" style={{ fontSize: 12, margin: '10px 0 0' }}>
         保存后<b>不必重启 executor</b>：它每轮对账时都会重新读一次设置，下一轮（默认 5
         分钟内）就用新值。 「留空 =
-        沿用当前生效的地址」——但保存之后这一份会被固化到库里（地址仍然加密）， 此后它就是生效来源。
+        沿用当前生效的地址」——但保存之后这一份会被固化到库里（地址仍然加密），
+        此后它就是生效来源。改勾选只影响<b>之后</b>的推送，不会撤回已经发出去的消息。
       </p>
 
       {confirmClear ? (
