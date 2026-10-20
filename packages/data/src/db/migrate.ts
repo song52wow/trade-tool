@@ -18,6 +18,45 @@ export interface MigrateOptions {
   sqlDir?: string;
 }
 
+/**
+ * 迁移期间持有的 **session 级** advisory lock 的键表达式。
+ *
+ * 为什么需要这把锁：四个入口（web / sync / executor / cli）**各自**在启动时跑迁移，
+ * 而 `docker compose up -d` 会让它们**同时**启动。两个进程同时执行同一份
+ * `CREATE TABLE`，必然有一个撞上
+ * `duplicate key value violates unique constraint "pg_type_typname_nsp_index"`：
+ * 那个进程回滚并留下一条 ERROR，另一个进程成功——**谁先跑完决定谁报错**，
+ * 于是「迁移失败」和「迁移成功」会同时出现在同一分钟的日志里。
+ *
+ * 「迁移是幂等的，所以并发跑也无妨」是错的：**幂等保证的是重复执行安全，
+ * 不保证同时执行安全**。这两件事不一样。
+ *
+ * 锁按 **schema** 划分，与 `removeSymbolEntry` 的单写者锁同一套键算法
+ * （`hashtextextended`）：生产里四个入口共用同一个 schema，会被真正串行化；
+ * 测试里不同 schema 各跑各的，不会互相等待。
+ */
+const MIGRATION_LOCK_EXPR = `hashtextextended(coalesce(current_schema(), 'public') || '/migration', 0)`;
+
+/**
+ * 拿迁移锁。**必须先拿锁再读「已应用版本」**——
+ * 反过来就会出现两个进程读到同一个空集合、然后一起去建同一张表。
+ *
+ * 阻塞式获取（不是 try）：等另一个进程把迁移跑完正是这里想要的行为。
+ * 持锁进程若崩溃，连接断开会让 session 级锁**自动释放**，不会留下死锁。
+ */
+async function acquireMigrationLock(client: PoolClient): Promise<void> {
+  await client.query(`SELECT pg_advisory_lock(${MIGRATION_LOCK_EXPR})`);
+}
+
+/**
+ * 放迁移锁。必须在 `client.release()` **之前**：
+ * session 级 advisory lock 跟着连接走，把连接还回池子等于把锁也还了回去。
+ */
+async function releaseMigrationLock(client: PoolClient): Promise<void> {
+  // 解锁失败不掩盖主流程的结果：连接即将归还，断开时 PG 也会自动释放。
+  await client.query(`SELECT pg_advisory_unlock(${MIGRATION_LOCK_EXPR})`).catch(() => undefined);
+}
+
 export interface MigrateResult {
   applied: string[];
   skipped: string[];
@@ -61,7 +100,10 @@ export async function migrate(pool: Pool, options: MigrateOptions = {}): Promise
   }
 
   const client = await pool.connect();
+  let lockHeld = false;
   try {
+    await acquireMigrationLock(client);
+    lockHeld = true;
     const already = await appliedVersions(client);
     const applied: string[] = [];
     const skipped: string[] = [];
@@ -96,6 +138,7 @@ export async function migrate(pool: Pool, options: MigrateOptions = {}): Promise
   } catch (error) {
     throw toSyncError(error, '应用数据库迁移失败');
   } finally {
+    if (lockHeld) await releaseMigrationLock(client);
     client.release();
   }
 }

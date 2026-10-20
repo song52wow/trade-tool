@@ -262,6 +262,14 @@ apps/cli/src/index.ts   apps/sync/src/main.ts   apps/web/src/main.ts   apps/exec
 schema 的唯一来源是 `packages/data/sql/*.sql`；**每张迁移文件头部的注释就是它的设计理由**，
 改之前先读。迁移必须幂等（`IF NOT EXISTS` / 可重复执行的 `ALTER`），因为每个入口启动都会跑一遍。
 
+**幂等只保证「重复执行」安全，不保证「同时执行」安全。** `docker compose up -d` 会让
+web / sync / executor 三个容器同时启动，三个容器各自在入口里跑一遍迁移，两个进程就会
+一起去建同一张表，撞 `duplicate key value violates unique constraint
+"pg_type_typname_nsp_index"`——一个失败回滚、一个成功，「迁移失败」和「迁移成功」同框出现。
+因此迁移内部持一把 **session 级 advisory lock**（`packages/data/src/db/migrate.ts`，
+按 schema 划分），把并发迁移串行化。**别删这把锁，也别改成 try 版本**：
+try 版本会让第二个进程「拿不到锁就跳过」，那正是「库还是旧的就启动了」的静默失败。
+
 | 迁移                    | 内容                                                                                                    |
 | ----------------------- | ------------------------------------------------------------------------------------------------------- |
 | `001_init`              | `klines_1m`、`gaps`、`symbols`、`sync_state`、`contract_spec`、`weight_budget`、`schema_migrations`     |
@@ -953,6 +961,13 @@ stdout 是命令结果（日志走 stderr），`--json` 时输出纯 JSON。**�
 运行期 Python **不调 uv**（配置里 `data.python = "python3"`，用镜像内建好的 venv）。
 代理要四条一起配（`HTTPS_PROXY` / `NODE_OPTIONS=--use-env-proxy` / `NO_PROXY` 含 `postgres` /
 凭据只放目标机 `.env`），少一条就是「Python 通、Node 不通」的半通状态。
+
+**代理变量的大小写陷阱（2026-10-21 实测）**：Node 的 `fetch`（undici `EnvHttpProxyAgent`）
+**优先读小写的 `http_proxy` / `https_proxy`**。因此：镜像里**不许**留下这三个变量的空值
+（`deploy/Dockerfile` 曾把 `ARG` 写进 `ENV`，空值固化进运行层，把大写顶掉），
+`deploy/compose.yaml` 必须**同时显式注入大小写两套**、值取自同一个 `TRADE_TOOL_*`。
+被遮蔽时的症状是「代理配了却连不上交易所，报错只有一句 `fetch failed`」——
+看不出是代理问题，所以先在容器里 `env | grep -i proxy` 对一下。
 
 ## 10 交易所接缝与外部证据
 

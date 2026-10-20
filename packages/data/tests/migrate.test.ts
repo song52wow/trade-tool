@@ -174,6 +174,52 @@ describe('迁移文件（R-1.1）', () => {
   });
 });
 
+describe('并发迁移（部署实测踩到）', () => {
+  it('两个入口同时跑迁移不会撞 duplicate key', async () => {
+    // 生产现场：docker compose up -d 让 web / sync / executor 三个容器同时启动，
+    // 三个容器各自在入口里跑一遍迁移。没有锁时必然有一个撞
+    // `duplicate key value violates unique constraint "pg_type_typname_nsp_index"`。
+    const schema = `tt_conc_${Date.now().toString(36)}`;
+    const admin = createPool(TEST_DATABASE_CONFIG, {
+      overrides: { max: 2, searchPath: 'public', password: TEST_PG.password },
+    });
+    await admin.query(`DROP SCHEMA IF EXISTS ${schema} CASCADE`);
+    await admin.query(`CREATE SCHEMA ${schema}`);
+    await admin.end();
+
+    const poolA = createPool(TEST_DATABASE_CONFIG, {
+      overrides: { max: 2, searchPath: schema, password: TEST_PG.password },
+    });
+    const poolB = createPool(TEST_DATABASE_CONFIG, {
+      overrides: { max: 2, searchPath: schema, password: TEST_PG.password },
+    });
+    try {
+      const [a, b] = await Promise.all([migrate(poolA), migrate(poolB)]);
+
+      // 每个版本恰好被应用一次：两个进程不能都以为是自己建的那张表。
+      const known = listMigrations(resolveSqlDir()).map((m) => m.version);
+      expect(a.applied.length + b.applied.length).toBe(known.length);
+      expect(new Set([...a.applied, ...b.applied]).size).toBe(known.length);
+
+      const recorded = await poolA.query<{ version: string }>(
+        'SELECT version FROM schema_migrations',
+      );
+      expect(recorded.rows.length).toBe(known.length);
+
+      const status = await schemaStatus(poolA);
+      expect(status.ok).toBe(true);
+    } finally {
+      await poolA.end();
+      await poolB.end();
+      const cleanup = createPool(TEST_DATABASE_CONFIG, {
+        overrides: { max: 2, searchPath: 'public', password: TEST_PG.password },
+      });
+      await cleanup.query(`DROP SCHEMA IF EXISTS ${schema} CASCADE`);
+      await cleanup.end();
+    }
+  });
+});
+
 describe('版本闸门（R-1.3 / AC-1 / R-19.7）', () => {
   it('库落后时报错而不是继续运行', async () => {
     // 一个只有 schema_migrations、没有业务表的空 schema = 迁移未跑

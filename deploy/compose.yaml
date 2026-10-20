@@ -50,9 +50,16 @@ services:
       # 显式代理（可选，留空即直连）。Python 侧 urllib 读这两个变量；
       # Node 侧靠 NODE_OPTIONS=--use-env-proxy 才会读，否则 fetch 直连。
       # NO_PROXY 必须含 postgres：容器之间与数据库的连接不该绕一圈代理。
+      # 大写给 Python（urllib 认大写），小写给 Node（undici 的 EnvHttpProxyAgent
+      # **优先读小写**）。两套都要显式给：容器里只要存在一个**空的**小写变量，
+      # Node 就会拿它把大写顶掉，表现为「代理明明配了却连不上交易所」，
+      # 报错还只是一句 `fetch failed`（2026-10-21 实测踩到，见 deploy/README.md §6）。
       HTTP_PROXY: ${TRADE_TOOL_HTTP_PROXY:-}
       HTTPS_PROXY: ${TRADE_TOOL_HTTPS_PROXY:-}
+      http_proxy: ${TRADE_TOOL_HTTP_PROXY:-}
+      https_proxy: ${TRADE_TOOL_HTTPS_PROXY:-}
       NO_PROXY: ${TRADE_TOOL_NO_PROXY:-postgres,127.0.0.1,localhost}
+      no_proxy: ${TRADE_TOOL_NO_PROXY:-postgres,127.0.0.1,localhost}
       NODE_OPTIONS: ${TRADE_TOOL_NODE_OPTIONS:-}
     ports:
       # 两端同值：控制面读的就是 TRADE_TOOL_WEB_PORT，容器内监听端口由它决定，
@@ -91,9 +98,16 @@ services:
       # 显式代理（可选，留空即直连）。Python 侧 urllib 读这两个变量；
       # Node 侧靠 NODE_OPTIONS=--use-env-proxy 才会读，否则 fetch 直连。
       # NO_PROXY 必须含 postgres：容器之间与数据库的连接不该绕一圈代理。
+      # 大写给 Python（urllib 认大写），小写给 Node（undici 的 EnvHttpProxyAgent
+      # **优先读小写**）。两套都要显式给：容器里只要存在一个**空的**小写变量，
+      # Node 就会拿它把大写顶掉，表现为「代理明明配了却连不上交易所」，
+      # 报错还只是一句 `fetch failed`（2026-10-21 实测踩到，见 deploy/README.md §6）。
       HTTP_PROXY: ${TRADE_TOOL_HTTP_PROXY:-}
       HTTPS_PROXY: ${TRADE_TOOL_HTTPS_PROXY:-}
+      http_proxy: ${TRADE_TOOL_HTTP_PROXY:-}
+      https_proxy: ${TRADE_TOOL_HTTPS_PROXY:-}
       NO_PROXY: ${TRADE_TOOL_NO_PROXY:-postgres,127.0.0.1,localhost}
+      no_proxy: ${TRADE_TOOL_NO_PROXY:-postgres,127.0.0.1,localhost}
       NODE_OPTIONS: ${TRADE_TOOL_NODE_OPTIONS:-}
     volumes:
       - appli:/data
@@ -122,9 +136,16 @@ services:
       # 显式代理（可选，留空即直连）。Python 侧 urllib 读这两个变量；
       # Node 侧靠 NODE_OPTIONS=--use-env-proxy 才会读，否则 fetch 直连。
       # NO_PROXY 必须含 postgres：容器之间与数据库的连接不该绕一圈代理。
+      # 大写给 Python（urllib 认大写），小写给 Node（undici 的 EnvHttpProxyAgent
+      # **优先读小写**）。两套都要显式给：容器里只要存在一个**空的**小写变量，
+      # Node 就会拿它把大写顶掉，表现为「代理明明配了却连不上交易所」，
+      # 报错还只是一句 `fetch failed`（2026-10-21 实测踩到，见 deploy/README.md §6）。
       HTTP_PROXY: ${TRADE_TOOL_HTTP_PROXY:-}
       HTTPS_PROXY: ${TRADE_TOOL_HTTPS_PROXY:-}
+      http_proxy: ${TRADE_TOOL_HTTP_PROXY:-}
+      https_proxy: ${TRADE_TOOL_HTTPS_PROXY:-}
       NO_PROXY: ${TRADE_TOOL_NO_PROXY:-postgres,127.0.0.1,localhost}
+      no_proxy: ${TRADE_TOOL_NO_PROXY:-postgres,127.0.0.1,localhost}
       NODE_OPTIONS: ${TRADE_TOOL_NODE_OPTIONS:-}
     volumes:
       - appli:/data

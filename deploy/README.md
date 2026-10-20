@@ -158,6 +158,25 @@ TRADE_TOOL_NODE_OPTIONS=--use-env-proxy
 4. 代理节点若开了访问控制，填进 URL 的用户名密码会**以明文存在目标机 `.env`**（权限 600）。
    更稳的做法是在代理侧关掉认证、改用「访问控制」按 IP 只放行目标机 IP。
 
+**小写代理变量会把大写的顶掉（2026-10-21 实测踩到）。**
+Node 的 `fetch`（undici 的 `EnvHttpProxyAgent`）**优先读小写的 `http_proxy` / `https_proxy`**，
+而镜像里曾经带着三个**空值**的小写变量（`deploy/Dockerfile` 的 `toolchain` 阶段写进了 `ENV`，
+运行层继承了它）。于是容器里的大写 `HTTPS_PROXY` 形同虚设，Node 直连币安 → 超时 →
+报错只有一句 `fetch failed`，**完全看不出是代理被遮蔽**。
+
+现在的做法是两头都堵上：
+
+- 镜像里**不再带**这三个变量（`ARG` 的值本来就自动是 `RUN` 里的环境变量，apt 用得上，
+  但不该固化进镜像）；
+- `deploy/compose.yaml` 里**显式同时注入大小写**两套，值都取自同一个
+  `TRADE_TOOL_*`，于是谁先读都一样。
+
+排查时先在容器里对一下：
+
+```bash
+docker compose exec -T web sh -c 'env | grep -i proxy'   # 大写小写都该是同一个地址
+```
+
 验证：
 
 ```bash
@@ -172,14 +191,16 @@ curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8787/api/overview   # 
 
 ## 7. 排查
 
-| 现象                                             | 多半是                                                                                                                                |
-| ------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------- |
-| 容器反复重启，日志停在「等待 PostgreSQL」        | PG 没起来或 `TRADE_TOOL_PG_PASSWORD` 与库不一致；`docker compose logs postgres`                                                       |
-| `EISDIR: illegal operation on a directory, read` | `/data/trade-tool.config.json` 被挂成了**目录**：宿主机上那个路径当时不存在，Docker 就地建了同名目录。确认文件已 `scp` 过去再 `up -d` |
-| 控制面起不来，日志说 schema 版本对不上           | 迁移没跑成。入口每次启动都迁移，这里多半是它自己也连不上库                                                                            |
-| 同步进程起来了但一条数据没进                     | `sync.symbols` 为空、或全是 `paused`；控制面「标的」页看状态                                                                          |
-| 首次同步卡很久                                   | 首次全量是几十分钟量级，属正常。控制面能看 `sync_state` 的进度                                                                        |
-| `Loaded image` 后仍然 `pull_policy` 报错         | 镜像标签与 `.env` 的 `TRADE_TOOL_IMAGE` 不一致                                                                                        |
+| 现象                                                 | 多半是                                                                                                                                |
+| ---------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------- |
+| 容器反复重启，日志停在「等待 PostgreSQL」            | PG 没起来或 `TRADE_TOOL_PG_PASSWORD` 与库不一致；`docker compose logs postgres`                                                       |
+| `EISDIR: illegal operation on a directory, read`     | `/data/trade-tool.config.json` 被挂成了**目录**：宿主机上那个路径当时不存在，Docker 就地建了同名目录。确认文件已 `scp` 过去再 `up -d` |
+| 控制面起不来，日志说 schema 版本对不上               | 迁移没跑成。入口每次启动都迁移，这里多半是它自己也连不上库                                                                            |
+| 同步进程起来了但一条数据没进                         | `sync.symbols` 为空、或全是 `paused`；控制面「标的」页看状态                                                                          |
+| 首次同步卡很久                                       | 首次全量是几十分钟量级，属正常。控制面能看 `sync_state` 的进度                                                                        |
+| `Loaded image` 后仍然 `pull_policy` 报错             | 镜像标签与 `.env` 的 `TRADE_TOOL_IMAGE` 不一致                                                                                        |
+| 容器日志只有一句 `启动失败：TypeError: fetch failed` | 代理被小写变量遮蔽了（Node 优先读小写的 `http_proxy`）。见 §6 的「小写代理变量会把大写的顶掉」                                        |
+| 同一分钟里既有「迁移失败」又有「迁移成功」           | 多个容器同时跑迁移撞了 duplicate key。已由迁移锁修掉；旧镜像需重新构建                                                                |
 
 macOS 本机用 colima 跑这套 compose 时注意：colima 默认只挂 `/Users`，
 **不挂 `/Volumes`**。仓库在 `/Volumes/data/...` 时，配置文件绑定会被 Docker
@@ -189,8 +210,16 @@ macOS 本机用 colima 跑这套 compose 时注意：colima 默认只挂 `/Users
 
 **迁移在入口里跑。** `deploy/entrypoint.sh` 做的事是「等 PostgreSQL → `db migrate` → exec 目标命令」。
 apps/web 启动第一件事就是 `assertSchema()`，版本对不上直接拒绝启动；把迁移放在入口里，
-就不存在「web 起来了但库还是旧的」这种半个可用状态。迁移幂等，三个容器同时启动
-互相跑一遍也无妨。等库超时或失败会直接退出并说明去看 postgres 日志，不静默重试。
+就不存在「web 起来了但库还是旧的」这种半个可用状态。等库超时或失败会直接退出并说明去看
+postgres 日志，不静默重试。
+
+**迁移幂等 ≠ 迁移能并发跑。** 幂等保证的是**重复执行**安全（`sql/00N_*.sql` 逐个记录已应用版本），
+不保证**同时执行**安全：`docker compose up -d` 会让 web / sync / executor 三个容器同时启动，
+三个容器各自在入口里跑一遍迁移，两个进程就会一起去建同一张表，撞
+`duplicate key value violates unique constraint "pg_type_typname_nsp_index"`——
+一个失败回滚、一个成功，日志里「迁移失败」和「迁移成功」同框出现，还取决于谁先跑完。
+现在迁移内部持一把 **session 级 advisory lock**（`packages/data/src/db/migrate.ts`），
+把并发迁移串行化：第二个进程等第一个跑完，发现自己无事可做。
 
 **Python 运行期不调 uv。** 配置里 `data.python` 写的是 `python3`，解释器来自构建期
 `uv sync --frozen --no-dev --no-editable` 建好的 venv。默认的 `uv` 运行模式会在每次

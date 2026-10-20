@@ -30,6 +30,18 @@ ARG BUILD_NODE_OPTIONS=""
 # deb.debian.org 并在受限网络下失败）。因此显式声明小写版本并透传，
 # build 时与预定义变量一起给：`--build-arg http_proxy=… --build-arg https_proxy=…`。
 # 未传入时为空字符串，apt 与大多数工具都会忽略，不影响直连网络的环境。
+#
+# ARG 的值**自动就是 RUN 里的环境变量**，所以下面的 apt 步骤照常拿得到代理，
+# 不需要（也不该）为此在 ENV 里声明它们。
+#
+# **不要把它们写进 ENV**（2026-10-21 实测踩到）：ENV 会把这三个变量以**空值**
+# 固化进运行层镜像。运行期 Node 的 `fetch`（undici EnvHttpProxyAgent）**优先读
+# 小写变量**，于是读到这个空值就把 compose 注入的大写 `HTTPS_PROXY` 顶掉了——
+# 表现是「代理明明配了却连不上交易所」，报错只有一句 `fetch failed`，
+# 完全看不出是代理被遮蔽（本机 curl 带 `-x` 通、容器里 fetch 不通，就是它）。
+#
+# 之所以会一路带进最终镜像：`toolchain` 既是构建层的基础也是**运行层**的基础，
+# 这里的 ENV 会被 runtime 阶段继承。
 ARG http_proxy=""
 ARG https_proxy=""
 ARG no_proxy=""
@@ -40,9 +52,6 @@ ENV DEBIAN_FRONTEND=noninteractive \
     COREPACK_ENABLE_DOWNLOAD_PROMPT=0 \
     UV_PROJECT_ENVIRONMENT=/app/python/.venv \
     NODE_OPTIONS=${BUILD_NODE_OPTIONS} \
-    http_proxy=${http_proxy} \
-    https_proxy=${https_proxy} \
-    no_proxy=${no_proxy} \
     PATH=/pnpm:/app/python/.venv/bin:$PATH
 
 # ca-certificates：出网访问交易所。tini：让 SIGTERM 真的到达 Node 进程，

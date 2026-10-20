@@ -37,8 +37,12 @@ if [[ "${TRADE_TOOL_SKIP_MIGRATE:-0}" != "1" ]]; then
   done
   log "PostgreSQL 已就绪"
 
-  # 迁移是幂等的（sql/00N_*.sql 逐个记录已应用版本），重复执行安全，
-  # 因此 web / sync / executor 三个容器同时启动时互相跑一遍也无妨。
+  # 迁移是幂等的（sql/00N_*.sql 逐个记录已应用版本），重复执行安全。
+  # 但「幂等」只保证**重复执行**安全，不保证**同时执行**安全：web / sync / executor
+  # 三个容器同时启动时，两个进程会一起去建同一张表，撞
+  # `duplicate key value violates unique constraint "pg_type_typname_nsp_index"`。
+  # 因此迁移内部持一把 session 级 advisory lock（packages/data/src/db/migrate.ts），
+  # 把并发迁移真正串行化——第二个进程会等第一个跑完，然后发现自己无事可做。
   log "应用数据库迁移…"
   node "${CLI}" db migrate
   log "迁移完成"
