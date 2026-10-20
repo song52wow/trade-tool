@@ -77,7 +77,7 @@ describe('feishuSign', () => {
 });
 
 describe('FeishuNotifier', () => {
-  it('发的是文本消息体（官方 msg_type: text）', async () => {
+  it('先发卡片：头部按严重度上色，正文是明细行', async () => {
     const captured: Captured[] = [];
     const notifier = new FeishuNotifier({
       webhookUrl: WEBHOOK,
@@ -88,10 +88,67 @@ describe('FeishuNotifier', () => {
 
     expect(captured).toHaveLength(1);
     expect(captured[0]?.url).toBe(WEBHOOK);
-    expect(captured[0]?.body['msg_type']).toBe('text');
-    const content = captured[0]?.body['content'] as { text: string };
+    expect(captured[0]?.body['msg_type']).toBe('interactive');
+    const card = captured[0]?.body['card'] as {
+      header: { title: { content: string }; subtitle: { content: string }; template: string };
+      body: { elements: { tag: string; content?: string }[] };
+    };
+    // 头部标题带固定前缀：飞书的「自定义关键词」只对 text / title 这类文本参数生效，
+    // 卡片的 header.title 正是 title 参数。
+    expect(card.header.title.content).toContain('trade-tool 告警');
+    expect(card.header.title.content).toContain('注意');
+    expect(card.header.subtitle.content).toBe('标题');
+    expect(card.header.template).toBe('orange');
+    expect(card.body.elements[0]?.content).toBe('正文');
+  });
+
+  it('卡片被飞书拒收时退回纯文本再发一次（兜底不是静默的）', async () => {
+    const captured: Captured[] = [];
+    const notifier = new FeishuNotifier({
+      webhookUrl: WEBHOOK,
+      // 第一次（卡片）被拒，第二次（纯文本）成功
+      fetchImpl: (url, init) => {
+        captured.push({ url, body: JSON.parse(init.body) as Record<string, unknown> });
+        const rejected = captured.length === 1;
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          text: () =>
+            Promise.resolve(
+              rejected ? JSON.stringify({ code: 19024, msg: 'Key Words Not Found' }) : OK_BODY,
+            ),
+        });
+      },
+    });
+
+    await notifier.notify({ title: '标题', severity: 'info', lines: ['正文'] });
+
+    expect(captured).toHaveLength(2);
+    expect(captured[0]?.body['msg_type']).toBe('interactive');
+    expect(captured[1]?.body['msg_type']).toBe('text');
+    const content = captured[1]?.body['content'] as { text: string };
     expect(content.text).toContain('标题');
-    expect(content.text).toContain('正文');
+    expect(content.text).toContain('trade-tool 告警');
+  });
+
+  it('卡片与纯文本都被拒时报错（不假装发出去）', async () => {
+    const captured: Captured[] = [];
+    const notifier = new FeishuNotifier({
+      webhookUrl: WEBHOOK,
+      fetchImpl: (url, init) => {
+        captured.push({ url, body: JSON.parse(init.body) as Record<string, unknown> });
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          text: () => Promise.resolve(JSON.stringify({ code: 19024, msg: 'Key Words Not Found' })),
+        });
+      },
+    });
+
+    await expect(notifier.notify({ title: '标题', severity: 'info' })).rejects.toMatchObject({
+      code: 'CONFIG_INVALID',
+    });
+    expect(captured).toHaveLength(2);
   });
 
   it('配了密钥就带上 timestamp 与 sign（都是秒级）', async () => {

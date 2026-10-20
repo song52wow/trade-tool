@@ -96,6 +96,8 @@ export interface NotifyEvent {
   severity: NotifySeverity;
   /** 正文行，逐行展示。 */
   lines?: readonly string[];
+  /** 卡片底部的小字（来源、时间等）。可选。 */
+  footer?: string;
 }
 
 /**
@@ -112,7 +114,7 @@ export interface Notifier {
 }
 
 /**
- * 拼出飞书文本消息的内容。
+ * 拼出飞书**纯文本**消息的内容（卡片发不出去时的兜底）。
  *
  * 第一行固定带 `trade-tool 告警` 三个字：飞书自定义机器人可以配「自定义关键词」，
  * 只有正文里**包含**关键词才放行（否则返回 19024）。固定前缀让「配了关键词」的群
@@ -123,7 +125,71 @@ export function formatFeishuText(event: NotifyEvent): string {
   for (const line of event.lines ?? []) {
     if (line !== '') lines.push(line);
   }
+  if (event.footer !== undefined && event.footer !== '') lines.push(event.footer);
   return lines.join('\n');
+}
+
+/** 卡片头部的配色。严重度一眼可见，不靠人读文字。 */
+const CARD_TEMPLATE: Record<NotifySeverity, string> = {
+  critical: 'red',
+  warning: 'orange',
+  info: 'blue',
+};
+
+/**
+ * 拼出飞书**卡片**（`msg_type: "interactive"`）。
+ *
+ * 为什么用卡片：纯文本在群里就是一坨字，看不出轻重缓急。卡片的**头部颜色**按严重度分
+ * （紧急红 / 注意橙 / 提示蓝），扫一眼就知道要不要立刻处理。
+ *
+ * 头部标题固定带 `trade-tool 告警`：飞书的「自定义关键词」只对 `text` / `title` 这类
+ * 文本参数生效（官方文档原话），卡片的 `header.title` 正是 title 参数——关键词写在
+ * 标题里就能过检。正文**不重复**这个前缀（卡片已经很明显了）。
+ *
+ * 形状照官方《自定义机器人使用指南》里的卡片示例（`schema: "2.0"`）。
+ */
+export function formatFeishuCard(event: NotifyEvent): Record<string, unknown> {
+  const elements: Record<string, unknown>[] = (event.lines ?? [])
+    .filter((line) => line !== '')
+    .map((line) => ({
+      tag: 'markdown',
+      content: line,
+      text_align: 'left',
+      text_size: 'normal_v2',
+      margin: '0px 0px 0px 0px',
+    }));
+  if (event.footer !== undefined && event.footer !== '') {
+    elements.push({
+      tag: 'note',
+      elements: [{ tag: 'plain_text', content: event.footer }],
+    });
+  }
+  return {
+    schema: '2.0',
+    config: {
+      update_multi: true,
+      wide_screen_mode: true,
+      style: {
+        text_size: {
+          normal_v2: { default: 'normal', pc: 'normal', mobile: 'heading' },
+        },
+      },
+    },
+    body: {
+      direction: 'vertical',
+      padding: '12px 12px 12px 12px',
+      elements,
+    },
+    header: {
+      title: {
+        tag: 'plain_text',
+        content: `trade-tool 告警·${SEVERITY_LABEL[event.severity]}`,
+      },
+      subtitle: { tag: 'plain_text', content: event.title },
+      template: CARD_TEMPLATE[event.severity],
+      padding: '12px 12px 12px 12px',
+    },
+  };
 }
 
 /**
@@ -223,10 +289,40 @@ export class FeishuNotifier implements Notifier {
   }
 
   async notify(event: NotifyEvent): Promise<void> {
-    const body: Record<string, unknown> = {
+    // **先发卡片**：头部按严重度上色，群里一眼看得出轻重缓急。
+    //
+    // 被飞书**明确拒收**（回了一个非 0 的码）时，退回纯文本再发一次——
+    // 兜底不是静默的：卡片被拒的原因会记进日志，纯文本那条也带着
+    // 「trade-tool 告警」前缀，关键词校验照样能过。
+    //
+    // 只在「对方明确拒收」时兜底：网络错误意味着「不知道送没送到」，
+    // 那时再发一次可能变成群里两条一样的消息。
+    const rejected = await this.post({
+      msg_type: 'interactive',
+      card: formatFeishuCard(event),
+    });
+    if (rejected === null) return;
+
+    console.error(`[notify] 飞书拒绝了卡片消息（${rejected.message}），改用纯文本重发`);
+    const textRejected = await this.post({
       msg_type: 'text',
       content: { text: formatFeishuText(event) },
-    };
+    });
+    if (textRejected !== null) {
+      throw new SyncError(textRejected.code, textRejected.message, textRejected.details);
+    }
+  }
+
+  /**
+   * 发一次请求。
+   *
+   * 成功返回 `null`；被飞书拒收（业务码非 0）返回拒收原因；网络/HTTP 层的失败
+   * 直接抛错——那不是「对方拒收」，是「送不到」，不归兜底管。
+   */
+  private async post(
+    payload: Record<string, unknown>,
+  ): Promise<{ code: SyncErrorCode; message: string; details: Record<string, unknown> } | null> {
+    const body: Record<string, unknown> = { ...payload };
 
     if (this.secret !== undefined && this.secret !== '') {
       // 官方要求 timestamp 是秒级、且距发送时刻不超过 1 小时。
@@ -279,11 +375,13 @@ export class FeishuNotifier implements Notifier {
     if (parsed.code !== 0) {
       const code = typeof parsed.code === 'number' ? parsed.code : -1;
       const msg = typeof parsed.msg === 'string' ? parsed.msg : '（无消息）';
-      throw new SyncError(feishuErrorCode(code), `飞书 webhook 拒绝：${String(code)} ${msg}`, {
-        feishuCode: code,
-        feishuMsg: msg,
-      });
+      return {
+        code: feishuErrorCode(code),
+        message: `飞书 webhook 拒绝：${String(code)} ${msg}`,
+        details: { feishuCode: code, feishuMsg: msg },
+      };
     }
+    return null;
   }
 
   /**
