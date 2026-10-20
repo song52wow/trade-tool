@@ -364,13 +364,20 @@ export function createExecutorService(deps: ExecutorServiceDeps): ExecutorServic
     });
     await pushAlert('bracket-settled', () => ({
       fingerprint: `settled|${after.symbol}|${after.entryOrderId}`,
+      // 类型「成交」：一轮买卖走完了。
+      category: 'trade',
       // 亏了比赚了更值得看一眼——用「注意」而不是「提示」。
       severity: pnl.net >= 0 ? 'info' : 'warning',
       oneShot: true,
-      title: `${after.symbol} 一轮完成（${state === 'take_profit' ? '止盈成交' : '止损成交'}）`,
+      // 标题带净盈亏：推送预览里直接看到这一轮赚没赚。
+      title: `${after.symbol} 净盈亏 ${money(pnl.net)}`,
       lines: [
         `入场 ${after.entryPrice} → 出场 ${update.lastFilledPrice}`,
         `已平 ${after.closedQty}（均价 ${(after.exitNotional / after.closedQty).toFixed(2)}）`,
+        `本轮${state === 'take_profit' ? '止盈' : '止损'}成交`,
+      ],
+      // 金额单独一段并加粗。
+      highlights: [
         `毛利 ${money(pnl.gross)}`,
         `手续费 ${money(pnl.fee)}`,
         `净盈亏 ${money(pnl.net)}`,
@@ -693,18 +700,23 @@ export function createExecutorService(deps: ExecutorServiceDeps): ExecutorServic
     });
     await pushAlert('bracket-armed', () => ({
       fingerprint: `armed|${update.symbol}|${entryOrderId}`,
+      // 类型「止盈止损」：消息列表里只看得到标题，这一眼要能分清是哪种推送。
+      category: 'risk',
       severity: 'info',
       // 一次性事件：下一轮它不在了，**不代表**「问题恢复了」，因此不参与恢复判定。
       oneShot: true,
-      title: `${update.symbol} 止盈止损已挂上`,
+      // 标题带上止盈/止损价：推送预览里就能看到关键数字，不用点开。
+      title: `${update.symbol} 止盈 ${takeProfitPrice} / 止损 ${plan.stopPrice}`,
       lines: [
         `入场 ${update.averagePrice} × ${update.cumulativeQty}（${
           plan.positionSide === 'LONG' ? '多头' : '空头'
         }）`,
-        `止损 ${plan.stopPrice} ｜ 止盈 ${takeProfitPrice}`,
+        ...(plan.mode === 'partial' ? ['剩余仓位由移动止损了结，止损位只上移不放宽'] : []),
+      ],
+      // 金额单独一段并加粗。
+      highlights: [
         `预估收益 +${money(estimate.expectedProfit)}`,
         `预估亏损 -${money(stopEstimate.expectedLoss)}`,
-        ...(plan.mode === 'partial' ? ['剩余仓位由移动止损了结，止损位只上移不放宽'] : []),
       ],
     }));
 
@@ -782,6 +794,8 @@ export function createExecutorService(deps: ExecutorServiceDeps): ExecutorServic
       // 混成一句话就等于没告警——读到「仓位仍受保护」的人不会去查仓位。
       await pushAlert('llm-fallback', () => ({
         fingerprint: `llm-fallback|${update.symbol}`,
+        // 类型「报错」：这一轮是决策没能用上（降级或拒绝），不是成交也不是止盈止损。
+        category: 'error',
         severity: outcome.refuse ? 'critical' : 'warning',
         title: outcome.refuse
           ? `${update.symbol} LLM 决策失败且不降级：本次没有挂任何保护单`

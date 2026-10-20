@@ -84,7 +84,13 @@ describe('FeishuNotifier', () => {
       fetchImpl: stubFetch({ body: OK_BODY }, captured),
     });
 
-    await notifier.notify({ title: '标题', severity: 'warning', lines: ['正文'] });
+    await notifier.notify({
+      category: 'trade',
+      title: '标题',
+      severity: 'warning',
+      lines: ['正文'],
+      highlights: ['净盈亏 +1.00 USDT'],
+    });
 
     expect(captured).toHaveLength(1);
     expect(captured[0]?.url).toBe(WEBHOOK);
@@ -93,13 +99,18 @@ describe('FeishuNotifier', () => {
       header: { title: { content: string }; subtitle: { content: string }; template: string };
       body: { elements: { tag: string; content?: string }[] };
     };
-    // 头部标题带固定前缀：飞书的「自定义关键词」只对 text / title 这类文本参数生效，
-    // 卡片的 header.title 正是 title 参数。
-    expect(card.header.title.content).toContain('trade-tool 告警');
-    expect(card.header.title.content).toContain('注意');
-    expect(card.header.subtitle.content).toBe('标题');
+    // 头部标题 = 类型 + 图标 + 事情：消息列表里只看得到这一行，
+    // 「这是止盈止损 / 报错 / 成交」必须在这一眼里说得清。
+    expect(card.header.title.content).toContain('💰');
+    expect(card.header.title.content).toContain('成交');
+    expect(card.header.title.content).toContain('标题');
+    // 副标题带固定前缀（关键词要能命中）+ 严重度。
+    expect(card.header.subtitle.content).toContain('trade-tool 告警');
+    expect(card.header.subtitle.content).toContain('注意');
     expect(card.header.template).toBe('orange');
     expect(card.body.elements[0]?.content).toBe('正文');
+    // 数值单独一段并**加粗**。
+    expect(card.body.elements[1]?.content).toContain('**净盈亏 +1.00 USDT**');
   });
 
   it('卡片被飞书拒收时退回纯文本再发一次（兜底不是静默的）', async () => {

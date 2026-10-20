@@ -51,6 +51,8 @@ export function buildReconcileAlert(
 
   return {
     fingerprint: `reconcile|${fingerprint}`,
+    // 这类是「仓位有问题」——推��里要能一眼看出是报错，不是成交。
+    category: 'error',
     severity,
     title:
       `交易对账发现 ${String(differences.length)} 处差异` +

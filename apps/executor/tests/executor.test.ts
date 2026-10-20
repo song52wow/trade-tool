@@ -538,11 +538,15 @@ describe('通知：止盈止损挂上与一轮完成（v0.8.0）', () => {
     await service.handleFill(fill());
 
     expect(items).toHaveLength(1);
-    expect(items[0]?.title).toContain('止盈止损已挂上');
-    const text = (items[0]?.lines ?? []).join('\n');
+    // 类型进标题（消息列表里只看得到标题）
+    expect(items[0]?.category).toBe('risk');
+    expect(items[0]?.title).toContain('止盈 60300');
+    expect(items[0]?.title).toContain('止损 59800');
+    // 金额单独一段（卡片里加粗）
+    const money = (items[0]?.highlights ?? []).join('\n');
     // ATR=100，止损 2 倍、止盈 3 倍，入场 60000 × 0.1 → 收益 30 USDT / 亏损 20 USDT
-    expect(text).toContain('预估收益 +30.00 USDT');
-    expect(text).toContain('预估亏损 -20.00 USDT');
+    expect(money).toContain('预估收益 +30.00 USDT');
+    expect(money).toContain('预估亏损 -20.00 USDT');
   });
 
   it('一轮完成 → 通知带实际盈亏，且**已扣手续费**', async () => {
@@ -568,13 +572,15 @@ describe('通知：止盈止损挂上与一轮完成（v0.8.0）', () => {
       }),
     );
 
-    const settled = items.find((item) => item.title.includes('一轮完成'));
+    const settled = items.find((item) => item.category === 'trade');
     expect(settled).toBeDefined();
-    const text = (settled?.lines ?? []).join('\n');
+    // 净盈亏直接进标题：推送预览里就能看到这一轮赚没赚
+    expect(settled?.title).toContain('净盈亏 -20.08 USDT');
+    const money = (settled?.highlights ?? []).join('\n');
     // 毛利 (59800−60000)×0.1 = −20；手续费 0.04（入场）+ 0.04（出场）= 0.08
-    expect(text).toContain('毛利 -20.00 USDT');
-    expect(text).toContain('手续费 0.08 USDT');
-    expect(text).toContain('净盈亏 -20.08 USDT');
+    expect(money).toContain('毛利 -20.00 USDT');
+    expect(money).toContain('手续费 0.08 USDT');
+    expect(money).toContain('净盈亏 -20.08 USDT');
   });
 
   it('没勾的内容类型不推（过滤用的是这一轮生效的设置）', async () => {

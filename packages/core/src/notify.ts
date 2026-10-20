@@ -89,13 +89,46 @@ export function severityLabel(severity: NotifySeverity): string {
   return SEVERITY_LABEL[severity];
 }
 
+/**
+ * 通知的**类型**。
+ *
+ * 为什么要单独一维：飞书的消息列表里只显示卡片的头部标题，于是「这是什么事」
+ * 必须在那一眼里说得清。严重度回答「急不急」，类型回答「是什么事」，两件事。
+ */
+export type NotifyCategory = 'risk' | 'error' | 'trade' | 'info';
+
+/** 每种类型的标签与图标。**只有这一份**。 */
+export const NOTIFY_CATEGORY_META: Record<NotifyCategory, { label: string; emoji: string }> = {
+  // 止盈止损挂上了：这类是「保护已就位」。
+  risk: { label: '止盈止损', emoji: '🛡️' },
+  // 报错：仓位有问题、或者决策降级了。
+  error: { label: '报错', emoji: '🚨' },
+  // 成交：一轮买卖走完了，附实际盈亏。
+  trade: { label: '成交', emoji: '💰' },
+  // 提示：其余（例如「发送测试消息」）。
+  info: { label: '提示', emoji: 'ℹ️' },
+};
+
 /** 一条要推出去的通知。 */
 export interface NotifyEvent {
+  /**
+   * 推送类型。**进消息标题**——消息列表里只看得到标题，
+   * 所以「这是止盈止损还是报错还是成交」必须在这一眼里说得清。
+   */
+  category?: NotifyCategory;
   /** 一句话标题。给人看的，不是给机器解析的。 */
   title: string;
   severity: NotifySeverity;
   /** 正文行，逐行展示。 */
   lines?: readonly string[];
+  /**
+   * **要突出的数值**（盈亏金额之类）。
+   *
+   * 卡片里加粗；纯文本兜底时同样展示，只是不加粗。
+   * 单独一栏而不是塞进 `lines`，是因为「加粗」是卡片的表达方式，
+   * 而文案本身不该带着 markdown 符号。
+   */
+  highlights?: readonly string[];
   /** 卡片底部的小字（来源、时间等）。可选。 */
   footer?: string;
 }
@@ -121,8 +154,14 @@ export interface Notifier {
  * 也能收到消息，而不用把关键词塞进每一句告警文案里。
  */
 export function formatFeishuText(event: NotifyEvent): string {
-  const lines = [`【trade-tool 告警·${SEVERITY_LABEL[event.severity]}】${event.title}`];
+  const category = NOTIFY_CATEGORY_META[event.category ?? 'info'];
+  const lines = [
+    `【trade-tool 告警·${category.label}·${SEVERITY_LABEL[event.severity]}】${event.title}`,
+  ];
   for (const line of event.lines ?? []) {
+    if (line !== '') lines.push(line);
+  }
+  for (const line of event.highlights ?? []) {
     if (line !== '') lines.push(line);
   }
   if (event.footer !== undefined && event.footer !== '') lines.push(event.footer);
@@ -149,6 +188,7 @@ const CARD_TEMPLATE: Record<NotifySeverity, string> = {
  * 形状照官方《自定义机器人使用指南》里的卡片示例（`schema: "2.0"`）。
  */
 export function formatFeishuCard(event: NotifyEvent): Record<string, unknown> {
+  const category = NOTIFY_CATEGORY_META[event.category ?? 'info'];
   const elements: Record<string, unknown>[] = (event.lines ?? [])
     .filter((line) => line !== '')
     .map((line) => ({
@@ -158,6 +198,17 @@ export function formatFeishuCard(event: NotifyEvent): Record<string, unknown> {
       text_size: 'normal_v2',
       margin: '0px 0px 0px 0px',
     }));
+  // 数值单独一段并**加粗**：盈亏金额是这张卡里最该被一眼看到的东西。
+  const highlights = (event.highlights ?? []).filter((line) => line !== '');
+  if (highlights.length > 0) {
+    elements.push({
+      tag: 'markdown',
+      content: highlights.map((line) => `**${line}**`).join('\n'),
+      text_align: 'left',
+      text_size: 'normal_v2',
+      margin: '4px 0px 0px 0px',
+    });
+  }
   if (event.footer !== undefined && event.footer !== '') {
     elements.push({
       tag: 'note',
@@ -181,11 +232,18 @@ export function formatFeishuCard(event: NotifyEvent): Record<string, unknown> {
       elements,
     },
     header: {
+      // 标题 = 类型 + 图标 + 具体是什么事。飞书的消息列表只显示这一行，
+      // 所以「这是止盈止损 / 报错 / 成交」必须在这里就说清。
       title: {
         tag: 'plain_text',
-        content: `trade-tool 告警·${SEVERITY_LABEL[event.severity]}`,
+        content: `${category.emoji} ${category.label} · ${event.title}`,
       },
-      subtitle: { tag: 'plain_text', content: event.title },
+      // 副标题带固定前缀：飞书的「自定义关键词」只对 text / title 这类文本参数生效，
+      // 标题里必须能命中关键词。
+      subtitle: {
+        tag: 'plain_text',
+        content: `trade-tool 告警 · ${SEVERITY_LABEL[event.severity]}`,
+      },
       template: CARD_TEMPLATE[event.severity],
       padding: '12px 12px 12px 12px',
     },
@@ -505,9 +563,13 @@ export interface AlertItem {
    * （否则每轮都算新指纹，冷却形同虚设）。
    */
   fingerprint: string;
+  /** 推送类型（止盈止损 / 报错 / 成交 / 提示）。进消息标题。 */
+  category?: NotifyCategory;
   severity: NotifySeverity;
   title: string;
   lines?: readonly string[];
+  /** 要突出的数值（盈亏金额之类）。卡片里加粗。 */
+  highlights?: readonly string[];
   /** 问题消失时推送的标题（缺省用「已恢复：<原标题>」）。 */
   resolvedTitle?: string;
   /**
@@ -671,7 +733,9 @@ export class AlertDispatcher {
         await notifier.notify({
           title: item.title,
           severity: item.severity,
+          ...(item.category === undefined ? {} : { category: item.category }),
           ...(item.lines === undefined ? {} : { lines: item.lines }),
+          ...(item.highlights === undefined ? {} : { highlights: item.highlights }),
         });
         this.sent.set(item.fingerprint, { severity: item.severity, at: now, item });
         result.sent += 1;
