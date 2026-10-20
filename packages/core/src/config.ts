@@ -1,6 +1,7 @@
 import { z } from 'zod';
 
 import { EXCHANGE_ENVIRONMENTS } from './exchange-endpoints.js';
+import { NOTIFY_SEVERITIES } from './notify.js';
 import { INTERVALS } from './types.js';
 
 export const marketSchema = z.object({
@@ -339,6 +340,43 @@ export const executorSchema = z.object({
   environment: z.enum(EXCHANGE_ENVIRONMENTS).default('live'),
 });
 
+/**
+ * 通知配置（v0.8.0）。
+ *
+ * 通道是**飞书自定义机器人的 webhook**。webhook 地址本身就是一个凭据
+ * （拿到它就能往群里发消息，官方文档明确要求不要外泄），因此这里**只写环境变量名**，
+ * 地址本身留在 `.env` 里——与 `executor.apiKeyEnv` 同一套做法。
+ *
+ * 默认**关闭**：通知是给人看的辅助出口，不该因为「装了包」就往群里发东西。
+ * 打开它要显式做两件事：配置里 `enabled = true`，且环境变量里填上地址。
+ */
+export const notifySchema = z.object({
+  /** 关闭时完全不推送。 */
+  enabled: z.boolean().default(false),
+  /** webhook 地址所在的**环境变量名**。 */
+  webhookEnv: z.string().min(1).default('TRADE_TOOL_FEISHU_WEBHOOK_URL'),
+  /** 签名密钥所在的**环境变量名**。机器人的「安全设置」选了「签名校验」时才需要。 */
+  secretEnv: z.string().min(1).default('TRADE_TOOL_FEISHU_WEBHOOK_SECRET'),
+  /**
+   * 低于这个严重度的告警不推。
+   *
+   * 缺省 `warning` = 紧急与注意都推。改成 `critical` 就只推「仓位当前没有止损保护」
+   * 这一类，噪音最小的极端。
+   */
+  minSeverity: z.enum(NOTIFY_SEVERITIES).default('warning'),
+  /**
+   * 同一条告警的重复推送冷却时间（毫秒）。
+   *
+   * 对账默认每 5 分钟跑一次；一个一直存在的裸仓若每轮都推，群里三天就没人看了。
+   * 缺省 30 分钟：既不会刷屏，又不至于让人以为「服务已经不管这事了」。
+   */
+  repeatCooldownMs: z
+    .number()
+    .int()
+    .min(0)
+    .default(30 * 60_000),
+});
+
 export const configSchema = z.object({
   version: z.literal(1).default(1),
   market: marketSchema,
@@ -348,6 +386,7 @@ export const configSchema = z.object({
   database: databaseSchema.default({}),
   sync: syncSchema.default({}),
   executor: executorSchema.default({}),
+  notify: notifySchema.default({}),
 });
 
 export type MarketConfig = z.infer<typeof marketSchema>;
@@ -356,6 +395,7 @@ export type DataConfig = z.infer<typeof dataSchema>;
 export type DatabaseConfig = z.infer<typeof databaseSchema>;
 export type SyncConfig = z.infer<typeof syncSchema>;
 export type ExecutorConfig = z.infer<typeof executorSchema>;
+export type NotifyConfig = z.infer<typeof notifySchema>;
 // 注意：`RemovePolicy` 这个类型名归 market-sync.ts 所有，config 只导出 zod schema，
 // 避免同一概念在两个模块各有一个类型名。
 export type RemovePolicySchema = z.infer<typeof removePolicySchema>;

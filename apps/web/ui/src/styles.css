@@ -724,6 +724,17 @@ button.link.current {
   font-size: 12px;
 }
 
+/* 复选框：默认的 grid 布局会把文字压在框上方，读起来别扭，这里改成并排。 */
+.form-grid label.check {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.form-grid label.check input {
+  width: auto;
+}
+
 .form-block {
   border: 1px solid var(--line);
   border-radius: var(--radius);

@@ -146,6 +146,35 @@ describe('indicatorSpecs', () => {
   });
 });
 
+describe('notify', () => {
+  it('缺省 = 关闭（通知是辅助出口，不该因为「装了包」就往群里发东西）', () => {
+    const notify = configSchema.parse({ market: { symbol: 'ETHUSDT', interval: '1h' } }).notify;
+    expect(notify.enabled).toBe(false);
+    expect(notify.webhookEnv).toBe('TRADE_TOOL_FEISHU_WEBHOOK_URL');
+    expect(notify.secretEnv).toBe('TRADE_TOOL_FEISHU_WEBHOOK_SECRET');
+    expect(notify.minSeverity).toBe('warning');
+    expect(notify.repeatCooldownMs).toBe(30 * 60_000);
+  });
+
+  it('webhook 地址只能经环境变量名，配置里不写地址本身', () => {
+    const notify = configSchema.parse({
+      market: { symbol: 'ETHUSDT', interval: '1h' },
+      notify: { enabled: true, webhookEnv: 'MY_HOOK' },
+    }).notify;
+    expect(notify.webhookEnv).toBe('MY_HOOK');
+    // 地址本身是凭据，schema 里根本没有它的位置
+    expect(Object.keys(notify)).not.toContain('webhookUrl');
+  });
+
+  it('非法严重度一律拒绝（不许静默回落成某个默认值）', () => {
+    const result = configSchema.safeParse({
+      market: { symbol: 'ETHUSDT', interval: '1h' },
+      notify: { minSeverity: 'fatal' },
+    });
+    expect(result.success).toBe(false);
+  });
+});
+
 describe('MANUAL_INTERVENTION_CODES', () => {
   it('指标层的三个码都需人工介入（v0.3.0 R-12.3）', () => {
     for (const code of [

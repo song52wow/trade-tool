@@ -181,6 +181,60 @@ function fakeDeps(overrides: Partial<WebDeps> = {}): WebDeps & { calls: string[]
       updatedAt: NOW,
       masterKeyReady: true,
     }),
+    getNotifyStatus: async () => ({
+      enabled: false,
+      minSeverity: 'warning' as const,
+      repeatCooldownMs: 1_800_000,
+      configured: false,
+      hint: null,
+      secretConfigured: false,
+      source: 'config' as const,
+      webhookEnv: 'TRADE_TOOL_FEISHU_WEBHOOK_URL',
+      secretEnv: 'TRADE_TOOL_FEISHU_WEBHOOK_SECRET',
+      panel: null,
+      updatedAt: null,
+      masterKeyReady: true,
+    }),
+    writeNotifySettings: async () => ({
+      enabled: true,
+      minSeverity: 'warning' as const,
+      repeatCooldownMs: 1_800_000,
+      configured: true,
+      hint: 'beef',
+      secretConfigured: false,
+      source: 'panel' as const,
+      webhookEnv: 'TRADE_TOOL_FEISHU_WEBHOOK_URL',
+      secretEnv: 'TRADE_TOOL_FEISHU_WEBHOOK_SECRET',
+      panel: {
+        configured: true,
+        hint: 'beef',
+        enabled: true,
+        minSeverity: 'warning' as const,
+        repeatCooldownMs: 1_800_000,
+        updatedAt: NOW,
+        secretConfigured: false,
+      },
+      updatedAt: NOW,
+      masterKeyReady: true,
+    }),
+    clearNotifySettings: async () => ({
+      enabled: false,
+      minSeverity: 'warning' as const,
+      repeatCooldownMs: 1_800_000,
+      configured: false,
+      hint: null,
+      secretConfigured: false,
+      source: 'config' as const,
+      webhookEnv: 'TRADE_TOOL_FEISHU_WEBHOOK_URL',
+      secretEnv: 'TRADE_TOOL_FEISHU_WEBHOOK_SECRET',
+      panel: null,
+      updatedAt: NOW,
+      masterKeyReady: true,
+    }),
+    testNotify: async () => {
+      calls.push('test-notify');
+      return { ok: true as const, sentAt: NOW };
+    },
     getRiskPolicy: async () => ({
       exchange: 'binance',
       global: null,
@@ -796,6 +850,116 @@ describe('POST /api/symbols/:symbol/aggregate', () => {
 
     expect(body.items).toHaveLength(1);
     expect(body.countsByState.failed).toBe(2);
+  });
+
+  // ------------------------------------------------- 飞书通知设置（v0.8.0）
+
+  it('通知读取接口的回包里没有地址、没有密文', async () => {
+    const app = buildApp(fakeDeps());
+    const body = (await (await app.request('/api/settings/notify')).json()) as Record<
+      string,
+      unknown
+    >;
+
+    // 与凭据同一条安全线：控制面从设计上就没有显示凭据的能力。
+    expect(Object.keys(body).sort()).toEqual([
+      'configured',
+      'enabled',
+      'hint',
+      'masterKeyReady',
+      'minSeverity',
+      'panel',
+      'repeatCooldownMs',
+      'secretConfigured',
+      'secretEnv',
+      'source',
+      'updatedAt',
+      'webhookEnv',
+    ]);
+    expect(JSON.stringify(body)).not.toMatch(/webhookUrl/i);
+  });
+
+  it('写入通知设置后回包里不出现地址原文', async () => {
+    const app = buildApp(fakeDeps());
+    const res = await app.request('/api/settings/notify', {
+      method: 'PUT',
+      body: JSON.stringify({
+        enabled: true,
+        webhookUrl: 'https://open.feishu.cn/open-apis/bot/v2/hook/secret-token',
+        minSeverity: 'warning',
+        repeatCooldownMs: 1_800_000,
+      }),
+      headers: { 'content-type': 'application/json' },
+    });
+    const text = await res.text();
+
+    expect(res.status).toBe(200);
+    expect(text).not.toContain('secret-token');
+  });
+
+  it('非法严重度被拒（不许静默回落成默认值）', async () => {
+    const app = buildApp(fakeDeps());
+    const res = await app.request('/api/settings/notify', {
+      method: 'PUT',
+      body: JSON.stringify({
+        enabled: true,
+        webhookUrl: '',
+        minSeverity: 'fatal',
+        repeatCooldownMs: 1_800_000,
+      }),
+      headers: { 'content-type': 'application/json' },
+    });
+    expect(res.status).toBe(400);
+  });
+
+  it('负的重复提醒间隔被拒', async () => {
+    const app = buildApp(fakeDeps());
+    const res = await app.request('/api/settings/notify', {
+      method: 'PUT',
+      body: JSON.stringify({
+        enabled: true,
+        webhookUrl: '',
+        minSeverity: 'warning',
+        repeatCooldownMs: -1,
+      }),
+      headers: { 'content-type': 'application/json' },
+    });
+    expect(res.status).toBe(400);
+  });
+
+  it('跨站写请求被拒', async () => {
+    const app = buildApp(fakeDeps());
+    const res = await app.request('http://127.0.0.1:8787/api/settings/notify', {
+      method: 'PUT',
+      body: JSON.stringify({
+        enabled: true,
+        webhookUrl: '',
+        minSeverity: 'warning',
+        repeatCooldownMs: 1_800_000,
+      }),
+      headers: { 'content-type': 'application/json', origin: 'http://evil.example' },
+    });
+    expect(res.status).toBe(400);
+  });
+
+  it('发送测试消息走同源校验，并如实回报成功', async () => {
+    const deps = fakeDeps();
+    const app = buildApp(deps);
+    const res = await app.request('http://127.0.0.1:8787/api/settings/notify/test', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', origin: 'http://127.0.0.1:8787' },
+    });
+    expect(res.status).toBe(200);
+    expect(deps.calls).toContain('test-notify');
+  });
+
+  it('跨站的测试发送被拒', async () => {
+    const app = buildApp(fakeDeps());
+    const res = await app.request('http://127.0.0.1:8787/api/settings/notify/test', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', origin: 'http://evil.example' },
+    });
+    expect(res.status).toBe(400);
   });
 
   // ------------------------------------------------- 运行期设置（v0.5.0）

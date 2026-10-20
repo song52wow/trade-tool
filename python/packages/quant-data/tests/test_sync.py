@@ -1124,6 +1124,8 @@ def test_migrations_are_idempotent(conn: DbConn, pg_dsn: str) -> None:
         "009_reconcile_run",
         # v0.7.0：两段止盈的阶段（partial_armed / trailing）与移动止损档位
         "010_risk_trailing",
+        # v0.8.0：飞书通知通道的运行期设置
+        "011_notify_settings",
     ]
     pg.ensure_schema(conn)
 

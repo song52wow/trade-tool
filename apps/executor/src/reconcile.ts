@@ -12,13 +12,20 @@
  *   3. **定时器独立于主循环**：用户数据流重连、ATR 计算再慢，都不影响对账的节奏。
  */
 
-import { createLogger, type ReconcileReport, type TradeToolConfig } from '@trade-tool/core';
+import {
+  createLogger,
+  type AlertDispatcher,
+  type ReconcileReport,
+  type TradeToolConfig,
+} from '@trade-tool/core';
 import {
   recordReconciliation,
   runReconciliation,
   type BinancePrivateClient,
   type Pool,
 } from '@trade-tool/data';
+
+import { buildReconcileAlert } from './alert.js';
 
 const log = createLogger('reconcile');
 
@@ -29,6 +36,13 @@ export interface PeriodicReconcileDeps {
   now?: () => number;
   setIntervalImpl?: (fn: () => void, ms: number) => NodeJS.Timeout;
   clearIntervalImpl?: (handle: NodeJS.Timeout) => void;
+  /**
+   * 告警派发器（v0.8.0）。**可选**：不传就只记日志，不推送。
+   *
+   * 它是「差异 → 飞书」这条出口，与对账本身**只读**的性质不冲突：
+   * 推一条消息不改任何账本，也不碰交易所。
+   */
+  alerts?: AlertDispatcher;
 }
 
 /**
@@ -82,7 +96,36 @@ export async function runOnce(deps: PeriodicReconcileDeps): Promise<ReconcileRep
       );
     }
   }
+
+  await dispatchAlerts(deps, report);
   return report;
+}
+
+/**
+ * 把这轮的对账结论推出去（v0.8.0）。
+ *
+ * **绝不影响挂单**：推送失败、推送卡住，都不许把对账这一轮变成一次异常。
+ * 因此这里整段兜住，失败只记日志——对账是旁观者，挂了也不能影响止盈止损。
+ */
+async function dispatchAlerts(deps: PeriodicReconcileDeps, report: ReconcileReport): Promise<void> {
+  const alerts = deps.alerts;
+  if (alerts === undefined) return;
+
+  try {
+    // 没有差异时传空数组：派发器据此推一条「已恢复」，并清掉上一轮的记账。
+    const alert = buildReconcileAlert(report);
+    const result = await alerts.dispatch(alert === null ? [] : [alert]);
+    if (result.sent > 0 || result.recovered > 0 || result.failed > 0) {
+      log.info(
+        `告警推送：发出 ${String(result.sent)} / 恢复 ${String(result.recovered)}` +
+          ` / 冷却压制 ${String(result.suppressed)} / 失败 ${String(result.failed)}`,
+      );
+    }
+  } catch (error) {
+    log.error(
+      `告警推送异常（不影响挂单）：${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
 }
 
 export interface PeriodicReconcile {

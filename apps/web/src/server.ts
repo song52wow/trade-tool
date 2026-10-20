@@ -25,6 +25,8 @@ import type {
   JobDto,
   JobKind,
   LifecycleAction,
+  NotifyStatusDto,
+  NotifyWriteBody,
   OverviewDto,
   RemoveSymbolBody,
   RiskPolicyEntryDto,
@@ -90,6 +92,21 @@ export interface WebDeps {
   /** 写入加密后的凭据。返回状态而非明文。 */
   writeCredentials(input: { apiKey: string; apiSecret: string }): Promise<CredentialStatusDto>;
   clearCredentials(): Promise<CredentialStatusDto>;
+  /**
+   * 通知设置状态（v0.8.0）。**只回状态**，没有明文地址。
+   *
+   * 与凭据那条线同一条安全线：控制面从设计上就没有把凭据显示出来的能力。
+   */
+  getNotifyStatus(): Promise<NotifyStatusDto>;
+  writeNotifySettings(body: NotifyWriteBody): Promise<NotifyStatusDto>;
+  clearNotifySettings(): Promise<NotifyStatusDto>;
+  /**
+   * 发送一条测试消息（v0.8.0）。
+   *
+   * 它是**唯一**一条会拿明文地址出网的控制面路径：不解密就发不出去。
+   * 回包只有「成没成」，**绝不**把地址带出去。
+   */
+  testNotify(): Promise<{ ok: true; sentAt: number }>;
   /** 策略总览。`symbol` 为 null 时 `resolved` 用全局默认推算。 */
   getRiskPolicy(symbol: string | null): Promise<RiskPolicyViewDto>;
   writeRiskPolicy(body: RiskPolicyWriteBody): Promise<RiskPolicyEntryDto>;
@@ -337,6 +354,61 @@ export function buildApp(deps: WebDeps): Hono {
   app.delete('/api/settings/credentials', async (c) => {
     assertSameOrigin(c);
     return c.json(await deps.clearCredentials());
+  });
+
+  // ------------------------------------------------- 飞书通知设置（v0.8.0）
+
+  /**
+   * 通知设置状态。**没有明文地址**，只有「配没配 / 末 4 位 / 生效来源」。
+   */
+  app.get('/api/settings/notify', async (c) => c.json(await deps.getNotifyStatus()));
+
+  app.put('/api/settings/notify', async (c) => {
+    assertSameOrigin(c);
+    const body = await bodyOf<NotifyWriteBody>(c);
+    if (typeof body?.enabled !== 'boolean') {
+      throw new SyncError('CONFIG_INVALID', '缺少 enabled（必须是布尔值）');
+    }
+    if (typeof body?.webhookUrl !== 'string') {
+      throw new SyncError('CONFIG_INVALID', '缺少 webhookUrl（留空表示「保持原样」）');
+    }
+    if (body.secret !== undefined && typeof body.secret !== 'string') {
+      throw new SyncError('CONFIG_INVALID', 'secret 必须是字符串');
+    }
+    if (
+      body.minSeverity !== 'critical' &&
+      body.minSeverity !== 'warning' &&
+      body.minSeverity !== 'info'
+    ) {
+      throw new SyncError(
+        'CONFIG_INVALID',
+        `minSeverity 必须是 critical / warning / info，收到：${String(body.minSeverity)}`,
+      );
+    }
+    if (!Number.isInteger(body.repeatCooldownMs) || body.repeatCooldownMs < 0) {
+      throw new SyncError(
+        'CONFIG_INVALID',
+        `repeatCooldownMs 必须是不小于 0 的整数毫秒，收到：${String(body.repeatCooldownMs)}`,
+      );
+    }
+    return c.json(await deps.writeNotifySettings(body));
+  });
+
+  app.delete('/api/settings/notify', async (c) => {
+    assertSameOrigin(c);
+    return c.json(await deps.clearNotifySettings());
+  });
+
+  /**
+   * 发送一条测试消息。
+   *
+   * **出网**，因此要过来源校验；回包只有「成没成」。
+   * 失败要如实报错（带上飞书返回的错误码），而不是回一句「已发送」——
+   * 「看起来成功其实什么都没发」是这个仓库最忌讳的状态。
+   */
+  app.post('/api/settings/notify/test', async (c) => {
+    assertSameOrigin(c);
+    return c.json(await deps.testNotify());
   });
 
   /** 策略总览：全局默认 + 全部标的覆盖 + 该标的最终生效的那一套。 */

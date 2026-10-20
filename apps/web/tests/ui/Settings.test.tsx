@@ -5,7 +5,7 @@ import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/re
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { App } from '../../ui/src/App';
-import type { CredentialStatusDto, RiskPolicyViewDto } from '../../src/types';
+import type { CredentialStatusDto, NotifyStatusDto, RiskPolicyViewDto } from '../../src/types';
 import { navigate } from '../../ui/src/router';
 import { baseHandlers, stubFetch, symbolHandlers, symbolRow } from './fixtures';
 
@@ -16,6 +16,25 @@ function credential(overrides: Partial<CredentialStatusDto> = {}): CredentialSta
     exchange: 'binance',
     configured: false,
     hint: null,
+    updatedAt: null,
+    masterKeyReady: true,
+    ...overrides,
+  };
+}
+
+/** 通知设置状态。默认「没配、走配置文件那一档」。 */
+function notify(overrides: Partial<NotifyStatusDto> = {}): NotifyStatusDto {
+  return {
+    enabled: false,
+    minSeverity: 'warning',
+    repeatCooldownMs: 1_800_000,
+    configured: false,
+    hint: null,
+    secretConfigured: false,
+    source: 'config',
+    webhookEnv: 'TRADE_TOOL_FEISHU_WEBHOOK_URL',
+    secretEnv: 'TRADE_TOOL_FEISHU_WEBHOOK_SECRET',
+    panel: null,
     updatedAt: null,
     masterKeyReady: true,
     ...overrides,
@@ -46,6 +65,7 @@ function handlers(extra: Record<string, unknown> = {}) {
   return baseHandlers({
     '/api/symbols': { items: [symbolRow('AAAUSDT'), symbolRow('BBBUSDT')] },
     '/api/settings/credentials': credential(),
+    '/api/settings/notify': notify(),
     '/api/settings/risk-policy': policy(),
     ...extra,
   });
@@ -185,6 +205,155 @@ describe('设置页 · 凭据', () => {
     await waitFor(() =>
       expect(
         stub.calls.some((c) => c.method === 'DELETE' && c.url === '/api/settings/credentials'),
+      ).toBe(true),
+    );
+  });
+});
+
+describe('设置页 · 飞书通知', () => {
+  it('显示生效来源与地址状态，但不回填地址明文', async () => {
+    stubFetch(
+      handlers({
+        '/api/settings/notify': notify({
+          enabled: true,
+          configured: true,
+          hint: 'KLMN',
+          secretConfigured: true,
+          source: 'panel',
+          panel: {
+            configured: true,
+            hint: 'KLMN',
+            enabled: true,
+            minSeverity: 'warning',
+            repeatCooldownMs: 1_800_000,
+            updatedAt: NOW,
+            secretConfigured: true,
+          },
+          updatedAt: NOW,
+        }),
+      }),
+    );
+    render(<App />);
+
+    await waitFor(() => expect(screen.getByText('控制面录入')).toBeTruthy());
+    // 末 4 位会出现两处（「地址」行与「页面这一份」行）——生效的就是面板这一份
+    expect(screen.getAllByText(/末 4 位 KLMN/).length).toBeGreaterThan(0);
+    // 回包里没有地址，前端也就没有可回填的东西
+    expect((screen.getByLabelText('webhook 地址') as HTMLInputElement).value).toBe('');
+    expect((screen.getByLabelText('webhook 地址') as HTMLInputElement).type).toBe('password');
+  });
+
+  it('主密钥未就绪时表单禁用，并说清缺什么', async () => {
+    stubFetch(handlers({ '/api/settings/notify': notify({ masterKeyReady: false }) }));
+    render(<App />);
+
+    await waitFor(() => expect(screen.getByText(/TRADE_TOOL_SECRET_KEY/)).toBeTruthy());
+    expect((screen.getByLabelText('webhook 地址') as HTMLInputElement).disabled).toBe(true);
+    expect((screen.getByRole('button', { name: '保存设置' }) as HTMLButtonElement).disabled).toBe(
+      true,
+    );
+  });
+
+  it('保存时带上开关、地址与参数，提交完清空输入框', async () => {
+    const stub = stubFetch(
+      handlers({
+        '/api/settings/notify': notify({
+          enabled: false,
+          configured: true,
+          hint: 'KLMN',
+          source: 'panel',
+        }),
+      }),
+    );
+    render(<App />);
+    await waitFor(() => expect(screen.getByLabelText('webhook 地址')).toBeTruthy());
+
+    fireEvent.click(screen.getByLabelText('启用飞书通知'));
+    fireEvent.change(screen.getByLabelText('webhook 地址'), {
+      target: { value: 'https://open.feishu.cn/open-apis/bot/v2/hook/token' },
+    });
+    fireEvent.change(screen.getByLabelText('重复提醒间隔（分钟）'), { target: { value: '15' } });
+    fireEvent.click(screen.getByRole('button', { name: '保存设置' }));
+
+    await waitFor(() => {
+      const put = stub.calls.find((c) => c.method === 'PUT' && c.url === '/api/settings/notify');
+      expect(put?.body).toEqual({
+        enabled: true,
+        webhookUrl: 'https://open.feishu.cn/open-apis/bot/v2/hook/token',
+        secret: '',
+        clearSecret: false,
+        minSeverity: 'warning',
+        // 页面填的是分钟，服务端收的是毫秒（换算只在这一处）
+        repeatCooldownMs: 900_000,
+      });
+    });
+    await waitFor(() =>
+      expect((screen.getByLabelText('webhook 地址') as HTMLInputElement).value).toBe(''),
+    );
+  });
+
+  it('服务端拒绝时错误常驻显示在页面上', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input);
+        if (init?.method === 'PUT') {
+          return new Response(
+            JSON.stringify({
+              error: { code: 'CONFIG_INVALID', message: '这不像是飞书自定义机器人的 webhook 地址' },
+            }),
+            { status: 400 },
+          );
+        }
+        const all = handlers();
+        const key = Object.keys(all)
+          .filter((k) => url.startsWith(k))
+          .sort((a, b) => b.length - a.length)[0];
+        if (key === undefined) return new Response('not found', { status: 404 });
+        return new Response(JSON.stringify(all[key]), { status: 200 });
+      }),
+    );
+    render(<App />);
+    await waitFor(() => expect(screen.getByLabelText('webhook 地址')).toBeTruthy());
+
+    fireEvent.change(screen.getByLabelText('webhook 地址'), { target: { value: 'https://x/y' } });
+    fireEvent.click(screen.getByRole('button', { name: '保存设置' }));
+
+    await waitFor(() => expect(screen.getByText(/CONFIG_INVALID/)).toBeTruthy());
+  });
+
+  it('清空配置需要二次确认', async () => {
+    const stub = stubFetch(
+      handlers({
+        '/api/settings/notify': notify({
+          configured: true,
+          hint: 'KLMN',
+          source: 'panel',
+          panel: {
+            configured: true,
+            hint: 'KLMN',
+            enabled: true,
+            minSeverity: 'warning',
+            repeatCooldownMs: 1_800_000,
+            updatedAt: NOW,
+            secretConfigured: false,
+          },
+        }),
+      }),
+    );
+    render(<App />);
+    await waitFor(() => expect(screen.getByRole('button', { name: '清空配置' })).toBeTruthy());
+
+    fireEvent.click(screen.getByRole('button', { name: '清空配置' }));
+
+    // 只弹出解释窗，还没有发 DELETE
+    await waitFor(() => expect(screen.getByText(/清空之后/)).toBeTruthy());
+    expect(stub.calls.some((c) => c.method === 'DELETE')).toBe(false);
+
+    fireEvent.click(screen.getByRole('button', { name: '确认清空' }));
+    await waitFor(() =>
+      expect(
+        stub.calls.some((c) => c.method === 'DELETE' && c.url === '/api/settings/notify'),
       ).toBe(true),
     );
   });

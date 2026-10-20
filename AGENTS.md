@@ -124,6 +124,7 @@ apps/cli/src/index.ts   apps/sync/src/main.ts   apps/web/src/main.ts   apps/exec
 | `TRADE_TOOL_BINANCE_DEMO_STREAM_URL`                    | Demo 用户数据流**基址**（不带 `/private/ws?listenKey=`）。只在 `executor.environment = demo` 时必填，本仓库**不内置默认值**                                                                   |
 | `TRADE_TOOL_BINANCE_API_KEY` / `_API_SECRET`            | 行情同步**不需要**；只有 `apps/executor` 下单用。名字可由 `executor.apiKeyEnv` / `apiSecretEnv` 改                                                                                            |
 | `TRADE_TOOL_SECRET_KEY`                                 | 凭据静态加密主密钥（32 字节 = 64 位 hex 或 44 位 base64）。**丢了就解不开库里的密文**，只能重新录入，见 §6.4                                                                                  |
+| `TRADE_TOOL_FEISHU_WEBHOOK_URL` / `_SECRET`             | 飞书自定义机器人的 webhook 地址（**它本身就是凭据**）与可选的签名密钥。只在 `notify.enabled = true` 时需要，见 §6.9                                                                           |
 | `TRADE_TOOL_TEST_PG_{HOST,PORT,DATABASE,USER,PASSWORD}` | 测试库连接参数覆盖（默认同上）。Python 侧另认 `TRADE_TOOL_TEST_PG_DSN`                                                                                                                        |
 
 只在 `deploy/` 里出现、本机开发用不到的：`TRADE_TOOL_IMAGE`、`TRADE_TOOL_PG_BIND`、
@@ -176,6 +177,8 @@ apps/cli/src/index.ts   apps/sync/src/main.ts   apps/web/src/main.ts   apps/exec
 | **私有交易接口（下单 / 用户数据流）**        | **`packages/data/src/binance-private.ts`**                                |
 | 止盈止损编排、幂等、执行记录                 | `apps/executor/src` + `packages/data/src/db/risk.ts`                      |
 | **凭据静态加密**                             | **`packages/core/src/secret.ts`** + `packages/data/src/db/credentials.ts` |
+| **告警通道（飞书推送、去重与冷却）**         | **`packages/core/src/notify.ts`**（转换在 `apps/executor/src/alert.ts`）  |
+| **通知设置的读写与「哪一份在生效」**         | **`packages/data/src/db/notify.ts`**（密文落库 + 优先级解析）             |
 | **新策略 / 回测引擎**                        | **`python/packages/quant-backtest/src/`**                                 |
 | 命令行命令                                   | `apps/cli/src/commands/`                                                  |
 | 常驻同步、生命周期、控制原语                 | `apps/sync/src`                                                           |
@@ -252,24 +255,26 @@ apps/cli/src/index.ts   apps/sync/src/main.ts   apps/web/src/main.ts   apps/exec
 | 凭据与运行期设置   | v0.5.0 | **无需求文档**                                                                   | [`sql/007`](packages/data/sql/007_executor_settings.sql) 头注释、§6.4 |
 | 交易对账           | v0.6.0 | **无需求文档**                                                                   | [`README.md`](README.md) 的对账一节、§6.5                             |
 | 两段止盈与移动止损 | v0.7.0 | [`docs/v0.7.0-…`](docs/v0.7.0-staged-take-profit-trailing-stop.md)（**已实现**） | §6.8                                                                  |
+| 通知层（飞书告警） | v0.8.0 | **无需求文档**                                                                   | §6.9                                                                  |
 
 ### 6.0 迁移与表的索引
 
 schema 的唯一来源是 `packages/data/sql/*.sql`；**每张迁移文件头部的注释就是它的设计理由**，
 改之前先读。迁移必须幂等（`IF NOT EXISTS` / 可重复执行的 `ALTER`），因为每个入口启动都会跑一遍。
 
-| 迁移                    | 内容                                                                                                |
-| ----------------------- | --------------------------------------------------------------------------------------------------- |
-| `001_init`              | `klines_1m`、`gaps`、`symbols`、`sync_state`、`contract_spec`、`weight_budget`、`schema_migrations` |
-| `002_sync_plan`         | `sync_state.plan_*`（首次全量的规模预估，开启之前就写进去）                                         |
-| `003_daemon_heartbeat`  | `daemon_heartbeat`                                                                                  |
-| `004_klines_agg`        | `klines_{15m,1h,4h,1d}`（列与 `klines_1m` 逐列一致）                                                |
-| `005_indicators`        | `indicator_{ma,macd,rsi,boll,kdj,atr,obv}`                                                          |
-| `006_risk_bracket`      | `risk_bracket`（幂等锚点 + ATR 快照 + `last_error`）                                                |
-| `007_executor_settings` | `executor_credentials`（密文 + 末 4 位提示）、`risk_policy`（global / symbol 两作用域）             |
-| `008_algo_order_ids`    | `risk_bracket` 的条件单编号列改名（Algo 编号空间，与普通 orderId 不通）                             |
-| `009_reconcile_run`     | `reconcile_run`（观测快照）                                                                         |
-| `010_risk_trailing`     | 两段止盈的阶段（`partial_armed` / `trailing`）与移动止损档位。**v0.7.0 设计，未落地**               |
+| 迁移                    | 内容                                                                                                    |
+| ----------------------- | ------------------------------------------------------------------------------------------------------- |
+| `001_init`              | `klines_1m`、`gaps`、`symbols`、`sync_state`、`contract_spec`、`weight_budget`、`schema_migrations`     |
+| `002_sync_plan`         | `sync_state.plan_*`（首次全量的规模预估，开启之前就写进去）                                             |
+| `003_daemon_heartbeat`  | `daemon_heartbeat`                                                                                      |
+| `004_klines_agg`        | `klines_{15m,1h,4h,1d}`（列与 `klines_1m` 逐列一致）                                                    |
+| `005_indicators`        | `indicator_{ma,macd,rsi,boll,kdj,atr,obv}`                                                              |
+| `006_risk_bracket`      | `risk_bracket`（幂等锚点 + ATR 快照 + `last_error`）                                                    |
+| `007_executor_settings` | `executor_credentials`（密文 + 末 4 位提示）、`risk_policy`（global / symbol 两作用域）                 |
+| `008_algo_order_ids`    | `risk_bracket` 的条件单编号列改名（Algo 编号空间，与普通 orderId 不通）                                 |
+| `009_reconcile_run`     | `reconcile_run`（观测快照）                                                                             |
+| `010_risk_trailing`     | 两段止盈的阶段（`partial_armed` / `trailing`）与移动止损档位。**v0.7.0 设计，未落地**                   |
+| `011_notify_settings`   | 飞书通知通道的运行期设置（v0.8.0）：地址与签名密钥**密文**落库 + 开关与参数。**新增迁移，两侧都要登记** |
 
 ### 6.1 派生周期层（v0.2.0）
 
@@ -552,6 +557,8 @@ v0.5.0 把「密钥只从环境变量读」改成「**也可以从控制面录�
   超过 15 分钟在界面上标出「已过期，请以「立即对账」为准」。
 - 「从没跑过」必须返回 `null` 而不是空报告：「还没对过账」与「对过了、一致」在界面上必须能
   分开说。
+- 差异除了进日志，还会经**通知层**推到飞书（§6.9）。那仍然是「只报告」：不改任何账本，
+  也不碰交易所——**告警不是处置**，处置一律人工决定。
 
 ### 6.6 控制面（apps/web）
 
@@ -689,6 +696,82 @@ v0.5.0 把「密钥只从环境变量读」改成「**也可以从控制面录�
 2026-10-17 已评估并**否决**：它的距离是**固定百分比，不随波动率变化**。要的是「距离跟着
 ATR 走」，所以走自建 Chandelier（附录 §F.2 有完整对比）。另外它的 `orderType` 会让
 `packages/core/src/risk-ids.ts` 的 `algoOrderTag` 直接抛错，真要用还得先补那一类。
+
+### 6.9 通知层（v0.8.0）
+
+把「系统里发生的事」推到**人看得到的地方**。这个仓库里最贵的故障不是报错，而是
+**没人知道**：止盈止损挂单失败、仓位在交易所裸奔、工具外的仓位——在日志里只是几行
+warn，而日志没人盯着。
+
+通道是**飞书自定义机器人的 webhook**（不是机器人应用：它不需要管理员审核、不需要申请
+消息权限，配一个地址就能用）。实现全在
+[`packages/core/src/notify.ts`](packages/core/src/notify.ts)，对账侧的转换在
+[`apps/executor/src/alert.ts`](apps/executor/src/alert.ts)。
+
+四条**不可协商**的规则：
+
+1. **推送失败必须抛错**。静默失败等于没接：调用方会以为「已经通知过了」，而群里什么
+   都没有。但**推送绝不影响主流程**——对账失败绝不能拖垮挂单（§6.5），因此**调用方**
+   负责兜住异常并记日志，通知层自己不吞错误。
+2. **同一件事不许反复刷屏**。对账默认每 5 分钟跑一次；一个一直存在的裸仓若每轮都推，
+   群里三天就没人看了——而被无视的告警等于没接。`AlertDispatcher` 负责
+   **去重 + 冷却 + 恢复通知**：同一指纹在冷却期内只推一次，**严重度变了立刻重推**
+   （注意 → 紧急是新情况），问题消失推一条「已恢复」。推送失败**不记账**——记了就等于
+   把一条永远送不出去的告警当成「已经通知过了」。
+3. **地址只走环境变量**。webhook 地址本身就是凭据（拿到它就能往群里发消息，官方明确
+   要求不要外泄），因此配置里只写变量名（`notify.webhookEnv`），与 `executor.apiKeyEnv`
+   同一套做法。**开着却没配地址 → 启动失败**，不静默跳过；关闭时状态也必须看得见
+   （executor 启动日志里明写「飞书通知未启用」）。
+4. **只发文本消息，不发卡片**。官方文档写明「自定义关键词只对 `text`、`title` 这类文本
+   参数值生效」：正文用文本才能兼容配了关键词的群；卡片的 body 是 markdown 元素，
+   关键词根本不会去那里匹配——结果是「配了关键词的群收不到卡片」。
+
+告警的**唯一来源**是对账（§6.5）：`apps/executor/src/alert.ts` 把一份报告变成一条告警，
+一轮对账的多个差异**合成一条**（一个裸仓常同时命中好几条判据，拆开推就成了「一个问题推
+了三遍」）。差异类型与严重度的判据仍然只有 `packages/core/src/reconcile.ts` 一份。
+
+### 6.9.1 通知设置：两档来源，一份优先级（v0.8.0）
+
+通知的**设置**也有两档，来源不同、优先级明确：
+
+1. **控制面录入**（`sql/011_notify_settings`，地址与签名密钥**密文**落库）；
+2. **配置文件 + 环境变量**（`notify` 段 + `TRADE_TOOL_FEISHU_WEBHOOK_URL` / `_SECRET`）。
+
+三条**不可协商**的规则：
+
+1. **优先级只有一份实现**：`packages/data/src/db/notify.ts` 的 `resolveAll()` 是**所有出口
+   的唯一来源**（面板状态、executor 生效设置、测试发送用的地址都从它派生）。两处各判一次
+   的话，「哪一份在生效」就有两个答案——而那正是排障时第一个要回答的问题。
+2. **面板那一档是整体的**：地址、开关、参数要么一起生效，要么一起不生效。拆开用
+   （地址走面板、开关走文件）会让「界面显示的和实际发生的不一致」。
+3. **控制面那条读路径永远拿不到明文**：回包只有「配没配 / 末 4 位 / 生效来源」。
+   与交易所凭据同一条安全线（§6.4 第 2 条）——webhook 地址拿到就能往群里发消息。
+
+另外两条：
+
+- **每轮重新解析**：executor 在**每轮对账时**重新读一次设置，所以控制面改完**不必重启
+  executor**（下一轮，默认 5 分钟内生效）。这是它与交易所凭据的**不同**之处：
+  凭据是启动时读的（改了要重启），通知不是。两条别混。
+  地址、最低严重度、冷却时间**一次取全**（同一个 `AlertChannel`）——只换地址却留着
+  旧阈值，那种「半更新」比不改更难查。
+- **「留空 = 保持原样」**：页面上的地址与签名密钥留空表示沿用**当前生效**的那一份
+  （面板的或环境变量的）；保存之后这一份会被固化到库里（地址仍然加密），此后它就是
+  生效来源。**第一次**保存必须填地址——留空表示「保持原样」，而还没有原样可保持。
+
+⚠️ **新增迁移要两边都登记**：`sql/011_notify_settings.sql` 之外，**Python 侧**
+`quant_data/pg.py` 的 `KNOWN_MIGRATION_VERSIONS` 也必须加（它不读写这张表，但版本闸门
+两个方向都要校）。漏登记会让**所有**碰 PG 的用例报「库比代码新」——这是跨语言契约的
+硬要求（§5 第 2 条）。
+
+契约核对日期 **2026-10-19**（官方《自定义机器人使用指南》）：
+
+- 请求：`POST`，体为 `{"msg_type":"text","content":{"text":…}}`；成功回 `{"code":0,…}`；
+- 签名：`HMAC-SHA256(key = "<timestamp>\n<secret>", 空串)` 再 base64。`timestamp` 是
+  **秒**，且距发送时刻不超过 1 小时（官方硬性要求）；
+- 错误码：11232 限频 / 19021 签名 / 19022 IP 白名单 / 19024 关键词；
+- 体不超过 20 KB；单租户单机器人 100 次/分钟、5 次/秒。
+
+改动前重新核对官方文档并更新核对日期（§10.2 的纪律对飞书同样适用）。
 
 ## 7 已知漂移与技术债
 

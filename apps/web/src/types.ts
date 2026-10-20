@@ -237,6 +237,59 @@ export interface CredentialWriteBody {
   apiSecret: string;
 }
 
+// ------------------------------------------------- 飞书通知设置（v0.8.0）
+
+/**
+ * 通知设置状态。**没有明文地址，也没有密文**——与凭据那条线同一套规矩：
+ * 控制面从设计上就没有把凭据显示出来的能力。
+ */
+export interface NotifyStatusDto {
+  /** 生效的那一档是否启用推送。 */
+  enabled: boolean;
+  minSeverity: 'critical' | 'warning' | 'info';
+  repeatCooldownMs: number;
+  /** 生效的那一档有没有地址。 */
+  configured: boolean;
+  /** 地址末 4 位，纯展示用，不是机密。 */
+  hint: string | null;
+  /** 有没有配签名密钥。 */
+  secretConfigured: boolean;
+  /** 生效来源：`panel` = 控制面录入；`config` = 配置文件 + 环境变量。 */
+  source: 'panel' | 'config';
+  /** 生效来源是 `config` 时，地址取自哪个环境变量（排障要看）。 */
+  webhookEnv: string;
+  secretEnv: string;
+  /**
+   * 面板那一档的状态。**无论它是否生效都在这里**——
+   * 「面板里配过、但当前生效的是配置文件那一档」必须看得见。
+   */
+  panel: {
+    configured: boolean;
+    hint: string | null;
+    enabled: boolean;
+    minSeverity: 'critical' | 'warning' | 'info';
+    repeatCooldownMs: number;
+    updatedAt: number | null;
+    /** `null` = 读不到（主密钥没注入，解不开密文）——不是「没配」。 */
+    secretConfigured: boolean | null;
+  } | null;
+  updatedAt: number | null;
+  /** 主密钥是否已注入环境变量。没注入时页面必须**明确说不能保存**，而不是存完失败。 */
+  masterKeyReady: boolean;
+}
+
+export interface NotifyWriteBody {
+  enabled: boolean;
+  /** 空 = 保持原样（第一次保存时必填）。 */
+  webhookUrl: string;
+  /** 空 = 保持原样。 */
+  secret?: string;
+  /** 显式清除签名密钥。 */
+  clearSecret?: boolean;
+  minSeverity: 'critical' | 'warning' | 'info';
+  repeatCooldownMs: number;
+}
+
 /** 止盈止损策略的**作用域**。`global` 是默认，`symbol` 是单标的覆盖。 */
 export type RiskPolicyScopeDto = 'global' | 'symbol';
 

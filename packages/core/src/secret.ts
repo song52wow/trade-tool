@@ -148,3 +148,33 @@ export function openCredentials(payload: SealedPayload, key: Buffer): SecretCred
   }
   return parsed as SecretCredentials;
 }
+
+/**
+ * 通知通道的凭据（v0.8.0）：飞书自定义机器人的 webhook 地址 + 可选的签名密钥。
+ *
+ * 形状与 `SecretCredentials` 同构，理由也一样：它们**永远是一起填的**
+ * （签名密钥要配在同一个机器人上），打包成一段 JSON 再整体加密，
+ * 认证标签就覆盖了整段——分开加密就多一份要各自校验的元数据。
+ */
+export interface SecretNotifyTarget {
+  webhookUrl: string;
+  /** 机器人「安全设置」选了「签名校验」时才有；否则是空串。 */
+  secret: string;
+}
+
+export function sealNotifyTarget(target: SecretNotifyTarget, key: Buffer): SealedPayload {
+  return seal(Buffer.from(JSON.stringify(target), 'utf8'), key);
+}
+
+export function openNotifyTarget(payload: SealedPayload, key: Buffer): SecretNotifyTarget {
+  const parsed = JSON.parse(open_(payload, key).toString('utf8')) as unknown;
+  if (
+    typeof parsed !== 'object' ||
+    parsed === null ||
+    typeof (parsed as SecretNotifyTarget).webhookUrl !== 'string' ||
+    typeof (parsed as SecretNotifyTarget).secret !== 'string'
+  ) {
+    throw new SyncError('CONFIG_INVALID', '通知密文解开后不是 {webhookUrl, secret} 结构');
+  }
+  return parsed as SecretNotifyTarget;
+}

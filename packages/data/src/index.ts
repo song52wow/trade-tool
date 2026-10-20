@@ -13,6 +13,8 @@ export * from './db/risk.js';
 /** 控制面可写的运行期设置（v0.5.0）：加密凭据 + 止盈止损策略。 */
 export * from './db/credentials.js';
 export * from './db/risk-policy.js';
+/** 飞书通知通道的运行期设置（v0.8.0）：密文落库 + 「哪一份在生效」的解析。 */
+export * from './db/notify.js';
 export * from './db/sql-files.js';
 /** 私有交易接口（签名 REST + 用户数据流），v0.4.0 `apps/executor` 的交易所侧适配。 */
 export * from './binance-private.js';

@@ -7,6 +7,8 @@ import type {
   CredentialWriteBody,
   ExchangeListDto,
   JobDto,
+  NotifyStatusDto,
+  NotifyWriteBody,
   OverviewDto,
   ReconcileReport,
   RiskPolicyEntryDto,
@@ -211,6 +213,22 @@ export const api = {
     }),
   clearCredentials: () =>
     request<CredentialStatusDto>('/api/settings/credentials', { method: 'DELETE' }),
+
+  // ------------------------------------------------- 飞书通知设置（v0.8.0）
+  //
+  // 与凭据同一条安全线：回包里没有地址、没有密文，只有「配没配 / 末 4 位 / 生效来源」。
+  // 所以页面**永远不要**把地址回填进输入框——它手上根本没有这个值。
+
+  notifyStatus: () => request<NotifyStatusDto>('/api/settings/notify'),
+  writeNotifySettings: (body: NotifyWriteBody) =>
+    request<NotifyStatusDto>('/api/settings/notify', {
+      method: 'PUT',
+      headers: JSON_HEADERS,
+      body: JSON.stringify(body),
+    }),
+  clearNotifySettings: () => request<NotifyStatusDto>('/api/settings/notify', { method: 'DELETE' }),
+  /** 发一条测试消息（出网）。失败要如实报错——「看起来成功其实没发出去」最坑。 */
+  testNotify: () => post<{ ok: boolean; sentAt: number }>('/api/settings/notify/test'),
 
   /**
    * 策略总览。`symbol` 省略时 `resolved` 按全局默认算——设置页在还没选标的时也要能显示

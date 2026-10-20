@@ -7,6 +7,8 @@ export * from './net-position.js';
 export * from './risk-ids.js';
 /** 交易对账判据（v0.6.0，纯函数，只报告不动手）。 */
 export * from './reconcile.js';
+/** 通知层（v0.8.0，飞书自定义机器人 webhook + 告警去重/冷却）。 */
+export * from './notify.js';
 export * from './secret.js';
 export * from './config.js';
 export * from './config-io.js';

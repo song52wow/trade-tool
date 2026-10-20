@@ -69,5 +69,12 @@
     "reconnectBaseMs": 2000,
     "reconnectMaxMs": 60000,
     "reconcileIntervalMs": 300000
+  },
+  "notify": {
+    "enabled": false,
+    "webhookEnv": "TRADE_TOOL_FEISHU_WEBHOOK_URL",
+    "secretEnv": "TRADE_TOOL_FEISHU_WEBHOOK_SECRET",
+    "minSeverity": "warning",
+    "repeatCooldownMs": 1800000
   }
 }

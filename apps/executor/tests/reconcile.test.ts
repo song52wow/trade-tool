@@ -14,7 +14,7 @@
 
 import { describe, expect, it } from 'vitest';
 
-import type { TradeToolConfig } from '@trade-tool/core';
+import { AlertDispatcher, type NotifyEvent, type TradeToolConfig } from '@trade-tool/core';
 import type { BinancePrivateClient, Pool } from '@trade-tool/data';
 
 import { runOnce, startPeriodicReconcile } from '../src/reconcile.js';
@@ -200,5 +200,112 @@ describe('startPeriodicReconcile', () => {
     expect(calls.count).toBe(2);
 
     periodic.stop();
+  });
+});
+
+/**
+ * 对账 → 告警（v0.8.0）。
+ *
+ * 锁三件事：
+ *   1. **有差异才推**，且推的是一条（一次对账的多个差异合成一条）；
+ *   2. **一致时不推**（不能每次对账都往群里发「一切正常」）；
+ *   3. 差异消失后有一条「已恢复」——让人知道事情结束了。
+ */
+describe('对账告警', () => {
+  interface Recorder {
+    events: NotifyEvent[];
+    alerts: AlertDispatcher;
+  }
+
+  function recorder(): Recorder {
+    const events: NotifyEvent[] = [];
+    const alerts = new AlertDispatcher({
+      channel: {
+        notifier: {
+          enabled: true,
+          notify: (event: NotifyEvent) => {
+            events.push(event);
+            return Promise.resolve();
+          },
+        },
+        minSeverity: 'info',
+        repeatCooldownMs: 30 * 60_000,
+      },
+      now: () => NOW,
+    });
+    return { events, alerts };
+  }
+
+  /** 交易所有一笔仓位、本地没有任何记录 → 判据报 `position-without-record`（紧急）。 */
+  function clientWithPosition(withPosition: boolean): BinancePrivateClient {
+    return {
+      positionRisk: (): Promise<unknown[]> =>
+        Promise.resolve(
+          withPosition
+            ? [
+                {
+                  symbol: 'BTCUSDT',
+                  positionSide: 'BOTH',
+                  positionAmt: 1,
+                  entryPrice: 100,
+                  markPrice: 101,
+                  updateTime: NOW,
+                },
+              ]
+            : [],
+        ),
+      openAlgoOrders: (): Promise<never[]> => Promise.resolve([]),
+    } as unknown as BinancePrivateClient;
+  }
+
+  it('发现差异时推一条紧急告警', async () => {
+    const { events, alerts } = recorder();
+    const report = await runOnce({
+      pool: fakePool().pool,
+      client: clientWithPosition(true),
+      config: configWith(60_000),
+      now: () => NOW,
+      alerts,
+    });
+
+    expect(report?.healthy).toBe(false);
+    expect(events).toHaveLength(1);
+    expect(events[0]?.severity).toBe('critical');
+    expect(events[0]?.title).toContain('交易对账发现');
+    expect(events[0]?.lines?.join('\n')).toContain('BTCUSDT');
+  });
+
+  it('一致时不推告警', async () => {
+    const { events, alerts } = recorder();
+    await runOnce({
+      pool: fakePool().pool,
+      client: clientWithPosition(false),
+      config: configWith(60_000),
+      now: () => NOW,
+      alerts,
+    });
+    expect(events).toHaveLength(0);
+  });
+
+  it('差异消失后推一条「已恢复」', async () => {
+    const { events, alerts } = recorder();
+    await runOnce({
+      pool: fakePool().pool,
+      client: clientWithPosition(true),
+      config: configWith(60_000),
+      now: () => NOW,
+      alerts,
+    });
+    await runOnce({
+      pool: fakePool().pool,
+      client: clientWithPosition(false),
+      config: configWith(60_000),
+      now: () => NOW,
+      alerts,
+    });
+
+    expect(events).toHaveLength(2);
+    expect(events[1]?.title).toBe('交易对账已恢复正常');
+    expect(events[1]?.severity).toBe('info');
   });
 });

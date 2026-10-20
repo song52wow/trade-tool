@@ -17,6 +17,10 @@
   （迁移 `002_sync_plan` 的 `plan_*` 列）也在这里读写，供 `sync status` 暴露进度分母。
   `removeSymbolEntry(policy='delete')` 会取与 Python 侧 `SymbolLock` **同一个键**的
   advisory lock——删除是 TS 侧唯一写 `klines_1m` 的路径，不能与在跑的一轮同步交错。
+- `db/notify.ts` — 飞书通知通道的运行期设置（v0.8.0，迁移 `011_notify_settings`）。
+  地址与签名密钥**密文**落库；`resolveAll()` 是「**哪一份在生效**」的唯一实现
+  （控制面录入优先，配置文件 + 环境变量兜底），面板状态、executor 的生效设置、
+  测试发送用的地址都从它派生。
 - `market.ts` — 控制面唯一需要认识的东西：调 Python 干活 + 查 PG 看状态，收敛成结构化输入输出。
 - `bridge.ts` — `python -m quant_data` 子进程调用。**只传控制信息**，不传数据。
 - `provider.ts` / `cache.ts` — 既有离线合成链路（`source: 'synthetic'`），行为未变。

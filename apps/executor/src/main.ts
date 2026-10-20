@@ -1,10 +1,15 @@
 #!/usr/bin/env node
 import {
+  AlertDispatcher,
   NetPositionTracker,
+  createNotifier,
   loadConfigOrDefault,
   loadProjectEnv,
+  parseSecretKey,
+  SECRET_KEY_ENV,
   SyncError,
   describeClockSkew,
+  type AlertChannel,
   type Credentials,
 } from '@trade-tool/core';
 import {
@@ -15,10 +20,10 @@ import {
   parseAccountUpdate,
   parseOrderTradeUpdate,
   resolveActiveCredentials,
+  resolveNotifySettings,
   resolvePolicy,
   exchangeEndpointsFromEnv,
 } from '@trade-tool/data';
-import { parseSecretKey, SECRET_KEY_ENV } from '@trade-tool/core';
 
 import type { Pool } from '@trade-tool/data';
 
@@ -98,6 +103,53 @@ async function main(): Promise<void> {
 
   const pool = createPool(config.database);
   const credentials = await loadCredentials(config, pool);
+  const masterKey = parseSecretKey(process.env[SECRET_KEY_ENV]);
+
+  // 告警通道（v0.8.0）。**每轮重新解析**一次，因此控制面改完设置后不必重启
+  // executor——下一轮对账（默认 5 分钟内）就用新设置。
+  //
+  // 解析顺序：**库里（控制面录入，密文）优先，配置文件 + 环境变量兜底**。
+  // 优先级只有 `resolveNotifySettings` 一份实现，两处各判一次的话，
+  // 「哪一份在生效」就有两个答案。
+  //
+  // 地址、阈值、冷却时间**一次取全**（同一个 AlertChannel）：只换地址却留着旧阈值，
+  // 那种「半更新」比不改更难查。
+  const resolveChannel = async (): Promise<AlertChannel | null> => {
+    const resolved = await resolveNotifySettings({
+      pool,
+      masterKey,
+      config: config.notify,
+    });
+    if (!resolved.settings.enabled) return null;
+    if (resolved.settings.webhookUrl === '') {
+      // 开着却没有地址：抛错而不是安静地不推（AGENTS.md 约定 9）。
+      throw new SyncError(
+        'CONFIG_INVALID',
+        '通知已启用但没有 webhook 地址：请在控制面「设置」页录入，' +
+          `或在环境变量 ${config.notify.webhookEnv} 里配置。`,
+      );
+    }
+    return {
+      notifier: createNotifier({
+        webhookUrl: resolved.settings.webhookUrl,
+        secret: resolved.settings.secret,
+      }),
+      minSeverity: resolved.settings.minSeverity,
+      repeatCooldownMs: resolved.settings.repeatCooldownMs,
+    };
+  };
+
+  // 启动时先解析一次并把状态打出来：配错了要**启动时就炸**，
+  // 而不是让服务跑起来、告警一条都发不出去。
+  const startupChannel = await resolveChannel();
+  console.error(
+    startupChannel === null
+      ? '[executor] 飞书通知未启用：对账差异只记日志，不推送'
+      : '[executor] 飞书通知已启用（设置每轮对账时重新读取，改完不必重启本进程）',
+  );
+
+  const alerts = new AlertDispatcher({ channel: resolveChannel });
+
   const ctx = buildContext(pool, config);
   const client = new BinancePrivateClient({
     credentials,
@@ -186,7 +238,7 @@ async function main(): Promise<void> {
   await seedNetPositions();
 
   // 自动对账与用户数据流**并行**：它跑得慢或挂掉都不影响挂单（见 reconcile.ts）。
-  reconcileTimer = startPeriodicReconcile({ pool, client, config });
+  reconcileTimer = startPeriodicReconcile({ pool, client, config, alerts });
 
   // 移动止损定时器与对账定时器**必须分开**（v0.7.0 / AGENTS.md §6.8）：对账是只读的，
   // 而移动止损要下单，合并会让「对账绝不动手」这条保证失守。

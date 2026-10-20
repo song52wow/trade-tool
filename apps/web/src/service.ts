@@ -1,5 +1,7 @@
 import {
   INTERVAL_MS,
+  SyncError,
+  createNotifier,
   loadConfigOrDefault,
   parseSecretKey,
   percentToRatio,
@@ -25,12 +27,16 @@ import {
   getState,
   countBracketsByState,
   clearCredential,
+  clearNotifySettings as clearNotifySettingsRow,
   listBrackets,
   listRiskPolicies,
   readCredentialStatus,
+  readNotifyStatus,
+  readNotifyTarget,
   recordReconciliation,
   resolvePolicy,
   writeCredential,
+  writeNotifySettings as writeNotifySettingsRow,
   deleteRiskPolicy as deleteRiskPolicyRow,
   writeRiskPolicy as writeRiskPolicyRow,
   listExchangeSymbols,
@@ -91,6 +97,7 @@ import type {
   BarDto,
   BracketsDto,
   CredentialStatusDto,
+  NotifyStatusDto,
   RiskPolicyEntryDto,
   RiskPolicyViewDto,
   DaemonStatusDto,
@@ -362,6 +369,105 @@ export function createWebRuntime(config: TradeToolConfig): WebRuntime {
     async clearCredentials(): Promise<CredentialStatusDto> {
       await clearCredential(pool, ctx.exchange, Date.now());
       return this.getCredentialStatus();
+    },
+
+    /**
+     * 通知设置状态（v0.8.0）。**只回状态**，没有明文地址。
+     *
+     * 主密钥缺失时如实说 `masterKeyReady: false`：面板那一档存的是密文，
+     * 没有主密钥就既存不进去、也读不出来——页面必须能提前显示「当前不能保存」，
+     * 而不是让人填完提交才失败。
+     */
+    async getNotifyStatus(): Promise<NotifyStatusDto> {
+      const status = await readNotifyStatus({
+        pool,
+        masterKey: masterKeyOrNull(),
+        config: config.notify,
+      });
+      return { ...status, masterKeyReady: masterKeyStatus().ok };
+    },
+
+    async writeNotifySettings(body): Promise<NotifyStatusDto> {
+      const key = requireMasterKey();
+      // 当前生效的地址：面板那一档或环境变量那一档。「留空 = 保持原样」在两种
+      // 来源下都成立，用户不必把环境变量里的地址抄一遍才能保存开关与参数。
+      const { target } = await readNotifyTarget({
+        pool,
+        masterKey: masterKeyOrNull(),
+        config: config.notify,
+      });
+      await writeNotifySettingsRow(
+        pool,
+        key,
+        {
+          enabled: body.enabled,
+          webhookUrl: body.webhookUrl,
+          secret: body.secret,
+          clearSecret: body.clearSecret === true,
+          minSeverity: body.minSeverity,
+          repeatCooldownMs: body.repeatCooldownMs,
+          now: Date.now(),
+        },
+        target,
+      );
+      // 写完重新读一遍状态：回包里的「生效来源」必须是从库里读出来的事实，
+      // 而不是「我们刚写了什么」的自我复述。
+      return this.getNotifyStatus();
+    },
+
+    async clearNotifySettings(): Promise<NotifyStatusDto> {
+      await clearNotifySettingsRow(pool, Date.now());
+      return this.getNotifyStatus();
+    },
+
+    /**
+     * 发送一条测试消息。
+     *
+     * 这是**唯一**一条会拿明文地址出网的控制面路径：不解密就发不出去。
+     * 明文只活在这一个函数里，**不进回包**——回包只有「成没成」。
+     *
+     * 失败如实抛错（带上飞书的错误码），不假装成功。
+     */
+    async testNotify(): Promise<{ ok: true; sentAt: number }> {
+      const { target, source } = await readNotifyTarget({
+        pool,
+        masterKey: masterKeyOrNull(),
+        config: config.notify,
+      });
+      if (target === null) {
+        // 「读不到」与「没有」是两回事：控制面录入过、但主密钥没注入时，
+        // 提示应该说清缺的是主密钥，而不是让人以为地址没填。
+        const status = await readNotifyStatus({
+          pool,
+          masterKey: masterKeyOrNull(),
+          config: config.notify,
+        });
+        if (status.panel?.configured === true) {
+          throw new SyncError(
+            'CONFIG_INVALID',
+            '控制面录入的地址读不出来：主密钥环境变量 ' +
+              `${SECRET_KEY_ENV} 没有注入或长度不合法。` +
+              '请先在 .env 里配好主密钥并重启控制面。',
+            { source },
+          );
+        }
+        throw new SyncError(
+          'CONFIG_INVALID',
+          '还没有可用的 webhook 地址，无法发送测试消息。' +
+            '请在本页填入地址并保存，或在环境变量里配置。',
+          { source },
+        );
+      }
+      const notifier = createNotifier({ webhookUrl: target.webhookUrl, secret: target.secret });
+      await notifier.notify({
+        title: '这是一条测试消息',
+        severity: 'info',
+        lines: [
+          '如果你在飞书群里看到了这条消息，说明通道是通的。',
+          '之后对账发现差异（尤其是「仓位当前没有止损保护」）就会推到这里。',
+        ],
+      });
+      return { ok: true, sentAt: Date.now() };
     },
 
     async getRiskPolicy(symbol): Promise<RiskPolicyViewDto> {

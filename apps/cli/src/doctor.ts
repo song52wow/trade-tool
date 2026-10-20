@@ -12,6 +12,7 @@ import {
   buildContext,
   createPool,
   exchangeEndpointsFromEnv,
+  readNotifyStatus,
   resolveActiveCredentials,
 } from '@trade-tool/data';
 
@@ -72,6 +73,56 @@ async function probeClock(): Promise<ProbeResult> {
   }
 }
 
+/**
+ * 通知探针。
+ *
+ * 它回答一个很具体的问题：「我以为告警在推，真的在推吗？」
+ * `notify.enabled = true` 却没配 webhook 地址 = 告警**从来没发出去过**，
+ * 而对账与止盈止损照跑不误，日志里也一切正常——这正是要靠一个显式探针挡住的。
+ *
+ * 它读的是**真实生效的那一档**（控制面录入优先，配置文件 + 环境变量兜底），
+ * 因此控制面改过设置之后，doctor 说的仍然是现在真正在用的那一份。
+ */
+async function probeNotify(): Promise<ProbeResult> {
+  loadProjectEnv();
+  let pool: ReturnType<typeof createPool> | undefined;
+  try {
+    const config = await loadConfigOrDefault();
+    pool = createPool(config.database);
+    // 主密钥没注入就读不到控制面录入的那一份——如实按「读不到」处理，不当成「没配」。
+    const masterKey = (() => {
+      try {
+        return parseSecretKey(process.env[SECRET_KEY_ENV]);
+      } catch {
+        return null;
+      }
+    })();
+    const status = await readNotifyStatus({ pool, masterKey, config: config.notify });
+    const from = status.source === 'panel' ? '控制面录入' : `配置文件 + 环境变量`;
+    const address = status.configured ? `末 4 位 ${status.hint ?? '—'}` : '无地址';
+    if (status.enabled && !status.configured) {
+      return {
+        name: 'notify',
+        ok: false,
+        detail: `已启用但没有 webhook 地址（来源：${from}）——告警发不出去`,
+      };
+    }
+    return {
+      name: 'notify',
+      ok: true,
+      detail: `${status.enabled ? '已启用' : '未启用'}（来源：${from}，${address}）`,
+    };
+  } catch (error) {
+    return {
+      name: 'notify',
+      ok: false,
+      detail: (error as Error).message.split('\n')[0] ?? 'unknown',
+    };
+  } finally {
+    await pool?.end().catch(() => undefined);
+  }
+}
+
 /** doctor：把「双轨环境是否就绪」一次性摊开，避免第一次跑命令就踩坑。 */
 export async function collectDiagnostics(): Promise<ProbeResult[]> {
   return Promise.all([
@@ -80,5 +131,6 @@ export async function collectDiagnostics(): Promise<ProbeResult[]> {
     probe('uv', 'uv', ['--version']),
     probe('git', 'git', ['--version']),
     probeClock(),
+    probeNotify(),
   ]);
 }
