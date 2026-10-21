@@ -217,7 +217,10 @@ describe('parseOrderTradeUpdate', () => {
       o: 'MARKET',
       f: 'GTC',
       q: '0.1',
-      p: '60000',
+      // 官方口径（2026-10-22 核对）：`p` 是**原始**价，市价单就是 0；
+      // `L` 才是**末次成交价**，`ap` 是均价。
+      p: '0',
+      L: '60010.5',
       ap: '60010.5',
       sp: '0',
       x: 'TRADE',
@@ -245,6 +248,7 @@ describe('parseOrderTradeUpdate', () => {
       status: 'FILLED',
       executionType: 'TRADE',
       averagePrice: 60010.5,
+      lastFilledPrice: 60010.5,
       cumulativeQty: 0.1,
       tradeTime: 1_700_000_000_002,
     });
@@ -255,7 +259,31 @@ describe('parseOrderTradeUpdate', () => {
       ...payload,
       o: { ...payload.o, ap: '0' },
     });
-    expect(update?.averagePrice).toBe(60000);
+    expect(update?.averagePrice).toBe(60010.5);
+  });
+
+  it('市价单的原始价 p=0 时不会把成交价当成 0（线上真实 bug）', () => {
+    // 2026-10-22 实测：止损触发后是市价成交，事件里 `p` = "0"。
+    // 曾经把 `p` 当成交价 → 出场价 0 → 成交额 0 → 盈亏被算成巨大的假亏损。
+    const update = parseOrderTradeUpdate(payload);
+    expect(update?.lastFilledPrice).toBe(60010.5);
+    expect(update?.lastFilledPrice).toBeGreaterThan(0);
+  });
+
+  it('末次成交价缺失时退回均价', () => {
+    const { L, ...withoutLastFilled } = payload.o;
+    void L;
+    const update = parseOrderTradeUpdate({ ...payload, o: withoutLastFilled });
+    expect(update?.lastFilledPrice).toBe(60010.5);
+  });
+
+  it('两个价都没有时如实是 0：由调用方说「算不出」，不编数', () => {
+    const update = parseOrderTradeUpdate({
+      ...payload,
+      o: { ...payload.o, L: '0', ap: '0' },
+    });
+    expect(update?.lastFilledPrice).toBe(0);
+    expect(update?.averagePrice).toBe(0);
   });
 
   it('非该事件返回 null', () => {

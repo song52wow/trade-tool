@@ -195,7 +195,6 @@ describe('策略：优先级只有一份实现', () => {
       stopAtrMult: 2.5,
       takeProfitAtrMult: 4,
       takeProfit1Ratio: 0,
-      takeProfit1AtrMult: 3,
       trailAtrMult: 2,
       breakevenAfterTp1: true,
       now: T0,
@@ -216,7 +215,6 @@ describe('策略：优先级只有一份实现', () => {
       stopAtrMult: 2.5,
       takeProfitAtrMult: 4,
       takeProfit1Ratio: 0,
-      takeProfit1AtrMult: 3,
       trailAtrMult: 2,
       breakevenAfterTp1: true,
       now: T0,
@@ -230,7 +228,6 @@ describe('策略：优先级只有一份实现', () => {
       stopAtrMult: 1.5,
       takeProfitAtrMult: 6,
       takeProfit1Ratio: 0,
-      takeProfit1AtrMult: 3,
       trailAtrMult: 2,
       breakevenAfterTp1: true,
       now: T0,
@@ -259,7 +256,6 @@ describe('策略：优先级只有一份实现', () => {
       stopAtrMult: 2.5,
       takeProfitAtrMult: 4,
       takeProfit1Ratio: 0,
-      takeProfit1AtrMult: 3,
       trailAtrMult: 2,
       breakevenAfterTp1: true,
       now: T0,
@@ -273,7 +269,6 @@ describe('策略：优先级只有一份实现', () => {
       stopAtrMult: 1.5,
       takeProfitAtrMult: 6,
       takeProfit1Ratio: 0,
-      takeProfit1AtrMult: 3,
       trailAtrMult: 2,
       breakevenAfterTp1: true,
       now: T0,
@@ -295,7 +290,6 @@ describe('策略：优先级只有一份实现', () => {
       stopAtrMult: 2.5,
       takeProfitAtrMult: 4,
       takeProfit1Ratio: 0,
-      takeProfit1AtrMult: 3,
       trailAtrMult: 2,
       breakevenAfterTp1: true,
       now: T0,
@@ -309,7 +303,6 @@ describe('策略：优先级只有一份实现', () => {
       stopAtrMult: 1.5,
       takeProfitAtrMult: 6,
       takeProfit1Ratio: 0,
-      takeProfit1AtrMult: 3,
       trailAtrMult: 2,
       breakevenAfterTp1: true,
       now: T0,
@@ -333,7 +326,6 @@ describe('策略：schema 挡住脏数据', () => {
         stopAtrMult: 2,
         takeProfitAtrMult: 3,
         takeProfit1Ratio: 0,
-        takeProfit1AtrMult: 3,
         trailAtrMult: 2,
         breakevenAfterTp1: true,
         now: T0,
@@ -352,7 +344,6 @@ describe('策略：schema 挡住脏数据', () => {
         stopAtrMult: 0,
         takeProfitAtrMult: 3,
         takeProfit1Ratio: 0,
-        takeProfit1AtrMult: 3,
         trailAtrMult: 2,
         breakevenAfterTp1: true,
         now: T0,
@@ -371,11 +362,53 @@ describe('策略：schema 挡住脏数据', () => {
         stopAtrMult: 2,
         takeProfitAtrMult: 3,
         takeProfit1Ratio: 0,
-        takeProfit1AtrMult: 3,
         trailAtrMult: 2,
         breakevenAfterTp1: true,
         now: T0,
       }),
     ).rejects.toThrow();
+  });
+
+  it('比例 100 归一到 0：与「不分批」逐字等价，不是非法值', async () => {
+    // 只有一个止盈倍数之后，比例 1 与 0 是同一件事（一次全平）。
+    // 页面把输入框限到 99，但 API 直调仍可能送来 100 —— 写入口必须自己归一，
+    // 否则迁移 014 之后 `take_profit1_ratio` 的 `< 1` 约束会以一句看不懂的报错把请求顶回去。
+    const saved = await writeRiskPolicy(schema.pool, {
+      scope: 'symbol',
+      exchange: EXCHANGE,
+      symbol: SYMBOL,
+      atrPeriod: 14,
+      atrInterval: '1h',
+      stopAtrMult: 2,
+      takeProfitAtrMult: 3,
+      takeProfit1Ratio: 1,
+      trailAtrMult: 2,
+      breakevenAfterTp1: true,
+      now: T0,
+    });
+    expect(saved.takeProfit1Ratio).toBe(0);
+    const rows = await schema.pool.query<{ take_profit1_ratio: number }>(
+      'SELECT take_profit1_ratio FROM risk_policy WHERE symbol = $1',
+      [SYMBOL],
+    );
+    expect(rows.rows[0]?.take_profit1_ratio).toBe(0);
+  });
+
+  it('比例越界报 CONFIG_INVALID 并说清范围，而不是等数据库拒', async () => {
+    await expect(
+      writeRiskPolicy(schema.pool, {
+        scope: 'symbol',
+        exchange: EXCHANGE,
+        symbol: SYMBOL,
+        atrPeriod: 14,
+        atrInterval: '1h',
+        stopAtrMult: 2,
+        takeProfitAtrMult: 3,
+        takeProfit1Ratio: 1.5,
+        trailAtrMult: 2,
+        breakevenAfterTp1: true,
+        now: T0,
+      }),
+    ).rejects.toMatchObject({ code: 'CONFIG_INVALID' });
   });
 });

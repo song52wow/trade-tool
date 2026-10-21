@@ -17,6 +17,7 @@ import {
   markBracketSettled,
   markBracketTrailing,
   readBracket,
+  recordBracketTp1Fill,
 } from '../src/index.js';
 
 import { createTestSchema, type TestSchema } from './helpers/pg.js';
@@ -86,13 +87,15 @@ describe('盈亏事实的落库', () => {
     await claim(1, true);
     // 两段形态：第一段止盈（带数量）+ 止损两张单都挂上了
     await markBracketPartialArmed(schema.pool, KEY, { slAlgoId: 11, tp1AlgoId: 12 }, NOW);
-    // 第一段止盈成交 → 推进到移动止损阶段
+    // 第一段止盈成交 → **先记这个事实**（v0.9.1：它不再挂在「推进阶段」的副作用上，
+    // 否则推进一失败，这一段的成交价 / 数量 / 手续费就整个丢了）。
+    await recordBracketTp1Fill(schema.pool, KEY, { price: 110, qty: 1, fee: 0.4 }, NOW);
+    // 再推进到移动止损阶段
     await markBracketTrailing(
       schema.pool,
       KEY,
       { extreme: 120, stopPrice: 104, atr: 2, atrFrom: NOW - 3600_000, atrTo: NOW },
       NOW,
-      { price: 110, qty: 1, fee: 0.4 },
     );
 
     let record = await readBracket(schema.pool, KEY.exchange, KEY.symbol, KEY.entryOrderId);

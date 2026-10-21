@@ -70,6 +70,11 @@ export interface RealizedPnl {
  * `exitNotional` 是**累计成交额**（事实），而不是「均价 × 数量」（派生值）。
  * 理由：均价要等整轮走完才算得出，而分批止盈（v0.7.0 的两段模型）的中途状态里
  * 根本没有「整轮的均价」这回事——只平了一段时，任何均价都是半个事实。
+ *
+ * **返回 `null` = 算不出来**：已经平了仓（`closedQty > 0`）却没拿到出场成交额
+ * （`exitNotional === 0`）。这时**不能编一个数**——`(0 − 入场价) × 数量` 会得到一个
+ * 巨大的假亏损（2026-10-22 实测：一轮真实止损被算成 −194 USDT，飞书卡片上写着
+ * 「出场 0」）。「如实说算不出」比「给一个看着精确的假数」安全得多。
  */
 export function realizedPnl(input: {
   positionSide: PnlSide;
@@ -80,7 +85,8 @@ export function realizedPnl(input: {
   exitNotional: number;
   /** 累计手续费（计价币）。 */
   feeAmount: number;
-}): RealizedPnl {
+}): RealizedPnl | null {
+  if (input.closedQty > 0 && input.exitNotional === 0) return null;
   const sign = input.positionSide === 'LONG' ? 1 : -1;
   const cost = input.entryPrice * input.closedQty;
   const gross = (input.exitNotional - cost) * sign;

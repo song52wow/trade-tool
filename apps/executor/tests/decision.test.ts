@@ -89,13 +89,14 @@ function fakePool() {
       const p = params as unknown[];
       // 列顺序与 db/risk.ts 的 INSERT 一致：
       // 0-6 基本七列，7-13 ATR 与窗口，14-16 tp1 三列，17 手续费，
-      // 18 起是 v0.9.0 的决策列（来源 + 六个参数 + 理由 + 降级原因 + 原文 + 时刻）。
+      // 18 起是 v0.9.0 的决策列（来源 + 四个倍数 + 理由 + 降级原因 + 原文 + 时刻）。
+      // v0.9.1 合并成一个止盈倍数后，决策列少了一列——下标也跟着前移。
       claimed.push({
         symbol: String(p[1]),
         decisionSource: p[18] === null ? null : String(p[18]),
         stopAtrMult: p[19] === null ? null : Number(p[19]),
-        fallbackReason: p[26] === null ? null : String(p[26]),
-        rationale: p[25] === null ? null : String(p[25]),
+        fallbackReason: p[25] === null ? null : String(p[25]),
+        rationale: p[24] === null ? null : String(p[24]),
       });
       // RETURNING 必须给出**完整一行**：读侧逐列校验，缺列会报 NULL_NOT_ALLOWED。
       return { rows: [returningRow(p)], rowCount: 1 };
@@ -161,17 +162,16 @@ function returningRow(p: unknown[]): Record<string, unknown> {
     decision_stop_atr_mult: p[19],
     decision_take_profit_atr_mult: p[20],
     decision_take_profit1_ratio: p[21],
-    decision_take_profit1_atr_mult: p[22],
-    decision_trail_atr_mult: p[23],
-    decision_breakeven_after_tp1: p[24],
-    decision_rationale: p[25],
-    decision_fallback_reason: p[26],
-    decision_raw: p[27],
-    decision_at: p[28],
+    decision_trail_atr_mult: p[22],
+    decision_breakeven_after_tp1: p[23],
+    decision_rationale: p[24],
+    decision_fallback_reason: p[25],
+    decision_raw: p[26],
+    decision_at: p[27],
     state: 'failed',
     last_error: null,
-    created_at: p[29],
-    updated_at: p[30],
+    created_at: p[28],
+    updated_at: p[29],
   };
 }
 
@@ -217,7 +217,6 @@ const VALID_DECISION = {
   stopAtrMult: 2.5,
   takeProfitAtrMult: 4,
   takeProfit1Ratio: 0,
-  takeProfit1AtrMult: 3,
   trailAtrMult: 2,
   breakevenAfterTp1: true,
 };
@@ -277,7 +276,6 @@ function makeService(
       stopAtrMult: 2,
       takeProfitAtrMult: 3,
       takeProfit1Ratio: 0,
-      takeProfit1AtrMult: 3,
       trailAtrMult: 2,
       breakevenAfterTp1: true,
       source: 'global',
@@ -351,22 +349,23 @@ describe('LLM 决策：模型不可靠时不能做出危险的事', () => {
     expect(pool.claimed[0]?.decisionSource).toBe('config-fallback');
   });
 
-  it('模型给的档位自相矛盾（分批的第一段比整段还远）→ 拒绝这一份', async () => {
+  it('分批形态的决策照常采纳（合并成一个倍数后，不再有「两段比远近」的自相矛盾）', async () => {
     const { service, placer, pool } = makeService({
       llm: llmReturning(
         JSON.stringify({
           ...VALID_DECISION,
           takeProfit1Ratio: 0.5,
-          takeProfit1AtrMult: 5,
           takeProfitAtrMult: 3,
         }),
       ),
     });
     const outcome = await service.handleFill(fillEvent());
     expect(outcome).toBe('armed');
-    expect(placer.calls.find((c) => c.stopPrice !== 0)?.stopPrice).toBe(80);
-    expect(pool.claimed[0]?.decisionSource).toBe('config-fallback');
-    expect(pool.claimed[0]?.fallbackReason).toContain('自相矛盾');
+    // 止损按模型给的 2.5×ATR = 75
+    expect(placer.calls.find((c) => c.stopPrice !== 0)?.stopPrice).toBe(75);
+    // 止盈按模型给的 3×ATR = 130：只有一个止盈倍数，第一段与「整段」是同一个数
+    expect(placer.calls.find((c) => c.tp !== 0)?.tp).toBe(130);
+    expect(pool.claimed[0]?.decisionSource).toBe('llm');
   });
 
   it('fallbackToPolicy=false 且模型失败 → 不挂单（用户明确选了宁可不挂）', async () => {

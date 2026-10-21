@@ -62,7 +62,6 @@ function policy(overrides: Partial<RiskPolicyViewDto> = {}): RiskPolicyViewDto {
       stopAtrMult: 2,
       takeProfitAtrMult: 3,
       takeProfit1Percent: 0,
-      takeProfit1AtrMult: 3,
       trailAtrMult: 2,
       breakevenAfterTp1: true,
       source: 'config',
@@ -534,7 +533,7 @@ describe('设置页 · 止盈止损策略', () => {
     expect((del as HTMLButtonElement).disabled).toBe(true);
   });
 
-  it('保存全局默认带上全部策略字段（含第一段比例）', async () => {
+  it('保存全局默认带上全部策略字段（只有一个止盈倍数）', async () => {
     const stub = stubFetch(handlers());
     render(<App />);
     await waitFor(() => expect(screen.getByLabelText('全局默认 ATR 周期')).toBeTruthy());
@@ -546,9 +545,6 @@ describe('设置页 · 止盈止损策略', () => {
     // 比例以 **百分数** 提交：页面填 80，body 里应是 0.8（换算只有 core 一处实现）
     fireEvent.change(screen.getByLabelText('全局默认 第一段止盈减仓百分比'), {
       target: { value: '80' },
-    });
-    fireEvent.change(screen.getByLabelText('全局默认 第一段止盈倍数'), {
-      target: { value: '1.5' },
     });
     fireEvent.change(screen.getByLabelText('全局默认 移动止损倍数'), { target: { value: '2.5' } });
     fireEvent.click(screen.getByRole('button', { name: '保存全局默认' }));
@@ -564,7 +560,6 @@ describe('设置页 · 止盈止损策略', () => {
         takeProfitAtrMult: 4,
         // 页面填 80，body 里就是 80（换算在服务端做，core 里只有一份实现）
         takeProfit1Percent: 80,
-        takeProfit1AtrMult: 1.5,
         trailAtrMult: 2.5,
         breakevenAfterTp1: true,
       });
@@ -609,6 +604,68 @@ describe('设置页 · 止盈止损策略', () => {
     render(<App />);
     await waitFor(() => expect(screen.getByText(/只影响之后的新买入成交/)).toBeTruthy());
   });
+
+  it('「当前生效」只有一个止盈倍数（分批时它就是第一段的目标价）', async () => {
+    stubFetch(
+      handlers({
+        '/api/settings/risk-policy': policy({
+          resolved: {
+            atrPeriod: 14,
+            atrInterval: '1h',
+            stopAtrMult: 2,
+            takeProfitAtrMult: 4,
+            takeProfit1Percent: 80,
+            trailAtrMult: 2,
+            breakevenAfterTp1: true,
+            source: 'global',
+          },
+        }),
+      }),
+    );
+    render(<App />);
+
+    await waitFor(() => expect(screen.getByText('止盈倍数')).toBeTruthy());
+    // 只有一个止盈倍数：4×ATR
+    expect(screen.getByText('4 × ATR')).toBeTruthy();
+    // 分批形态：余下的交给移动止损
+    expect(screen.getByText(/余下 20% 交给移动止损/)).toBeTruthy();
+    // 界面上不再有第二个止盈倍数（v0.9.1 起合并成一个）
+    expect(screen.queryByText('第一段止盈倍数')).toBeNull();
+  });
+
+  it('不分批时同一个止盈倍数表示「到价一次全平」', async () => {
+    stubFetch(handlers());
+    render(<App />);
+
+    await waitFor(() => expect(screen.getByText('止盈倍数')).toBeTruthy());
+    expect(screen.getByText('3 × ATR')).toBeTruthy();
+    expect(screen.getByText(/（不分批）/)).toBeTruthy();
+  });
+
+  it('减仓输入的上限是 99（100 与 0 逐字等价，已在服务端归一）', async () => {
+    stubFetch(handlers());
+    render(<App />);
+    await waitFor(() =>
+      expect(screen.getByLabelText('全局默认 第一段止盈减仓百分比')).toBeTruthy(),
+    );
+    const input = screen.getByLabelText('全局默认 第一段止盈减仓百分比') as HTMLInputElement;
+    expect(input.max).toBe('99');
+  });
+
+  it('每个倍数框都写明「什么时候才生效」（否则用户不知道填了有没有用）', async () => {
+    stubFetch(handlers());
+    render(<App />);
+    await waitFor(() => expect(screen.getByLabelText('全局默认 止盈倍数')).toBeTruthy());
+
+    // 全局默认与标的覆盖两块各有一份同样的说明，因此用 getAllByText。
+    expect(screen.getAllByText('不分批时：涨到离入场这么远，一次全部卖掉').length).toBeGreaterThan(
+      0,
+    );
+    expect(
+      screen.getAllByText('0 = 不分批；1–99 = 先按「止盈倍数」卖掉这个比例').length,
+    ).toBeGreaterThan(0);
+    expect(screen.getAllByText('分批后剩下的仓位靠它了结，只上移不放宽').length).toBeGreaterThan(0);
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -641,7 +698,6 @@ describe('标的详情页内的止盈止损策略', () => {
             stopAtrMult: 2.5,
             takeProfitAtrMult: 4,
             takeProfit1Percent: 80,
-            takeProfit1AtrMult: 1.5,
             trailAtrMult: 3,
             breakevenAfterTp1: true,
             updatedAt: NOW,
@@ -653,7 +709,6 @@ describe('标的详情页内的止盈止损策略', () => {
           stopAtrMult: 2.5,
           takeProfitAtrMult: 4,
           takeProfit1Percent: 80,
-          takeProfit1AtrMult: 1.5,
           trailAtrMult: 3,
           breakevenAfterTp1: true,
           source: 'symbol' as const,

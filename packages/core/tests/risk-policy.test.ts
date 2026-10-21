@@ -15,6 +15,7 @@ import {
   deriveBracketPlan,
   deriveStagedPlan,
   deriveTrailingPlan,
+  normalizeTakeProfit1Ratio,
   percentToRatio,
   ratioToPercent,
 } from '@trade-tool/core';
@@ -134,7 +135,7 @@ describe('deriveBracketPlan', () => {
 });
 
 // ---------------------------------------------------------------------------
-// v0.7.0 两段止盈 + 移动止损
+// 分批止盈 + 移动止损（v0.7.0 起；v0.9.1 合并成一个止盈倍数）
 // ---------------------------------------------------------------------------
 
 const staged = {
@@ -147,7 +148,6 @@ const staged = {
   filledQty: 1,
   stopAtrMult: 2,
   takeProfitAtrMult: 3,
-  takeProfit1AtrMult: 1,
   takeProfit1Ratio: 0.5,
 };
 
@@ -165,21 +165,58 @@ describe('alignToQty', () => {
   });
 });
 
+describe('normalizeTakeProfit1Ratio', () => {
+  it('1 归一到 0（两者逐字等价：都是一次全平、都用同一个倍数）', () => {
+    expect(normalizeTakeProfit1Ratio(1)).toBe(0);
+    expect(normalizeTakeProfit1Ratio(0)).toBe(0);
+    expect(normalizeTakeProfit1Ratio(0.5)).toBe(0.5);
+  });
+
+  it('越界直接报错，不静默夹回', () => {
+    expect(() => normalizeTakeProfit1Ratio(1.5)).toThrow(SyncError);
+    expect(() => normalizeTakeProfit1Ratio(-0.1)).toThrow(SyncError);
+    expect(() => normalizeTakeProfit1Ratio(Number.NaN)).toThrow(SyncError);
+  });
+});
+
 describe('deriveStagedPlan', () => {
-  it('比例 0：与 v0.4.0 同一形态，止盈用整段倍数', () => {
+  it('比例 0：不分批，一次全平', () => {
     const plan = deriveStagedPlan({ ...staged, takeProfit1Ratio: 0 });
     expect(plan.mode).toBe('single');
     expect(plan.tp1Qty).toBeNull();
-    expect(plan.tp1Price).toBe(plan.takeProfitPrice);
+    // 止盈价 = 入场 + 3×ATR；它就是挂出去的那张单的价
+    expect(plan.takeProfitPrice).toBe(106);
     // 止损与 v0.4.0 逐字一致：入场 ∓ 2×ATR
     expect(plan.stopPrice).toBe(96);
   });
 
-  it('比例 1：全平但没有数量，也不需要移动止损', () => {
-    const plan = deriveStagedPlan({ ...staged, takeProfit1Ratio: 1 });
-    expect(plan.mode).toBe('full');
-    expect(plan.tp1Qty).toBeNull();
-    expect(plan.tp1Price).toBe(102); // 100 + 1×ATR
+  it('比例 1：归一到 0，因此与「比例 0」逐字相同', () => {
+    const one = deriveStagedPlan({ ...staged, takeProfit1Ratio: 1 });
+    const zero = deriveStagedPlan({ ...staged, takeProfit1Ratio: 0 });
+    expect(one.mode).toBe('single');
+    expect(one.tp1Qty).toBeNull();
+    expect(one.takeProfitPrice).toBe(zero.takeProfitPrice);
+    expect(one.stopPrice).toBe(zero.stopPrice);
+  });
+
+  it('分批形态：止盈价用**同一个**倍数（没有「整段价」那个虚构概念了）', () => {
+    const plan = deriveStagedPlan({ ...staged, takeProfit1Ratio: 0.5 });
+    expect(plan.mode).toBe('partial');
+    // 挂出去的是那张「带数量」的第一段止盈单，它的价格 = 入场 + 3×ATR
+    expect(plan.takeProfitPrice).toBe(106);
+    expect(plan.tp1Qty).toBe(0.5);
+  });
+
+  it('分批形态：止盈价落在入场价同一侧时拒绝（别挂一张必然被拒的单）', () => {
+    expect(() =>
+      deriveStagedPlan({
+        ...staged,
+        takeProfit1Ratio: 0.5,
+        atr: 0.001,
+        tickSize: 0.1,
+        takeProfitAtrMult: 0.5,
+      }),
+    ).toThrow(/同一侧/);
   });
 
   it('比例落在 (0,1)：减仓量按步长向下取整，止损不变', () => {
@@ -190,12 +227,6 @@ describe('deriveStagedPlan', () => {
     expect(plan.tp1Qty!).toBeLessThan(0.3);
     expect(Number.isInteger(Math.round(plan.tp1Qty! / 0.001))).toBe(true);
     expect(plan.stopPrice).toBe(96);
-  });
-
-  it('第一段比整段还远 → 拒绝这种自相矛盾的配置', () => {
-    expect(() =>
-      deriveStagedPlan({ ...staged, takeProfit1AtrMult: 4, takeProfit1Ratio: 0.5 }),
-    ).toThrow(/更靠近入场价/);
   });
 
   it('取整后数量不合法 → 拒绝，不退化成全平或不减仓', () => {
@@ -209,7 +240,7 @@ describe('deriveStagedPlan', () => {
     const plan = deriveStagedPlan({ ...staged, side: 'SELL', takeProfit1Ratio: 0.5 });
     expect(plan.exitSide).toBe('BUY');
     expect(plan.stopPrice).toBe(104);
-    expect(plan.tp1Price).toBe(98);
+    expect(plan.takeProfitPrice).toBe(94);
     expect(plan.tp1Qty).toBe(0.5);
   });
 

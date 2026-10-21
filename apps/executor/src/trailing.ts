@@ -57,9 +57,9 @@ export function startTrailingTimer(
     void service
       .trailOnce()
       .then((report: TrailReport) => {
-        if (report.moved > 0 || report.failed > 0) {
+        if (report.moved > 0 || report.failed > 0 || report.advanced > 0) {
           log.info(
-            `移动止损一轮：换档 ${report.moved} / 未变 ${report.unchanged} / ` +
+            `移动止损一轮：推进 ${report.advanced} / 换档 ${report.moved} / 未变 ${report.unchanged} / ` +
               `失败 ${report.failed} / 跳过 ${report.skipped}`,
           );
         }

@@ -318,15 +318,20 @@ export interface RiskPolicyDto {
   atrPeriod: number;
   atrInterval: string;
   stopAtrMult: number;
+  /**
+   * 止盈倍数。**两种形态都用它**（v0.9.1 起只有这一个止盈倍数）：
+   * 不分批时是全平目标，分批时是先兑现那一段的目标。
+   */
   takeProfitAtrMult: number;
   /**
    * 第一段减仓的**百分数**（v0.7.0），`0`–`100`。库里存的是 `[0, 1]` 的比例，
    * 换算只在服务端用 `@trade-tool/core` 的 `percentToRatio` / `ratioToPercent`
    * ——**浏览器端不引 core**（它带 node 内置模块，打包进 UI 会炸），
    * 也不在前端自己 `÷ 100` 了事再让后端与库各存一份口径。
+   *
+   * `100` 与 `0` 逐字等价（都是一次全平），服务端会归一到 `0`。
    */
   takeProfit1Percent: number;
-  takeProfit1AtrMult: number;
   trailAtrMult: number;
   breakevenAfterTp1: boolean;
 }
@@ -360,7 +365,6 @@ export interface RiskPolicyWriteBody {
   stopAtrMult: number;
   takeProfitAtrMult: number;
   takeProfit1Percent: number;
-  takeProfit1AtrMult: number;
   trailAtrMult: number;
   breakevenAfterTp1: boolean;
 }

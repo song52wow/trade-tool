@@ -11,10 +11,13 @@ type PolicyForm = {
   atrPeriod: string;
   atrInterval: string;
   stopAtrMult: string;
+  /**
+   * **只有一个止盈倍数**（v0.9.1 起）：它是「这次要卖的那部分，涨到离入场多远就卖」。
+   * 不分批时卖全部，分批时先卖减仓比例那部分。
+   */
   takeProfitAtrMult: string;
   /** 第一段减仓的**百分数**（0–100），不是 0–1。 */
   takeProfit1Percent: string;
-  takeProfit1AtrMult: string;
   trailAtrMult: string;
   /** 复选框用字符串存，因为表单整体是「非空字符串 = 可提交」。 */
   breakevenAfterTp1: string;
@@ -26,7 +29,6 @@ const EMPTY_FORM: PolicyForm = {
   stopAtrMult: '',
   takeProfitAtrMult: '',
   takeProfit1Percent: '0',
-  takeProfit1AtrMult: '3',
   trailAtrMult: '2',
   breakevenAfterTp1: 'true',
 };
@@ -39,7 +41,6 @@ function toForm(p: RiskPolicyDto): PolicyForm {
     takeProfitAtrMult: String(p.takeProfitAtrMult),
     // 百分数由服务端换算好（core 那边只有一份实现），前端不自己 `× 100`。
     takeProfit1Percent: String(p.takeProfit1Percent),
-    takeProfit1AtrMult: String(p.takeProfit1AtrMult),
     trailAtrMult: String(p.trailAtrMult),
     breakevenAfterTp1: String(p.breakevenAfterTp1),
   };
@@ -124,7 +125,6 @@ export function RiskPolicyPanel(props: {
       stopAtrMult: Number(form.stopAtrMult),
       takeProfitAtrMult: Number(form.takeProfitAtrMult),
       takeProfit1Percent: Number(form.takeProfit1Percent),
-      takeProfit1AtrMult: Number(form.takeProfit1AtrMult),
       trailAtrMult: Number(form.trailAtrMult),
       breakevenAfterTp1: form.breakevenAfterTp1 === 'true',
     };
@@ -135,7 +135,6 @@ export function RiskPolicyPanel(props: {
       !Number.isFinite(body.stopAtrMult) ||
       !Number.isFinite(body.takeProfitAtrMult) ||
       !Number.isFinite(body.takeProfit1Percent) ||
-      !Number.isFinite(body.takeProfit1AtrMult) ||
       !Number.isFinite(body.trailAtrMult)
     ) {
       setError('[CONFIG_INVALID] 数值字段都必须是数字');
@@ -260,6 +259,8 @@ export function RiskPolicyPanel(props: {
             <dt>止损倍数</dt>
             <dd className="mono">{view.resolved.stopAtrMult} × ATR</dd>
             <dt>止盈倍数</dt>
+            {/* 只有一个止盈倍数（v0.9.1 起）：不分批时是全平目标，分批时是
+                「先兑现那一段」的目标。形态由下面「第一段减仓」那行说明。 */}
             <dd className="mono">{view.resolved.takeProfitAtrMult} × ATR</dd>
             <dt>第一段减仓</dt>
             <dd className="mono">
@@ -406,6 +407,7 @@ function PolicyFormBlock(props: {
             disabled={disabled}
             onChange={(e) => set({ stopAtrMult: e.target.value })}
           />
+          <span className="field-note">两种形态都用它算止损价</span>
         </label>
         <label>
           <span className="label">止盈倍数（× ATR）</span>
@@ -418,39 +420,32 @@ function PolicyFormBlock(props: {
             disabled={disabled}
             onChange={(e) => set({ takeProfitAtrMult: e.target.value })}
           />
+          <span className="field-note">
+            {Number(form.takeProfit1Percent) > 0
+              ? '分批时：涨到离入场这么远，先卖掉减仓的那部分'
+              : '不分批时：涨到离入场这么远，一次全部卖掉'}
+          </span>
         </label>
       </div>
 
-      {/* v0.7.0 两段止盈。三个取值走三种形态，提示必须写清，否则用户会把
-          「0」误读成「不分批也不止盈」。 */}
+      {/* v0.7.0 分批。提示必须写清，否则用户会把「0」误读成「不分批也不止盈」。 */}
       <div className="row" style={{ marginTop: 10 }}>
-        <label>
+        <label className="field">
           <span className="label">第一段止盈减仓（%）</span>
           <input
             type="number"
             inputMode="decimal"
             step="1"
             min={0}
-            max={100}
+            max={99}
             aria-label={`${props.title} 第一段止盈减仓百分比`}
             value={form.takeProfit1Percent}
             disabled={disabled}
             onChange={(e) => set({ takeProfit1Percent: e.target.value })}
           />
+          <span className="field-note">0 = 不分批；1–99 = 先按「止盈倍数」卖掉这个比例</span>
         </label>
-        <label>
-          <span className="label">第一段止盈倍数（× ATR）</span>
-          <input
-            type="number"
-            inputMode="decimal"
-            step="0.1"
-            aria-label={`${props.title} 第一段止盈倍数`}
-            value={form.takeProfit1AtrMult}
-            disabled={disabled}
-            onChange={(e) => set({ takeProfit1AtrMult: e.target.value })}
-          />
-        </label>
-        <label>
+        <label className="field">
           <span className="label">移动止损倍数（× ATR）</span>
           <input
             type="number"
@@ -461,6 +456,7 @@ function PolicyFormBlock(props: {
             disabled={disabled}
             onChange={(e) => set({ trailAtrMult: e.target.value })}
           />
+          <span className="field-note">分批后剩下的仓位靠它了结，只上移不放宽</span>
         </label>
       </div>
       <div className="row" style={{ marginTop: 6, alignItems: 'center' }}>
@@ -477,9 +473,8 @@ function PolicyFormBlock(props: {
         </label>
       </div>
       <p className="hint">
-        0% = 不分批（到价一次全平，与旧行为一致）；1–99% = 先按「第一段止盈倍数」
-        卖掉这个比例，剩余仓位交给移动止损（止损 = 持仓期最高价 − 移动止损倍数 × 当前
-        ATR，只上移不放宽）；100% = 到价一次全平，用「第一段止盈倍数」算。
+        0% = 不分批（到价一次全平，与旧行为一致）；1–99% = 先按「止盈倍数」卖掉这个
+        比例，剩余仓位交给移动止损（止损 = 持仓期最高价 − 移动止损倍数 × 当前 ATR， 只上移不放宽）。
       </p>
 
       <div className="row" style={{ marginTop: 10 }}>

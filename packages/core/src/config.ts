@@ -2,6 +2,7 @@ import { z } from 'zod';
 
 import { EXCHANGE_ENVIRONMENTS } from './exchange-endpoints.js';
 import { NOTIFY_KINDS } from './notify.js';
+import { normalizeTakeProfit1Ratio } from './risk-policy.js';
 import { INTERVALS } from './types.js';
 
 export const marketSchema = z.object({
@@ -314,23 +315,29 @@ export const executorSchema = z.object({
   atrWindowBars: z.number().int().positive().max(5_000).default(240),
   /** 止损 = 入场价 ∓ 该倍数 × ATR。 */
   stopAtrMult: z.number().positive().max(20).default(2),
-  /** 止盈 = 入场价 ± 该倍数 × ATR。 */
+  /**
+   * 止盈 = 入场价 ± 该倍数 × ATR。
+   *
+   * **两种形态都用它**（v0.9.1 起只有这一个止盈倍数）：不分批时它是全平目标，
+   * 分批时它是「先兑现那一段」的目标，剩下仓位交给移动止损。
+   */
   takeProfitAtrMult: z.number().positive().max(50).default(3),
   /**
    * 第一段止盈减仓的比例（v0.7.0），`[0, 1]`。**0 = 关闭分批**，此时行为与 v0.4.0
    * 逐字一致。
    *
-   * 三个取值走三种形态，只有 `(0, 1)` 会启用剩余仓位的移动止损：
-   *   * `0`      整段止盈用 `takeProfitAtrMult`，全平；
-   *   * `(0, 1)` 第一段按 `takeProfit1AtrMult` 平掉这个比例，剩余交给移动止损；
-   *   * `1`      一次性止盈用 `takeProfit1AtrMult`，全平（不需要移动止损，更简单）。
+   * 两个取值走两种形态，只有 `(0, 1)` 会启用剩余仓位的移动止损：
+   *   * `0`      到价一次全平；
+   *   * `(0, 1)` 先按这个比例减仓，剩下的交给移动止损。
+   *
+   * `1` 与 `0` 逐字等价（都是一次全平、都用 `takeProfitAtrMult` 算价），
+   * 因此**归一到 `0`**——归一只有一份实现（`normalizeTakeProfit1Ratio`），
+   * 这里直接用它，不另写一遍 `v >= 1 ? 0 : v`。
    *
    * 控制面上以 **0–100 的百分数**呈现，换算只有一处实现（`ratioToPercent` /
    * `percentToRatio`），前端不许自己 `÷ 100` 了事。
    */
-  takeProfit1Ratio: z.number().min(0).max(1).default(0),
-  /** 第一段止盈 = 入场价 ± 该倍数 × ATR。 */
-  takeProfit1AtrMult: z.number().positive().max(50).default(3),
+  takeProfit1Ratio: z.number().min(0).max(1).default(0).transform(normalizeTakeProfit1Ratio),
   /**
    * 移动止损的 Chandelier 倍数：`止损 = 持仓期极值 ∓ 该倍数 × ATR(最新)`，
    * **只朝有利方向移动、永不放宽**。

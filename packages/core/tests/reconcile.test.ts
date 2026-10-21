@@ -32,6 +32,7 @@ function record(overrides: Partial<LocalBracket> = {}): LocalBracket {
     slAlgoId: 12,
     tp1AlgoId: null,
     tp1Price: null,
+    tp1FilledAt: null,
     trailStopPrice: null,
     state: 'armed',
     lastError: null,
@@ -431,6 +432,19 @@ describe('v0.7.0 两段形态的判据', () => {
     });
     const item = result.differences.find((d) => d.kind === 'missing-take-profit-order');
     expect(item?.severity).toBe('warning');
+  });
+
+  it('partial_armed 但**第一段已成交**：那张单消失是正常的，不报假警报', () => {
+    // 第一段止盈成交后，交易所上那张单就没了（成交即撤）。
+    // `tp1_filled_at` 有值就是证据——没有它，对账只能把「止盈单不见了」一律报成差异。
+    const result = report({
+      local: [
+        record({ state: 'partial_armed', tp1AlgoId: 13, tp1Price: 102, tp1FilledAt: NOW - 1000 }),
+      ],
+      positions: [position()],
+      algoOrders: [algo()],
+    });
+    expect(result.differences.find((d) => d.kind === 'missing-take-profit-order')).toBeUndefined();
   });
 
   it('partial_armed 却缺第一段价 → 抛错，不静默拿整段价顶上', () => {

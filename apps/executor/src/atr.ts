@@ -27,8 +27,17 @@ export interface AtrSnapshot {
    * `from` / `to` 是**实际取数的那段**的起止，**可能短于整个持仓期**——
    * 因为极值不许跨缺口，取的是 `asOf` 侧那个极大连续段。短了就如实回传，
    * 让调用方知道「这个极值只覆盖到这里」，而不是猜一个覆盖全程的值。
+   *
+   * **`null` = 取不到**：持仓期内一根已收盘 K 线都没有（**刚开仓就是这种情况**）。
+   * 它**不是**「取到了 0」，也**不是**「契约破损」——Python 侧如实回 null（见
+   * `quant_data/risk.py` 的模块说明第 5b 条）。
+   *
+   * 为什么不让 Python 直接抛错：极值与 ATR 在**同一次取数**里，抛错会把 ATR 一起带走，
+   * 调用方只能把整次取数当成「ATR 不可用」而**拒绝下单**——于是新开仓永远挂不上保护单。
+   * 处置按 v0.7.0 R-6.5：**极值取不到只是「本轮不移动止损、保留上一档」**，
+   * 与「ATR 取不到要拒绝下单」严重度不同，两者不许混成一个码。
    */
-  extreme: { high: number; low: number; from: number; to: number };
+  extreme: { high: number; low: number; from: number; to: number } | null;
   /**
    * 取数范围内最后一根已收盘 K 线的收盘价（与 `extreme` 同一段数据、同一次取数）。
    *
@@ -93,22 +102,34 @@ function validate(raw: unknown, symbol: string): AtrSnapshot {
   const r = raw as Record<string, unknown>;
   const need = (field: string): number => finite(r[field], field, symbol);
   const rawExtreme = r['extreme'];
-  if (typeof rawExtreme !== 'object' || rawExtreme === null) {
-    // 极值缺字段时**不静默补 0**：补 0 会让 Chandelier 算出一个「止损 = −k×ATR」
-    // 的怪价，而它要到价格反向运行时才显形（v0.7.0 R-6.3）。
+  // `null` 与「字段缺失」必须分开：**null = 极值取不到**（合法，调用方按 R-6.5 处理）；
+  // 字段缺失 = 契约破损（Python 侧版本不对），那要报错，不能当成「取不到」糊过去。
+  if (rawExtreme === undefined) {
     throw new SyncError(
       'INTERNAL_ERROR',
       `risk-atr 返回的摘要里没有 extreme 字段：${symbol}（Python 侧可能还没升级到 v0.7.0 的摘要形状）`,
       { symbol },
     );
   }
-  const e = rawExtreme as Record<string, unknown>;
-  const extreme = {
-    high: finite(e['high'], 'extreme.high', symbol),
-    low: finite(e['low'], 'extreme.low', symbol),
-    from: finite(e['from'], 'extreme.from', symbol),
-    to: finite(e['to'], 'extreme.to', symbol),
-  };
+  let extreme: AtrSnapshot['extreme'] = null;
+  if (rawExtreme !== null) {
+    if (typeof rawExtreme !== 'object') {
+      throw new SyncError(
+        'INTERNAL_ERROR',
+        `risk-atr 返回的 extreme 不是对象也不是 null：${symbol}`,
+        {
+          symbol,
+        },
+      );
+    }
+    const e = rawExtreme as Record<string, unknown>;
+    extreme = {
+      high: finite(e['high'], 'extreme.high', symbol),
+      low: finite(e['low'], 'extreme.low', symbol),
+      from: finite(e['from'], 'extreme.from', symbol),
+      to: finite(e['to'], 'extreme.to', symbol),
+    };
+  }
 
   const snapshot: AtrSnapshot = {
     symbol: typeof r['symbol'] === 'string' ? r['symbol'] : symbol,

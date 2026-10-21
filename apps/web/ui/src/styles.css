@@ -724,6 +724,24 @@ button.link.current {
   font-size: 12px;
 }
 
+/* `.row` 里的字段：默认是横排的（复选框那几处要并排），要挂小字说明就得竖排。 */
+label.field {
+  display: grid;
+  gap: 4px;
+}
+
+/*
+ * 字段下面那行小字：说清「这个框在哪种形态下才生效」。
+ * 不写的话用户改完不知道有没有用——止盈那块有两处倍数（整段 / 第一段），
+ * 哪个在起作用完全取决于「第一段减仓 %」，不说就等于让人猜。
+ */
+.field-note {
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.35;
+  max-width: 24em;
+}
+
 /* 复选框：默认的 grid 布局会把文字压在框上方，读起来别扭，这里改成并排。 */
 .form-grid label.check {
   display: flex;

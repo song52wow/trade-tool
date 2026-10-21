@@ -61,6 +61,14 @@ export interface LocalBracket {
   /** 第一段止盈的单号与价（`partial_armed` / `trailing` 行有值）。 */
   tp1AlgoId: number | null;
   tp1Price: number | null;
+  /**
+   * 「第一段止盈**已成交**」的时刻（`tp1_filled_at`）。
+   *
+   * 有值 = 那张单**成交后消失了**，交易所上找不到它是**正常的**。
+   * 没有它时，对账只能把「止盈单不见了」一律报成差异——而分批形态里
+   * 第一段成交后那张单本来就会消失，于是每轮一条假警报（§6.5 第 2 条）。
+   */
+  tp1FilledAt: number | null;
   /** 当前生效的那一档止损价。`trailing` 行必��用它比价，而不是 `stopPrice`。 */
   trailStopPrice: number | null;
   state: UnsettledBracketState;
@@ -440,18 +448,24 @@ export function reconcileBrackets(input: ReconcileInput): ReconcileReport {
     const takeProfit =
       record.state === 'partial_armed' ? requireTp1Price(record) : record.takeProfit;
     if (tp === undefined) {
-      differences.push({
-        kind: 'missing-take-profit-order',
-        severity: 'warning',
-        symbol: record.symbol,
-        entryOrderId: record.entryOrderId,
-        message: `${record.symbol} 止损单还在，但止盈单已不在交易所（另一张多半是被成交后由交易所自动撤销的，需要确认本地状态是否漏记）。`,
-        evidence: {
-          localState: record.state,
-          localTpAlgoId: record.state === 'partial_armed' ? record.tp1AlgoId : record.tpAlgoId,
-          localTakeProfit: takeProfit,
-        },
-      });
+      // 「第一段已成交」的行：止盈单**本来就会消失**（它成交了，交易所自动撤掉）。
+      // 报「止盈单不见了」是假警报——事实由 `tp1_filled_at` 记着。
+      // 没有这个标记的 `partial_armed` 行才是真的缺单（那张单还没成交就不见了）。
+      const tp1Filled = record.state === 'partial_armed' && record.tp1FilledAt !== null;
+      if (!tp1Filled) {
+        differences.push({
+          kind: 'missing-take-profit-order',
+          severity: 'warning',
+          symbol: record.symbol,
+          entryOrderId: record.entryOrderId,
+          message: `${record.symbol} 止损单还在，但止盈单已不在交易所（另一张多半是被成交后由交易所自动撤销的，需要确认本地状态是否漏记）。`,
+          evidence: {
+            localState: record.state,
+            localTpAlgoId: record.state === 'partial_armed' ? record.tp1AlgoId : record.tpAlgoId,
+            localTakeProfit: takeProfit,
+          },
+        });
+      }
     } else if (!samePrice(tp.triggerPrice, takeProfit)) {
       differences.push({
         kind: 'price-mismatch',

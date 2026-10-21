@@ -25,13 +25,15 @@ import {
   createExecutorService,
   parseBracketClientOrderId,
 } from '../src/service.js';
-import type { AtrProvider } from '../src/atr.js';
+import type { AtrProvider, AtrSnapshot } from '../src/atr.js';
 import { describe, expect, it, vi } from 'vitest';
 
 /** 假库里一行止盈止损记录。字段名跟真表一致（`state` 已是七态之一）。 */
 interface FakeClaim {
   symbol: string;
   positionSide: string;
+  /** 落库的止盈价（`take_profit` 列）。页面显示的「止盈价」读的就是它。 */
+  takeProfit: number;
   tpOrderId: number | null;
   /** v0.7.0：移动止损换档时新挂的那张止损单号。 */
   slAlgoId?: number;
@@ -41,6 +43,8 @@ interface FakeClaim {
   tp1AlgoId?: number | null;
   tp1Qty?: number | null;
   tp1Price?: number | null;
+  /** v0.9.1：「第一段止盈已成交」的标记。移动止损定时器靠它认领「等推进」的行。 */
+  tp1FilledAt?: number | null;
   trailStopPrice?: number | null;
   trailExtreme?: number | null;
   trailAtr?: number | null;
@@ -90,6 +94,7 @@ function fakePool() {
       state.claims.set(key, {
         symbol: String(symbol),
         positionSide: String(positionSide),
+        takeProfit: Number(takeProfit),
         tpOrderId: null,
         slOrderId: null,
         state: 'failed',
@@ -142,7 +147,6 @@ function fakePool() {
             decision_stop_atr_mult: null,
             decision_take_profit_atr_mult: null,
             decision_take_profit1_ratio: null,
-            decision_take_profit1_atr_mult: null,
             decision_trail_atr_mult: null,
             decision_breakeven_after_tp1: null,
             decision_rationale: null,
@@ -204,7 +208,6 @@ function fakePool() {
               decision_stop_atr_mult: null,
               decision_take_profit_atr_mult: null,
               decision_take_profit1_ratio: null,
-              decision_take_profit1_atr_mult: null,
               decision_trail_atr_mult: null,
               decision_breakeven_after_tp1: null,
               decision_rationale: null,
@@ -254,7 +257,7 @@ function fakePool() {
             tp1_qty: row.tp1Qty ?? null,
             tp1_price: row.tp1Price ?? null,
             tp1_filled_qty: null,
-            tp1_filled_at: null,
+            tp1_filled_at: row.tp1FilledAt ?? null,
             trail_extreme: row.trailExtreme ?? null,
             trail_stop_price: row.trailStopPrice ?? null,
             trail_atr: row.trailAtr ?? null,
@@ -269,7 +272,6 @@ function fakePool() {
             decision_stop_atr_mult: null,
             decision_take_profit_atr_mult: null,
             decision_take_profit1_ratio: null,
-            decision_take_profit1_atr_mult: null,
             decision_trail_atr_mult: null,
             decision_breakeven_after_tp1: null,
             decision_rationale: null,
@@ -290,6 +292,21 @@ function fakePool() {
       if (row) Object.assign(row, { tpOrderId: tp, slOrderId: sl, state: 'armed' });
       return { rows: [], rowCount: 1 };
     }
+    // v0.9.1：记「第一段止盈已成交」这个事实（幂等：`tp1_filled_at` 非空就不再写）。
+    if (sql.includes('tp1_filled_qty = $4')) {
+      const [, symbol, entryOrderId, qty, filledAt, , notional, fee] = params as unknown[];
+      const row = state.claims.get(key2(symbol, entryOrderId));
+      if (row && (row.tp1FilledAt ?? null) === null) {
+        Object.assign(row, {
+          tp1FilledAt: filledAt as number,
+          closedQty: (row.closedQty ?? 0) + Number(qty),
+          exitNotional: (row.exitNotional ?? 0) + Number(notional),
+          feeAmount: (row.feeAmount ?? 0) + Number(fee),
+        });
+        return { rows: [], rowCount: 1 };
+      }
+      return { rows: [], rowCount: 0 };
+    }
     if (sql.includes('SET state = $4')) {
       const [exchange, symbol, entryOrderId, nextState, , qty, notional, fee] = params as (
         string | number
@@ -308,7 +325,11 @@ function fakePool() {
       return { rows: [], rowCount: 1 };
     }
     // v0.7.0 的阶段流转：把 state 推进并把单号回填，让后续读得到正确形态。
-    if (sql.includes("state = 'partial_armed'")) {
+    //
+    // ⚠️ 匹配必须盯住 **SET 子句**，不能盯住「SQL 里出现过这个 state 字面量」：
+    // 每条 UPDATE 的 WHERE 里也有 state 字面量（`AND state = 'partial_armed'`），
+    // 盯字面量会让「推进到 trailing」那条语句被「置为 partial_armed」的分支截走。
+    if (sql.includes('SET sl_algo_id = $4, tp1_algo_id = $5')) {
       const [, symbol, entryOrderId, slAlgoId, tp1AlgoId, now] = params as unknown[];
       patch(key2(symbol, entryOrderId), {
         state: 'partial_armed',
@@ -318,23 +339,33 @@ function fakePool() {
       });
       return { rows: [], rowCount: 1 };
     }
-    if (sql.includes("state = 'trailing'")) {
+    if (sql.includes("SET state = 'trailing'")) {
       // from / to 是取数窗口的回传，本替身只记账用得到的字段。
       const [, symbol, entryOrderId, extreme, stopPrice, atr, , , now, slAlgoId] =
         params as unknown[];
+      const row = state.claims.get(key2(symbol, entryOrderId));
+      // 真库的 WHERE 是 `state = 'partial_armed'`：**只有**还停在这一态才推进。
+      if (!row || row.state !== 'partial_armed') return { rows: [], rowCount: 0 };
       patch(key2(symbol, entryOrderId), {
         state: 'trailing',
         trailExtreme: extreme as number,
         trailStopPrice: stopPrice as number,
         trailAtr: atr as number,
-        slOrderId: (slAlgoId as number | null) ?? null,
+        // 真库是 `COALESCE($10, sl_algo_id)`：**没给单号就沿用旧的**。
+        ...(slAlgoId === null || slAlgoId === undefined ? {} : { slOrderId: slAlgoId as number }),
+        // 真库同时清掉两个错误位（阶段推进了，之前那条失败原因就不成立了）。
+        lastError: null,
+        trailLastError: null,
         updatedAt: now as number,
       });
       return { rows: [], rowCount: 1 };
     }
-    if (sql.includes('trail_stop_price = $4, trail_extreme = $5')) {
+    if (sql.includes('SET trail_stop_price = $4, trail_extreme = $5')) {
       const [, symbol, entryOrderId, stopPrice, extreme, atr, , , now, slAlgoId] =
         params as unknown[];
+      const row = state.claims.get(key2(symbol, entryOrderId));
+      // 真库的 WHERE 是 `state = 'trailing'`。
+      if (!row || row.state !== 'trailing') return { rows: [], rowCount: 0 };
       patch(key2(symbol, entryOrderId), {
         trailStopPrice: stopPrice as number,
         trailExtreme: extreme as number,
@@ -344,7 +375,7 @@ function fakePool() {
       });
       return { rows: [], rowCount: 1 };
     }
-    if (sql.includes('trail_last_error = $4')) {
+    if (sql.includes('SET trail_last_error = $4')) {
       const [, symbol, entryOrderId, reason, now] = params as unknown[];
       patch(key2(symbol, entryOrderId), {
         trailLastError: String(reason),
@@ -381,7 +412,11 @@ function makeConfig(executor: Record<string, unknown> = {}): TradeToolConfig {
   });
 }
 
-const ATR = {
+/**
+ * ATR 夹具。**显式标成 `AtrSnapshot`**：不标的话 `extreme` 会被推断成「非空对象」，
+ * 于是「极值取不到」（`extreme: null`）这个用例在类型上就写不出来。
+ */
+const ATR: AtrSnapshot = {
   symbol: 'BTCUSDT',
   interval: '1m',
   intervalMs: 60_000,
@@ -581,6 +616,41 @@ describe('通知：止盈止损挂上与一轮完成（v0.8.0）', () => {
     expect(money).toContain('毛利 -20.00 USDT');
     expect(money).toContain('手续费 0.08 USDT');
     expect(money).toContain('净盈亏 -20.08 USDT');
+  });
+
+  it('没拿到出场价时：说「算不出」，不报一个看着精确的假盈亏', async () => {
+    // 2026-10-22 线上事故的回归：出场价是 0 时，成交额也是 0，
+    // 旧算法会算出「毛利 = (0 − 60000) × 0.1 = −6000」的假账。
+    const { alerts, items } = fakeAlerts();
+    const pool = fakePool();
+    const service = createExecutorService({
+      pool: pool.pool,
+      config: makeConfig(),
+      placer: fakePlacer(),
+      atr: fakeAtr(),
+      alerts,
+    });
+
+    await service.handleFill(fill());
+    await service.handleFill(
+      fill({
+        clientOrderId: bracketClientOrderId('sl', '42'),
+        side: 'SELL',
+        lastFilledPrice: 0,
+        lastFilledQty: 0.1,
+        commission: 0.04,
+      }),
+    );
+
+    const settled = items.find((item) => item.category === 'trade');
+    expect(settled).toBeDefined();
+    expect(settled?.title).toContain('盈亏算不出');
+    // 假数一个都不许出现。
+    const money = (settled?.highlights ?? []).join('\n');
+    expect(money).not.toContain('净盈亏');
+    expect(money).not.toContain('毛利');
+    const lines = (settled?.lines ?? []).join('\n');
+    expect(lines).toContain('出场价没拿到');
   });
 
   it('没勾的内容类型不推（过滤用的是这一轮生效的设置）', async () => {
@@ -899,6 +969,23 @@ describe('下单', () => {
     expect(placer.placed[1]?.stopPrice).toBeCloseTo(59_800, 6);
   });
 
+  it('极值取不到（null）时**照样**挂出保护单：刚开仓就是这种情况', async () => {
+    // 持仓期里一根已收盘 K 线都没有时极值取不到（Python 侧如实回 null）。
+    // 它与「ATR 取不到」严重度不同：ATR 在，价就能算，保护单必须挂出去。
+    // 早期实现把两者混成一个码 → 整次取数被当成 ATR 不可用 → **新开仓永远挂不上保护单**。
+    const placer = fakePlacer();
+    const service = createExecutorService({
+      pool: fakePool().pool,
+      config: makeConfig({ stopAtrMult: 2, takeProfitAtrMult: 3 }),
+      placer,
+      atr: fakeAtr({ extreme: null }),
+    });
+    expect(await service.handleFill(fill())).toBe('armed');
+    expect(placer.placed.map((p) => p.type)).toEqual(['TAKE_PROFIT_MARKET', 'STOP_MARKET']);
+    expect(placer.placed[0]?.stopPrice).toBeCloseTo(60_300, 6);
+    expect(placer.placed[1]?.stopPrice).toBeCloseTo(59_800, 6);
+  });
+
   it('止盈挂上、止损失败时撤掉止盈：不能留下裸奔仓位', async () => {
     const placer = fakePlacer({
       async placeClosePositionOrder(request) {
@@ -1001,7 +1088,6 @@ function stagedPolicy(over: Record<string, number | boolean> = {}) {
     stopAtrMult: 2,
     takeProfitAtrMult: 3,
     takeProfit1Ratio: 0.5,
-    takeProfit1AtrMult: 1,
     trailAtrMult: 2,
     breakevenAfterTp1: true,
     source: 'symbol',
@@ -1043,6 +1129,22 @@ describe('v0.7.0 两段形态', () => {
     expect(placer.placed.some((o) => o.quantity !== undefined)).toBe(false);
   });
 
+  it('比例 100%：归一到 0，因此与「不分批」逐字相同（一次全平）', async () => {
+    const fake = fakePool();
+    const d = { ...deps({ takeProfit1Ratio: 1 }, { takeProfit1Ratio: 1 }), pool: fake.pool };
+    const { placer } = d;
+    const service = createExecutorService(d);
+    expect(await service.handleFill(fill())).toBe('armed');
+
+    const tp = placer.placed.find((o) => o.type === 'TAKE_PROFIT_MARKET');
+    // 归一到「不分批」：全平单，价格 = 入场 60000 + 3×ATR(100) = 60300。
+    expect(tp?.stopPrice).toBe(60_300);
+    expect(tp?.closePosition).toBe(true);
+    // 落库的 `take_profit` 必须是**同一个价**：页面显示的「止盈价」要能拿去和交易所
+    // 对照，显示一个从没挂出去的价格会让人以为仓位其实没保护。
+    expect(fake.state.claims.get('binance/BTCUSDT/42')?.takeProfit).toBe(60_300);
+  });
+
   it('比例 50%：止盈带数量 + reduceOnly，止损仍是 closePosition 且不带数量', async () => {
     const d = deps();
     const { placer } = d;
@@ -1070,5 +1172,218 @@ describe('v0.7.0 两段形态', () => {
     });
     expect(await service.handleFill(fill())).toBe('failed');
     expect(placer.cancelled).toEqual([]);
+  });
+});
+
+describe('移动止损：极值取不到时（R-6.5）', () => {
+  it('本轮**不移动**止损，保留上一档，并留下可见原因——它不是「本轮失败」', async () => {
+    const fake = fakePool();
+    fake.state.claims.set('binance/BTCUSDT/42', {
+      symbol: 'BTCUSDT',
+      positionSide: 'LONG',
+      takeProfit: 60_300,
+      tpOrderId: 11,
+      slOrderId: 12,
+      state: 'trailing',
+      lastError: null,
+      trailStopPrice: 59_800,
+      trailExtreme: 60_000,
+      trailAtr: 100,
+    });
+    const placer = fakePlacer();
+    const service = createExecutorService({
+      pool: fake.pool,
+      config: makeConfig(),
+      placer,
+      atr: fakeAtr({ extreme: null }),
+    });
+
+    const report = await service.trailOnce();
+    // 不动 ≠ 失败：仓位仍受上一档止损保护，只是这一轮不调整。
+    expect(report.unchanged).toBe(1);
+    expect(report.failed).toBe(0);
+    expect(report.moved).toBe(0);
+    expect(placer.placed).toHaveLength(0);
+
+    const row = fake.state.claims.get('binance/BTCUSDT/42');
+    // 原因必须可见（trail_last_error）：「看起来正常、而移动止损其实没动过」是同一件事的两面。
+    expect(row?.trailLastError).toContain('极值取不到');
+    // 档位没动
+    expect(row?.trailStopPrice).toBe(59_800);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// v0.9.1：第一段止盈成交之后——成交事实、阶段推进、止损真的挪档
+// ---------------------------------------------------------------------------
+
+/**
+ * 一个「行情涨了一点」的 ATR 夹具。
+ *
+ * 默认夹具的 `lastClose` 是 480（比入场价低太多），于是每一档算出来的止损位都会
+ * 「越过现价」，移动止损永远不动。要测「往上挪」，现价必须**高于**入场价。
+ */
+const ATR_UP = {
+  extreme: { high: 60_100, low: 59_500, from: 1, to: 2 },
+  lastClose: 60_100,
+} as const;
+
+describe('v0.9.1：第一段止盈成交之后', () => {
+  it('成交事实落库 + 阶段推进 + 止损真的挪到保本位（先挂新、再撤旧）', async () => {
+    const fake = fakePool();
+    const placer = fakePlacer();
+    const service = createExecutorService({
+      pool: fake.pool,
+      config: makeConfig(),
+      placer,
+      atr: fakeAtr(ATR_UP),
+      resolvePolicy: stagedPolicy(),
+    });
+
+    // 先开仓：分批形态 → 两张单挂上，记录停在 `partial_armed`。
+    expect(await service.handleFill(fill())).toBe('armed');
+    const before = fake.state.claims.get('binance/BTCUSDT/42');
+    expect(before?.state).toBe('partial_armed');
+    const entrySlId = before?.slOrderId;
+    expect(entrySlId).not.toBeNull();
+
+    // 第一段止盈成交（带数量的那张）。
+    const outcome = await service.handleFill(
+      fill({
+        clientOrderId: bracketClientOrderId('tp', '42'),
+        side: 'SELL',
+        lastFilledPrice: 60_300,
+        lastFilledQty: 0.05,
+        commission: 0.02,
+      }),
+    );
+    expect(outcome).toBe('trailing');
+
+    const row = fake.state.claims.get('binance/BTCUSDT/42');
+    // ① 成交这个**事实**落库了（盈亏要靠它算，重投事件不会重复算）。
+    expect(row?.tp1FilledAt).not.toBeNull();
+    expect(row?.closedQty).toBeCloseTo(0.05, 10);
+    expect(row?.exitNotional).toBeCloseTo(60_300 * 0.05, 6);
+    expect(row?.feeAmount).toBeCloseTo(0.06, 10); // 入场 0.04 + 这一段 0.02
+    // ② 阶段推进到移动止损。
+    expect(row?.state).toBe('trailing');
+    // ③ 止损**真的挪到了保本位**（入场价 60000），并回填了新的单号。
+    expect(row?.trailStopPrice).toBe(60_000);
+    expect(row?.slOrderId).not.toBe(entrySlId);
+    // 顺序：先挂新、再撤旧（R-4.1）。
+    expect(placer.actions.slice(-2)).toEqual(['place:STOP_MARKET:60000', `cancel:${entrySlId}`]);
+  });
+
+  it('定时器把「TP1 成交了但没推进成功」的行推进成 trailing，并把止损挪到保本位', async () => {
+    const fake = fakePool();
+    fake.state.claims.set('binance/BTCUSDT/42', {
+      symbol: 'BTCUSDT',
+      positionSide: 'LONG',
+      takeProfit: 60_300,
+      tpOrderId: 11,
+      slOrderId: 12,
+      state: 'partial_armed',
+      lastError: null,
+      tp1AlgoId: 11,
+      tp1Qty: 0.05,
+      tp1Price: 60_300,
+      // 关键：第一段**已经成交**（当时推进失败，卡在这一态）。
+      tp1FilledAt: 1_500,
+      trailLastError: '推进移动止损失败：持仓期极值取不到',
+    });
+    const placer = fakePlacer();
+    const service = createExecutorService({
+      pool: fake.pool,
+      config: makeConfig(),
+      placer,
+      atr: fakeAtr(ATR_UP),
+      resolvePolicy: stagedPolicy(),
+    });
+
+    const report = await service.trailOnce();
+    expect(report.advanced).toBe(1);
+    expect(report.moved).toBe(1);
+    expect(report.failed).toBe(0);
+
+    const row = fake.state.claims.get('binance/BTCUSDT/42');
+    expect(row?.state).toBe('trailing');
+    // 挪到保本位 60000（原来停在进场的 59800）。
+    expect(row?.trailStopPrice).toBe(60_000);
+    // 进场那张止损单被撤掉，换成新的那张。
+    expect(placer.cancelled).toEqual([12]);
+    expect(placer.actions).toEqual(['place:STOP_MARKET:60000', 'cancel:12']);
+    // 这一格补上了，之前那条失败原因就不该再挂着。
+    expect(row?.trailLastError).toBeNull();
+  });
+
+  it('「TP1 还没成交」的行不动：那是进场保护，不是移动止损该管的', async () => {
+    const fake = fakePool();
+    fake.state.claims.set('binance/BTCUSDT/42', {
+      symbol: 'BTCUSDT',
+      positionSide: 'LONG',
+      takeProfit: 60_300,
+      tpOrderId: 11,
+      slOrderId: 12,
+      state: 'partial_armed',
+      lastError: null,
+      tp1AlgoId: 11,
+      tp1Qty: 0.05,
+      tp1Price: 60_300,
+      // 第一段**还没成交** → `tp1_filled_at` 为空。
+    });
+    const placer = fakePlacer();
+    const service = createExecutorService({
+      pool: fake.pool,
+      config: makeConfig(),
+      placer,
+      atr: fakeAtr(ATR_UP),
+      resolvePolicy: stagedPolicy(),
+    });
+
+    const report = await service.trailOnce();
+    expect(report.advanced).toBe(0);
+    expect(report.moved).toBe(0);
+    expect(placer.placed).toHaveLength(0);
+    expect(fake.state.claims.get('binance/BTCUSDT/42')?.state).toBe('partial_armed');
+  });
+
+  it('撤旧失败：不推进档位（账面以旧档为准），但原因常驻可见', async () => {
+    const fake = fakePool();
+    fake.state.claims.set('binance/BTCUSDT/42', {
+      symbol: 'BTCUSDT',
+      positionSide: 'LONG',
+      takeProfit: 60_300,
+      tpOrderId: 11,
+      slOrderId: 12,
+      state: 'partial_armed',
+      lastError: null,
+      tp1AlgoId: 11,
+      tp1Qty: 0.05,
+      tp1Price: 60_300,
+      tp1FilledAt: 1_500,
+    });
+    const placer = fakePlacer({
+      async cancelAlgoOrder(): Promise<void> {
+        throw new SyncError('EXCHANGE_ERROR', '模拟撤单失败');
+      },
+    });
+    const service = createExecutorService({
+      pool: fake.pool,
+      config: makeConfig(),
+      placer,
+      atr: fakeAtr(ATR_UP),
+      resolvePolicy: stagedPolicy(),
+    });
+
+    const report = await service.trailOnce();
+    expect(report.failed).toBe(1);
+    expect(report.moved).toBe(0);
+
+    const row = fake.state.claims.get('binance/BTCUSDT/42');
+    // 阶段推进了（可修），但档位没推进（保守：账面以旧档为准）。
+    expect(row?.state).toBe('trailing');
+    expect(row?.trailStopPrice).toBe(59_800);
+    // 「新单已挂上、旧单撤不掉」这件事必须看得见。
+    expect(row?.trailLastError).toContain('撤旧止损失败');
   });
 });

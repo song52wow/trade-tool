@@ -42,7 +42,7 @@ const COLUMNS = `exchange, symbol, entry_order_id, entry_price, entry_time, fill
   trail_extreme, trail_stop_price, trail_atr, trail_atr_from, trail_atr_to,
   trail_updated_at, trail_last_error,
   decision_source, decision_stop_atr_mult, decision_take_profit_atr_mult,
-  decision_take_profit1_ratio, decision_take_profit1_atr_mult, decision_trail_atr_mult,
+  decision_take_profit1_ratio, decision_trail_atr_mult,
   decision_breakeven_after_tp1, decision_rationale, decision_fallback_reason,
   decision_raw, decision_at,
   closed_qty, exit_notional, fee_amount`;
@@ -204,7 +204,6 @@ export interface BracketRecord {
   decisionStopAtrMult: number | null;
   decisionTakeProfitAtrMult: number | null;
   decisionTakeProfit1Ratio: number | null;
-  decisionTakeProfit1AtrMult: number | null;
   decisionTrailAtrMult: number | null;
   decisionBreakevenAfterTp1: boolean | null;
   /** 模型给的理由（人可读）。 */
@@ -311,7 +310,6 @@ function toRecord(row: Record<string, unknown>): BracketRecord {
     decisionStopAtrMult: optionalNum(row, 'decision_stop_atr_mult', where),
     decisionTakeProfitAtrMult: optionalNum(row, 'decision_take_profit_atr_mult', where),
     decisionTakeProfit1Ratio: optionalNum(row, 'decision_take_profit1_ratio', where),
-    decisionTakeProfit1AtrMult: optionalNum(row, 'decision_take_profit1_atr_mult', where),
     decisionTrailAtrMult: optionalNum(row, 'decision_trail_atr_mult', where),
     decisionBreakevenAfterTp1: optionalBool(row, 'decision_breakeven_after_tp1', where),
     decisionRationale: optionalStr(row, 'decision_rationale', where),
@@ -355,7 +353,6 @@ export async function claimBracket(pool: Pool, claim: BracketClaim): Promise<Bra
     decision?.decision?.stopAtrMult ?? null,
     decision?.decision?.takeProfitAtrMult ?? null,
     decision?.decision?.takeProfit1Ratio ?? null,
-    decision?.decision?.takeProfit1AtrMult ?? null,
     decision?.decision?.trailAtrMult ?? null,
     decision?.decision?.breakevenAfterTp1 ?? null,
     decision?.rationale ?? null,
@@ -371,11 +368,11 @@ export async function claimBracket(pool: Pool, claim: BracketClaim): Promise<Bra
          position_side, atr, atr_period, atr_interval, atr_window_from, atr_window_to,
          stop_price, take_profit, tp1_algo_id, tp1_qty, tp1_price, fee_amount, state,
          decision_source, decision_stop_atr_mult, decision_take_profit_atr_mult,
-         decision_take_profit1_ratio, decision_take_profit1_atr_mult, decision_trail_atr_mult,
+         decision_take_profit1_ratio, decision_trail_atr_mult,
          decision_breakeven_after_tp1, decision_rationale, decision_fallback_reason,
          decision_raw, decision_at, created_at, updated_at)
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, 'failed',
-               $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31)
+               $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30)
        ON CONFLICT (exchange, symbol, entry_order_id) DO NOTHING
        RETURNING ${COLUMNS}`,
       values,
@@ -440,16 +437,77 @@ export async function markBracketPartialArmed(
 }
 
 /**
- * 第一段已成交：进入 `trailing`，同时落**意图**（极值、这一轮算出的档位与 ATR 快照）。
+ * 记下「第一段止盈已成交」这个**事实**，并把这一段的平仓事实累加进去。
+ *
+ * 为什么单独一个函数（v0.9.1 补）：**成交了就是成交了**，它不依赖于「能不能算出移动止损」。
+ * 早先这条事实只在 `markBracketTrailing` 里落库，而那是「推进到 trailing 阶段」
+ * 的副作用——于是**推进失败时，这一段成交的事实就整个丢了**：成交价、数量、手续费
+ * 都没记，盈亏少算一段；更糟的是，**没有任何东西能证明「TP1 成交过」**，
+ * 于是「推进失败 → 永远不会被重试」——记录卡在 `partial_armed` 直到仓位被手工平掉。
+ *
+ * `tp1_filled_qty` / `tp1_filled_at` 这两列（迁移 `010` 加的）此前**没有任何代码写过**，
+ * 它们就是为这件事留的位置：它们是「TP1 已成交」的**持久标记**，
+ * 移动止损定时器靠它认领「等推进」的那些行。
+ *
+ * **幂等**：`WHERE … AND tp1_filled_at IS NULL`。用户数据流会重投事件
+ * （listenKey 续期、断线重连），重投时不能把这一段再累加一次——
+ * 累加两次算出来的净盈亏是错的，而且错得看不出来。
+ *
+ * **不改 state**：它记的是事实，不是阶段。阶段由 {@link markBracketTrailing} 推进。
+ */
+export async function recordBracketTp1Fill(
+  pool: Pool,
+  key: { exchange: string; symbol: string; entryOrderId: string },
+  leg: CloseLeg,
+  now: number,
+): Promise<number> {
+  try {
+    const result = await pool.query(
+      `UPDATE ${TABLE} SET tp1_filled_qty = $4, tp1_filled_at = $5,
+         closed_qty = closed_qty + $6,
+         exit_notional = exit_notional + $7,
+         fee_amount = fee_amount + $8,
+         updated_at = $5
+       WHERE exchange = $1 AND symbol = $2 AND entry_order_id = $3
+         AND tp1_filled_at IS NULL`,
+      [
+        key.exchange,
+        key.symbol,
+        key.entryOrderId,
+        leg.qty,
+        now,
+        leg.qty,
+        leg.price * leg.qty,
+        leg.fee,
+      ],
+    );
+    return result.rowCount ?? 0;
+  } catch (caught) {
+    throw toSyncError(caught, `记录第一段止盈成交事实失败：${key.symbol} ${key.entryOrderId}`);
+  }
+}
+
+/**
+ * 第一段已成交：进入 `trailing`，同时落**这一轮观测到的**极值与 ATR 快照。
  *
  * 为什么先落库再动交易所（AGENTS.md §6.3 第 4 条 / v0.7.0 R-5.4）：进程死在
- * 「已置 `trailing`、还没挂新止损」时，对账会看到 `trailing` 却查不到止损单，
- * 报 `missing-stop-order`（紧急）；定时器下一轮补挂。反过来（先挂单后落库），
- * 崩在中间就是「止损已经换了但库里还是旧档位」，账面与交易所永久对不上。
+ * 「已置 `trailing`、还没挂新止损」时，记录停在 `trailing`、止损还在进场那一档，
+ * 移动止损定时器下一轮补挂（它按 `trail_stop_price` 重新算，价没变就不动单）。
+ * 反过来（先挂单后落库），崩在中间就是「止损已经换了但库里还是旧档位」，
+ * 账面与交易所永久对不上。
+ *
+ * ⚠️ `trail.stopPrice` 传进来的必须是**交易所上那张止损单现在的价**，不是
+ * 「这一轮打算挪到的那一档」。这条口径让「库里记的」与「交易所挂着的」永远是
+ * 同一件事：对账（§6.5）拿 `trail_stop_price` 比价才不会一直报价格不符，
+ * 而「阶段推进了、价位还没挪」这一格是**可修**的（定时器下一轮接着挪），
+ * 「价位写了、单还没挂」那一格不是。
  *
  * ⚠️ `WHERE … AND state = 'partial_armed'`：**只有**还停在这一态才推进。
  * 事件重放（listenKey 续期、断线重连）会让 TP1 成交事件再来一次，
  * 而不带这个条件，第二次会把止损**重挂一遍**——止盈止损是会真实下单的动作。
+ *
+ * **平仓事实不在这里累加**：它由 {@link recordBracketTp1Fill} 单独记一次
+ * （幂等，且推进失败时也不会丢）。这里只管阶段与观测。
  *
  * **返回 rowCount**：调用方据此判断「这次真的推进了」还是「已经被推进过了」。
  */
@@ -465,13 +523,6 @@ export async function markBracketTrailing(
     slAlgoId?: number;
   },
   now: number,
-  /**
-   * 第一段止盈成交的事实（成交价 / 数量 / 手续费）。
-   *
-   * 两段模型下，一轮会平两段：**这一段 + 移动止损了结的那一段**。
-   * 不把这一段累加进去，最后算出来的净盈亏就只算了一半——比不报还危险。
-   */
-  leg?: CloseLeg,
 ): Promise<number> {
   try {
     const result = await pool.query(
@@ -479,9 +530,6 @@ export async function markBracketTrailing(
          trail_extreme = $4, trail_stop_price = $5, trail_atr = $6,
          trail_atr_from = $7, trail_atr_to = $8, trail_updated_at = $9,
          sl_algo_id = COALESCE($10, sl_algo_id),
-         closed_qty = closed_qty + $11,
-         exit_notional = exit_notional + $12,
-         fee_amount = fee_amount + $13,
          last_error = NULL, trail_last_error = NULL, updated_at = $9
        WHERE exchange = $1 AND symbol = $2 AND entry_order_id = $3
          AND state = 'partial_armed'`,
@@ -496,9 +544,6 @@ export async function markBracketTrailing(
         trail.atrTo,
         now,
         trail.slAlgoId ?? null,
-        leg?.qty ?? 0,
-        leg === undefined ? 0 : leg.price * leg.qty,
-        leg?.fee ?? 0,
       ],
     );
     return result.rowCount ?? 0;
@@ -792,7 +837,26 @@ export async function listUnsettledBrackets(
   }
 }
 
-/** 只取正在移动止损中的记录——移动止损定时器的工作集合。 */
+/**
+ * 移动止损定时器的工作集合。
+ *
+ * **两类行**（v0.9.1 补）：
+ *
+ * 1. `trailing` —— 已经在移动止损里的（含 `sl_algo_id` 还没回填、等着补挂的那种）。
+ * 2. `partial_armed` 且 **`tp1_filled_at` 非空** —— 第一段止盈**已经成交**、
+ *    但当时没能推进到 `trailing` 的那些行。它们的成交事实已经落库
+ *    （`recordBracketTp1Fill`），所以「该推进」这件事是**已提交但没做完**的意图，
+ *    定时器有权续做。
+ *
+ * 为什么第 2 类必须有（2026-10-21 实测踩到）：推进失败时记录停在 `partial_armed`，
+ * 而早先的定时器只取 `trailing` ——于是**没有任何东西会重试它**。
+ * 失败原因写进了 `trail_last_error`，看着「有原因、很安全」，实际上那一笔仓位
+ * 永远进不了移动止损：止损位不跟着价格上移，而人只会看到一行报错。
+ * 「当时算不出来」是**暂时**的（行情没同步到开仓之后那种），过一会儿就该重试。
+ *
+ * ⚠️ `partial_armed` 但 `tp1_filled_at` 为空的那行**不在**这里：
+ * 那是「TP1 还没成交」，属于进场保护，止损不该被移动（§6.8 第 3 条）。
+ */
 export async function listTrailingBrackets(
   pool: Pool,
   exchange: string,
@@ -801,7 +865,11 @@ export async function listTrailingBrackets(
   const all = await listUnsettledBrackets(pool, exchange);
   // 定时器可能正在补挂一条刚置为 trailing 的记录（含 sl_algo_id 还没回填的那种）。
   // **不按 updated_at 过滤**：崩溃后重启时，旧记录当然很旧，而它正是要补的对象。
-  return all.filter((record) => record.state === 'trailing' && record.entryTime <= now);
+  return all.filter(
+    (record) =>
+      (record.state === 'trailing' && record.entryTime <= now) ||
+      (record.state === 'partial_armed' && record.tp1FilledAt !== null),
+  );
 }
 
 /** 七态计数，**七项永远都在**，没有的态是 0。

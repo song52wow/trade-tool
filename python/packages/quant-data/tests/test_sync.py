@@ -1130,6 +1130,10 @@ def test_migrations_are_idempotent(conn: DbConn, pg_dsn: str) -> None:
         "012_trade_pnl",
         # v0.9.0：LLM 决策的记录列
         "013_llm_decision",
+        # v0.9.0：止盈倍数合并成一个（退役 take_profit1_atr_mult，比例禁 1）
+        "014_take_profit_single_mult",
+        # v0.9.0：补回「LLM 决策的数必须齐全」那条约束
+        "015_restore_llm_params_check",
     ]
     pg.ensure_schema(conn)
 
