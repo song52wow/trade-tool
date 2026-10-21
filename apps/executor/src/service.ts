@@ -400,6 +400,10 @@ export function createExecutorService(deps: ExecutorServiceDeps): ExecutorServic
         ? `已平 ${after.closedQty}（均价 ${avgExitPrice.toFixed(2)}）`
         : `已平 ${after.closedQty}（成交额没拿到，算不出均价）`;
     const round = `本轮${state === 'take_profit' ? '止盈' : '止损'}成交`;
+    // 订单号是**排查用的钥匙**：出问题时拿着它去交易所的订单记录里查，
+    // 不用靠「哪个标的、什么时候」去猜是哪一张单。
+    // 入场单号是这一轮的锚（库里那一行的主键），出场单号是真正成交的那张。
+    const orderLine = `订单号：入场 ${after.entryOrderId}，出场 ${update.orderId}`;
 
     await pushAlert('bracket-settled', () => {
       // 盈亏**算不出来**时如实说算不出来，绝不拿 0 去凑一个「看起来精确」的数字。
@@ -411,7 +415,13 @@ export function createExecutorService(deps: ExecutorServiceDeps): ExecutorServic
           severity: 'warning',
           oneShot: true,
           title: `${after.symbol} 一轮完成（盈亏算不出）`,
-          lines: [priceLine, qtyLine, round, '没拿到出场成交额，这一轮的盈亏暂时算不出来'],
+          lines: [
+            priceLine,
+            qtyLine,
+            orderLine,
+            round,
+            '没拿到出场成交额，这一轮的盈亏暂时算不出来',
+          ],
           highlights: [`已计手续费 ${money(after.feeAmount)}`],
         };
       }
@@ -424,7 +434,7 @@ export function createExecutorService(deps: ExecutorServiceDeps): ExecutorServic
         oneShot: true,
         // 标题带净盈亏：推送预览里直接看到这一轮赚没赚。
         title: `${after.symbol} 净盈亏 ${money(pnl.net)}`,
-        lines: [priceLine, qtyLine, round],
+        lines: [priceLine, qtyLine, orderLine, round],
         // 金额单独一段并加粗。
         highlights: [
           `毛利 ${money(pnl.gross)}`,
@@ -904,6 +914,9 @@ export function createExecutorService(deps: ExecutorServiceDeps): ExecutorServic
         `入场 ${update.averagePrice} × ${update.cumulativeQty}（${
           plan.positionSide === 'LONG' ? '多头' : '空头'
         }）`,
+        // 订单号是**排查用的钥匙**：出问题时拿着它去交易所的订单记录里查，
+        // 不用靠「哪个标的、什么时候」去猜是哪一张单。
+        `订单号：入场 ${entryOrderId}，止盈 ${tpAlgoId}，止损 ${slAlgoId}`,
         ...(plan.mode === 'partial' ? ['剩余仓位由移动止损了结，止损位只上移不放宽'] : []),
       ],
       // 金额单独一段并加粗。
@@ -993,6 +1006,8 @@ export function createExecutorService(deps: ExecutorServiceDeps): ExecutorServic
           : `${update.symbol} LLM 决策降级到配置档位`,
         lines: [
           `原因：${outcome.fallbackReason ?? '未知'}`,
+          // 单号：降级这一轮对应的是哪一笔入场，查仓位时用得上。
+          `订单号：入场 ${String(update.orderId)}`,
           outcome.refuse
             ? '按配置 llm.fallbackToPolicy=false，本次**没有挂单**——仓位当前是裸的，需要人工处理。'
             : '本次止盈止损按 risk_policy 的档位挂出，仓位仍受保护。',

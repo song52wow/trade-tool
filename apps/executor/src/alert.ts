@@ -12,8 +12,38 @@ import {
   RECONCILE_KINDS,
   severityLabel,
   type AlertItem,
+  type ReconcileDifference,
   type ReconcileReport,
 } from '@trade-tool/core';
+
+/**
+ * 差异条目里跟「单号」有关的证据键 → 展示时的名字。
+ *
+ * 为什么要单号：差异说的是「本地的单和交易所的单对不上」，
+ * 而排查这件事的钥匙就是**单号**——拿着它去交易所的订单记录里查，
+ * 不用靠「哪个标的、什么时候、什么价」去猜是哪一张单。
+ *
+ * 键名各条判据不一样（有的记交易所那侧，有的记本地记的那侧），
+ * 这里列全，取到哪个算哪个。
+ */
+const ORDER_ID_EVIDENCE: ReadonlyArray<readonly [string, string]> = [
+  ['exchangeAlgoId', '交易所条件单'],
+  ['localSlAlgoId', '本地止损单'],
+  ['localTpAlgoId', '本地止盈单'],
+  ['algoId', '交易所条件单'],
+  ['clientAlgoId', '自定义单号'],
+];
+
+/** 把这一条差异里能拿到的单号拼成「（单号：…）」；一个都没有时返回空串。 */
+function orderIdsOf(item: ReconcileDifference): string {
+  const parts: string[] = [];
+  for (const [key, label] of ORDER_ID_EVIDENCE) {
+    const value = item.evidence[key];
+    if (value === undefined || value === null || value === '') continue;
+    parts.push(`${label} ${String(value)}`);
+  }
+  return parts.length === 0 ? '' : `（单号：${parts.join('，')}）`;
+}
 
 /**
  * 把一份对账报告变成一条告警；没有**要通知的**差异时返回 `null`。
@@ -41,7 +71,7 @@ export function buildReconcileAlert(
 
   const lines = differences.map((item) => {
     const entry = item.entryOrderId === null ? '' : `（入场 ${item.entryOrderId}）`;
-    return `[${severityLabel(item.severity)}] ${item.symbol}${entry}：${item.message}`;
+    return `[${severityLabel(item.severity)}] ${item.symbol}${entry}：${item.message}${orderIdsOf(item)}`;
   });
 
   const fingerprint = differences

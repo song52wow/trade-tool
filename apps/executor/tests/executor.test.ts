@@ -582,6 +582,11 @@ describe('通知：止盈止损挂上与一轮完成（v0.8.0）', () => {
     // ATR=100，止损 2 倍、止盈 3 倍，入场 60000 × 0.1 → 收益 30 USDT / 亏损 20 USDT
     expect(money).toContain('预估收益 +30.00 USDT');
     expect(money).toContain('预估亏损 -20.00 USDT');
+    // 单号：排查时拿着它去交易所查，不用靠「哪个标的、什么时候」去猜。
+    const lines = (items[0]?.lines ?? []).join('\n');
+    expect(lines).toContain('入场 42');
+    expect(lines).toContain('止盈 ');
+    expect(lines).toContain('止损 ');
   });
 
   it('一轮完成 → 通知带实际盈亏，且**已扣手续费**', async () => {
@@ -596,10 +601,11 @@ describe('通知：止盈止损挂上与一轮完成（v0.8.0）', () => {
     });
 
     await service.handleFill(fill());
-    // 我们的止损成交：59800 × 0.1，手续费 0.04
+    // 我们的止损成交：59800 × 0.1，手续费 0.04（成交单号 43，与入场单 42 不同）
     await service.handleFill(
       fill({
         clientOrderId: bracketClientOrderId('sl', '42'),
+        orderId: 43,
         side: 'SELL',
         lastFilledPrice: 59_800,
         lastFilledQty: 0.1,
@@ -616,6 +622,10 @@ describe('通知：止盈止损挂上与一轮完成（v0.8.0）', () => {
     expect(money).toContain('毛利 -20.00 USDT');
     expect(money).toContain('手续费 0.08 USDT');
     expect(money).toContain('净盈亏 -20.08 USDT');
+    // 单号：入场单号（这一轮的锚）+ 出场单号（真正成交的那张）。
+    const lines = (settled?.lines ?? []).join('\n');
+    expect(lines).toContain('入场 42');
+    expect(lines).toContain('出场 43');
   });
 
   it('没拿到出场价时：说「算不出」，不报一个看着精确的假盈亏', async () => {
