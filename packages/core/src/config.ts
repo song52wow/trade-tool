@@ -590,21 +590,36 @@ export const agentSchema = z.object({
    * 打开它意味着「模型决定的这笔方案会真的开仓」——那是真钱，
    * 因此要显式打开，且受 `risk` 段的全部上限约束。
    *
-   * ⚠️ **本期没有实现自动执行路径**：`apps/executor` 还不消费
-   * `trading_plan.status = 'approved'` 的方案。因此把这个开关打开时，
-   * `apps/agent` 会**启动即报错**而不是「开着却什么也不做」——
-   * 后者是 AGENTS.md 约定 9 点名的最危险的一种失败。
+   * 打开后的完整链路（v1.0.0 已实现）：
+   *
+   *   1. Agent 跑完一轮 → 方案**自动进入 `approved`**（不再停在「建议」）；
+   *   2. `apps/executor` 捞起 `approved` 的方案 → **认领** → 下市价进场单；
+   *   3. 成交事件回来 → 按**方案给的 ATR 倍数**挂止损止盈
+   *      （`decision_source='agent-plan'`，落进账本可查）。
+   *
+   * ⚠️ **关着的时候，控制面上的「批准」不会导致下单**：批准只是把方案标成
+   * `approved`（为将来打开开关做准备），执行器在开关关着时**根本不消费**它。
+   * 反过来，打开开关后方案自动批准——否则用户开了开关还要再点一下，
+   * 等于两处开关。
    */
   execute: z
     .object({
       /**
        * 是否把方案变成真实订单。缺省 false。
        *
-       * **本期未实现**：打开会让 `apps/agent` 启动即报错（见上一段）。
+       * 打开后由 `apps/executor` 执行（**不是** `apps/agent`）：
+       * 下单要用交易所凭据，而凭据在 executor 那边。
        */
       enabled: z.boolean().default(false),
       /** 同时最多挂多少笔未终结的方案。缺省 1。 */
       maxOpenPlans: z.number().int().positive().max(20).default(1),
+      /**
+       * executor 多久检查一次「有没有已批准的方案」（毫秒）。缺省 30 秒。
+       *
+       * 它只影响**下单的延迟**，不影响分析节奏：Agent 按 `agent.intervalMs`
+       * 出方案，executor 按这个节奏去捡。
+       */
+      pollIntervalMs: z.number().int().positive().min(1_000).default(30_000),
       /**
        * 方案的有效期（毫秒）。超时的方案不再执行。
        *

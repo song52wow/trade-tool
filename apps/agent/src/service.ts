@@ -54,7 +54,6 @@ import {
   type MarketContext,
 } from '@trade-tool/data';
 
-import { assertAutoExecutionDisabled } from './execute-guard.js';
 
 /** 一份行情上下文 + 落库留痕要的原始载荷。 */
 export interface AgentContextBundle {
@@ -126,15 +125,10 @@ const SYSTEM_MESSAGE = {
 /**
  * 建编排器。
  *
- * @throws SyncError 'CONFIG_INVALID' 配置不合法（由 `configSchema` 保证，这里不再重复校验）；
- *         'CONFIG_INVALID' `execute.enabled = true`——自动执行路径本期未实现，
- *         开着它就等于「以为在下单、实际什么也没做」（见 `execute-guard.ts`）。
+ * @throws SyncError 'CONFIG_INVALID' 配置不合法（由 `configSchema` 保证，这里不再重复校验）。
  */
 export function createAgentService(deps: AgentDeps): AgentService {
   const { ctx, llm, config } = deps;
-  // 闸门放在这里而不是各入口：守护进程与 CLI 共用这一个编排器，
-  // 于是两条路径**同时**被拦住，不会出现「守护进程拦了、命令行没拦」的缝。
-  assertAutoExecutionDisabled(config);
   const now = deps.now ?? (() => Date.now());
   const log = deps.log ?? createLogger('agent');
   const loadContext = deps.loadContext ?? loadAgentContext;
@@ -366,6 +360,19 @@ export function createAgentService(deps: AgentDeps): AgentService {
         adjustments: plan.action === 'enter' ? plan.adjustments : [],
         failureReason: null,
         raw: traderRaw,
+        // 自动执行开关打开时，**可执行的**方案直接进 `approved`，由 executor 消费。
+        //
+        // 为什么不是「停在建议、等人在控制面点批准」：那等于两处开关——
+        // 用户已经明确打开了「允许自动下单」，还要再点一次批准，
+        // 于是「开关打开了却没下单」看起来像是坏了。
+        //
+        // `action !== 'enter'` 的方案（「这一轮不做」「出不了方案」）**不批准**：
+        // 它们没有可执行的进场，批准了也执行不了，只会在执行器那边
+        // 每轮被捞出来又跳过。
+        //
+        // 关着的时候一律 `advisory`：方案只是建议，控制面与 CLI 能看，
+        // 真正下单要显式打开开关。
+        status: config.execute.enabled && plan.action === 'enter' ? 'approved' : 'advisory',
       });
 
       if (plan.action === 'enter') {

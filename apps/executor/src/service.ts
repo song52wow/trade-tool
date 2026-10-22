@@ -80,6 +80,7 @@ import {
 
 import type { AtrProvider, AtrSnapshot } from './atr.js';
 import { applyDecision, type DecideOutput, type RiskDecider } from './decision.js';
+import type { AgentPlanDecision } from './plan-execution.js';
 
 const log = createLogger('executor');
 
@@ -181,6 +182,15 @@ export interface ExecutorServiceDeps {
    * 传了就由它决定这一笔成交用哪套档位，模型失败时按 `llm.fallbackToPolicy` 降级。
    */
   decider?: RiskDecider;
+  /**
+   * 反查这笔成交是不是按 Agent 方案下的（v1.0.0 自动下单）。
+   *
+   * 返回 `null` = 不是（走配置档位或模型决策）。
+   *
+   * **不传则整段跳过**，行为与 v1.0.0 之前逐字一致——
+   * 这样「没开自动下单」的执行器与之前没有任何区别。
+   */
+  resolveAgentPlan?: (update: OrderTradeUpdate) => Promise<AgentPlanDecision | null>;
   /**
    * 读最近若干根 K 线的收益率（给模型看走势）。
    *
@@ -1168,11 +1178,67 @@ export function createExecutorService(deps: ExecutorServiceDeps): ExecutorServic
    *   * 模型失败 / 越界 / 自相矛盾 → `source='config-fallback'` + 原因。
    *     降级时**同时**告警，让「模型连续不生效」这件事不必翻日志才能发现。
    */
+  /**
+   * 反查这笔成交是不是按 Agent 方案下的（v1.0.0 自动下单）。
+   *
+   * **查不到不抛错**：查失败时继续往下走，用配置档位挂单。
+   *
+   * 为什么不是「抛错不挂单」：挂不上单意味着**仓位裸奔**——那是这个仓库
+   * 最贵的一种状态。而查失败只是「档位可能不是批准时那一套」。
+   * 仓位有保护比档位完全对得上更要紧，因此选前者，但**必须留一条显眼的错误日志**：
+   * 人会看到「这笔按方案下的单挂的止损不是方案里的档位」。
+   */
+  async function resolveAgentPlan(update: OrderTradeUpdate): Promise<AgentPlanDecision | null> {
+    if (deps.resolveAgentPlan === undefined) return null;
+    try {
+      return await deps.resolveAgentPlan(update);
+    } catch (error) {
+      log.error(
+        `${update.symbol} 反查 Agent 方案失败（本次按配置档位挂单，与批准的方案可能不一致）：` +
+          reasonOf(error),
+      );
+      return null;
+    }
+  }
+
   async function decideForBracket(
     update: OrderTradeUpdate,
     policy: RiskPolicy,
     snapshot: AtrSnapshot,
   ): Promise<DecideOutput> {
+    /**
+     * Agent 方案（v1.0.0 自动下单）**优先于**配置与模型。
+     *
+     * 为什么优先：这份成交是**人批准过的方案**下的，方案里的档位是批准时
+     * 看到的（而配置档位随时会被改）。让人批准的数和实际挂单的数不是同一个，
+     * 那批准就等于没批准。
+     *
+     * 价格的算法仍然一样：这里给的是**倍数**，价格由 `deriveStagedPlan`
+     * 按**实际成交价**算。方案里的进场价是估算值，用它算会把止损挂在错的位置。
+     */
+    const agentPlan = await resolveAgentPlan(update);
+    if (agentPlan !== null) {
+      log.info(
+        `${update.symbol} 这笔成交按 Agent 方案 #${agentPlan.planId} 的档位挂单：` +
+          `止损 ${String(agentPlan.stopAtrMult)}×ATR、止盈 ${String(agentPlan.takeProfitAtrMult)}×ATR`,
+      );
+      return {
+        decision: {
+          stopAtrMult: agentPlan.stopAtrMult,
+          takeProfitAtrMult: agentPlan.takeProfitAtrMult,
+          // 方案不分批：它只给了一个止盈价，没有「第一段减仓」这回事。
+          takeProfit1Ratio: 0,
+          // 移动止损的档位与「第一段成交后保本」都由配置决定：
+          // 方案没提这两件事，而不分批形态下它们本来也不参与。
+          trailAtrMult: policy.trailAtrMult,
+          breakevenAfterTp1: policy.breakevenAfterTp1,
+        },
+        source: 'agent-plan',
+        refuse: false,
+        rationale: agentPlan.rationale,
+      };
+    }
+
     if (deps.decider === undefined) {
       return {
         decision: {

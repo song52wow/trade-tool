@@ -504,7 +504,21 @@ export interface TradingPlanDto {
   createdAtMs: number;
   /** `enter` = 有可执行方案；`hold` = 这一轮不做；`failed` = 出不了方案。 */
   action: 'enter' | 'hold' | 'failed';
-  status: 'advisory' | 'approved' | 'executed' | 'rejected' | 'expired';
+  /**
+   * 方案的生命周期。
+   *
+   * `executing` = **已认领、正在下单**；`failed` = 下单失败。
+   * 这两个态必须显示出来：`executing` 说明「那一单到底下没下还不知道」，
+   * `failed` 说明「仓位没有建立、止损也没有挂」。
+   */
+  status:
+    | 'advisory'
+    | 'approved'
+    | 'executing'
+    | 'executed'
+    | 'rejected'
+    | 'expired'
+    | 'failed';
   side: 'BUY' | 'SELL' | null;
   entryType: 'market' | 'limit' | null;
   entryPrice: number | null;
@@ -524,6 +538,10 @@ export interface TradingPlanDto {
   adjustments: string[];
   /** 出不了方案的原因。 */
   failureReason: string | null;
+  /** 变成真实订单之后的交易所单号。 */
+  entryOrderId: string | null;
+  /** 下单失败的原因（`status = 'failed'` 时有值）。 */
+  executionFailureReason: string | null;
 }
 
 /** `/agent` 的回包。`report` / `plan` 各自可能为 `null`（还没分析过）。 */

@@ -86,6 +86,10 @@ KNOWN_MIGRATION_VERSIONS: frozenset[str] = frozenset(
         # Python 侧不读写这两张表，但版本闸门两个方向都要校，漏登记会让
         # **所有**碰 PG 的用例报「库比代码新」。
         "017_agent_decisions",
+        # v1.0.0：让「批准的方案」能变成真实订单（trading_plan 增执行态列 +
+        # risk_bracket.decision_source 允许 agent-plan）。
+        # 同样不读写，但版本闸门两个方向都要校。
+        "018_agent_plan_execution",
     }
 )
 

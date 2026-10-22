@@ -149,6 +149,53 @@ export interface PlacedAlgoOrder {
 }
 
 /**
+ * **进场**市价单（v1.0.0 自动下单）。
+ *
+ * 为什么单独一个形态：上面两个都是**条件单**（`STOP_MARKET` / `TAKE_PROFIT_MARKET`），
+ * 它们走 Algo Order API，回执是 `algoId`。而市价进场是**普通订单**，走
+ * `POST /fapi/v1/order`，回执是 `orderId`——两套编号空间互不通用，
+ * 拿 `orderId` 去撤条件单会得到「订单不存在」。
+ *
+ * 为什么进场用市价而不是限价：Agent 的方案里 `entry_price` 是**估算值**
+ * （它在出方案时看到的是那一刻的盘口），限价单挂在那个价上很可能永远不成交，
+ * 于是仓位不建立、止损也不挂——一个「看起来在等、实际上什么都不会发生」的状态。
+ * 市价单成交价会与估算值有偏差（滑点），但**偏差是有限的、可见的**，
+ * 而「不成交」是不可见的。止损与止盈按**实际成交价**重新算（见 executor 的
+ * `deriveStagedPlan`），所以滑点不会让止损落在一个错误的位置。
+ */
+export interface MarketOrderRequest {
+  symbol: string;
+  side: OrderSide;
+  /** 数量，必须已按 `LOT_SIZE.stepSize` 对齐。 */
+  quantity: number;
+  /**
+   * 自定义单号（交易所侧叫 `newClientOrderId`）。
+   *
+   * **必须由调用方按「每次尝试一个新号」的规则生成**：Binance 不允许两张
+   * `clientOrderId` 相同的挂单同时存在，沿用同一个号重试必然撞「重复」，
+   * 于是重试永远失败（与 §6.8.4 止损单号复用是同一个坑）。
+   */
+  clientOrderId: string;
+  /** 只减不开。进场单用不到，留着是为了将来平仓复用同一条路径。 */
+  reduceOnly?: boolean;
+  recvWindowMs?: number;
+}
+
+/** 普通订单挂成之后的回执。**是 orderId**，与条件单的 `algoId` 不是一回事。 */
+export interface PlacedMarketOrder {
+  orderId: number;
+  clientOrderId: string;
+  symbol: string;
+  side: OrderSide;
+  /** 交易所回的状态（`NEW` / `FILLED` / `PARTIALLY_FILLED` …）。 */
+  status: string;
+  /** 成交均价。回执里可能没有（未成交时），此时为 `null`。 */
+  avgPrice: number | null;
+  /** 累计成交量。未成交时是 0。 */
+  executedQty: number;
+}
+
+/**
  * 交易所的错误体：`{ code, msg }`。
  *
  * 判定**只看 code 的值**，不看「有没有 code 这个键」。
@@ -780,6 +827,55 @@ export class BinancePrivateClient {
       signed: true,
       params: { algoId },
     });
+  }
+
+  /**
+   * 挂一张**市价进场单**（v1.0.0 自动下单）。
+   *
+   * 走**普通订单**接口 `POST /fapi/v1/order`，不是 Algo Order API——
+   * 市价单没有「条件」可言，回执也是普通 `orderId`。
+   *
+   * ⚠️ **数量必须已经按 `LOT_SIZE.stepSize` 对齐**：交易所不会替你截断，
+   * 数量不合规时整单被拒（`-1013`），而那种失败看起来像「网络问题」——
+   * 排查时容易走偏。对齐由调用方用 `alignToQty` 做（判据只有一份实现）。
+   */
+  async placeMarketOrder(request: MarketOrderRequest): Promise<PlacedMarketOrder> {
+    if (!Number.isFinite(request.quantity) || request.quantity <= 0) {
+      throw new SyncError(
+        'CONFIG_INVALID',
+        `市价单数量必须为正：${String(request.quantity)}`,
+        { symbol: request.symbol, quantity: request.quantity },
+      );
+    }
+    const body = await this.request<Record<string, unknown>>('POST', '/fapi/v1/order', {
+      signed: true,
+      params: {
+        symbol: request.symbol,
+        side: request.side,
+        type: 'MARKET',
+        quantity: String(request.quantity),
+        newClientOrderId: request.clientOrderId,
+        ...(request.reduceOnly === undefined ? {} : { reduceOnly: String(request.reduceOnly) }),
+        recvWindow: request.recvWindowMs ?? this.recvWindowMs,
+      },
+    });
+    const where = `placeMarketOrder ${request.symbol}`;
+    // `avgPrice` 在未成交的回执里是 "0"（字符串）。它是「成交均价」，
+    // 0 表示**还没成交**而不是「成交价是 0」——两者不能混，因此 null 与 0 要分开。
+    const rawAvg = body['avgPrice'];
+    const avgPrice =
+      rawAvg === undefined || rawAvg === null || rawAvg === ''
+        ? null
+        : requireNumber(rawAvg, 'avgPrice', where);
+    return {
+      orderId: requireNumber(body['orderId'], 'orderId', where),
+      clientOrderId: requireString(body['clientOrderId'], 'clientOrderId', where),
+      symbol: requireString(body['symbol'], 'symbol', where),
+      side: requireString(body['side'], 'side', where) as OrderSide,
+      status: requireString(body['status'], 'status', where),
+      avgPrice: avgPrice !== null && avgPrice > 0 ? avgPrice : null,
+      executedQty: requireNumber(body['executedQty'], 'executedQty', where),
+    };
   }
 
   // ------------------------------------------------- 只读查询（v0.6.0 交易对账）

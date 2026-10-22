@@ -262,8 +262,14 @@ function fallback(
  * 模型说了也不算（见 `llm-decision.ts` 的「三个刻意的边界」）。
  *
  * 这个函数是「模型输出」到「真正拿去算价的参数」之间的**唯一**转换点。
+ *
+ * ⚠️ **`agent-plan` 也走这条路**（v1.0.0）：Agent 方案的档位同样要覆盖配置档位，
+ * 否则「人批准的那份方案」挂出去的止损价与方案页面上写的不一样——
+ * 而方案是**人看过才批准**的，它比配置档位更该说话。
+ *
+ * `config` 与 `config-fallback` 不覆盖：它们本来就是策略本身。
  */
 export function applyDecision<T extends LlmDecision>(policy: T, outcome: DecideOutput): T {
-  if (outcome.source !== 'llm') return policy;
+  if (outcome.source !== 'llm' && outcome.source !== 'agent-plan') return policy;
   return mergeDecisionIntoPolicy(policy, outcome.decision);
 }

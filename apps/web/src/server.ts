@@ -20,6 +20,7 @@ import { toErrorBody } from './errors.js';
 import type {
   AddSymbolBody,
   AgentViewDto,
+  TradingPlanDto,
   BarDto,
   BracketsDto,
   CredentialStatusDto,
@@ -124,6 +125,17 @@ export interface WebDeps {
    * 在界面上必须能分开说，因此不返回空报告冒充。
    */
   listAgentView(symbol: string): Promise<AgentViewDto>;
+  /**
+   * 批准 / 驳回一份执行方案（v1.0.0 自动下单）。
+   *
+   * **批准本身不下单**——下单由 `apps/executor` 消费 `approved` 方案完成，
+   * 而 executor 只在 `agent.execute.enabled` 开着时才消费。
+   */
+  setTradingPlanStatus(
+    symbol: string,
+    planId: string,
+    status: 'approved' | 'rejected',
+  ): Promise<TradingPlanDto>;
   startJob(input: { kind: JobKind; symbol: string; target?: number | undefined }): Promise<JobDto>;
   listJobs(): Promise<JobDto[]>;
   getJob(id: string): Promise<JobDto | null>;
@@ -433,6 +445,26 @@ export function buildApp(deps: WebDeps): Hono {
   app.get('/api/symbols/:symbol/agent', async (c) => {
     const symbol = normalizeSymbol(c.req.param('symbol'));
     return c.json(await deps.listAgentView(symbol));
+  });
+
+  /**
+   * 批准 / 驳回一份执行方案（v1.0.0 自动下单）。
+   *
+   * ⚠️ **批准本身不下单**。下单由 `apps/executor` 消费 `approved` 的方案完成，
+   * 而 executor 只在 `agent.execute.enabled` 开着时才消费。
+   * 开关关着时，批准只是「预先批准」，**不会有单下出去**。
+   *
+   * 它是写操作，因此要过来源校验（与其它写路由一致）。
+   */
+  app.put('/api/symbols/:symbol/agent/plans/:planId', async (c) => {
+    assertSameOrigin(c);
+    const symbol = normalizeSymbol(c.req.param('symbol'));
+    const planId = c.req.param('planId');
+    const body = await bodyOf<{ status?: unknown }>(c);
+    if (body?.status !== 'approved' && body?.status !== 'rejected') {
+      throw new SyncError('CONFIG_INVALID', 'status 必须是 approved 或 rejected');
+    }
+    return c.json(await deps.setTradingPlanStatus(symbol, planId, body.status));
   });
 
   /** 策略总览：全局默认 + 全部标的覆盖 + 该标的最终生效的那一套。 */ app.get(

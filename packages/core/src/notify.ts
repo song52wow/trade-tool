@@ -43,6 +43,8 @@ export const NOTIFY_KINDS = [
   'llm-fallback',
   'tp1-filled',
   'trail-moved',
+  'agent-plan-executed',
+  'agent-plan-failed',
 ] as const;
 
 export type NotifyKind = (typeof NOTIFY_KINDS)[number];
@@ -69,6 +71,14 @@ export const NOTIFY_KIND_INFO: Record<NotifyKind, { label: string; hint: string 
   'trail-moved': {
     label: '移动止损换档',
     hint: '止损位挪到新的一档了，附新旧两档的价。同一笔仓位在冷却期内只推一次',
+  },
+  'agent-plan-executed': {
+    label: 'Agent 方案已下单',
+    hint: '一份被批准的方案变成了真实订单，附方向、数量、止损与止盈价',
+  },
+  'agent-plan-failed': {
+    label: 'Agent 方案下单失败',
+    hint: '方案没能变成订单，附失败原因。仓位没有建立，止损也不会挂',
   },
 };
 

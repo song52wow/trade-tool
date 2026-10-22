@@ -148,6 +148,36 @@ function fakeDeps(overrides: Partial<WebDeps> = {}): WebDeps & { calls: string[]
       calls.push(`agent:${symbol}`);
       return { symbol, report: null, plan: null };
     },
+    setTradingPlanStatus: async (symbol, planId, status) => {
+      calls.push(`plan:${symbol}:${planId}:${status}`);
+      return {
+        id: planId,
+        symbol,
+        reportId: null,
+        createdAtMs: NOW,
+        action: 'enter',
+        status,
+        side: 'BUY',
+        entryType: 'market',
+        entryPrice: 100,
+        stopPrice: 98,
+        takeProfitPrice: 103,
+        quantity: 1,
+        notional: 100,
+        riskAmount: 2,
+        equity: 1000,
+        equitySource: 'config',
+        riskFraction: 0.002,
+        riskReward: 1.5,
+        stance: 'bullish',
+        confidence: 0.7,
+        rationale: '测试',
+        adjustments: [],
+        failureReason: null,
+        entryOrderId: null,
+        executionFailureReason: null,
+      };
+    },
     latestReconciliation: async () => {
       calls.push('latest-reconcile');
       return null;
@@ -1243,6 +1273,8 @@ describe('GET /api/symbols/:symbol/agent（分析师 / 交易员，只读）', (
             rationale: '顺势进场。',
             adjustments: [],
             failureReason: null,
+            entryOrderId: null,
+            executionFailureReason: null,
           },
         }),
       }),

@@ -4,7 +4,6 @@ import { buildContext, createLlmClient, createPool, listSymbolEntries } from '@t
 
 import { createAgentDaemon } from './daemon.js';
 import { createEquityReader } from './equity.js';
-import { assertAutoExecutionDisabled } from './execute-guard.js';
 import { createAgentService } from './service.js';
 
 // 必须在 loadConfigOrDefault / createPool 之前：配置路径、数据库密码与 API 密钥
@@ -33,12 +32,22 @@ async function main(): Promise<void> {
     );
   }
 
-  // `agent.execute.enabled` 是「方案自动变成真实订单」的开关。
-  // **本期没有实现那条路径**（apps/executor 还不消费 approved 方案），
-  // 因此打开它必须**报错**，而不是「打开后什么也不发生」——
-  // 日志写着「自动执行：开」而实际一笔单都没下，是约定 9 点名的最危险的一种失败。
-  // 闸门本体在 execute-guard.ts（编排器里也有一道，CLI 那条路同样被拦住）。
-  assertAutoExecutionDisabled(config.agent);
+  // `agent.execute.enabled` 是「方案自动变成真实订单」的开关（v1.0.0 已实现）。
+  //
+  // 打开之后：**本进程**只负责出方案（方案直接进 `approved`），
+  // 真正下单的是 `apps/executor`——下单要用交易所凭据，而凭据在那边。
+  //
+  // ⚠️ 两件事必须说清，否则用户会以为「开了开关就有人在下单」：
+  //   * executor 必须**同时在跑**（它才是消费方案的那个进程）；
+  //   * 开关打开**不会**让本进程自己下单，它连交易所凭据都不碰。
+  if (config.agent.execute.enabled) {
+    console.error(
+      '[agent] 自动执行已开启：本进程产出的方案直接进入「已批准」，' +
+        '由 apps/executor 消费并下真实订单（executor 没在跑就只会积压，不会下单）',
+    );
+  } else {
+    console.error('[agent] 自动执行未开启：方案只落库供查看，不会变成真实订单');
+  }
 
   const pool = createPool(config.database);
   const ctx = buildContext(pool, config);

@@ -8,4 +8,3 @@
 export * from './service.js';
 export * from './daemon.js';
 export * from './equity.js';
-export * from './execute-guard.js';

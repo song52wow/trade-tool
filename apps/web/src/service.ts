@@ -48,6 +48,8 @@ import {
   readLatestReconciliation,
   readLatestAnalystReport,
   readLatestTradingPlan,
+  readTradingPlanById,
+  updateTradingPlanStatus,
   resolveActiveCredentials,
   resolveContract,
   runReconciliation,
@@ -324,6 +326,61 @@ export function createWebRuntime(config: TradeToolConfig): WebRuntime {
         report: report === null ? null : toAgentReportDto(report),
         plan: plan === null ? null : toTradingPlanDto(plan),
       };
+    },
+
+    /**
+     * 批准 / 驳回一份执行方案（v1.0.0 自动下单）。
+     *
+     * ⚠️ **批准本身不下单**。真正的下单由 `apps/executor` 消费 `approved` 的方案完成，
+     * 而 executor 只在 `agent.execute.enabled` 开着时才消费。因此：
+     *
+     * - 开关**关着**时：批准只是把方案标成 `approved`（为将来打开开关做准备），
+     *   executor 压根不看它——**不会有单下出去**；
+     * - 开关**打开**时：Agent 产出的方案本来就直接进 `approved`，
+     *   executor 会消费它。这一条路由留给「上一轮开关是关着的」那种情况。
+     *
+     * 页面必须把这两件事说清楚，否则用户会以为「点了批准 = 立刻开仓」。
+     */
+    async setTradingPlanStatus(symbol, planId, status): Promise<TradingPlanDto> {
+      if (status !== 'approved' && status !== 'rejected') {
+        throw new SyncError('CONFIG_INVALID', `不允许把方案状态改成 ${status}`, { status });
+      }
+      const plan = await readTradingPlanById(pool, ctx.exchange, symbol, planId);
+      if (plan === null) {
+        throw new SyncError('DB_UNIQUE_VIOLATION', `方案 ${planId} 不存在`, { planId });
+      }
+      if (status === 'approved') {
+        // 只批准**真能执行**的方案。
+        //
+        // 批准一份「这一轮不做」或「出不了方案」的记录没有意义——它没有进场可执行，
+        // 而执行器每轮都会把它捞出来又跳过。与其让用户以为自己批了个会执行的方案，
+        // 不如在这里就说清楚。
+        if (plan.action !== 'enter') {
+          throw new SyncError(
+            'CONFIG_INVALID',
+            `方案 ${planId} 是「${plan.action === 'hold' ? '这一轮不做' : '出不了方案'}」，` +
+              '没有可执行的进场，不能批准',
+            { planId, action: plan.action },
+          );
+        }
+        // 限价进场**暂不支持自动执行**（挂着的限价单可能永远不成交，
+        // 而不成交的仓位没有止损保护）。在这里就拒绝，
+        // 免得用户批了一份注定执行不了的方案。
+        if (plan.entryType === 'limit') {
+          throw new SyncError(
+            'CONFIG_INVALID',
+            '限价进场暂不支持自动执行（只支持市价进场）：限价单可能永远不成交，' +
+              '而挂着不成交的仓位没有止损保护。请改用市价进场，或在交易所手动下单。',
+            { planId, entryType: plan.entryType },
+          );
+        }
+      }
+      await updateTradingPlanStatus(pool, planId, status);
+      const updated = await readTradingPlanById(pool, ctx.exchange, symbol, planId);
+      if (updated === null) {
+        throw new SyncError('DB_UNIQUE_VIOLATION', `方案 ${planId} 读不到了`, { planId });
+      }
+      return toTradingPlanDto(updated);
     },
 
     /**
@@ -650,5 +707,7 @@ function toTradingPlanDto(row: TradingPlanRow): TradingPlanDto {
     rationale: row.rationale,
     adjustments: row.adjustments,
     failureReason: row.failureReason,
+    entryOrderId: row.entryOrderId,
+    executionFailureReason: row.executionFailureReason,
   };
 }

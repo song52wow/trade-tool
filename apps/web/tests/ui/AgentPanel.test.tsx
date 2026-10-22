@@ -66,6 +66,8 @@ function plan(overrides: Partial<TradingPlanDto> = {}): TradingPlanDto {
     rationale: '顺势进场。',
     adjustments: [],
     failureReason: null,
+    entryOrderId: null,
+    executionFailureReason: null,
     ...overrides,
   };
 }
@@ -159,6 +161,8 @@ describe('AgentPanel', () => {
         riskReward: null,
         rationale: '分析师模型调用失败：超时',
         failureReason: '分析师模型调用失败：超时',
+        entryOrderId: null,
+        executionFailureReason: null,
       }),
     } satisfies AgentViewDto);
     render(<AgentPanel symbol="AAAUSDT" tick={0} />);

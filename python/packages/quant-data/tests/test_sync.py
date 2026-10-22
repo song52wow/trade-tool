@@ -1138,6 +1138,8 @@ def test_migrations_are_idempotent(conn: DbConn, pg_dsn: str) -> None:
         "016_trail_step",
         # v1.0.0：分析师报告 + 交易员执行方案
         "017_agent_decisions",
+        # v1.0.0：方案变真实订单（执行态列 + agent-plan 决策来源）
+        "018_agent_plan_execution",
     ]
     pg.ensure_schema(conn)
 
