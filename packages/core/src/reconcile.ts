@@ -69,8 +69,29 @@ export interface LocalBracket {
    * 第一段成交后那张单本来就会消失，于是每轮一条假警报（§6.5 第 2 条）。
    */
   tp1FilledAt: number | null;
-  /** 当前生效的那一档止损价。`trailing` 行必��用它比价，而不是 `stopPrice`。 */
+  /** 当前生效的那一档止损价。`trailing` 行必须用它比价，而不是 `stopPrice`。 */
   trailStopPrice: number | null;
+  /**
+   * 移动止损的**档位序号**（已占用几个止损单号）。
+   *
+   * 它与 {@link LocalBracket.trailMoves} 的差值就是「有几次换档尝试没有成功」。
+   * 2026-10-22 实测踩到的那个缺陷（止损单号复用 → 每次挪单都被交易所拒）
+   * **只靠价格看不出来**：止损单确实在交易所上、价格也确实对得上，
+   * 只是那个价从来没被更新过。只有「试过几次 / 成功几次」这一对数能看见它。
+   */
+  trailStep: number;
+  /** 移动止损**成功换过几档**。 */
+  trailMoves: number;
+  /**
+   * 移动止损**最近一轮**的结果。
+   *
+   * 只有 `failed` 会被报成差异：它意味着「这一轮想挪止损、没挪成」。
+   * `not-moved`（价没变 / 越过现价 / 极值取不到）**不是故障**——仓位仍受上一档保护，
+   * 把它报成故障就是制造假警报。
+   */
+  trailStatus: 'idle' | 'moved' | 'not-moved' | 'failed';
+  /** 最近一次「没挪成 / 没挪动」的原因，常驻可见。 */
+  trailLastError: string | null;
   state: UnsettledBracketState;
   lastError: string | null;
   updatedAt: number;
@@ -198,6 +219,18 @@ export const RECONCILE_KINDS = [
   'record-without-position',
   /** 交易所挂着我方条件单，但没有任何未终结的本地记录引用它的 algoId。 */
   'orphan-algo-order',
+  /**
+   * 本地已进入移动止损，但**有换档尝试没有成功**（`trail_step > trail_moves`）。
+   *
+   * 它专治一类**账面全绿、实际空转**的故障：止损单确实在交易所上、价格也确实
+   * 与本地记录对得上，只是那个价**从来没被更新过**——移动止损这条线整个是死的。
+   * 2026-10-22 实测踩到：条件单的自定义号被复用，于是每次挪止损都被交易所以
+   * 「ClientOrderId is duplicated」拒掉，而这一层之外**没有任何一处会报异常**。
+   *
+   * 严重度是 `warning` 而不是 `critical`：仓位此刻**仍受止损保护**（那张单还在），
+   * 只是保护得不够紧。按「仓位是否有止损保护」分档（§6.5 第 4 条），它够不上紧急。
+   */
+  'trail-move-failed',
 ] as const;
 
 export type ReconcileKind = (typeof RECONCILE_KINDS)[number];
@@ -244,6 +277,10 @@ export const RECONCILE_KIND_INFO: Record<ReconcileKind, { label: string; hint: s
   'orphan-algo-order': {
     label: '有我方挂单但没有记录引用',
     hint: '交易所挂着我方条件单，但本地没有任何未终结记录引用它',
+  },
+  'trail-move-failed': {
+    label: '移动止损换档失败',
+    hint: '这一笔仓位已进入移动止损，但有换档尝试没有成功——止损位可能一直停在旧档',
   },
 };
 
@@ -439,6 +476,38 @@ export function reconcileBrackets(input: ReconcileInput): ReconcileReport {
             exchangeAlgoId: tp.algoId,
             exchangeTriggerPrice: tp.triggerPrice,
             localTrailStopPrice: stopPrice,
+          },
+        });
+      }
+
+      // 移动止损**接管失败**：最近一轮想挪、没挪成。
+      //
+      // 为什么必须看这一条而不是看价格：止损单确实在交易所上、触发价也确实与本地
+      // 记录对得上（`price-mismatch` 不会报），只是那个价**从来没被更新过**——
+      // 「账面全绿、实际空转」的那一类故障，只靠价格是看不见的。
+      //
+      // 为什么看**状态**而不看「尝试次数 − 成功次数」：那是个**累计差**，
+      // 一次失败之后它永远不归零——移动止损早就修好了，对账却还在报「换档失败」。
+      // 「现在坏着吗」只能由最近一轮的状态回答。
+      const failedAttempts = record.trailStep - record.trailMoves;
+      if (record.trailStatus === 'failed') {
+        differences.push({
+          kind: 'trail-move-failed',
+          severity: 'warning',
+          symbol: record.symbol,
+          entryOrderId: record.entryOrderId,
+          message:
+            `${record.symbol} 已进入移动止损，但有 ${String(failedAttempts)} 次换档尝试没有成功` +
+            `（成功换过 ${String(record.trailMoves)} 档）——止损位可能仍停在旧档 ${stopPrice}。` +
+            `最近一次原因：${record.trailLastError ?? '未记录'}。`,
+          evidence: {
+            localState: record.state,
+            trailStep: record.trailStep,
+            trailMoves: record.trailMoves,
+            failedAttempts,
+            localTrailStopPrice: stopPrice,
+            localStopPrice: record.stopPrice,
+            trailLastError: record.trailLastError,
           },
         });
       }

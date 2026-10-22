@@ -77,6 +77,11 @@ KNOWN_MIGRATION_VERSIONS: frozenset[str] = frozenset(
         # v0.9.0：补回「LLM 决策的数必须齐全」那条约束（014 删列时顺带删掉了它）。
         # 同样不读写该表，但版本闸门两个方向都要校。
         "015_restore_llm_params_check",
+        # v0.9.2：移动止损的档位序号（risk_bracket 增 trail_step / trail_moves）
+        # + 通知内容类型扩容（notify_settings 的 kinds 白名单）。
+        # Python 侧两表都不读写，但版本闸门两个方向都要校，
+        # 漏登记会让**所有**碰 PG 的用例报「库比代码新」。
+        "016_trail_step",
     }
 )
 

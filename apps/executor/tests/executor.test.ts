@@ -49,6 +49,12 @@ interface FakeClaim {
   trailExtreme?: number | null;
   trailAtr?: number | null;
   trailLastError?: string | null;
+  /** v0.9.2：已占用的止损单号序号（每次挪单前 +1）。 */
+  trailStep?: number;
+  /** v0.9.2：成功换过几档。 */
+  trailMoves?: number;
+  /** v0.9.2：最近一轮的结果（idle / moved / not-moved / failed）。 */
+  trailStatus?: string;
   updatedAt?: number;
   /** v0.8.0：入场那笔的手续费。 */
   entryFee?: number;
@@ -138,6 +144,10 @@ function fakePool() {
             trail_atr_to: null,
             trail_updated_at: null,
             trail_last_error: null,
+            // v0.9.2：移动止损的档位序号与成功次数。占坑时都还没有。
+            trail_step: 0,
+            trail_moves: 0,
+            trail_status: 'idle',
             // v0.8.0：盈亏的事实（累计）。盈亏金额本身不存，由 core 现算。
             closed_qty: 0,
             exit_notional: 0,
@@ -201,6 +211,10 @@ function fakePool() {
               trail_atr_to: null,
               trail_updated_at: null,
               trail_last_error: row.trailLastError ?? null,
+              // v0.9.2：移动止损的档位序号与成功次数。
+              trail_step: row.trailStep ?? 0,
+              trail_moves: row.trailMoves ?? 0,
+              trail_status: row.trailStatus ?? 'idle',
               closed_qty: row.closedQty ?? 0,
               exit_notional: row.exitNotional ?? 0,
               fee_amount: row.feeAmount ?? 0,
@@ -265,6 +279,10 @@ function fakePool() {
             trail_atr_to: null,
             trail_updated_at: null,
             trail_last_error: row.trailLastError ?? null,
+            // v0.9.2：移动止损的档位序号与成功次数。
+            trail_step: row.trailStep ?? 0,
+            trail_moves: row.trailMoves ?? 0,
+            trail_status: row.trailStatus ?? 'idle',
             closed_qty: row.closedQty ?? 0,
             exit_notional: row.exitNotional ?? 0,
             fee_amount: row.feeAmount ?? 0,
@@ -371,14 +389,34 @@ function fakePool() {
         trailExtreme: extreme as number,
         trailAtr: atr as number,
         slOrderId: slAlgoId as number,
+        // v0.9.2：真库这里 `trail_moves = trail_moves + 1`——
+        // 「成功换过几档」是「移动止损接管失败」那条判据的一半。
+        trailMoves: (row.trailMoves ?? 0) + 1,
+        trailStatus: 'moved',
         updatedAt: now as number,
       });
       return { rows: [], rowCount: 1 };
     }
+    // v0.9.2：占用一个新的止损单号（档位序号）。**先占后用**——
+    // 号一旦占掉就作废，哪怕那次下单最终失败（否则重试会撞同一个号）。
+    if (sql.includes('SET trail_step = trail_step + 1')) {
+      const [, symbol, entryOrderId] = params as unknown[];
+      const row = state.claims.get(key2(symbol, entryOrderId));
+      if (!row || (row.state !== 'trailing' && row.state !== 'partial_armed')) {
+        return { rows: [], rowCount: 0 };
+      }
+      row.trailStep = (row.trailStep ?? 0) + 1;
+      return { rows: [{ trail_step: row.trailStep }], rowCount: 1 };
+    }
     if (sql.includes('SET trail_last_error = $4')) {
-      const [, symbol, entryOrderId, reason, now] = params as unknown[];
+      // 末尾那个参数是**最近一轮的结果**（not-moved / failed）——
+      // 对账据此判定「移动止损接管失败」（见 core 的 reconcile）。
+      const [, symbol, entryOrderId, reason, now, , , , , status, slAlgoId] = params as unknown[];
       patch(key2(symbol, entryOrderId), {
         trailLastError: String(reason),
+        trailStatus: status === undefined ? 'not-moved' : String(status),
+        // 「用旧价挂回去」之后，交易所上当前那张是**另一张**单，账面要跟着改。
+        ...(slAlgoId === null || slAlgoId === undefined ? {} : { slOrderId: slAlgoId as number }),
         updatedAt: now as number,
       });
       return { rows: [], rowCount: 1 };
@@ -681,7 +719,11 @@ describe('通知：止盈止损挂上与一轮完成（v0.8.0）', () => {
 describe('clientOrderId 往返', () => {
   it('认得出自己挂的单与它属于哪一笔入场', () => {
     const id = bracketClientOrderId('sl', '123456789');
-    expect(parseBracketClientOrderId(id)).toEqual({ tag: 'sl', entryOrderId: '123456789' });
+    expect(parseBracketClientOrderId(id)).toEqual({
+      tag: 'sl',
+      entryOrderId: '123456789',
+      step: 0,
+    });
   });
 
   it('用户自己的单不被误认', () => {
@@ -691,6 +733,35 @@ describe('clientOrderId 往返', () => {
 
   it('长度被交易所上限截断', () => {
     expect(bracketClientOrderId('tp', 'x'.repeat(60))).toHaveLength(36);
+  });
+
+  // v0.9.2：移动止损每挪一档都要挂一张**新的**止损单，而 Binance 不允许同时存在
+  // 两张 clientAlgoId 相同的挂单。于是每一档必须有自己的号。
+  it('每一档止损单有自己的号（同一个号挂两次会被交易所拒）', () => {
+    const first = bracketClientOrderId('sl', '123456789', 1);
+    const second = bracketClientOrderId('sl', '123456789', 2);
+    expect(first).not.toBe(second);
+    expect(parseBracketClientOrderId(first)).toEqual({
+      tag: 'sl',
+      entryOrderId: '123456789',
+      step: 1,
+    });
+    expect(parseBracketClientOrderId(second)).toEqual({
+      tag: 'sl',
+      entryOrderId: '123456789',
+      step: 2,
+    });
+  });
+
+  it('0 号沿用旧格式：交易所上已经挂着的那张单不必改号', () => {
+    expect(bracketClientOrderId('sl', '123456789')).toBe('rsk-sl-123456789');
+    expect(bracketClientOrderId('sl', '123456789', 0)).toBe('rsk-sl-123456789');
+  });
+
+  it('档位序号在长度截断之前，因此永远不会被切掉', () => {
+    const id = bracketClientOrderId('sl', 'x'.repeat(60), 12);
+    expect(id).toHaveLength(36);
+    expect(parseBracketClientOrderId(id)?.step).toBe(12);
   });
 });
 
@@ -1280,8 +1351,9 @@ describe('v0.9.1：第一段止盈成交之后', () => {
     // ③ 止损**真的挪到了保本位**（入场价 60000），并回填了新的单号。
     expect(row?.trailStopPrice).toBe(60_000);
     expect(row?.slOrderId).not.toBe(entrySlId);
-    // 顺序：先挂新、再撤旧（R-4.1）。
-    expect(placer.actions.slice(-2)).toEqual(['place:STOP_MARKET:60000', `cancel:${entrySlId}`]);
+    // 顺序：**先撤旧、再挂新**。Binance 不允许同标的同方向同时存在两张
+    // `closePosition` 条件单（2026-10-22 实测），「先挂新」必然被拒。
+    expect(placer.actions.slice(-2)).toEqual([`cancel:${entrySlId}`, 'place:STOP_MARKET:60000']);
   });
 
   it('定时器把「TP1 成交了但没推进成功」的行推进成 trailing，并把止损挪到保本位', async () => {
@@ -1321,9 +1393,164 @@ describe('v0.9.1：第一段止盈成交之后', () => {
     expect(row?.trailStopPrice).toBe(60_000);
     // 进场那张止损单被撤掉，换成新的那张。
     expect(placer.cancelled).toEqual([12]);
-    expect(placer.actions).toEqual(['place:STOP_MARKET:60000', 'cancel:12']);
+    expect(placer.actions).toEqual(['cancel:12', 'place:STOP_MARKET:60000']);
     // 这一格补上了，之前那条失败原因就不该再挂着。
     expect(row?.trailLastError).toBeNull();
+  });
+
+  // v0.9.2：第一段止盈成交与移动止损换档，此前**都没有任何出口**——
+  // 「一半的仓位已经兑现」与「止损挪了」只存在于库里与日志里，人看不到。
+  it('第一段止盈成交 → 通知带这一段的成交价与已落袋的盈亏', async () => {
+    const fake = fakePool();
+    const placer = fakePlacer();
+    const { alerts, items } = fakeAlerts(['tp1-filled']);
+    const service = createExecutorService({
+      pool: fake.pool,
+      config: makeConfig(),
+      placer,
+      atr: fakeAtr(ATR_UP),
+      resolvePolicy: stagedPolicy(),
+      alerts,
+    });
+
+    expect(await service.handleFill(fill())).toBe('armed');
+    expect(
+      await service.handleFill(
+        fill({
+          clientOrderId: bracketClientOrderId('tp', '42'),
+          side: 'SELL',
+          lastFilledPrice: 60_300,
+          lastFilledQty: 0.05,
+          commission: 0.02,
+        }),
+      ),
+    ).toBe('trailing');
+
+    const pushed = items.filter((item) => item.fingerprint.startsWith('tp1-filled|'));
+    expect(pushed).toHaveLength(1);
+    const item = pushed[0];
+    expect(item?.category).toBe('trade');
+    expect(item?.oneShot).toBe(true);
+    expect(item?.title).toContain('BTCUSDT');
+    expect(item?.title).toContain('第一段止盈成交');
+    // 成交价与数量要在里面：这一段兑现了多少，是这条通知的全部意义。
+    const lines = (item?.lines ?? []).join('\n');
+    expect(lines).toContain('60300');
+    expect(lines).toContain('0.05');
+    // 盈亏按 core 的口径算（已扣手续费），不许出现一个假的 0。
+    const highlights = (item?.highlights ?? []).join('\n');
+    expect(highlights).toContain('净盈亏');
+    expect(highlights).not.toContain('净盈亏 0.00');
+  });
+
+  it('移动止损换档 → 通知带新旧两档的价', async () => {
+    const fake = fakePool();
+    const placer = fakePlacer();
+    const { alerts, items } = fakeAlerts(['trail-moved']);
+    const service = createExecutorService({
+      pool: fake.pool,
+      config: makeConfig(),
+      placer,
+      atr: fakeAtr(ATR_UP),
+      resolvePolicy: stagedPolicy(),
+      alerts,
+    });
+
+    expect(await service.handleFill(fill())).toBe('armed');
+    expect(
+      await service.handleFill(
+        fill({
+          clientOrderId: bracketClientOrderId('tp', '42'),
+          side: 'SELL',
+          lastFilledPrice: 60_300,
+          lastFilledQty: 0.05,
+          commission: 0.02,
+        }),
+      ),
+    ).toBe('trailing');
+
+    const pushed = items.filter((item) => item.fingerprint.startsWith('trail-moved|'));
+    expect(pushed).toHaveLength(1);
+    const item = pushed[0];
+    expect(item?.category).toBe('risk');
+    expect(item?.oneShot).toBe(true);
+    // 「挪到哪了」比「挪了」有用得多：新旧两档都要在。
+    expect(item?.title).toContain('60000');
+    const lines = (item?.lines ?? []).join('\n');
+    expect(lines).toContain('59800 → 60000');
+  });
+
+  it('没勾的内容类型不推（新加的两类也一样）', async () => {
+    const fake = fakePool();
+    const placer = fakePlacer();
+    const { alerts, items } = fakeAlerts(['bracket-armed']);
+    const service = createExecutorService({
+      pool: fake.pool,
+      config: makeConfig(),
+      placer,
+      atr: fakeAtr(ATR_UP),
+      resolvePolicy: stagedPolicy(),
+      alerts,
+    });
+
+    expect(await service.handleFill(fill())).toBe('armed');
+    expect(
+      await service.handleFill(
+        fill({
+          clientOrderId: bracketClientOrderId('tp', '42'),
+          side: 'SELL',
+          lastFilledPrice: 60_300,
+          lastFilledQty: 0.05,
+          commission: 0.02,
+        }),
+      ),
+    ).toBe('trailing');
+
+    expect(items.some((item) => item.fingerprint.startsWith('tp1-filled|'))).toBe(false);
+    expect(items.some((item) => item.fingerprint.startsWith('trail-moved|'))).toBe(false);
+  });
+
+  // v0.9.2：Binance 不允许同时存在两张 `clientAlgoId` 相同的挂单，
+  // 而挪单是「先挂新、再撤旧」——旧单此刻还在。于是每一档必须有自己的号。
+  it('每一档止损单都有自己的号：号复用会被交易所拒', async () => {
+    const fake = fakePool();
+    const placer = fakePlacer();
+    const service = createExecutorService({
+      pool: fake.pool,
+      config: makeConfig(),
+      placer,
+      atr: fakeAtr(ATR_UP),
+      resolvePolicy: stagedPolicy(),
+    });
+
+    expect(await service.handleFill(fill())).toBe('armed');
+    expect(
+      await service.handleFill(
+        fill({
+          clientOrderId: bracketClientOrderId('tp', '42'),
+          side: 'SELL',
+          lastFilledPrice: 60_300,
+          lastFilledQty: 0.05,
+          commission: 0.02,
+        }),
+      ),
+    ).toBe('trailing');
+
+    // 进场那张 + 挪到保本位那张。
+    const slIds = placer.placed
+      .filter((order) => order.type === 'STOP_MARKET')
+      .map((order) => order.clientAlgoId);
+    expect(slIds).toHaveLength(2);
+    expect(new Set(slIds).size).toBe(2);
+    // 进场那张沿用旧格式（交易所上已经挂着的那张不必改号），
+    // 挪过档的那张带上档位序号。
+    expect(slIds[0]).toBe('rsk-sl-42');
+    expect(slIds[1]).toBe('rsk-sl1-42');
+
+    // 库里记着「占用了几个号」与「成功换过几档」：两者相等 = 没有失败的尝试。
+    const row = fake.state.claims.get('binance/BTCUSDT/42');
+    expect(row?.trailStep).toBe(1);
+    expect(row?.trailMoves).toBe(1);
   });
 
   it('「TP1 还没成交」的行不动：那是进场保护，不是移动止损该管的', async () => {
@@ -1394,6 +1621,12 @@ describe('v0.9.1：第一段止盈成交之后', () => {
     expect(row?.state).toBe('trailing');
     expect(row?.trailStopPrice).toBe(59_800);
     // 「新单已挂上、旧单撤不掉」这件事必须看得见。
-    expect(row?.trailLastError).toContain('撤旧止损失败');
+    expect(row?.trailLastError).toContain('撤旧止损');
+    expect(row?.trailLastError).toContain('已挂上');
+    // 账面指向交易所上**当前**那张（新挂的），不是那张撤不掉的旧单——
+    // 否则对账会拿一个已失效的单号去比价。
+    expect(row?.slOrderId).not.toBe(12);
+    // 这一轮是「失败」：对账据此报「移动止损换档失败」。
+    expect(row?.trailStatus).toBe('failed');
   });
 });

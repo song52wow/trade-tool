@@ -29,8 +29,9 @@ import { RECONCILE_KIND_INFO, RECONCILE_KINDS } from './reconcile.js';
  * **要通知哪些内容**的完整清单。
  *
  * 两类来源合成一份：
- *   * 交易对账的差异类型（`RECONCILE_KINDS`，8 种）——「哪种异常要我知道了」；
- *   * 交易生命周期事件（2 种）——「止盈止损挂上了」「这一轮走完了」。
+ *   * 交易对账的差异类型（`RECONCILE_KINDS`）——「哪种异常要我知道了」；
+ *   * 交易生命周期事件（4 种）——「第一段止盈成交」「止损挪了」「止盈止损挂上了」
+ *     「这一轮走完了」。
  *
  * 合成一份而不是两套机制：用户在一个列表里勾，页面也只有一份清单可显示。
  * 清单与文案都由服务端下发（`NOTIFY_KIND_INFO`），页面不自己抄一份——抄了就会漂。
@@ -40,6 +41,8 @@ export const NOTIFY_KINDS = [
   'bracket-armed',
   'bracket-settled',
   'llm-fallback',
+  'tp1-filled',
+  'trail-moved',
 ] as const;
 
 export type NotifyKind = (typeof NOTIFY_KINDS)[number];
@@ -58,6 +61,14 @@ export const NOTIFY_KIND_INFO: Record<NotifyKind, { label: string; hint: string 
   'llm-fallback': {
     label: 'LLM 决策降级',
     hint: '模型这一轮没给出可用档位，本次按 risk_policy 的配置挂单（仓位仍受保护）',
+  },
+  'tp1-filled': {
+    label: '第一段止盈成交',
+    hint: '分批形态的第一段减仓成交了，附这一段的成交价与已落袋的盈亏（计价币）',
+  },
+  'trail-moved': {
+    label: '移动止损换档',
+    hint: '止损位挪到新的一档了，附新旧两档的价。同一笔仓位在冷却期内只推一次',
   },
 };
 
@@ -554,6 +565,13 @@ export function createNotifierFromEnv(
   return createNotifier({ webhookUrl, secret });
 }
 
+/**
+ * 默认作用域。**只有一个调用方在用它时**才有意义——
+ * 多个话题共用一个派发器时，各调用方必须传自己的作用域
+ * （否则一个话题的推送会把另一个话题的记账当成「问题消失了」）。
+ */
+export const DEFAULT_ALERT_SCOPE = 'default';
+
 /** 一条待推送的告警。 */
 export interface AlertItem {
   /**
@@ -656,10 +674,20 @@ export class AlertDispatcher {
   private readonly channel: AlertChannel | AlertChannelProvider;
   private readonly now: () => number;
   private readonly onError: AlertDispatcherOptions['onError'];
-  /** 指纹 → 上次推送的信息。 */
+  /**
+   * **按作用域分开**的记账：作用域 → 指纹 → 上次推送的信息。
+   *
+   * 为什么要分开：一次 `dispatch` 只看得见**自己这个作用域**的条目，
+   * 而「已恢复」是按「上一轮有、这一轮没有」判定的。若所有作用域共用一份记账，
+   * 推一条生命周期事件就会把别的话题的条目当成「问题消失了」——
+   * 于是凭空多一条「已恢复」，而真正该恢复的那条**永远推不出来**。
+   *
+   * 2026-10-22 实测踩到：对账报了一次「移动止损换档失败」，移动止损修好之后，
+   * 对账不再报它了——但群里既没有「已恢复」，反而收到一条对账的假「已恢复」。
+   */
   private readonly sent = new Map<
     string,
-    { severity: NotifySeverity; at: number; item: AlertItem }
+    Map<string, { severity: NotifySeverity; at: number; item: AlertItem }>
   >();
   /** 上一轮启用的是哪些内容种类。用来区分「问题解决了」与「用户改了勾选」。 */
   private lastKinds: string | null = null;
@@ -691,6 +719,14 @@ export class AlertDispatcher {
    */
   async dispatch(
     build: (channel: AlertChannel) => readonly AlertItem[],
+    /**
+     * **作用域**：记账与「已恢复」判定都按它分开。
+     *
+     * 同一作用域内的条目才互相看得见——「上一轮有、这一轮没有」才有意义。
+     * 不同作用域（例如「对账差异」与「第一段止盈成交」）互不影响：
+     * 推后者不该把前者当成「问题消失了」。
+     */
+    scope = DEFAULT_ALERT_SCOPE,
   ): Promise<AlertDispatchResult> {
     const result: AlertDispatchResult = { sent: 0, suppressed: 0, failed: 0, recovered: 0 };
     const channel = await this.resolve();
@@ -718,11 +754,14 @@ export class AlertDispatcher {
     const notifier = channel.notifier;
     const now = this.now();
     const seen = new Set<string>();
+    // **本作用域**的记账。
+    const scopeSent = this.sent.get(scope) ?? new Map();
+    this.sent.set(scope, scopeSent);
 
     for (const item of items) {
       seen.add(item.fingerprint);
 
-      const previous = this.sent.get(item.fingerprint);
+      const previous = scopeSent.get(item.fingerprint);
       const sameSeverity = previous !== undefined && previous.severity === item.severity;
       if (sameSeverity && now - previous.at < channel.repeatCooldownMs) {
         result.suppressed += 1;
@@ -737,7 +776,7 @@ export class AlertDispatcher {
           ...(item.lines === undefined ? {} : { lines: item.lines }),
           ...(item.highlights === undefined ? {} : { highlights: item.highlights }),
         });
-        this.sent.set(item.fingerprint, { severity: item.severity, at: now, item });
+        scopeSent.set(item.fingerprint, { severity: item.severity, at: now, item });
         result.sent += 1;
       } catch (error) {
         this.reportError(error, { item, phase: 'alert' });
@@ -746,9 +785,10 @@ export class AlertDispatcher {
     }
 
     // 已经不在这一轮里的指纹 = 问题消失了，推一条「已恢复」。
-    for (const [fingerprint, previous] of [...this.sent.entries()]) {
+    // **只扫本作用域**：别的作用域的条目在这一轮「不在」不代表它的问题恢复了。
+    for (const [fingerprint, previous] of [...scopeSent.entries()]) {
       if (seen.has(fingerprint)) continue;
-      this.sent.delete(fingerprint);
+      scopeSent.delete(fingerprint);
       // 事件型告警推过即忘：它不在了**不代表**问题恢复了（下一轮本来就没有它）。
       if (previous.item.oneShot === true) continue;
       const title = previous.item.resolvedTitle ?? `已恢复：${previous.item.title}`;

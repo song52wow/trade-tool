@@ -114,11 +114,16 @@ async function dispatchAlerts(deps: PeriodicReconcileDeps, report: ReconcileRepo
   try {
     // 构造条目的那一步要按**当前生效的设置**过滤（只推用户勾选的内容），
     // 因此条目由通道参数来构造：设置只解析一次，过滤与发送看到的是同一份。
-    const result = await alerts.dispatch((channel) => {
-      const alert = buildReconcileAlert(report, channel.kinds);
-      // 没有差异时传空数组：派发器据此推一条「已恢复」，并清掉上一轮的记账。
-      return alert === null ? [] : [alert];
-    });
+    const result = await alerts.dispatch(
+      (channel) => {
+        const alert = buildReconcileAlert(report, channel.kinds);
+        // 没有差异时传空数组：派发器据此推一条「已恢复」，并清掉上一轮的记账。
+        return alert === null ? [] : [alert];
+      },
+      // 作用域：与生命周期事件的推送**分开记账**——推「第一段止盈成交」
+      // 不该把对账的差异当成「问题消失了」。
+      'reconcile',
+    );
     if (result.sent > 0 || result.recovered > 0 || result.failed > 0) {
       log.info(
         `告警推送：发出 ${String(result.sent)} / 恢复 ${String(result.recovered)}` +
