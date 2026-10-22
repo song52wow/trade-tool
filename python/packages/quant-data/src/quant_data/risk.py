@@ -29,6 +29,18 @@ v0.7.0 追加第五条（Chandelier 移动止损）：
    「新止损位有没有越过现价」的判断随之失去意义。``entryTime`` 是**必填**——
    拿不到持仓期起点就算不出极值，**不许**默认成 0 或拿窗口起点顶替（R-6.3）。
    极值与 ATR 各用自己的段（极值走持仓期、ATR 走窗口），互不影响。
+
+v0.9.0 修订第五条（实测踩到的坑，2026-10-21）：
+
+5b. **极值取不到不许把 ATR 一起带走**。持仓期里一根已收盘 K 线都没有时
+   （**刚开仓就是这种情况**：持仓期只有几秒，没有任何一根 K 线收盘），
+   极值**取不到**——但 ATR **取得到**，而且必须取得到：ATR 是挂单的前提。
+   于是极值这一项**如实回 ``null``**（不是 0、不是 NaN、不是借来的窗口起点），
+   由调用方按 R-6.5 走「本轮不移动止损、保留上一档」。
+   早期实现在这里抛 ``RISK_TRAIL_EXTREME_UNAVAILABLE``，而极值与 ATR 在**同一次调用**里，
+   于是一次抛错把 ATR 一起带走了——调用方只能把整次取数当成「ATR 不可用」而拒绝下单。
+   后果是**新开仓永远挂不上保护单**（成交事件不会重放，没有第二次机会），
+   仓位从此裸奔。这与 R-6.5「两者严重度不同，不许混成一个码」直接冲突。
 """
 
 from __future__ import annotations
@@ -159,7 +171,10 @@ class AtrSnapshot:
     segment_from: int
     segment_to: int
     as_of_ms: int
-    extreme: PositionExtreme
+    #: 持仓期极值。**``None`` = 取不到**（持仓期内一根已收盘 K 线都没有）。
+    #: ``None`` 与「取到 0」是两回事：0 会被当成价格算进 Chandelier 公式，
+    #: 而 ``None`` 只表示「这一项本轮没有」，调用方据此走 R-6.5。
+    extreme: PositionExtreme | None
     last_close: float
 
     def to_dict(self) -> dict[str, object]:
@@ -173,7 +188,9 @@ class AtrSnapshot:
             "segmentFrom": self.segment_from,
             "segmentTo": self.segment_to,
             "asOfMs": self.as_of_ms,
-            "extreme": self.extreme.to_dict(),
+            # 取不到时是 null（**不是 0、不是缺字段**）：调用方据此区分
+            # 「极值本轮没有」与「契约破损」。见模块说明的第 5b 条。
+            "extreme": self.extreme.to_dict() if self.extreme is not None else None,
             # 移动止损要判断「算出来的新止损位有没有越过现价」，而这必须与极值取自**同一时刻**
             # （同一次读库的连续段末根），因此跟 ATR 一起回，绝不另开一次取数。
             "lastClose": self.last_close,
@@ -303,44 +320,37 @@ def compute_atr(window: Window, period: int) -> float:
 
 
 def compute_position_extreme(
-    window: Window, entry_time_ms: int, *, symbol: str, interval: str
-) -> PositionExtreme:
+    window: Window, entry_time_ms: int
+) -> PositionExtreme | None:
     """在 ``[entry_time_ms, as_of]`` ∩ 窗口 的交集上求 high 最大值与 low 最小值。
 
     ``window`` 已经是 ``asOf`` 侧的**极大连续段**（规则 2），因此这里只需按入场时刻切一刀；
     取交集而不是「借窗口起点」是 R-6.3 的硬要求——借来的极值描述的是入场之前的价格。
 
-    交集为空一律抛 ``RISK_TRAIL_EXTREME_UNAVAILABLE`` 而**不**返回空值：调用方要靠这个码
-    走「本轮不移动止损、保留上一档」，返回一个 0 顶替的极值会让它以为止损该挪到 0 去。
+    **交集为空时返回 ``None``**（不是抛错、不是 0）：持仓期里一根已收盘 K 线都没有，
+    是**刚开仓时的常态**（成交后几秒内没有任何一根 K 线收盘）。这种情况下的极值
+    「取不到」，但 ATR **取得到**，而 ATR 才是挂单的前提——所以它必须活着回到调用方。
+    早期实现在这里抛 ``RISK_TRAIL_EXTREME_UNAVAILABLE``，而极值与 ATR 在同一次调用里，
+    于是一次抛错把 ATR 一起带走，调用方只能当成「ATR 不可用」而拒绝下单：
+    **新开仓永远挂不上保护单**，仓位从此裸奔。
+
+    调用方按 R-6.5 处理 ``None``：**本轮不移动止损、保留上一档**，并留下可见原因。
+    它与 ``RISK_ATR_UNAVAILABLE`` 严重度不同，不许混成一个码。
     """
     lo = bisect_left(window.times, entry_time_ms)
     if lo >= len(window):
-        raise SyncError(
-            "RISK_TRAIL_EXTREME_UNAVAILABLE",
-            f"{symbol} 持仓期 [{entry_time_ms}, {window.times[-1]}] 内没有一根连续的 "
-            f"{interval} 已收盘 K 线，无法求持仓期极值；"
-            "先让 apps/sync 把入场时刻之后的行情补上来（缺口不许插值补齐）",
-            {
-                "symbol": symbol,
-                "interval": interval,
-                "entryTimeMs": entry_time_ms,
-                "segmentFrom": window.times[0],
-                "segmentTo": window.times[-1],
-                "hint": "pnpm --filter @trade-tool/sync start（并在控制面 start 该标的）",
-            },
-        )
+        # 持仓期内没有一根已收盘 K 线 → 极值取不到，如实回 None（见 docstring）。
+        return None
     highs = window.high[lo:]
     lows = window.low[lo:]
     high = float(np.max(highs))
     low = float(np.min(lows))
-    # 非有限值当成「取不到」：NaN 一路进 JSON 会让 TS 侧解析成 null，
+    # 非有限值同样当成「取不到」：NaN 一路进 JSON 会让 TS 侧解析成 null，
     # 而移动止损会拿着 null 当价格算出 -Infinity 的止损位。
+    # 这里**不抛错**：抛错会把同一次调用里的 ATR 一起带走（见 docstring），
+    # 代价是仓位没有保护单——而数据异常时更该保住保护单。
     if not np.isfinite(high) or not np.isfinite(low):
-        raise SyncError(
-            "RISK_TRAIL_EXTREME_UNAVAILABLE",
-            f"{symbol} 持仓期极值算出无效值：high={high} low={low}",
-            {"symbol": symbol, "high": high, "low": low, "bars": len(window) - lo},
-        )
+        return None
     return PositionExtreme(
         high=high,
         low=low,
@@ -383,7 +393,10 @@ def atr_at(
     # ATR 先算：取不到 ATR 要拒绝下单（RISK_ATR_UNAVAILABLE），
     # 比「本轮不移动止损」严重，码必须先于极值抛出去。
     value = compute_atr(tail_window(window, bars), per)
-    extreme = compute_position_extreme(window, entry_time_ms, symbol=symbol, interval=iv)
+    # 极值取不到时是 None（**不是抛错**）：抛错会把同一次调用里的 ATR 一起带走，
+    # 刚开仓时（持仓期内一根已收盘 K 线都没有）就会连保护单都挂不上。
+    # 调用方按 R-6.5 处理：极值不可用 ≠ ATR 不可用。
+    extreme = compute_position_extreme(window, entry_time_ms)
     return AtrSnapshot(
         symbol=symbol,
         interval=iv,

@@ -8,6 +8,11 @@
   两侧都不得另持影子定义。
 - `db/migrate.ts` — 版本化迁移：`migrate`（幂等）、`schemaStatus`（只读比对）、
   `assertSchemaVersion`（启动闸门，版本不匹配**必须报错**而不是按旧 schema 继续跑）。
+  ⚠️ **写迁移时的一条硬规则**（2026-10-21 实测踩到）：PostgreSQL 的 `DROP COLUMN` 会**自动删掉
+  引用该列的 CHECK 约束**，而且**一声不响**——迁移跑完、版本对得上，守门人却已经没了
+  （迁移 `014` 退役 `decision_take_profit1_atr_mult` 时顺带删掉了
+  `risk_bracket_decision_llm_params_check`，补在 `015` 里）。**退役任何一列之前，
+  先查一遍 `pg_constraint` 里有没有约束提到它**，被顺带删掉的要用新迁移补回来。
 - `db/pool.ts` — PG 连接池与连接串。密码**只从环境变量读**（`database.passwordEnv`），
   配置文件里只存变量名。`buildDsn` 产出给 Python 用的 libpq 连接串。
 - `db/errors.ts` — PG 错误分类（R-21.6）：连接失败 / 唯一冲突 / 事务回滚 / 死锁，

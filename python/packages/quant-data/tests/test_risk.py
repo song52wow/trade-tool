@@ -292,27 +292,39 @@ def test_extreme_reports_the_short_segment_truthfully() -> None:
     assert extreme["from"] != T0
 
 
-def test_extreme_raises_its_own_code_when_empty() -> None:
-    """交集为空用**新码**，且不进 MANUAL_INTERVENTION_CODES（本轮不调整即可恢复）。"""
+def test_extreme_is_null_when_holding_period_has_no_closed_bar() -> None:
+    """持仓期内一根已收盘 K 线都没有 → **极值为 null，但 ATR 必须活着**。
+
+    这是**刚开仓时的常态**（成交后几秒内没有任何一根 K 线收盘）。
+
+    早期实现在这里抛 ``RISK_TRAIL_EXTREME_UNAVAILABLE``，而极值与 ATR 在同一次调用里，
+    一次抛错把 ATR 一起带走 → 调用方当成「ATR 不可用」而拒绝下单 →
+    **新开仓永远挂不上保护单**，仓位从此裸奔（与 R-6.5 冲突）。
+    """
     from quant_data.errors import MANUAL_INTERVENTION_CODES
     from quant_data.risk import atr_at
 
     conn = fake_conn(BASE_TABLE, bars(T0, 200))
     # 入场时刻晚于 asOf：持仓期内没有任何已收盘 K 线
-    with pytest.raises(SyncError) as exc:
-        atr_at(
-            conn,
-            "SYM",
-            entry_time_ms=T0 + 500 * MINUTE,
-            interval="1m",
-            period=14,
-            as_of_ms=T0 + 200 * MINUTE,
-        )
-    assert exc.value.code == "RISK_TRAIL_EXTREME_UNAVAILABLE"
-    assert exc.value.code in ERROR_CODES
-    # 两个码都必须在册：合并会让「拒绝下单」与「本轮不调整」共用一个处置方式（R-6.5）。
+    snapshot = atr_at(
+        conn,
+        "SYM",
+        entry_time_ms=T0 + 500 * MINUTE,
+        interval="1m",
+        period=14,
+        as_of_ms=T0 + 200 * MINUTE,
+    )
+    # ATR 照常算出来了（这是挂单的前提）
+    assert snapshot.atr > 0
+    assert snapshot.extreme is None
+    # 摘要里是 null（**不是缺字段**）：调用方据此区分「取不到」与「契约破损」
+    summary = snapshot.to_dict()
+    assert "extreme" in summary
+    assert summary["extreme"] is None
+    # 两个码仍然都要在册：合并会让「拒绝下单」与「本轮不调整」共用一个处置方式（R-6.5）。
     assert "RISK_ATR_UNAVAILABLE" in ERROR_CODES
-    assert exc.value.code not in MANUAL_INTERVENTION_CODES
+    assert "RISK_TRAIL_EXTREME_UNAVAILABLE" in ERROR_CODES
+    assert "RISK_TRAIL_EXTREME_UNAVAILABLE" not in MANUAL_INTERVENTION_CODES
 
 
 def test_extreme_rejects_non_positive_entry_time() -> None:
@@ -334,12 +346,14 @@ def test_extreme_rejects_non_positive_entry_time() -> None:
 
 
 def test_compute_position_extreme_guards_non_finite() -> None:
-    """NaN 极值绝不能流到 stdout（TS 侧会读成 null，然后算出 -Infinity 的止损）。"""
+    """NaN 极值绝不能流到 stdout（TS 侧会读成 null，然后算出 -Infinity 的止损）。
+
+    取不到时回 ``None`` 而不是抛错：抛错会把同一次调用里的 ATR 一起带走，
+    代价是仓位没有保护单——而数据异常时更该保住保护单。
+    """
     rows = bars(T0, 10)
     rows[3]["high"] = float("nan")
-    with pytest.raises(SyncError) as exc:
-        compute_position_extreme(window_of(rows), T0, symbol="SYM", interval="1m")
-    assert exc.value.code == "RISK_TRAIL_EXTREME_UNAVAILABLE"
+    assert compute_position_extreme(window_of(rows), T0) is None
 
 
 def test_atr_and_extreme_come_from_one_read() -> None:

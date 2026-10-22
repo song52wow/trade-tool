@@ -240,19 +240,56 @@ export function describePlan(plan: BracketPlan): string {
 // ---------------------------------------------------------------------------
 
 /**
- * 分批形态。三种取值走三种形态，只有中间那种会进 `trailing`：
+ * 止盈的两种形态。**只有一个止盈倍数**，它决定「这次要卖的那部分，涨到离入场多远就卖」。
  *
- * | `takeProfit1Ratio` | 形态                    | 止盈单                        |
- * | ----------------- | ----------------------- | ----------------------------- |
- * | `0`               | `single`（v0.4.0 行为）  | `closePosition`，全平         |
+ * | `takeProfit1Ratio` | 形态                    | 止盈单                          |
+ * | ----------------- | ----------------------- | ------------------------------- |
+ * | `0`               | `single`（v0.4.0 行为）  | `closePosition`，全平           |
  * | `(0, 1)`          | `partial`               | `quantity = tp1Qty`，减仓一部分 |
- * | `1`               | `full`                  | `closePosition`，全平         |
  *
- * `0` 与 `1` 的唯一区别是**用哪个倍数算止盈价**（`takeProfitAtrMult` vs
- * `takeProfit1AtrMult`）。两者都保留 `closePosition` 带来的交易所自动撤单保证，
- * 因此都不需要移动止损、不需要定时器——`full` 比 `partial` **更简单**，不是更复杂。
+ * 两种形态的止盈价用**同一个**倍数算（`takeProfitAtrMult`）：不分批时它是全平目标，
+ * 分批时它是先兑现那一段的目标——剩下的仓位交给移动止损。
+ *
+ * ## 为什么只剩两种形态
+ *
+ * v0.7.0 原本有第三种（比例 = `1`，「用另一个倍数全平」）与**两个**止盈倍数。
+ * 那一档功能上完全冗余（比例 = 0 + 把止盈倍数填成同一个数，效果逐字相同），
+ * 却在两处制造了真实的错：
+ *
+ *   * 算出来的「整段价」被当成实际挂单价落库，页面显示的「止盈价」因此是一个
+ *     **从没挂出去过**的价，对账每轮报一次 `price-mismatch` 假警报；
+ *   * 分批形态下「整段价」压根不挂单（剩余仓位交给移动止损），却仍要参与
+ *     「第一段必须比整段近」的比较——那是一道与真实挂单无关的自检。
+ *
+ * 于是合并成一个倍数：比例 = `1` 归一到 `0`（见 {@link normalizeTakeProfit1Ratio}），
+ * 「整段止盈价」这个概念整个消失。**页面上从此只有一个止盈倍数可填。**
  */
-export type StagedMode = 'single' | 'partial' | 'full';
+export type StagedMode = 'single' | 'partial';
+
+/**
+ * 第一段减仓比例的归一：**`1` 归一到 `0`**。
+ *
+ * 只有一个止盈倍数之后，「比例 = 1」与「比例 = 0」逐字等价（都是一次全平、都用
+ * `takeProfitAtrMult` 算价），因此 `1` 不再是独立取值。
+ *
+ * **只有这一份实现**，两处都要用：
+ *
+ *   * 决策落库前——留痕必须记归一后的值，否则事后对不上「当时用的哪套档位」；
+ *   * 算价时——兜底，防止任何一个绕过归一的调用方把 `1` 带进来。
+ *
+ * 两处各写一遍 `ratio >= 1 ? 0 : ratio` 的话，改了一处忘了另一处，就会出现
+ * 「留痕是 0、算价是 1」这种查不出来的不一致。
+ */
+export function normalizeTakeProfit1Ratio(ratio: number): number {
+  if (!Number.isFinite(ratio) || ratio < 0 || ratio > 1) {
+    throw new SyncError(
+      'CONFIG_INVALID',
+      `第一段减仓比例必须在 [0, 1] 内（收到 ${String(ratio)}）`,
+      { ratio },
+    );
+  }
+  return ratio >= 1 ? 0 : ratio;
+}
 
 export interface StagedPlanInput {
   side: EntrySide;
@@ -272,10 +309,11 @@ export interface StagedPlanInput {
   /** 入场成交量（`cumulativeQty`）。 */
   filledQty: number;
   stopAtrMult: number;
+  /**
+   * 止盈倍数。**两种形态都用它**：不分批时是全平目标，分批时是先兑现那一段的目标。
+   */
   takeProfitAtrMult: number;
-  /** 第一段止盈倍数。只在 `takeProfit1Ratio > 0` 时参与算价。 */
-  takeProfit1AtrMult: number;
-  /** 第一段减仓比例，`[0, 1]`。 */
+  /** 第一段减仓比例，`[0, 1]`；`1` 会先经 {@link normalizeTakeProfit1Ratio} 归一到 `0`。 */
   takeProfit1Ratio: number;
 }
 
@@ -290,10 +328,11 @@ export interface StagedPlan {
   /** 止损价。**始终**是 `closePosition` 单，保护的是当时剩余的全部仓位。 */
   stopPrice: number;
   stopDistance: number;
-  /** 整段止盈价。只在 `single` 模式下作为触发价使用。 */
+  /**
+   * 止盈价。**这一形态下真正会挂在交易所上的那个价**——落库与页面显示都读它，
+   * 所以它必须永远是实际挂出去的那个价。
+   */
   takeProfitPrice: number;
-  /** 第一段止盈价。`partial` / `full` 模式下有效。 */
-  tp1Price: number;
   /** 第一段减仓量。**只有** `partial` 模式有值（其余为 `null`，不留 0 冒充）。 */
   tp1Qty: number | null;
   /** `partial` 模式下第一段占整段的比例，仅供日志与页面显示。 */
@@ -319,78 +358,61 @@ export function deriveStagedPlan(input: StagedPlanInput): StagedPlan {
     filledQty,
     stopAtrMult,
     takeProfitAtrMult,
-    takeProfit1AtrMult,
     takeProfit1Ratio,
   } = input;
 
   if (!Number.isFinite(filledQty) || filledQty <= 0) {
     throw new SyncError('CONFIG_INVALID', `成交数量必须为正：${String(filledQty)}`, { filledQty });
   }
-  if (!Number.isFinite(takeProfit1Ratio) || takeProfit1Ratio < 0 || takeProfit1Ratio > 1) {
-    throw new SyncError(
-      'CONFIG_INVALID',
-      `第一段减仓比例必须在 [0, 1] 内（收到 ${String(takeProfit1Ratio)}）`,
-      { takeProfit1Ratio },
-    );
-  }
+  // 归一在**这里**也做一次（除了决策落库前那次）：比例 = 1 与 0 逐字等价，
+  // 统一按「不分批」处理，免得任何一个绕过归一的调用方把旧取值带进来。
+  const ratio = normalizeTakeProfit1Ratio(takeProfit1Ratio);
 
   const isLong = side === 'BUY';
-  const mode: StagedMode =
-    takeProfit1Ratio === 0 ? 'single' : takeProfit1Ratio >= 1 ? 'full' : 'partial';
+  const mode: StagedMode = ratio === 0 ? 'single' : 'partial';
   // 靠近入场价的一侧：多头向下、空头向上。
   const nearMode = isLong ? 'down' : 'up';
 
-  // 止损与整段止盈的算式完全复用 v0.4.0 的口径，不另抄一遍。
+  // 止损的算式完全复用 v0.4.0 的口径，不另抄一遍。
   const stopRaw = isLong ? entryPrice - stopAtrMult * atr : entryPrice + stopAtrMult * atr;
+  const stopPrice = alignToTick(stopRaw, tickSize, nearMode);
+
+  /**
+   * 校验止损价与**会挂出去的那个止盈价**分居入场价两侧。
+   *
+   * 与 `deriveBracketPlan` 的同一判断保持一致，不在这里另写一套宽松版。
+   *
+   * 只校验**实际挂单**的那一个价：v0.7.0 曾经在这里校验一个「整段价」，
+   * 而那一档下整段价压根不挂单——于是「填了没用」的数也能把整笔买入的保护单卡住，
+   * 报错还指向一个从没挂出去的价格。
+   */
+  const assertStraddles = (price: number): void => {
+    const straddles = isLong
+      ? stopPrice < entryPrice && price > entryPrice
+      : stopPrice > entryPrice && price < entryPrice;
+    if (!straddles) {
+      throw new SyncError(
+        'CONFIG_INVALID',
+        `ATR(${atrPeriod}) = ${atr} 相对 tick(${tickSize}) 与入场价 ${entryPrice} 太小，` +
+          `算出的止损/止盈会落在入场价同一侧（stop=${stopPrice}, tp=${price}）`,
+        { entryPrice, atr, atrPeriod, tickSize, stopPrice, takeProfitPrice: price },
+      );
+    }
+  };
+
+  /**
+   * 止盈价。**两种形态用同一个倍数算**：它是「这次要卖的那部分，涨到离入场多远就卖」。
+   *
+   * 不分批时卖全部（`closePosition` 单）；分批时先卖这一部分（带数量的单），
+   * 剩下的仓位交给移动止损。
+   */
   const takeProfitRaw = isLong
     ? entryPrice + takeProfitAtrMult * atr
     : entryPrice - takeProfitAtrMult * atr;
-  const stopPrice = alignToTick(stopRaw, tickSize, nearMode);
   const takeProfitPrice = alignToTick(takeProfitRaw, tickSize, nearMode);
+  assertStraddles(takeProfitPrice);
 
-  // 止损必须与止盈分居入场价两侧，否则说明 tickSize 相对 ATR 太大——
-  // 与 `deriveBracketPlan` 的同一判断保持一致，不在这里另写一套宽松版。
-  if (
-    isLong
-      ? !(stopPrice < entryPrice && takeProfitPrice > entryPrice)
-      : !(stopPrice > entryPrice && takeProfitPrice < entryPrice)
-  ) {
-    throw new SyncError(
-      'CONFIG_INVALID',
-      `ATR(${atrPeriod}) = ${atr} 相对 tick(${tickSize}) 与入场价 ${entryPrice} 太小，` +
-        `算出的止盈/止损会落在入场价同一侧（stop=${stopPrice}, tp=${takeProfitPrice}）`,
-      { entryPrice, atr, atrPeriod, tickSize, stopPrice, takeProfitPrice },
-    );
-  }
-
-  if (mode !== 'partial') {
-    if (mode === 'single') {
-      return {
-        mode,
-        positionSide: isLong ? 'LONG' : 'SHORT',
-        exitSide: isLong ? 'SELL' : 'BUY',
-        entryPrice,
-        atr,
-        stopPrice,
-        stopDistance: Math.abs(entryPrice - stopPrice),
-        takeProfitPrice,
-        tp1Price: takeProfitPrice,
-        tp1Qty: null,
-        ratio: 0,
-      };
-    }
-    // full：只算第一段的价，用它当触发价。
-    const tp1Raw = isLong
-      ? entryPrice + takeProfit1AtrMult * atr
-      : entryPrice - takeProfit1AtrMult * atr;
-    const tp1Price = alignToTick(tp1Raw, tickSize, nearMode);
-    if (isLong ? tp1Price <= entryPrice : tp1Price >= entryPrice) {
-      throw new SyncError(
-        'CONFIG_INVALID',
-        `第一段止盈(${takeProfit1AtrMult}×ATR) 对齐后落在入场价同一侧：${tp1Price}（入场 ${entryPrice}）`,
-        { entryPrice, atr, takeProfit1AtrMult, tp1Price },
-      );
-    }
+  if (mode === 'single') {
     return {
       mode,
       positionSide: isLong ? 'LONG' : 'SHORT',
@@ -400,25 +422,9 @@ export function deriveStagedPlan(input: StagedPlanInput): StagedPlan {
       stopPrice,
       stopDistance: Math.abs(entryPrice - stopPrice),
       takeProfitPrice,
-      tp1Price,
       tp1Qty: null,
-      ratio: 1,
+      ratio: 0,
     };
-  }
-
-  // partial：两个倍数必须能分出先后，否则「先兑现的那段比整段还远」是自相矛盾的配置。
-  const tp1Raw = isLong
-    ? entryPrice + takeProfit1AtrMult * atr
-    : entryPrice - takeProfit1AtrMult * atr;
-  const tp1Price = alignToTick(tp1Raw, tickSize, nearMode);
-  const tp1IsNearer = isLong ? tp1Price < takeProfitPrice : tp1Price > takeProfitPrice;
-  if (!tp1IsNearer) {
-    throw new SyncError(
-      'CONFIG_INVALID',
-      `第一段止盈(${takeProfit1AtrMult}×ATR = ${tp1Price}) 必须比整段止盈` +
-        `(${takeProfitAtrMult}×ATR = ${takeProfitPrice}) 更靠近入场价 ${entryPrice}，否则「先兑现的一段」反而更远`,
-      { entryPrice, atr, takeProfit1AtrMult, takeProfitAtrMult, tp1Price, takeProfitPrice },
-    );
   }
 
   // 减仓量向下取整：宁可少减一点，也不要多减到超过持仓量。
@@ -432,21 +438,21 @@ export function deriveStagedPlan(input: StagedPlanInput): StagedPlan {
   }
   let tp1Qty: number;
   try {
-    tp1Qty = alignToQty(filledQty * takeProfit1Ratio, stepSize, 'down');
+    tp1Qty = alignToQty(filledQty * ratio, stepSize, 'down');
   } catch (error) {
     throw new SyncError(
       'CONFIG_INVALID',
-      `按比例 ${takeProfit1Ratio} 与步长 ${stepSize} 取整后无法得到合法的第一段数量` +
+      `按比例 ${ratio} 与步长 ${stepSize} 取整后无法得到合法的第一段数量` +
         `（持仓 ${filledQty}）：拒绝这一段，不改成「不减仓」也不改成「全平」`,
-      { filledQty, takeProfit1Ratio, stepSize },
+      { filledQty, takeProfit1Ratio: ratio, stepSize },
     );
   }
   if (tp1Qty <= 0 || tp1Qty >= filledQty) {
     throw new SyncError(
       'CONFIG_INVALID',
-      `按比例 ${takeProfit1Ratio} 与步长 ${stepSize} 取整后，第一段数量为 ${tp1Qty}，` +
+      `按比例 ${ratio} 与步长 ${stepSize} 取整后，第一段数量为 ${tp1Qty}，` +
         `不满足 0 < q < 持仓 ${filledQty}——拒绝这一段，不改成「不减仓」也不改成「全平」`,
-      { filledQty, takeProfit1Ratio, stepSize, tp1Qty },
+      { filledQty, takeProfit1Ratio: ratio, stepSize, tp1Qty },
     );
   }
 
@@ -458,10 +464,10 @@ export function deriveStagedPlan(input: StagedPlanInput): StagedPlan {
     atr,
     stopPrice,
     stopDistance: Math.abs(entryPrice - stopPrice),
+    // 分批形态下挂出去的就是这个价（带数量的那张单），落库的 `take_profit` 也是它。
     takeProfitPrice,
-    tp1Price,
     tp1Qty,
-    ratio: takeProfit1Ratio,
+    ratio,
   };
 }
 

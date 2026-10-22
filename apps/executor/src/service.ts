@@ -70,6 +70,7 @@ import {
   parseTickSize,
   readBracket,
   readContractSpecRaw,
+  recordBracketTp1Fill,
   type OrderTradeUpdate,
   type BracketRecord,
   type BracketState,
@@ -200,10 +201,13 @@ export interface RiskPolicy {
   atrPeriod: number;
   atrInterval: string;
   stopAtrMult: number;
+  /**
+   * 止盈倍数。**两种形态都用它**（v0.9.1 起只有这一个止盈倍数）：
+   * 不分批时是全平目标，分批时是先兑现那一段的目标。
+   */
   takeProfitAtrMult: number;
-  /** v0.7.0：`[0, 1]`。`0` = 不分批；`1` = 一次性全平；中间值 = 分批。 */
+  /** v0.7.0：`[0, 1)`。`0` = 不分批；中间值 = 分批。`1` 会被归一到 `0`。 */
   takeProfit1Ratio: number;
-  takeProfit1AtrMult: number;
   trailAtrMult: number;
   breakevenAfterTp1: boolean;
 }
@@ -236,10 +240,17 @@ export interface ExecutorService {
 }
 
 /**
- * 一轮移动止损的结果。**四项都单独计数**，不合成一个「成功与否」：
+ * 一轮移动止损的结果。**五项都单独计数**，不合成一个「成功与否」：
  * 「这一轮没有动作」与「这一轮失败了」在处置上完全不同，合成一个就看不出区别。
  */
 export interface TrailReport {
+  /**
+   * 本轮把「等推进」的行推进到 `trailing` 的条数。
+   *
+   * 它与 {@link TrailReport.moved} 是**两件事**：阶段推进了不等于止损挪了
+   * （价位没变时只推进阶段、不动交易所上的单）。
+   */
+  advanced: number;
   /** 真正换档（含补挂）的条数。 */
   moved: number;
   /** 本轮不需要动的条数。 */
@@ -248,6 +259,21 @@ export interface TrailReport {
   failed: number;
   /** 不在配置范围内、跳过的条数。 */
   skipped: number;
+}
+
+/** 一次算好的移动止损档位。 */
+export interface TrailPlan {
+  /** 要挂上去的那一档。 */
+  stopPrice: number;
+  /** 是否需要撤旧挂新。`false` 时调用方**必须**跳过一切下单动作。 */
+  changed: boolean;
+  /** 没动的原因（`unchanged` / `beyond-price` / `breakeven` / `moved`）。 */
+  reason: TrailingReason;
+  /** 这一轮用到的持仓期极值。 */
+  extreme: number;
+  /** 极值取数窗口的起点 / 终点。 */
+  atrFrom: number;
+  atrTo: number;
 }
 
 function reasonOf(error: unknown): string {
@@ -390,21 +416,41 @@ export function createExecutorService(deps: ExecutorServiceDeps): ExecutorServic
    *
    * **为什么止损单此时还是有效的**：第一段止盈带数量、止损是 `closePosition`，
    * 而 `closePosition` 的语义是「触发时平掉当时剩余的全部仓位」。减仓之后仓位还在，
-   * 所以那张止损单**继续保护剩余仓位**，这里只把档位推进，不重挂（重挂才会造出
-   * 无保护窗口）。
+   * 所以那张止损单**继续保护剩余仓位**。
    *
-   * **为什么先落库再动交易所**：进程死在「已置 `trailing`、还没挪止损」时，对账会看到
-   * `trailing` 却查不到止损单（紧急），定时器下一轮补；反过来先挪单后落库，
+   * **三步，顺序固定**：
+   *
+   * 1. **落「TP1 已成交」这个事实**（`recordBracketTp1Fill`）。它不依赖「能不能算出
+   *    移动止损」——成交了就是成交了。少了这一步，推进失败时这一段就**整个没影了**：
+   *    成交价、数量、手续费都没记（盈亏少算一段），而且**没有任何东西能证明
+   *    「TP1 成交过」**，于是推进失败 → 永远不会被重试 → 记录卡在 `partial_armed`。
+   * 2. **落阶段**（`partial_armed` → `trailing`，见 {@link advanceStage}）。
+   * 3. **把止损挪到新的一档**（见 {@link moveTrailStop}）：挂新 → 撤旧 → 回填。
+   *
+   * **先落库再动交易所**：进程死在「已置 `trailing`、还没挪止损」时，记录停在
+   * `trailing`、止损还在进场那一档——移动止损定时器下一轮会接着挪
+   * （它认领 `tp1_filled_at` 非空的行）。反过来先挪单后落库，
    * 崩在中间就是「交易所挂着新档位、库里记着旧档位」，两者永久对不上。
    *
    * **幂等**：`markBracketTrailing` 的 WHERE 只认 `partial_armed`，
-   * 事件重放时第二次拿不到行，不会重复推进。
+   * 事件重放时第二次拿不到行，不会重复推进、也不会重复挂单。
    */
   async function armTrailing(
     update: OrderTradeUpdate,
     record: BracketRecord,
   ): Promise<HandleOutcome> {
     const key = { exchange, symbol: record.symbol, entryOrderId: record.entryOrderId };
+    // **先落「TP1 已成交」这个事实**，再算移动止损。
+    //
+    // 幂等（`WHERE tp1_filled_at IS NULL`）：用户数据流会重投事件，重投不重复累加。
+    await recordBracketTp1Fill(
+      pool,
+      key,
+      { price: update.lastFilledPrice, qty: update.lastFilledQty, fee: update.commission },
+      now(),
+    ).catch((error: unknown) => {
+      log.error(`${record.symbol} 记录第一段止盈成交事实失败：${reasonOf(error)}`);
+    });
     try {
       const policy = await resolvePolicyFor(record.symbol);
       const snapshot = await atr.atrAt(record.symbol, update.tradeTime, record.entryTime, {
@@ -412,38 +458,38 @@ export function createExecutorService(deps: ExecutorServiceDeps): ExecutorServic
         period: policy.atrPeriod,
       });
       const plan = await planTrail(record, policy, snapshot);
-      const moved = await markBracketTrailing(
-        pool,
-        key,
-        {
-          extreme: plan.extreme,
-          stopPrice: plan.stopPrice,
-          atr: snapshot.atr,
-          atrFrom: snapshot.extreme.from,
-          atrTo: snapshot.extreme.to,
-        },
-        now(),
-        // 第一段成交的事实：两段模型下这一轮会平两段，不累加它，
-        // 最后算出来的净盈亏就只算了一半。
-        {
-          price: update.lastFilledPrice,
-          qty: update.lastFilledQty,
-          fee: update.commission,
-        },
-      );
-      if (moved === 0) {
+      const advanced = await advanceStage(record, plan, snapshot);
+      if (!advanced) {
         log.info(`${record.symbol} 第一段止盈已在处理中（记录已被推进过），不重复执行`);
         return 'settled';
       }
       log.info(
-        `${record.symbol} 第一段止盈已成交，进入移动止损：当前档 ${plan.stopPrice}` +
+        `${record.symbol} 第一段止盈已成交，进入移动止损` +
           `（极值 ${plan.extreme}，ATR ${snapshot.atr}）`,
       );
+
+      // 阶段已经落库，接着把止损**真的挪到新的一档**（R-5.4 的后半段）。
+      //
+      // 挪不动也不影响阶段：记录已经是 `trailing`，移动止损定时器下一轮会接着挪
+      // （「阶段推进了、价位还没挪」是**可修**的，而反过来不可修）。
+      if (plan.changed) {
+        try {
+          const result = await moveTrailStop(record, plan, snapshot);
+          if (result.moved) {
+            log.info(`${record.symbol} 止损已挪到 ${plan.stopPrice}`);
+          }
+        } catch (error) {
+          const reason = `${record.symbol} 推进后换档失败：${reasonOf(error)}`;
+          await markBracketTrailNotMoved(pool, key, reason, now()).catch(() => undefined);
+          log.error(`${reason}（移动止损定时器下一轮会重试）`);
+        }
+      }
       return 'trailing';
     } catch (error) {
       // 取不到极值 / ATR 时**不能**把记录置成终态：那会留下「账面上已了结、
       // 实际仓位无人跟踪」的一笔仓位，正是 v0.4.0 反复在治的那种分裂。
-      // 保留 `partial_armed` 并留下可见原因，等移动止损定时器重试。
+      // 保留 `partial_armed` 并留下可见原因——**移动止损定时器会重试**：
+      // 它认领「TP1 已成交但还没推进」的行（`tp1_filled_at` 非空）。
       const reason = `推进移动止损失败：${reasonOf(error)}`;
       await markBracketTrailNotMoved(pool, key, reason, now()).catch(() => undefined);
       log.error(`${record.symbol} ${reason}`);
@@ -461,13 +507,32 @@ export function createExecutorService(deps: ExecutorServiceDeps): ExecutorServic
   async function planTrail(
     record: Pick<
       BracketRecord,
-      'symbol' | 'positionSide' | 'entryPrice' | 'stopPrice' | 'trailStopPrice'
+      'symbol' | 'positionSide' | 'entryPrice' | 'entryTime' | 'stopPrice' | 'trailStopPrice'
     >,
     policy: RiskPolicy,
     snapshot: AtrSnapshot,
-  ): Promise<{ stopPrice: number; changed: boolean; reason: TrailingReason; extreme: number }> {
+  ): Promise<TrailPlan> {
     const isLong = record.positionSide === 'LONG';
-    const extreme = isLong ? snapshot.extreme.high : snapshot.extreme.low;
+    const extremeObj = snapshot.extreme;
+    if (extremeObj === null) {
+      // 极值取不到 → **本轮不移动止损、保留上一档**（v0.7.0 R-6.5）。
+      // 它与「ATR 不可用要拒绝下单」严重度不同，所以这里抛的是另一个码。
+      //
+      // 两条调用路径各自处置：推进到移动止损那条会落进 catch（记录留在 partial_armed，
+      // 等移动止损定时器重试）；定时器那条在调用前就判掉 null，走「本轮不调整 + 可见原因」。
+      throw new SyncError(
+        'RISK_TRAIL_EXTREME_UNAVAILABLE',
+        `${record.symbol} 持仓期内还没有已收盘的 ${policy.atrInterval} K 线，持仓期极值取不到；` +
+          '本轮不移动止损，保留上一档',
+        {
+          symbol: record.symbol,
+          atrInterval: policy.atrInterval,
+          entryTime: record.entryTime,
+          segmentTo: snapshot.segmentTo,
+        },
+      );
+    }
+    const extreme = isLong ? extremeObj.high : extremeObj.low;
     // 规格现读现用：它与算价必须来自**同一份**快照，而这一层没有可靠的缓存约定。
     const raw = await readContractSpecRaw(pool, exchange, record.symbol);
     const plan = deriveTrailingPlan({
@@ -486,7 +551,107 @@ export function createExecutorService(deps: ExecutorServiceDeps): ExecutorServic
       changed: plan.changed,
       reason: plan.reason,
       extreme,
+      atrFrom: extremeObj.from,
+      atrTo: extremeObj.to,
     };
+  }
+
+  /**
+   * 交易所上那张止损单**现在的价**。
+   *
+   * `trail_stop_price` 记的就是这个价——不是「打算挪到的那一档」。
+   * 这条口径让「库里记的」与「交易所挂着的」永远是同一件事：
+   * 对账（§6.5）直接拿它比价才不会一直报价格不符，
+   * 而「阶段推进了、价位还没挪」这一格是**可修**的（定时器下一轮接着挪）。
+   */
+  function liveStopPrice(record: Pick<BracketRecord, 'stopPrice' | 'trailStopPrice'>): number {
+    return record.trailStopPrice ?? record.stopPrice;
+  }
+
+  /**
+   * 推进阶段：`partial_armed` → `trailing`，同时落**这一轮观测到的**极值与 ATR 快照。
+   *
+   * 只在**还停在这一态**时推进（`WHERE state = 'partial_armed'`），
+   * 所以事件重放不会重复推进、也不会重复挂单。返回 `false` = 「已经有人推进过了」。
+   *
+   * `stopPrice` 传的是**交易所上那张单的价**，不是这一轮算出来的新档：
+   * 新档要等订单真的挂上之后才写（见 {@link moveTrailStop}）。
+   *
+   * 早先这里直接写新档，于是「库里写着新档、交易所还挂着旧档」那一格**没人能修**：
+   * 定时器拿它当基准，算出来「没变」就不动了；而对账会一直报价格不符。
+   * 「阶段推进了但价位还没挪」是**可修**的，「价位写了但单没挂」不是。
+   */
+  async function advanceStage(
+    record: BracketRecord,
+    plan: TrailPlan,
+    snapshot: AtrSnapshot,
+  ): Promise<boolean> {
+    const key = { exchange, symbol: record.symbol, entryOrderId: record.entryOrderId };
+    const advanced = await markBracketTrailing(
+      pool,
+      key,
+      {
+        extreme: plan.extreme,
+        stopPrice: liveStopPrice(record),
+        atr: snapshot.atr,
+        atrFrom: plan.atrFrom,
+        atrTo: plan.atrTo,
+        // **不给 `slAlgoId`**：沿用进场那张止损单（它还在交易所上挂着，仍在保护仓位）。
+      },
+      now(),
+    );
+    return advanced > 0;
+  }
+
+  /**
+   * 把止损挪到新的一档：**挂新 → 撤旧 → 回填**（R-4.1）。
+   *
+   * 撤旧失败按 R-4.3 处理：**不推进档位**（`sl_algo_id` 仍是旧的，账面以旧档为准，
+   * 保守），但「新单已经挂上、旧单撤不掉」这件事必须写进 `trail_last_error`——
+   * 否则交易所上会多出一张没人认领的止损单，而账面看不出任何异常。
+   *
+   * 挂新失败会抛出去，由调用方处置：旧单仍在，仓位仍受保护。
+   */
+  async function moveTrailStop(
+    record: BracketRecord,
+    plan: TrailPlan,
+    snapshot: AtrSnapshot,
+  ): Promise<{ moved: boolean; failed: boolean }> {
+    const key = { exchange, symbol: record.symbol, entryOrderId: record.entryOrderId };
+    const observed = {
+      extreme: plan.extreme,
+      atr: snapshot.atr,
+      atrFrom: plan.atrFrom,
+      atrTo: plan.atrTo,
+    };
+    const placed = await placer.placeClosePositionOrder({
+      symbol: record.symbol,
+      side: record.positionSide === 'LONG' ? 'SELL' : 'BUY',
+      type: 'STOP_MARKET',
+      stopPrice: plan.stopPrice,
+      clientAlgoId: bracketClientOrderId(SL_TAG, record.entryOrderId),
+      workingType: settings.workingType,
+      priceProtect: settings.priceProtect,
+    });
+    if (record.slAlgoId !== null) {
+      try {
+        await placer.cancelAlgoOrder(record.slAlgoId);
+      } catch (cancelError) {
+        const reason =
+          `${record.symbol} 撤旧止损失败（条件单 ${record.slAlgoId} 可能仍在交易所挂着，` +
+          `新档 ${plan.stopPrice} 的单 ${placed.algoId} 已挂上）：${reasonOf(cancelError)}`;
+        await markBracketTrailNotMoved(pool, key, reason, now(), observed);
+        log.warn(reason);
+        return { moved: false, failed: true };
+      }
+    }
+    await markBracketTrailMoved(
+      pool,
+      key,
+      { stopPrice: plan.stopPrice, slAlgoId: placed.algoId, ...observed },
+      now(),
+    );
+    return { moved: true, failed: false };
   }
 
   /**
@@ -501,7 +666,6 @@ export function createExecutorService(deps: ExecutorServiceDeps): ExecutorServic
         stopAtrMult: settings.stopAtrMult,
         takeProfitAtrMult: settings.takeProfitAtrMult,
         takeProfit1Ratio: settings.takeProfit1Ratio,
-        takeProfit1AtrMult: settings.takeProfit1AtrMult,
         trailAtrMult: settings.trailAtrMult,
         breakevenAfterTp1: settings.breakevenAfterTp1,
       };
@@ -606,7 +770,7 @@ export function createExecutorService(deps: ExecutorServiceDeps): ExecutorServic
               symbol: update.symbol,
               side: plan.exitSide,
               type: 'TAKE_PROFIT_MARKET',
-              stopPrice: plan.tp1Price,
+              stopPrice: plan.takeProfitPrice,
               quantity: plan.tp1Qty,
               reduceOnly: true,
               clientAlgoId: bracketClientOrderId(TP_TAG, entryOrderId),
@@ -617,7 +781,9 @@ export function createExecutorService(deps: ExecutorServiceDeps): ExecutorServic
               symbol: update.symbol,
               side: plan.exitSide,
               type: 'TAKE_PROFIT_MARKET',
-              stopPrice: plan.mode === 'full' ? plan.tp1Price : plan.takeProfitPrice,
+              // `takeProfitPrice` 就是这一形态**实际挂出去**的价：
+              // single 用整段倍数算，full 用第一段倍数算（纯函数里已统一）。
+              stopPrice: plan.takeProfitPrice,
               clientAlgoId: bracketClientOrderId(TP_TAG, entryOrderId),
               workingType,
               priceProtect,
@@ -682,7 +848,10 @@ export function createExecutorService(deps: ExecutorServiceDeps): ExecutorServic
     // 预估口径随形态而变：`single` / `full` 是整段打到止盈；`partial` 只有第一段
     // 有确定的价格，剩余仓位由移动止损了结——那一段的价格会随行情上移，因此
     // 这里只报「第一段的收益」与「整段打到当前止损的亏损」。
-    const takeProfitPrice = plan.mode === 'single' ? plan.takeProfitPrice : plan.tp1Price;
+    //
+    // 两种形态挂出去的止盈价都是 `takeProfitPrice`：`partial` 下它是第一段的价
+    // （带数量的那张单），`single` 下它是全平那张单的价。
+    const takeProfitPrice = plan.takeProfitPrice;
     const takeProfitQty = plan.mode === 'partial' ? (plan.tp1Qty ?? 0) : update.cumulativeQty;
     const estimate = estimateBracketPnl({
       positionSide: plan.positionSide,
@@ -744,7 +913,6 @@ export function createExecutorService(deps: ExecutorServiceDeps): ExecutorServic
           stopAtrMult: policy.stopAtrMult,
           takeProfitAtrMult: policy.takeProfitAtrMult,
           takeProfit1Ratio: policy.takeProfit1Ratio,
-          takeProfit1AtrMult: policy.takeProfit1AtrMult,
           trailAtrMult: policy.trailAtrMult,
           breakevenAfterTp1: policy.breakevenAfterTp1,
         },
@@ -779,7 +947,6 @@ export function createExecutorService(deps: ExecutorServiceDeps): ExecutorServic
         stopAtrMult: policy.stopAtrMult,
         takeProfitAtrMult: policy.takeProfitAtrMult,
         takeProfit1Ratio: policy.takeProfit1Ratio,
-        takeProfit1AtrMult: policy.takeProfit1AtrMult,
         trailAtrMult: policy.trailAtrMult,
         breakevenAfterTp1: policy.breakevenAfterTp1,
       },
@@ -940,7 +1107,6 @@ export function createExecutorService(deps: ExecutorServiceDeps): ExecutorServic
       atrPeriod: snapshot.period,
       stopAtrMult: effective.stopAtrMult,
       takeProfitAtrMult: effective.takeProfitAtrMult,
-      takeProfit1AtrMult: effective.takeProfit1AtrMult,
       takeProfit1Ratio: effective.takeProfit1Ratio,
       tickSize,
       // 只在分批形态才读 LOT_SIZE；不分批时止盈单不带数量，不需要这个步长。
@@ -1014,8 +1180,10 @@ export function createExecutorService(deps: ExecutorServiceDeps): ExecutorServic
       },
       // 分批形态才带；其余形态这三项保持 undefined → 落库 NULL，
       // 而 `partial_armed` 的 CHECK 会要求它们齐全（漏了写不进去）。
+      // `tp1Price` 与 `takeProfitPrice` 同值：合并成一个止盈倍数之后只有一种止盈价，
+      // 这一列记的是「第一段那张单的触发价」，`take_profit` 记的是「这个仓位的止盈价」。
       ...(plan.mode === 'partial' && plan.tp1Qty !== null
-        ? { tp1Qty: plan.tp1Qty, tp1Price: plan.tp1Price }
+        ? { tp1Qty: plan.tp1Qty, tp1Price: plan.takeProfitPrice }
         : {}),
       now: now(),
     });
@@ -1135,21 +1303,24 @@ export function createExecutorService(deps: ExecutorServiceDeps): ExecutorServic
     /**
      * 跑一轮移动止损（v0.7.0）。定时器调用它，**必须先跑一次再进周期**。
      *
-     * 四条纪律（AGENTS.md §6.8）：
+     * 五条纪律（AGENTS.md §6.8）：
      *
-     * 1. **只动 `trailing` 行**。`armed` / `partial_armed` 的止损不该被移动——
+     * 1. **只动 `trailing` 行**，外加「TP1 已成交但没推进成功」的 `partial_armed` 行。
+     *    `armed` 与「TP1 还没成交」的 `partial_armed` 的止损不该被移动——
      *    那是进场保护，动了就变成另一套策略。
      * 2. **价没变就不挂撤**。绝大多数轮次是零动作，这是限频的主要来源。
      * 3. **先挂新、再撤旧**（R-4.1）。反过来会造出无保护窗口；两张 `closePosition`
      *    单在重叠期内最多是一次「无仓可平」的拒绝，不会反向开仓。
      * 4. **本轮不动 / 失败都要留下原因**（`trail_last_error`）。它与「看起来正常、
      *    而追踪其实已经停了三天」是同一件事的两面。
+     * 5. **「等推进」的行只推进它自己该推进的部分**：阶段往前挪，止损换不换档
+     *    仍按第 2 条判断（价位没变就不动交易所上的单）。
      *
      * 它**不修复**自己在对账里发现的漂移（例如「交易所有仓位、本地无记录」）：
      * 那类处置是人工决定（§6.5 第 1 条）。补挂只做「自己已经提交、只是没做完」的意图。
      */
     async trailOnce(): Promise<TrailReport> {
-      const report: TrailReport = { moved: 0, unchanged: 0, failed: 0, skipped: 0 };
+      const report: TrailReport = { advanced: 0, moved: 0, unchanged: 0, failed: 0, skipped: 0 };
       let records;
       try {
         records = await listTrailingBrackets(pool, exchange, now());
@@ -1164,27 +1335,73 @@ export function createExecutorService(deps: ExecutorServiceDeps): ExecutorServic
           continue;
         }
         const key = { exchange, symbol: record.symbol, entryOrderId: record.entryOrderId };
+        /**
+         * 「等推进」的行：第一段止盈**已经成交**（`tp1_filled_at` 非空），
+         * 但当时没能推进到 `trailing`（多半是极值取不到——行情没同步到开仓之后）。
+         *
+         * 它要做的**只是把阶段推进过去**，外加必要的换档；**不是**去动进场保护那张止损单
+         * （那是 `armed` / 未成交的 `partial_armed` 才有的事，见 §6.8 第 3 条）。
+         */
+        const pending = record.state === 'partial_armed';
         try {
           const policy = await resolvePolicyFor(record.symbol);
           const snapshot = await atr.atrAt(record.symbol, now(), record.entryTime, {
             interval: policy.atrInterval,
             period: policy.atrPeriod,
           });
+          // 极值取不到 → **本轮不移动止损、保留上一档**（v0.7.0 R-6.5）。
+          // 它**不是**失败：仓位仍受上一档止损保护，只是不动它。
+          // 所以这里单独判，不落进下面的 catch（catch 是「本轮失败」语义）。
+          if (snapshot.extreme === null) {
+            report.unchanged += 1;
+            const reason =
+              `${record.symbol} 持仓期极值取不到（持仓期内还没有已收盘的 ${policy.atrInterval} K 线）：` +
+              '本轮不移动止损，保留上一档';
+            await markBracketTrailNotMoved(pool, key, reason, now()).catch(() => undefined);
+            log.warn(reason);
+            continue;
+          }
           const plan = await planTrail(record, policy, snapshot);
           const observed = {
             extreme: plan.extreme,
             atr: snapshot.atr,
-            atrFrom: snapshot.extreme.from,
-            atrTo: snapshot.extreme.to,
+            atrFrom: plan.atrFrom,
+            atrTo: plan.atrTo,
           };
 
+          // ① 「等推进」的行：先把**阶段**推进过去。
+          //
+          // 这一步只写阶段与观测（极值 / ATR），**不动交易所上的单**——
+          // 换档在下面统一做，免得两个地方各挂一次。
+          if (pending) {
+            const advanced = await advanceStage(record, plan, snapshot);
+            if (!advanced) {
+              // 已经有人推进过了（事件重放 / 另一条路径）。这轮不重复动单。
+              report.unchanged += 1;
+              continue;
+            }
+            report.advanced += 1;
+            log.info(
+              `${record.symbol} 第一段止盈已成交，推进到移动止损` +
+                `（极值 ${plan.extreme}，ATR ${snapshot.atr}）`,
+            );
+          }
+
+          // ② 换档：价没变就不挂撤。
+          //
           // `slAlgoId` 为空 = 崩在「已置 trailing、还没挂止损」那一格。
           // 这种情况下**即使价位没变也必须挂**，否则这一格永远补不上。
           const mustPlace = record.slAlgoId === null;
           if (!plan.changed && !mustPlace) {
-            report.unchanged += 1;
+            // 「等推进」且这一档没变：进场那张止损单**正好就在这一档上**，
+            // 所以交易所上不用动，阶段也已经在上面推进过了。
+            if (!pending) {
+              report.unchanged += 1;
+            }
             if (plan.reason !== 'unchanged') {
               // 越过现价这类「本轮不动」必须可见；`unchanged` 本身不是事件，不写。
+              // **推进了阶段也一样要写**：这一行刚被接管，「为什么没挪」正是
+              // 下一个人要看的第一件事。
               await markBracketTrailNotMoved(
                 pool,
                 key,
@@ -1197,47 +1414,22 @@ export function createExecutorService(deps: ExecutorServiceDeps): ExecutorServic
             continue;
           }
 
-          const placed = await placer.placeClosePositionOrder({
-            symbol: record.symbol,
-            side: record.positionSide === 'LONG' ? 'SELL' : 'BUY',
-            type: 'STOP_MARKET',
-            stopPrice: plan.stopPrice,
-            clientAlgoId: bracketClientOrderId(SL_TAG, record.entryOrderId),
-            workingType: settings.workingType,
-            priceProtect: settings.priceProtect,
-          });
-          if (record.slAlgoId !== null) {
-            try {
-              await placer.cancelAlgoOrder(record.slAlgoId);
-            } catch (cancelError) {
-              // 撤旧失败：**不推进档位**。新单已挂上、旧的也还在，账面上以旧档为准
-              // （保守），下一轮重试。把原因写下来，否则这处重叠会安静地存在。
-              await markBracketTrailNotMoved(
-                pool,
-                key,
-                `${record.symbol} 撤旧止损失败（条件单 ${record.slAlgoId} 可能仍在交易所挂着，` +
-                  `新档 ${plan.stopPrice} 的单 ${placed.algoId} 已挂上）：${reasonOf(cancelError)}`,
-                now(),
-                observed,
-              );
-              log.warn(
-                `${record.symbol} 撤旧止损 ${record.slAlgoId} 失败，新档 ${plan.stopPrice} 已挂上但未推进档位`,
-              );
-              report.failed += 1;
-              continue;
-            }
+          const result = await moveTrailStop(record, plan, snapshot);
+          if (result.failed) {
+            report.failed += 1;
+            continue;
           }
-          await markBracketTrailMoved(
-            pool,
-            key,
-            { stopPrice: plan.stopPrice, slAlgoId: placed.algoId, ...observed },
-            now(),
-          );
           report.moved += 1;
           log.info(
             `${record.symbol} 移动止损 ${
-              mustPlace ? '补挂' : record.trailStopPrice !== null ? '上移' : '初始化'
-            }到 ${plan.stopPrice}（极值 ${plan.extreme}，ATR ${snapshot.atr}）`,
+              pending
+                ? '推进到'
+                : mustPlace
+                  ? '补挂'
+                  : record.trailStopPrice !== null
+                    ? '上移'
+                    : '初始化'
+            } ${plan.stopPrice}（极值 ${plan.extreme}，ATR ${snapshot.atr}）`,
           );
         } catch (error) {
           report.failed += 1;
@@ -1266,19 +1458,16 @@ function describeTrailReason(reason: TrailingReason): string {
 }
 
 /**
- * 人话摘要。三种形态的日志必须让人一眼看出「挂的是全平还是减仓」——
+ * 人话摘要。两种形态的日志必须让人一眼看出「挂的是全平还是减仓」——
  * 「两套保护看起来一样」正是分批止盈最容易出事的地方。
  */
 function describeStaged(plan: StagedPlan): string {
   const head = `入场 ${plan.entryPrice} ATR=${plan.atr} 止损 ${plan.stopPrice}`;
   if (plan.mode === 'partial') {
     return (
-      `${head} 第一段止盈 ${plan.tp1Price} × ${plan.tp1Qty}` +
+      `${head} 第一段止盈 ${plan.takeProfitPrice} × ${plan.tp1Qty}` +
       `（${(plan.ratio * 100).toFixed(2)}% 仓位），剩余由移动止损了结`
     );
-  }
-  if (plan.mode === 'full') {
-    return `${head} 一次性止盈 ${plan.tp1Price}（全平）`;
   }
   return `${head} 止盈 ${plan.takeProfitPrice}（全平）`;
 }

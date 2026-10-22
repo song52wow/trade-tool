@@ -240,6 +240,15 @@ apps/cli/src/index.ts   apps/sync/src/main.ts   apps/web/src/main.ts   apps/exec
     [`packages/data/README.md`](packages/data/README.md#写边界)：K 线、水位、`sync_state` 的推进
     **全部在 Python 侧的事务里**完成（因为 `COPY` 只发生在 Python 进程内），TS 侧只写标的集合
     这类元数据。
+12. **删列之前先看有没有约束提到它**：PostgreSQL 的 `DROP COLUMN` 会**自动删掉引用该列的
+    CHECK 约束**，而且**一声不响**——迁移跑完、版本对得上、schema 看着还是「迁移过的样子」，
+    守门人却已经没了。2026-10-21 实测踩到：迁移 `014` 退役
+    `risk_bracket.decision_take_profit1_atr_mult`，顺带删掉了
+    `risk_bracket_decision_llm_params_check`（「LLM 决策的数必须齐全」那条联合约束），
+    直到有人去查约束才发现，补在迁移 `015` 里。
+    **新迁移退役任何一列之前，先 `SELECT conname, pg_get_constraintdef(oid) FROM pg_constraint
+WHERE conrelid = '<table>'::regclass` 查一遍**，被顺带删掉的约束要用新迁移补回来
+    （补回来的那条**语义要一样**，只是少了已退役的字段）。
 
 ## 6 各层规矩
 
@@ -270,21 +279,23 @@ web / sync / executor 三个容器同时启动，三个容器各自在入口里�
 按 schema 划分），把并发迁移串行化。**别删这把锁，也别改成 try 版本**：
 try 版本会让第二个进程「拿不到锁就跳过」，那正是「库还是旧的就启动了」的静默失败。
 
-| 迁移                    | 内容                                                                                                    |
-| ----------------------- | ------------------------------------------------------------------------------------------------------- |
-| `001_init`              | `klines_1m`、`gaps`、`symbols`、`sync_state`、`contract_spec`、`weight_budget`、`schema_migrations`     |
-| `002_sync_plan`         | `sync_state.plan_*`（首次全量的规模预估，开启之前就写进去）                                             |
-| `003_daemon_heartbeat`  | `daemon_heartbeat`                                                                                      |
-| `004_klines_agg`        | `klines_{15m,1h,4h,1d}`（列与 `klines_1m` 逐列一致）                                                    |
-| `005_indicators`        | `indicator_{ma,macd,rsi,boll,kdj,atr,obv}`                                                              |
-| `006_risk_bracket`      | `risk_bracket`（幂等锚点 + ATR 快照 + `last_error`）                                                    |
-| `007_executor_settings` | `executor_credentials`（密文 + 末 4 位提示）、`risk_policy`（global / symbol 两作用域）                 |
-| `008_algo_order_ids`    | `risk_bracket` 的条件单编号列改名（Algo 编号空间，与普通 orderId 不通）                                 |
-| `009_reconcile_run`     | `reconcile_run`（观测快照）                                                                             |
-| `010_risk_trailing`     | 两段止盈的阶段（`partial_armed` / `trailing`）与移动止损档位。**v0.7.0 设计，未落地**                   |
-| `011_notify_settings`   | 飞书通知通道的运行期设置（v0.8.0）：地址与签名密钥**密文**落库 + 开关与参数。**新增迁移，两侧都要登记** |
-| `012_trade_pnl`         | 盈亏的**事实**（v0.8.0）：`risk_bracket` 增累计平仓量 / 成交额 / 手续费；通知内容类型扩到 11 种         |
-| `013_llm_decision`      | LLM 决策的留痕（v0.9.0）：`risk_bracket` 增决策来源 / 生效档位 / 理由 / 降级原因                        |
+| 迁移                           | 内容                                                                                                                                                                                                                                               |
+| ------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `001_init`                     | `klines_1m`、`gaps`、`symbols`、`sync_state`、`contract_spec`、`weight_budget`、`schema_migrations`                                                                                                                                                |
+| `002_sync_plan`                | `sync_state.plan_*`（首次全量的规模预估，开启之前就写进去）                                                                                                                                                                                        |
+| `003_daemon_heartbeat`         | `daemon_heartbeat`                                                                                                                                                                                                                                 |
+| `004_klines_agg`               | `klines_{15m,1h,4h,1d}`（列与 `klines_1m` 逐列一致）                                                                                                                                                                                               |
+| `005_indicators`               | `indicator_{ma,macd,rsi,boll,kdj,atr,obv}`                                                                                                                                                                                                         |
+| `006_risk_bracket`             | `risk_bracket`（幂等锚点 + ATR 快照 + `last_error`）                                                                                                                                                                                               |
+| `007_executor_settings`        | `executor_credentials`（密文 + 末 4 位提示）、`risk_policy`（global / symbol 两作用域）                                                                                                                                                            |
+| `008_algo_order_ids`           | `risk_bracket` 的条件单编号列改名（Algo 编号空间，与普通 orderId 不通）                                                                                                                                                                            |
+| `009_reconcile_run`            | `reconcile_run`（观测快照）                                                                                                                                                                                                                        |
+| `010_risk_trailing`            | 两段止盈的阶段（`partial_armed` / `trailing`）与移动止损档位。**v0.7.0 设计，未落地**                                                                                                                                                              |
+| `011_notify_settings`          | 飞书通知通道的运行期设置（v0.8.0）：地址与签名密钥**密文**落库 + 开关与参数。**新增迁移，两侧都要登记**                                                                                                                                            |
+| `012_trade_pnl`                | 盈亏的**事实**（v0.8.0）：`risk_bracket` 增累计平仓量 / 成交额 / 手续费；通知内容类型扩到 11 种                                                                                                                                                    |
+| `013_llm_decision`             | LLM 决策的留痕（v0.9.0）：`risk_bracket` 增决策来源 / 生效档位 / 理由 / 降级原因                                                                                                                                                                   |
+| `014_take_profit_single_mult`  | 止盈倍数**合并成一个**（v0.9.0）：退役 `risk_policy.take_profit1_atr_mult` 与 `risk_bracket.decision_take_profit1_atr_mult`；`take_profit1_ratio` 的 CHECK 收紧为 `< 1`。**新增迁移，两侧都要登记**                                                |
+| `015_restore_llm_params_check` | 补回「LLM 决策的数必须齐全」那条**联合约束**（v0.9.0）：014 用 `DROP COLUMN` 退役 `decision_take_profit1_atr_mult` 时，PostgreSQL **自动删掉了引用它的 CHECK**，于是这条守门人无声消失。**删列前先看有没有约束提到它**。**新增迁移，两侧都要登记** |
 
 ### 6.1 派生周期层（v0.2.0）
 
@@ -399,6 +410,13 @@ BOLL 的 `k` 以**千分之一整数** `kMilli` 存（浮点参数不得进主�
    Binance 已于 2025-08-27 关停老 Futures Testnet，`testnet.binancefuture.com` 只在
    **尚未更新的单 endpoint 文档页**里出现；权威来源是 General Info 页——它同时也是上面
    那个 demo host 的权威来源。
+   **本仓库只跑 demo，不接主网**（2026-10-21 用户明确要求）：`executor.environment` 一律
+   `demo`，验证也在 Demo Trading 上做（虚拟资金，但挂单 / 成交 / 对账链路与主网逐字相同）。
+   **不要**把它改成 `live`、也不要用主网凭据做验证。
+   ⚠️ `executorSchema.environment` 的**缺省仍是 `live`**（schema 的缺省是生产部署那条路的
+   语义，不在这里动），所以「配置里漏写这个字段」= 连主网下真单。因此**每一份配置文件都要
+   显式写出来**：`.local/trade-tool.config.json` 与 `deploy/config/trade-tool.config.json`
+   都写着 `demo`。新增配置文件时同样要写，别靠缺省。
 7. **开仓 / 减仓 / 平仓由净仓位的符号判定，不由成交方向判定**（v0.4.1 支持做空时新增）。
    「一笔 SELL 是开空仓还是平多仓」不能只看方向——交易所的净仓位才是事实。
    v0.4.0 的「`side !== 'BUY'` 即忽略」在只做多时成立，支持做空后它是**错的**：
@@ -546,6 +564,11 @@ v0.5.0 把「密钥只从环境变量读」改成「**也可以从控制面录�
 4. **严重度按「仓位是否有止损保护」分档**，不按「是否异常」分。「本地记着已挂单却没有止损单」
    是紧急，「只有止损没止盈」只是注意；合成一档就是把最要紧的那种淹掉。七个差异类型的严重度见
    [`README.md`](README.md) 的对账表。
+5. **「这一阶段的形态上该有什么」由事实判，不由「有没有」判**。`trailing` 行本来就没有止盈单，
+   `partial_armed` 行在**第一段成交后**（`tp1_filled_at` 有值）那张单也**本来就该消失**。
+   没有这条事实时，对账只能把「止盈单不见了」一律报成差异——那是一条**每轮都发**的假警报，
+   而假警报是让整份报告失去可信度的最快方式（§6.5 第 2 条）。
+   `tp1_filled_at` 就是这条事实（v0.9.1 起才真的有代码写它，见 §6.8.3）。
 
 对账**必须出网**（签名访问私有接口），因此**自动周期对账放在 `apps/executor`**（本来就常驻、
 本来就持有凭据、本来就在用户数据流旁边），**控制面不许再起守护进程**；控制面只保留一条
@@ -681,10 +704,16 @@ v0.5.0 把「密钥只从环境变量读」改成「**也可以从控制面录�
    会让止损一开始就偏宽）。
    极值取不到只是「本轮不调整、保留上一档 + 可见原因」，它**不是** `RISK_ATR_UNAVAILABLE`
    （后者要拒绝下单），两者严重度不同，不许混成一个码。
+   **「取不到」在摘要里是 `extreme: null`，不是抛错、不是 0、也不是缺字段**：
+   极值与 ATR 在**同一次取数**里，Python 侧一抛错就把 ATR 一起带走，调用方只能把整次取数
+   当成「ATR 不可用」而**拒绝下单**——而「刚开仓」时持仓期内一根已收盘 K 线都没有，
+   极值**必然**取不到，于是**新开仓永远挂不上保护单**（成交事件不会重放，没有第二次机会），
+   仓位从此裸奔。2026-10-21 实测踩到并修掉（见 §6.8.1）。
 5. **阶段由 `state` 表达，不新增 `stage` 列**：`armed` / `partial_armed` / `trailing` /
    `take_profit` / `stop_loss` / `cancelled` / `failed`，迁移只**追加** CHECK 的取值。
    `trailing` 行**只有一张止损单**；`atr` / `stop_price` / `take_profit` 三列保持入场时的值不变
-   （它们记的是「第一段为什么这么算」），移动中的那一档写在 `trail_stop_price`。
+   （它们记的是「第一段为什么这么算」），移动中的那一档写在 `trail_stop_price`
+   （= **交易所上那张止损单现在的价**，见 §6.8.3 第 3 条）。
 
 还有两条跨层的硬约束：
 
@@ -706,6 +735,102 @@ v0.5.0 把「密钥只从环境变量读」改成「**也可以从控制面录�
 2026-10-17 已评估并**否决**：它的距离是**固定百分比，不随波动率变化**。要的是「距离跟着
 ATR 走」，所以走自建 Chandelier（附录 §F.2 有完整对比）。另外它的 `orderType` 会让
 `packages/core/src/risk-ids.ts` 的 `algoOrderTag` 直接抛错，真要用还得先补那一类。
+
+#### 6.8.1 止盈倍数合并成一个（v0.9.0 追说明）
+
+v0.7.0 的原文把止盈拆成「整段倍数 `takeProfitAtrMult`」与「第一段倍数 `takeProfit1AtrMult`」
+两个数，各有各的输入框、各有各的列。**v0.9.0 起只留一个止盈倍数**——因为两个数表达的是
+同一件事（「涨到离入场多少个 ATR」），拆成两个输入框只是让用户把同一个答案填两遍，
+还多出一份「哪个数当前生效」的判断。需求原文不改（那是历史验收记录），变更记在这里。
+
+四条不可协商的规则：
+
+1. **止盈倍数只有一个**：`executor.takeProfitAtrMult`。`takeProfit1AtrMult` 从配置 schema、
+   `risk_policy` 表、`risk_bracket` 留痕列、LLM 决策结构、web DTO 与表单里**全部消失**
+   （迁移 `014_take_profit_single_mult` 直接 `DROP COLUMN`，不留空壳——留着会诱导写出第二份实现）。
+2. **比例从三档变两档**：`takeProfit1Ratio` 的 `0` = 不分批（一张 `closePosition` 全平止盈单），
+   `1–99` = 分批（先按比例减仓，剩余仓位进 `trailing`）。原先的 `100%` 那一档**不是被删了，
+   而是被归一到 `0`**——动态策略下模型给的是一组数，`0` 与 `100%` 会挂出不同的价，
+   直接删会丢表达力；合并成单一倍数后两者逐字等价。
+3. **归一只有一份实现**：`packages/core/src/risk-policy.ts` 的 `normalizeTakeProfit1Ratio`
+   （`1 → 0`，越界抛 `CONFIG_INVALID`）。配置 schema 用 `.transform` 复用它，
+   `deriveStagedPlan` 与 LLM 决策校验都调它。**决策留痕必须在落库前归一**
+   （`clampLlmDecision` 里做），否则会留下「留痕记 1、实际按 0 算」的错位。
+4. **比例的 CHECK 收紧为 `< 1`**（迁移 014，`risk_policy` 与 `risk_bracket` 两处都改）：
+   `1` 不是非法值但已被归一，写库前就该被挡住。
+
+`risk_bracket.tp1_price` 列与 `partial_armed` 的 staged_check **保留不动**：它与 `take_profit`
+现在同值但概念不同（第一段那张单的触发价 vs 这个仓位的止盈价），将来若变成真两段止盈各有用处。
+
+#### 6.8.2 极值取不到时摘要回 `null`（v0.9.0 追说明）
+
+2026-10-21 实测踩到并修掉的缺陷：**新开仓挂不上任何保护单**。它与 §6.8.1 无关，
+是 v0.7.0 遗留的，实现 v0.7.0 时没暴露（单元测试的入场时刻都在过去）。
+
+成因是一条链：极值与 ATR 在**同一次取数**里（§6.8 第 4 条的 R-6.2）→ Python 侧
+`compute_position_extreme` 在「持仓期内一根已收盘 K 线都没有」时**抛错** → 一次抛错把
+**同一次调用里的 ATR 一起带走** → TS 侧只看到「这次取数失败了」→ 按 §6.3 第 3 条
+「取不到就拒绝下单」**拒绝挂单** → 成交事件**不会重放**，于是这笔仓位永远没有保护单。
+
+而「持仓期内一根已收盘 K 线都没有」**不是异常，是刚开仓的常态**：成交后几秒内
+没有任何一根 K 线收盘，持仓期与「已收盘 K 线」的交集必然为空（`atrInterval` 配成 1h 时
+要等一小时，配 1m 也要等一分钟——但那一次机会早过了）。
+
+三条不可协商的规则：
+
+1. **极值取不到时摘要里的 `extreme` 是 `null`**，不是抛错、不是 0、不是 NaN、
+   也不是「缺字段」。缺字段是契约破损（Python 侧版本不对），那要报错；
+   `null` 是「这一项本轮没有」，是合法状态。**0 更不行**：0 会被当成价格算进
+   Chandelier 公式，于是止损位变成一个从未成交过的价。
+2. **调用方按 R-6.5 处置**：`null` → **本轮不移动止损、保留上一档** + 可见原因
+   （`trail_last_error` + 日志），**不是**「本轮失败」，更**不是**「拒绝下单」。
+   仓位仍受上一档止损保护，所以它比「失败」轻。
+3. **ATR 与极值仍然是同一次取数**（R-6.2 不变）。不为了绕开这个缺陷而拆成两次调用——
+   两次取数之间会落进一根新 bar，公式随即失去意义。
+
+改这一处时**两侧要同提交改**：`quant_data/risk.py` 的摘要形状（`extreme` 可空）与
+`apps/executor/src/atr.ts` 的校验（`null` 合法、缺字段报错）是同一个契约的两端。
+
+#### 6.8.3 第一段成交之后：事实先落库、推进可重试、档位口径反过来（v0.9.1 追说明）
+
+2026-10-21 实测踩到的缺陷：**第一段止盈成交之后，移动止损可能永远不接管**。
+止损单还挂在交易所上（仓位没裸奔），但它**再也不跟着价格上移**——人只会看到一行报错。
+
+成因是三层，一层套一层：
+
+1. **「TP1 成交过」这个事实没有单独落库**。它只是 `markBracketTrailing`（推进到 `trailing`）
+   的副作用——推进一失败，这一整段就**没影了**：成交价、数量、手续费都没记（盈亏少算一段），
+   而且**没有任何东西能证明「TP1 成交过」**。没有证据就没有重试。
+2. **移动止损定时器的工作集合只取 `trailing` 行**。卡在 `partial_armed` 的那行根本不在集合里，
+   于是**没有任何东西会重试它**。失败原因写进了 `trail_last_error`，看着「有原因、很安全」，
+   实际上那一笔仓位永远进不了移动止损。
+3. **更隐蔽的一层**：`trail_stop_price` 记的是「这一轮**打算**挪到的那一档」，而订单是**之后**
+   才挂的。于是「库里写了新档、交易所还挂着旧单」那一格**谁也修不了**：定时器拿它当基准，
+   算出来「没变」就不动了；对账则一直报价格不符。**推进成功也不等于止损挪了。**
+
+四条不可协商的规则：
+
+1. **「TP1 已成交」必须先落库，且幂等**（`recordBracketTp1Fill`，`WHERE tp1_filled_at IS NULL`）。
+   成交了就是成交了，**与「能不能算出移动止损」无关**：极值取不到、ATR 取不到，都不许把这一段
+   吞掉。累积的平仓事实（量 / 成交额 / 手续费）也从这里记一次，重投事件**不许重复累加**
+   （累加两次算出来的净盈亏是错的，而且错得看不出来）。
+2. **移动止损的工作集合必须包含「TP1 已成交但没推进成功」的行**
+   （`partial_armed` 且 `tp1_filled_at` 非空）。「当时算不出来」是**暂时**的
+   （行情没同步到开仓之后那种），过一会儿就该重试。
+   ⚠️ `partial_armed` 但 `tp1_filled_at` **为空**的行**不在**集合里——那是「TP1 还没成交」，
+   属于进场保护，止损不该被移动（§6.8 第 3 条）。
+3. **`trail_stop_price` 记的是交易所上那张止损单现在的价**，不是「打算挪到的那一档」。
+   新档要等订单**真的挂上之后**才写（`markBracketTrailMoved`）。理由很直白：
+   「阶段推进了、价位还没挪」是**可修**的（定时器下一轮接着挪），「价位写了、单还没挂」不可修。
+   推进阶段（`markBracketTrailing`）只写阶段与观测（极值 / ATR 快照）。
+4. **推进阶段与换档是两件事，两处各有一个唯一实现点**：
+   `markBracketTrailing` 的 WHERE 只认 `partial_armed`（重放安全：第二次拿不到行），
+   `markBracketTrailMoved` 的 WHERE 只认 `trailing`。
+   **成交事件路径与移动止损定时器共用同一对函数**——同一个动作有两份实现，
+   迟早会有一份先坏掉（这正是第 1 条的成因）。
+
+撤旧失败仍按 R-4.3：不推进档位（账面以旧档为准，保守）、记 `trail_last_error`、
+下一轮重试。阶段推进了但换档失败时，失败原因同样要常驻可见。
 
 ### 6.9 通知层（v0.8.0）
 

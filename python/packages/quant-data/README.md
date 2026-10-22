@@ -35,9 +35,21 @@ uv run python -m quant_data generate --symbol BTCUSDT --interval 1h --bars 500
 - `pg.py` — 存储层：`COPY` 进临时表再 `INSERT … SELECT … ON CONFLICT`（R-3.1）、
   `SymbolLock` 单写者（R-3.3）、水位由 `max(time)` 推导（R-9.6）、
   `ensure_schema` 双向比对迁移版本（库落后与库超前都报 `SCHEMA_VERSION_MISMATCH`）。
+  比对用的版本清单是 `pg.KNOWN_MIGRATION_VERSIONS`：**新增 `packages/data/sql/*.sql` 时必须
+  在同一提交里往这里加一行**，否则 Python 侧会认为「库比代码新」，于是**所有**碰 PG 的用例
+  一起报 `SCHEMA_VERSION_MISMATCH`——症状离病因很远，排查时先看这里。
 - `ratelimit.py` — **进程全局**权重预算（R-20）：令牌桶落在 PG 的 `weight_budget` 单行表里，
   多个子进程天然共用；每次成功响应把 `X-MBX-USED-WEIGHT-1M` 并回本地计数（只增不减），
   429/418 时写 `pause_until` 实现全局暂停（R-21.4）。
+- `risk.py` — 买入成交 → 风控参数的取数端（`risk-atr`）：按成交时刻取**已收盘且连续**的一段
+  K 线，算 Wilder ATR（公式在 `quant_core`，本模块不含任何指标公式）并同时回**持仓期极值**
+  与末根收盘价（一次取数，R-6.2）。
+  ⚠️ 摘要里的 **`extreme` 可以是 `null`**：持仓期内一根已收盘 K 线都没有时极值取不到，
+  而**这正是刚开仓时的常态**（成交后几秒内没有任何一根 K 线收盘）。
+  此时 **ATR 照常回、极值如实回 `null`，不抛错**——抛错会把同一次调用里的 ATR 一起带走，
+  调用方只能当成「ATR 不可用」而拒绝下单；成交事件不会重放，于是**新开仓永远挂不上保护单**，
+  仓位从此裸奔（2026-10-21 实测踩到并修掉）。
+  `null` 与「缺字段」是两件事：缺字段是契约破损（TS 侧版本不对），那要报错。
 
 **表结构以 `packages/data/sql/*.sql` 为唯一来源**，本包不持有影子定义（R-2.5）。
 

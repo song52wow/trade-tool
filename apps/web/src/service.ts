@@ -506,7 +506,6 @@ export function createWebRuntime(config: TradeToolConfig): WebRuntime {
         stopAtrMult: body.stopAtrMult,
         takeProfitAtrMult: body.takeProfitAtrMult,
         takeProfit1Ratio: percentToRatio(body.takeProfit1Percent),
-        takeProfit1AtrMult: body.takeProfit1AtrMult,
         trailAtrMult: body.trailAtrMult,
         breakevenAfterTp1: body.breakevenAfterTp1,
         now: Date.now(),
@@ -545,7 +544,6 @@ function toPolicyDto(row: {
   stopAtrMult: number;
   takeProfitAtrMult: number;
   takeProfit1Ratio: number;
-  takeProfit1AtrMult: number;
   trailAtrMult: number;
   breakevenAfterTp1: boolean;
   scope?: 'global' | 'symbol';
@@ -559,7 +557,6 @@ function toPolicyDto(row: {
     stopAtrMult: row.stopAtrMult,
     takeProfitAtrMult: row.takeProfitAtrMult,
     takeProfit1Percent: ratioToPercent(row.takeProfit1Ratio),
-    takeProfit1AtrMult: row.takeProfit1AtrMult,
     trailAtrMult: row.trailAtrMult,
     breakevenAfterTp1: row.breakevenAfterTp1,
     scope: row.scope ?? 'global',

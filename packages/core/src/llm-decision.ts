@@ -23,10 +23,20 @@
  * ## 三个刻意的边界
  *
  * - **模型不选「用不用分批」**：`takeProfit1Ratio` 是倍数族里的一个，它为 0 就退化成
- *   单段止盈。这是**参数**不是**方法**，方法切换留给 §6.3 的 `mode` 三形态。
+ *   单段止盈。这是**参数**不是**方法**，方法切换留给 §6.3 的 `mode` 两形态。
  * - **模型不选 ATR 周期**：`atrInterval` 决定了取哪根 K 线算 ATR，那是**取数口径**，
  *   不是档位。模型改它会让「ATR 快照」与「档位倍数」来自两套口径。
  * - **模型不输出方法名**：见上一条，`mode` 由 `takeProfit1Ratio` 推出。
+ *
+ * ## 为什么只有一个止盈倍数
+ *
+ * v0.9.0 原本要模型输出**两个**止盈倍数（整段 / 第一段）。但分批形态下「整段止盈价」
+ * 压根不挂单——剩余仓位交给移动止损——那个数是**虚构的**。模型输出它就会遇到
+ * 「我输出的某个数被悄悄忽略」，而它自己不知道（`validateLlmDecision` 那时也没有
+ * 拦下「第一段比整段还远」这种自相矛盾的组）。
+ *
+ * 现在只有一个 `takeProfitAtrMult`：它是「这次要卖的那部分，涨到离入场多远就卖」。
+ * 模型于是**输出的每个数都会被用到**。
  *
  * ## 越界怎么办
  *
@@ -42,6 +52,7 @@
 import { z } from 'zod';
 
 import { SyncError } from './market-sync.js';
+import { normalizeTakeProfit1Ratio } from './risk-policy.js';
 
 /**
  * 模型可决定的参数族。
@@ -53,12 +64,18 @@ import { SyncError } from './market-sync.js';
 export const llmDecisionSchema = z.object({
   /** 止损距入场价的 ATR 倍数。 */
   stopAtrMult: z.number().positive().max(20),
-  /** 止盈距入场价的 ATR 倍数。 */
+  /**
+   * 止盈距入场价的 ATR 倍数。
+   *
+   * 不分批时它是**全平**目标；分批时它是**先兑现那一段**的目标（剩下的交给移动止损）。
+   */
   takeProfitAtrMult: z.number().positive().max(50),
-  /** 第一段减仓比例，`[0, 1]`。`0` = 关闭分批。 */
+  /**
+   * 第一段减仓比例，`[0, 1]`。`0` = 关闭分批。
+   *
+   * `1` 会先归一到 `0`（两者逐字等价，见 {@link normalizeTakeProfit1Ratio}）。
+   */
   takeProfit1Ratio: z.number().min(0).max(1),
-  /** 第一段止盈的 ATR 倍数。 */
-  takeProfit1AtrMult: z.number().positive().max(50),
   /** 移动止损的 Chandelier 倍数。 */
   trailAtrMult: z.number().positive().max(20),
   /** 第一段兑现后是否把止损上移到保本位。 */
@@ -166,13 +183,15 @@ function stripFence(raw: string): string {
 /**
  * 一份决策能不能直接用。
  *
- * 除了字段级范围（schema 已经查过），这里查**跨字段的语义约束**：
- * 分批形态下，第一段止盈必须比整段止盈更靠近入场价，否则「先兑现的一段反而更远」
- * 是自相矛盾的配置。
+ * 字段级范围由 schema 查过；这里查**归一之后**还成不成立。
  *
- * 注意 `deriveStagedPlan` 里也有同样的判断——但那是**下单时**的最终防线。
- * 这里提前拦是为了让「模型给的这份决策不可用」在**决策落库前**就暴露，
- * 而不是等到真实成交时才失败（那时仓位已经裸了几秒）。
+ * v0.9.0 原本在这里查「分批时第一段止盈必须比整段止盈更近」——那是**两个**止盈倍数
+ * 之间的比较。合并成一个倍数之后没有第二个数可比，这条约束连同它挡住的
+ * 自相矛盾配置一起消失了（分批形态下本来就没有「整段止盈」这个概念：
+ * 剩余仓位交给移动止损，不挂第二张止盈单）。
+ *
+ * 函数**保留**：调用方在决策落库前用它兜一道底，而且它是「以后再加跨字段约束」的
+ * 唯一落点——不让每个调用方各写一份。
  *
  * @param atrPeriod 只用于错误信息里说明是哪套参数。
  */
@@ -180,17 +199,14 @@ export function validateLlmDecision(
   decision: LlmDecision,
   atrPeriod: number,
 ): { ok: true } | { ok: false; reason: string } {
-  const ratio = decision.takeProfit1Ratio;
-  // 只有「真的分批」形态才需要比较两段止盈的远近。
-  // ratio = 0 是单段，ratio = 1 是全平（用第一段的价），两者都不存在「先后」。
-  if (ratio <= 0 || ratio >= 1) return { ok: true };
-  if (decision.takeProfit1AtrMult >= decision.takeProfitAtrMult) {
+  try {
+    normalizeTakeProfit1Ratio(decision.takeProfit1Ratio);
+  } catch {
     return {
       ok: false,
       reason:
-        `第一段止盈(${decision.takeProfit1AtrMult}×ATR) 必须比整段止盈` +
-        `(${decision.takeProfitAtrMult}×ATR) 更靠近入场价，否则「先兑现的一段」反而更远` +
-        `（ATR 周期 ${String(atrPeriod)}）`,
+        `第一段减仓比例必须在 [0, 1] 内（收到 ${String(decision.takeProfit1Ratio)}，` +
+        `ATR 周期 ${String(atrPeriod)}）`,
     };
   }
   return { ok: true };
@@ -206,15 +222,16 @@ export function validateLlmDecision(
  * 有 CHECK 约束。一份越界的决策写进去会报一个数据库层面的 `INTERNAL_ERROR`，
  * 那句话完全指不出「是模型给的档位越界」。在这里夹住，错误信息能直指原因。
  *
- * **只夹数值到边界，不改结构**：`takeProfit1Ratio` 是 0.999999 会夹到 1（等于全平），
- * 但不会改成别的形态——形态是策略语义，模型说了什么就是什么。
+ * **只夹数值到边界，不改结构**：`takeProfit1Ratio` 是 0.999999 会夹到 1，
+ * 而 1 与 0 逐字等价，随后由 {@link normalizeTakeProfit1Ratio} 归一到 0——
+ * 归一**必须发生在这里**（落库前），否则留痕记的是 1、实际按 0 算，
+ * 事后对不上「当时用的哪套档位」。
  */
 export function clampLlmDecision(decision: LlmDecision): LlmDecision {
   return {
     stopAtrMult: clamp(decision.stopAtrMult, 0.0001, 20),
     takeProfitAtrMult: clamp(decision.takeProfitAtrMult, 0.0001, 50),
-    takeProfit1Ratio: clamp(decision.takeProfit1Ratio, 0, 1),
-    takeProfit1AtrMult: clamp(decision.takeProfit1AtrMult, 0.0001, 50),
+    takeProfit1Ratio: normalizeTakeProfit1Ratio(clamp(decision.takeProfit1Ratio, 0, 1)),
     trailAtrMult: clamp(decision.trailAtrMult, 0.0001, 20),
     breakevenAfterTp1: decision.breakevenAfterTp1,
   };
@@ -240,7 +257,6 @@ export function mergeDecisionIntoPolicy<T extends LlmDecision>(
     stopAtrMult: decision.stopAtrMult,
     takeProfitAtrMult: decision.takeProfitAtrMult,
     takeProfit1Ratio: decision.takeProfit1Ratio,
-    takeProfit1AtrMult: decision.takeProfit1AtrMult,
     trailAtrMult: decision.trailAtrMult,
     breakevenAfterTp1: decision.breakevenAfterTp1,
   };
@@ -251,6 +267,9 @@ export function mergeDecisionIntoPolicy<T extends LlmDecision>(
  *
  * **纯函数**：同样的输入永远给出同样的提示词（AGENTS.md 约定 4：策略是纯函数）。
  * 提示词里**不出现**密钥、也不出现可变的请求标识——它进不了日志也不会被重放。
+ *
+ * 提示词里必须把**每个输出的数会被怎么用**讲清楚：模型按字面意思理解自己的输出，
+ * 而「某个数在这一形态下不参与」这种事它无从猜到。
  *
  * @param context 给模型看的行情上下文。
  */
@@ -265,9 +284,12 @@ export function buildDecisionPrompt(context: DecisionPromptContext): string {
     JSON.stringify(
       {
         stopAtrMult: '数字。止损距入场价的 ATR 倍数，取值 (0, 20]',
-        takeProfitAtrMult: '数字。止盈距入场价的 ATR 倍数，取值 (0, 50]',
-        takeProfit1Ratio: '数字。第一段减仓比例，取值 [0, 1]。0 = 不分批',
-        takeProfit1AtrMult: '数字。第一段止盈的 ATR 倍数，取值 (0, 50]',
+        takeProfitAtrMult:
+          '数字。止盈距入场价的 ATR 倍数，取值 (0, 50]。' +
+          '不分批时是「到价一次全平」的目标；分批时是「先兑现那一段」的目标',
+        takeProfit1Ratio:
+          '数字。第一段减仓比例，取值 [0, 1]。0 = 不分批（到价一次全平）；' +
+          '严格落在 0 与 1 之间 = 先按这个比例减仓，剩下的仓位交给移动止损',
         trailAtrMult: '数字。移动止损的 Chandelier 倍数，取值 (0, 20]',
         breakevenAfterTp1: '布尔。第一段兑现后是否把止损上移到保本位',
         rationale: '字符串。简短说明为什么这么选',
@@ -280,8 +302,8 @@ export function buildDecisionPrompt(context: DecisionPromptContext): string {
     '',
     '- **只输出 JSON**，不要加 markdown 代码块标记。',
     '- 所有倍数必须落在上面给的取值区间内。',
-    '- 若 `takeProfit1Ratio` 严格落在 0 与 1 之间（分批形态），',
-    '  则 `takeProfit1AtrMult` 必须**小于** `takeProfitAtrMult`。',
+    '- **你输出的每一个数都会被用到**：止盈倍数在两种形态下都决定止盈价，' +
+      '减仓比例决定卖多少，移动止损倍数决定剩下的仓位怎么了结。',
     '- 不要输出入场价、止损价、止盈价这些**绝对价格**——价格由系统按 ATR 倍数算。',
     '',
     '## 市场数据',
@@ -310,7 +332,6 @@ export function buildDecisionPrompt(context: DecisionPromptContext): string {
     `止损倍数：${String(context.baseline.stopAtrMult)}`,
     `止盈倍数：${String(context.baseline.takeProfitAtrMult)}`,
     `第一段减仓比例：${String(context.baseline.takeProfit1Ratio)}`,
-    `第一段止盈倍数：${String(context.baseline.takeProfit1AtrMult)}`,
     `移动止损倍数：${String(context.baseline.trailAtrMult)}`,
     `第一段后上移保本：${String(context.baseline.breakevenAfterTp1)}`,
   );

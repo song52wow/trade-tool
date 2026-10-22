@@ -12,7 +12,7 @@
  * ——那会平掉真实仓位，是不可逆的。
  */
 
-import { SyncError, type ExecutorConfig } from '@trade-tool/core';
+import { SyncError, normalizeTakeProfit1Ratio, type ExecutorConfig } from '@trade-tool/core';
 
 import { toSyncError } from './errors.js';
 import type { Pool } from './pool.js';
@@ -24,16 +24,22 @@ export interface RiskPolicy {
   atrPeriod: number;
   atrInterval: string;
   stopAtrMult: number;
+  /**
+   * 止盈倍数。**两种形态都用它**（v0.9.1 起只有这一个止盈倍数）：
+   * 不分批时是全平目标，分批时是先兑现那一段的目标。
+   */
   takeProfitAtrMult: number;
   /**
-   * 第一段减仓比例（v0.7.0），`[0, 1]`。`0` = 关闭分批。
+   * 第一段减仓比例（v0.7.0），`[0, 1)`。`0` = 关闭分批。
    *
-   * 库里的值**永远是具体数字**：`trailAtrMult` 与 `takeProfit1AtrMult` 的
-   * 「配置里没写就取另一个参数」那条规则只发生在 `resolvePolicy` 的兜底分支，
-   * 页面保存时要求显式给出，因此不存在「两处各有一份默认」的问题。
+   * 库里的值**永远是具体数字**：`trailAtrMult` 的「配置里没写就取另一个参数」
+   * 那条规则只发生在 `resolvePolicy` 的兜底分支，页面保存时要求显式给出，
+   * 因此不存在「两处各有一份默认」的问题。
+   *
+   * `1` 会被归一到 `0`（两者逐字等价，见 core 的 `normalizeTakeProfit1Ratio`），
+   * 所以库里**不可能**出现 1。
    */
   takeProfit1Ratio: number;
-  takeProfit1AtrMult: number;
   trailAtrMult: number;
   breakevenAfterTp1: boolean;
 }
@@ -57,7 +63,6 @@ interface Row {
   stop_atr_mult: number;
   take_profit_atr_mult: number;
   take_profit1_ratio: number;
-  take_profit1_atr_mult: number;
   trail_atr_mult: number;
   breakeven_after_tp1: boolean;
   updated_at: string | number;
@@ -65,7 +70,7 @@ interface Row {
 
 /** SELECT / RETURNING 共用一份列清单——两处各写一遍，改字段时必漏一处。 */
 const COLUMNS = `scope, exchange, symbol, atr_period, atr_interval,
-  stop_atr_mult, take_profit_atr_mult, take_profit1_ratio, take_profit1_atr_mult,
+  stop_atr_mult, take_profit_atr_mult, take_profit1_ratio,
   trail_atr_mult, breakeven_after_tp1, updated_at`;
 
 function toEntry(row: Row): RiskPolicyEntry {
@@ -78,7 +83,6 @@ function toEntry(row: Row): RiskPolicyEntry {
     stopAtrMult: row.stop_atr_mult,
     takeProfitAtrMult: row.take_profit_atr_mult,
     takeProfit1Ratio: row.take_profit1_ratio,
-    takeProfit1AtrMult: row.take_profit1_atr_mult,
     trailAtrMult: row.trail_atr_mult,
     breakevenAfterTp1: row.breakeven_after_tp1,
     updatedAt: typeof row.updated_at === 'number' ? row.updated_at : Number(row.updated_at),
@@ -112,19 +116,18 @@ export async function writeRiskPolicy(
   if (input.scope === 'symbol' && input.symbol.trim() === '') {
     throw new SyncError('CONFIG_INVALID', '标的覆盖必须给 symbol');
   }
-  // v0.7.0 的四个字段同样**必须有具体值**：不靠数据库 DEFAULT 兜。
+  // v0.7.0 的三个字段同样**必须有具体值**：不靠数据库 DEFAULT 兜。
   // 少了它们时若直接写库，报出来的是 `not-null constraint` 的 INTERNAL_ERROR，
   // 而那句话完全指不出「是策略请求缺字段」——用户会去看数据库而不是看请求体
   // （AGENTS.md 约定 8：配置缺失要说清怎么配）。
   for (const [name, value] of [
     ['takeProfit1Ratio', input.takeProfit1Ratio],
-    ['takeProfit1AtrMult', input.takeProfit1AtrMult],
     ['trailAtrMult', input.trailAtrMult],
   ] as const) {
     if (typeof value !== 'number' || !Number.isFinite(value)) {
       throw new SyncError(
         'CONFIG_INVALID',
-        `止盈止损策略缺少 ${name}（收到 ${String(value)}）：两段止盈与移动止损的参数必须显式给全，` +
+        `止盈止损策略缺少 ${name}（收到 ${String(value)}）：分批比例与移动止损的参数必须显式给全，` +
           `取值范围见 executorSchema`,
         { field: name, value: String(value) },
       );
@@ -139,20 +142,29 @@ export async function writeRiskPolicy(
     );
   }
   const symbol = input.scope === 'global' ? '' : input.symbol.trim();
+  // **归一在这一步做**（v0.9.0）：`1` → `0`。
+  //
+  // 为什么落在写入口而不是只靠调用方：页面把输入框限到 99，但 API 直调仍可能送来 100，
+  // 而 `percentToRatio(100) === 1`——迁移 014 之后 `take_profit1_ratio` 的 CHECK 是 `< 1`，
+  // 于是库里那条约束会以一句看不懂的「违反 check 约束」把请求顶回去。
+  // 更重要的是语义：`1` 与 `0` 逐字等价，它**不是**非法值，是要被归一的那个值。
+  //
+  // 归一只有一份实现（core 的 `normalizeTakeProfit1Ratio`），这里只是调用它。
+  // 顺带它也管范围：越界时报 `CONFIG_INVALID` 并说清范围，而不是等数据库拒。
+  const takeProfit1Ratio = normalizeTakeProfit1Ratio(input.takeProfit1Ratio);
   try {
     const result = await pool.query<Row>(
       `INSERT INTO ${TABLE}
          (scope, exchange, symbol, atr_period, atr_interval,
           stop_atr_mult, take_profit_atr_mult,
-          take_profit1_ratio, take_profit1_atr_mult, trail_atr_mult, breakeven_after_tp1,
+          take_profit1_ratio, trail_atr_mult, breakeven_after_tp1,
           updated_at)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
        ON CONFLICT (scope, exchange, symbol) DO UPDATE
          SET atr_period = EXCLUDED.atr_period, atr_interval = EXCLUDED.atr_interval,
              stop_atr_mult = EXCLUDED.stop_atr_mult,
              take_profit_atr_mult = EXCLUDED.take_profit_atr_mult,
              take_profit1_ratio = EXCLUDED.take_profit1_ratio,
-             take_profit1_atr_mult = EXCLUDED.take_profit1_atr_mult,
              trail_atr_mult = EXCLUDED.trail_atr_mult,
              breakeven_after_tp1 = EXCLUDED.breakeven_after_tp1,
              updated_at = EXCLUDED.updated_at
@@ -165,8 +177,7 @@ export async function writeRiskPolicy(
         input.atrInterval,
         input.stopAtrMult,
         input.takeProfitAtrMult,
-        input.takeProfit1Ratio,
-        input.takeProfit1AtrMult,
+        takeProfit1Ratio,
         input.trailAtrMult,
         input.breakevenAfterTp1,
         input.now,
@@ -233,23 +244,20 @@ export async function resolvePolicy(
         stopAtrMult: row.stop_atr_mult,
         takeProfitAtrMult: row.take_profit_atr_mult,
         takeProfit1Ratio: row.take_profit1_ratio,
-        takeProfit1AtrMult: row.take_profit1_atr_mult,
         trailAtrMult: row.trail_atr_mult,
         breakevenAfterTp1: row.breakeven_after_tp1,
         source: row.scope === 'symbol' ? 'symbol' : 'global',
       };
     }
-    // 兜底分支（库里一条都没有）。`trailAtrMult` / `takeProfit1AtrMult` 在这里
-    // **显式**取 `stopAtrMult` / `takeProfitAtrMult` 的值——这是「同一个参数的两个
-    // 名字」的声明，不是猜：改了止损倍数而没显式写移动止损倍数时，移动止损跟着它走
-    // 是用户预期内的，而反过来「两者毫无关联」才是意外。
+    // 兜底分支（库里一条都没有）。`trailAtrMult` 在这里**显式**取 `stopAtrMult` 的值
+    // ——这是「同一个参数的两个名字」的声明，不是猜：改了止损倍数而没显式写移动止损
+    // 倍数时，移动止损跟着它走是用户预期内的，而反过来「两者毫无关联」才是意外。
     return {
       atrPeriod: fallback.atrPeriod,
       atrInterval: fallback.atrInterval,
       stopAtrMult: fallback.stopAtrMult,
       takeProfitAtrMult: fallback.takeProfitAtrMult,
       takeProfit1Ratio: fallback.takeProfit1Ratio,
-      takeProfit1AtrMult: fallback.takeProfit1AtrMult,
       trailAtrMult: fallback.trailAtrMult,
       breakevenAfterTp1: fallback.breakevenAfterTp1,
       source: 'config',

@@ -12,7 +12,7 @@
 | `market-sync.ts`        | 同步领域的类型、错误码 `SyncError` 与 `SyncErrorCode`                 |
 | `net-position.ts`       | 流内增量净额（`NetPositionTracker`）                                  |
 | `risk-ids.ts`           | 条件单编号约定 + `orderType` 归类（对账与下单共用一份）               |
-| `risk-policy.ts`        | 止盈止损策略的纯函数（`deriveBracketPlan` 等）                        |
+| `risk-policy.ts`        | 止盈止损策略的纯函数（`deriveBracketPlan`、`deriveStagedPlan` 等）    |
 | `reconcile.ts`          | 交易对账判据（纯函数，只报告不动手）                                  |
 | `secret.ts`             | 凭据静态加密（AES-256-GCM）                                           |
 | `clock-skew.ts`         | 进程启动时测量与交易所的时钟偏移                                      |
@@ -27,3 +27,26 @@
 - 领域类型优先放这里，不要在 `data` / `backtest` 里重复定义。
 - **同一个概念只有一个名字**：一个类型若已归某个模块所有，别在别处再起一个同名或同义的
   （转发可以，重写不行）。严重度、人话标签这类词表也一样——`notify.ts` 里只有一份。
+
+## 止盈的两种形态（`deriveStagedPlan`）
+
+`takeProfit1Ratio`（第一段减仓比例）只有两个形态，**止盈倍数只有一个**：
+
+| 比例     | 形态      | 止盈单                 | 止盈价                                               |
+| -------- | --------- | ---------------------- | ---------------------------------------------------- |
+| `0`      | `single`  | `closePosition`，全平  | 入场 ± `takeProfitAtrMult` × ATR                     |
+| `(0, 1)` | `partial` | `quantity`，减仓一部分 | 入场 ± `takeProfitAtrMult` × ATR（**先兑现那一段**） |
+
+`1` 与 `0` 逐字等价（都是一次全平、都用同一个倍数），因此**归一到 `0`**
+（`normalizeTakeProfit1Ratio`，唯一一份实现）。
+
+v0.9.1 起只有这一个止盈倍数。原因是分批形态下**「整段止盈价」压根不挂单**——剩余仓位
+交给移动止损——那个数是虚构的：它被写进 `risk_bracket.take_profit`，页面显示的「止盈价」
+因此是一个**从没挂出去过**的价，对账每轮报一次 `price-mismatch` 假警报。
+
+两条要记住的：
+
+- **`takeProfitPrice` 永远是「这一形态实际挂出去的价」**。落库与页面显示都读它，
+  所以它必须等于交易所上那张单的价格。
+- **分批时那一个倍数就是「先兑现那一段」的目标**（不是「整段目标」）。剩余仓位由
+  `trailAtrMult` 管的移动止损了结。

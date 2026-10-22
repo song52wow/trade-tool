@@ -70,6 +70,13 @@ KNOWN_MIGRATION_VERSIONS: frozenset[str] = frozenset(
         # Python 侧不读写 risk_bracket，但版本闸门两个方向都要校，漏登记会让
         # **所有**碰 PG 的用例报「库比代码新」。
         "013_llm_decision",
+        # v0.9.0：止盈倍数合并成一个（退役 take_profit1_atr_mult，比例禁 1）。
+        # Python 侧不读写 risk_bracket / risk_policy，但版本闸门两个方向都要校，
+        # 漏登记会让**所有**碰 PG 的用例报「库比代码新」。
+        "014_take_profit_single_mult",
+        # v0.9.0：补回「LLM 决策的数必须齐全」那条约束（014 删列时顺带删掉了它）。
+        # 同样不读写该表，但版本闸门两个方向都要校。
+        "015_restore_llm_params_check",
     }
 )
 

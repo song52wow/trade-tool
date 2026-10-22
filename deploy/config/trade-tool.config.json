@@ -53,6 +53,7 @@
   },
   "executor": {
     "enabled": false,
+    "environment": "demo",
     "atrPeriod": 14,
     "atrInterval": "1m",
     "atrWindowBars": 240,

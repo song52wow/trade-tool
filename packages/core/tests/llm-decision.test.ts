@@ -22,7 +22,6 @@ const valid: LlmDecision = {
   stopAtrMult: 2.5,
   takeProfitAtrMult: 4,
   takeProfit1Ratio: 0,
-  takeProfit1AtrMult: 3,
   trailAtrMult: 2,
   breakevenAfterTp1: true,
 };
@@ -93,26 +92,15 @@ describe('parseLlmDecision', () => {
 });
 
 describe('validateLlmDecision', () => {
-  it('分批形态下第一段必须比整段更靠近入场价', () => {
-    const bad = { ...valid, takeProfit1Ratio: 0.5, takeProfit1AtrMult: 5, takeProfitAtrMult: 3 };
-    const result = validateLlmDecision(bad, 14);
-    expect(result.ok).toBe(false);
+  it('合并成一个止盈倍数后不再有「两段比远近」可查（只剩归一后的合法性）', () => {
+    // 分批形态：只有一个止盈倍数，没有「整段」可比，因此不会因为「远近」被拒。
+    const split = { ...valid, takeProfit1Ratio: 0.5 };
+    expect(validateLlmDecision(split, 14).ok).toBe(true);
   });
 
-  it('顺序对了就通过', () => {
-    const good = { ...valid, takeProfit1Ratio: 0.5, takeProfit1AtrMult: 2, takeProfitAtrMult: 3 };
-    expect(validateLlmDecision(good, 14).ok).toBe(true);
-  });
-
-  it('不分批（ratio=0）与全平（ratio=1）不比较远近', () => {
-    // ratio=0 时第一段倍数毫无意义，不该因此拒绝这份决策。
+  it('不分批（ratio=0）与全平（ratio=1）都通过', () => {
     expect(validateLlmDecision({ ...valid, takeProfit1Ratio: 0 }, 14).ok).toBe(true);
-    expect(
-      validateLlmDecision(
-        { ...valid, takeProfit1Ratio: 1, takeProfit1AtrMult: 9, takeProfitAtrMult: 3 },
-        14,
-      ).ok,
-    ).toBe(true);
+    expect(validateLlmDecision({ ...valid, takeProfit1Ratio: 1 }, 14).ok).toBe(true);
   });
 });
 
@@ -122,13 +110,13 @@ describe('clampLlmDecision', () => {
       stopAtrMult: 99,
       takeProfitAtrMult: 999,
       takeProfit1Ratio: 5,
-      takeProfit1AtrMult: 0,
       trailAtrMult: -3,
       breakevenAfterTp1: false,
     });
     expect(clamped.stopAtrMult).toBe(20);
     expect(clamped.takeProfitAtrMult).toBe(50);
-    expect(clamped.takeProfit1Ratio).toBe(1);
+    // 5 先夹到 1，再归一到 0：留痕必须记归一后的值，否则事后对不上实际用的形态。
+    expect(clamped.takeProfit1Ratio).toBe(0);
     expect(clamped.trailAtrMult).toBeGreaterThan(0);
     // 布尔值原样保留
     expect(clamped.breakevenAfterTp1).toBe(false);
@@ -143,7 +131,6 @@ describe('mergeDecisionIntoPolicy', () => {
       stopAtrMult: 2,
       takeProfitAtrMult: 3,
       takeProfit1Ratio: 0,
-      takeProfit1AtrMult: 3,
       trailAtrMult: 2,
       breakevenAfterTp1: true,
     };
@@ -183,13 +170,17 @@ describe('buildDecisionPrompt', () => {
       recentReturns: [],
       baseline: valid,
     });
-    // 要求模型输出六个字段
+    // 要求模型输出五个字段（v0.9.1 起只有一个止盈倍数）
     expect(prompt).toContain('stopAtrMult');
     expect(prompt).toContain('takeProfitAtrMult');
     expect(prompt).toContain('takeProfit1Ratio');
     expect(prompt).toContain('trailAtrMult');
     expect(prompt).toContain('breakevenAfterTp1');
+    // 合并之后不该再有第二个止盈倍数
+    expect(prompt).not.toContain('takeProfit1AtrMult');
     // 明确禁止它输出绝对价格
     expect(prompt).toContain('不要输出入场价、止损价、止盈价');
+    // 要说清「每个输出的数都会被用到」——否则模型不知道自己输出的数可能被忽略
+    expect(prompt).toContain('你输出的每一个数都会被用到');
   });
 });
