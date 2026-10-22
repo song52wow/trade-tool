@@ -57,3 +57,13 @@ pnpm --filter @trade-tool/data test
 独立 schema 上，从空库执行迁移，结束时整段 `DROP SCHEMA … CASCADE`——**不会碰到任何业务表**。
 `sync-integration.test.ts` 会拉起一个本地假交易所，让**真实的 Python 引擎**跑完整接缝，
 全程不访问真实网络。
+
+### 真库隔离设施放在 `src/testing-pg.ts`（不是 `tests/`）
+
+`createTestSchema()` / `insertBars()` 这些在 `src/testing-pg.ts`，从 `src/index.ts` 导出。
+**理由与 `src/testing.ts`（假交易所）完全一样**：`apps/sync`、`apps/executor` 等包也要写
+「真库 + 真迁移」的用例，而这套隔离设施**只有一份**。留在 `tests/` 里，别的包就只能复制一份——
+复制品会各自漂移，于是「测试库连错」这种事故只在某个包里偶发。
+
+`tests/helpers/pg.ts` 现在只是**转出口**，为的是既有用例的 import 路径不用改。
+新用例**直接**从 `@trade-tool/data` 导入。
