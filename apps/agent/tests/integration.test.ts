@@ -18,10 +18,12 @@ import {
   type MarketContext,
   type MockExchange,
   type MockSentimentSpec,
+  createTestSchema,
+  TEST_PG,
+  type TestSchema,
 } from '@trade-tool/data';
 
 import { createAgentService } from '../src/service.js';
-import { createTestSchema, TEST_PG, type TestSchema } from './helpers/pg.js';
 
 /**
  * 分析师 + 交易员 Agent 的**端到端**测试（v1.0.0）。

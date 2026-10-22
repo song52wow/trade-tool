@@ -5,24 +5,23 @@
 | 模块                    | 职责                                                                  |
 | ----------------------- | --------------------------------------------------------------------- |
 | `types.ts`              | `Bar` / `OrderIntent` / `Position` / `Signal` / `Interval` 等领域类型 |
+| `agent-analyst.ts`      | 分析师契约与纯函数（v1.0.0）：三面打分 → 合成立场 / 信心 / 一致性     |
+| `agent-context.ts`      | 行情上下文的跨语言契约（Python 载荷的 zod schema + 纯映射）           |
+| `agent-trader.ts`       | 交易员契约与纯函数（v1.0.0）：提议 → 进场价 / 数量 / 止损止盈         |
 | `config.ts`             | zod 配置 schema 与 `defaultConfig()`                                  |
 | `config-io.ts`          | 配置文件读写（`TRADE_TOOL_HOME` → `trade-tool.config.json`）          |
 | `env.ts`                | 加载仓库根的 `.env`（`loadProjectEnv()`，每个进程入口都要调）         |
+| `exchange-endpoints.ts` | REST 基址与用户数据流地址的**同源**解析（live / demo）                |
+| `llm-endpoint.ts`       | 模型接入的公共字段（`llmEndpointSchema` + 共享 refine）               |
 | `logger.ts`             | 带 scope 的分级 logger（warn/error 走 stderr）                        |
 | `market-sync.ts`        | 同步领域的类型、错误码 `SyncError` 与 `SyncErrorCode`                 |
 | `net-position.ts`       | 流内增量净额（`NetPositionTracker`）                                  |
+| `notify.ts`             | 通知层（v0.8.0）：飞书 webhook 通道 + 告警去重 / 冷却 / 恢复通知      |
+| `reconcile.ts`          | 交易对账判据（纯函数，只报告不动手）+ 差异类型清单与中文名            |
 | `risk-ids.ts`           | 条件单编号约定 + `orderType` 归类（对账与下单共用一份）               |
 | `risk-policy.ts`        | 止盈止损策略的纯函数（`deriveBracketPlan`、`deriveStagedPlan` 等）    |
-| `reconcile.ts`          | 交易对账判据（纯函数，只报告不动手）+ 差异类型清单与中文名            |
 | `secret.ts`             | 凭据静态加密（AES-256-GCM）                                           |
 | `clock-skew.ts`         | 进程启动时测量与交易所的时钟偏移                                      |
-| `exchange-endpoints.ts` | REST 基址与用户数据流地址的**同源**解析（live / demo）                |
-| `notify.ts`             | 通知层（v0.8.0）：飞书 webhook 通道 + 告警去重 / 冷却 / 恢复通知      |
-| `reconcile.ts`          | 交易对账判据 + 差异类型的清单与中文名（页面的「要通知哪些内容」来源） |
-| `llm-endpoint.ts`       | 模型接入的公共字段（`llmEndpointSchema` + 共享 refine）               |
-| `agent-analyst.ts`      | 分析师契约与纯函数（v1.0.0）：三面打分 → 合成立场 / 信心 / 一致性     |
-| `agent-trader.ts`       | 交易员契约与纯函数（v1.0.0）：提议 → 进场价 / 数量 / 止损止盈         |
-| `agent-context.ts`      | 行情上下文的跨语言契约（Python 载荷的 zod schema + 纯映射）           |
 
 约定：
 

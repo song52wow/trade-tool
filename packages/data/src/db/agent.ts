@@ -1,7 +1,7 @@
 /**
  * 分析师报告与交易员执行方案的读写（v1.0.0）。
  *
- * 表结构的唯一来源是 `sql/016_agent_decisions.sql`（AGENTS.md 约定 3）。
+ * 表结构的唯一来源是 `sql/017_agent_decisions.sql`（AGENTS.md 约定 3）。
  *
  * ## 写进来的都是「事实」，不是「判据」
  *

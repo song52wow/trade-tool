@@ -26,7 +26,7 @@
   地址与签名密钥**密文**落库；`resolveAll()` 是「**哪一份在生效**」的唯一实现
   （控制面录入优先，配置文件 + 环境变量兜底），面板状态、executor 的生效设置、
   测试发送用的地址都从它派生。
-- `db/agent.ts` — 分析师报告与执行方案的读写（v1.0.0，迁移 `016_agent_decisions`）。
+- `db/agent.ts` — 分析师报告与执行方案的读写（v1.0.0，迁移 `017_agent_decisions`）。
   `recordAnalystReport` 按 `(exchange, symbol, as_of_ms)` **幂等 upsert**
   （同一份数据时刻的同一标的只留一份报告）；`recordTradingPlan` / `updateTradingPlanStatus`
   管 `advisory → approved / rejected / expired → executed` 这条状态机。
@@ -72,3 +72,13 @@ pnpm --filter @trade-tool/data test
 - 假交易所，验的是「派生 K 线 → `market-context` → stdout 的 JSON → zod 契约 → 纯映射」
   这条链路。它能抓到替身抓不到的问题：Python 改了字段名，载荷是**拼进提示词的字符串**，
   字段一错模型照样会给出看起来合理的结论——**整条错误链没有一处会报错**。
+
+### 真库隔离设施放在 `src/testing-pg.ts`（不是 `tests/`）
+
+`createTestSchema()` / `insertBars()` 这些在 `src/testing-pg.ts`，从 `src/index.ts` 导出。
+**理由与 `src/testing.ts`（假交易所）完全一样**：`apps/sync`、`apps/executor` 等包也要写
+「真库 + 真迁移」的用例，而这套隔离设施**只有一份**。留在 `tests/` 里，别的包就只能复制一份——
+复制品会各自漂移，于是「测试库连错」这种事故只在某个包里偶发。
+
+`tests/helpers/pg.ts` 现在只是**转出口**，为的是既有用例的 import 路径不用改。
+新用例**直接**从 `@trade-tool/data` 导入。

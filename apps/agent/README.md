@@ -149,7 +149,7 @@ pnpm --filter @trade-tool/cli start -- agent report        # 只读库，不调�
 
 ## 落库
 
-两张表，迁移 `016_agent_decisions`（结构见 `packages/data/sql/016_agent_decisions.sql`）：
+两张表，迁移 `017_agent_decisions`（结构见 `packages/data/sql/017_agent_decisions.sql`）：
 
 - `analyst_report`：三面分数 + 合成立场 + 理由 + **当时喂给模型的完整上下文** + 模型原始返回。
   留上下文是因为只存结论的话，模型改了提示词就再也复现不了「它当时看到了什么」。

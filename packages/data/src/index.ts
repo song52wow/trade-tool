@@ -28,3 +28,5 @@ export * from './exchange-endpoints.js';
 export * from './reconcile.js';
 /** 测试专用：本地假交易所实现，详见文件头说明。 */
 export * from './testing.js';
+/** 测试专用：真库隔离（随机 schema + 从空库跑迁移），详见文件头说明。 */
+export * from './testing-pg.js';

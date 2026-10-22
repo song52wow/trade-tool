@@ -41,6 +41,7 @@ const COLUMNS = `exchange, symbol, entry_order_id, entry_price, entry_time, fill
   tp1_algo_id, tp1_qty, tp1_price, tp1_filled_qty, tp1_filled_at,
   trail_extreme, trail_stop_price, trail_atr, trail_atr_from, trail_atr_to,
   trail_updated_at, trail_last_error,
+  trail_step, trail_moves, trail_status,
   decision_source, decision_stop_atr_mult, decision_take_profit_atr_mult,
   decision_take_profit1_ratio, decision_trail_atr_mult,
   decision_breakeven_after_tp1, decision_rationale, decision_fallback_reason,
@@ -150,6 +151,13 @@ export interface BracketDecision {
 }
 
 /** 库里的一行。与 `BracketClaim` 分开：`now` 是入参，库里存的是两个时间戳。 */
+/**
+ * 移动止损**最近一轮**的结果。
+ *
+ * `failed` 是唯一会被对账报成差异的那一种：它意味着「这一轮想挪止损、没挪成」。
+ */
+export type TrailStatus = 'idle' | 'moved' | 'not-moved' | 'failed';
+
 export interface BracketRecord {
   exchange: string;
   symbol: string;
@@ -190,6 +198,30 @@ export interface BracketRecord {
   trailUpdatedAt: number | null;
   /** 本轮没有移动（或移动失败）的原因。常驻可见，不静默跳过。 */
   trailLastError: string | null;
+  // ---- v0.9.2：移动止损的档位序号与成功次数。
+  /**
+   * **已占用的止损单号序号**：进场时挂的那张是 0 号，每挪一次先占一个新号。
+   *
+   * 它存在的唯一理由：Binance 不允许同时存在两张 `clientAlgoId` 相同的挂单，
+   * 而挪单是「先挂新、再撤旧」——旧单此刻还在，新单必须用自己的号。
+   * 2026-10-22 实测：号只由入场单号派生时，**第一次挪就被拒**（`ClientOrderId is duplicated.`），
+   * 于是止损价永远停在入场那一档，而三方全绿（见 §6.8.4）。
+   */
+  trailStep: number;
+  /**
+   * **成功换过几档**。
+   *
+   * 它是「挪过几次」这个问题的答案。
+   */
+  trailMoves: number;
+  /**
+   * **最近一轮的结果**：`idle` / `moved` / `not-moved` / `failed`。
+   *
+   * 为什么不能拿「尝试次数 − 成功次数」代替：那是个**累计差**，一次失败之后
+   * 它永远不归零——移动止损早就修好了，对账却还在报「换档失败」。
+   * 「现在坏着吗」只能由最近一轮的状态回答（`failed` 才是要报的那一种）。
+   */
+  trailStatus: TrailStatus;
   // ---- v0.8.0：盈亏的**事实**（累计）。盈亏金额本身不存，由 core 的 realizedPnl() 现算。
   /** 累计平仓量。 */
   closedQty: number;
@@ -303,6 +335,9 @@ function toRecord(row: Record<string, unknown>): BracketRecord {
     trailAtrTo: optionalBigint(row, 'trail_atr_to', where),
     trailUpdatedAt: optionalBigint(row, 'trail_updated_at', where),
     trailLastError: optionalStr(row, 'trail_last_error', where),
+    trailStep: num(row, 'trail_step', where),
+    trailMoves: num(row, 'trail_moves', where),
+    trailStatus: str(row, 'trail_status', where) as TrailStatus,
     closedQty: num(row, 'closed_qty', where),
     exitNotional: num(row, 'exit_notional', where),
     feeAmount: num(row, 'fee_amount', where),
@@ -530,7 +565,7 @@ export async function markBracketTrailing(
          trail_extreme = $4, trail_stop_price = $5, trail_atr = $6,
          trail_atr_from = $7, trail_atr_to = $8, trail_updated_at = $9,
          sl_algo_id = COALESCE($10, sl_algo_id),
-         last_error = NULL, trail_last_error = NULL, updated_at = $9
+         last_error = NULL, trail_last_error = NULL, trail_status = 'idle', updated_at = $9
        WHERE exchange = $1 AND symbol = $2 AND entry_order_id = $3
          AND state = 'partial_armed'`,
       [
@@ -562,13 +597,32 @@ export async function markBracketTrailing(
  * ⚠️ `WHERE` 同时接受 `partial_armed`：第一段刚成交、推进 `trailing` 就失败时，
  * 记录还停在 `partial_armed`。只接受 `trailing` 的话，那次失败的原因会被**静默丢弃**
  * ——正是「看起来正常、而移动止损其实没启动」的那一类。
+ *
+ * `status` 是**最近一轮的结果**，对账据此判定「移动止损接管失败」：
+ * `failed` = 这一轮想挪、没挪成（会被报成差异）；`not-moved` = 这一轮决定不挪
+ * （价没变 / 越过现价 / 极值取不到），仓位仍受上一档保护，**不是故障**。
+ * 两者必须分开：混成一个码，对账就会把「行情还没走出来」报成「移动止损坏了」。
  */
 export async function markBracketTrailNotMoved(
   pool: Pool,
   key: { exchange: string; symbol: string; entryOrderId: string },
   reason: string,
   now: number,
-  observed?: { extreme: number; atr: number; atrFrom: number; atrTo: number },
+  status: Extract<TrailStatus, 'not-moved' | 'failed'>,
+  observed?: {
+    extreme: number;
+    atr: number;
+    atrFrom: number;
+    atrTo: number;
+    /**
+     * 交易所上**当前**那张止损单的单号。
+     *
+     * 它只在一种情况下与旧值不同：撤旧成功、而新单没挂上，于是**用旧价挂回去**，
+     * 恢复出来的是**另一张**单（号是新的）。此时账面必须指向它——
+     * 否则 `sl_algo_id` 会一直指着一张已被撤销的单，对账会误报「止损单不见了」。
+     */
+    slAlgoId?: number;
+  },
 ): Promise<void> {
   try {
     await pool.query(
@@ -576,7 +630,9 @@ export async function markBracketTrailNotMoved(
          trail_extreme = COALESCE($6, trail_extreme),
          trail_atr = COALESCE($7, trail_atr),
          trail_atr_from = COALESCE($8, trail_atr_from),
-         trail_atr_to = COALESCE($9, trail_atr_to)
+         trail_atr_to = COALESCE($9, trail_atr_to),
+         trail_status = $10,
+         sl_algo_id = COALESCE($11, sl_algo_id)
        WHERE exchange = $1 AND symbol = $2 AND entry_order_id = $3
          AND state IN ('partial_armed', 'trailing')`,
       [
@@ -589,10 +645,47 @@ export async function markBracketTrailNotMoved(
         observed?.atr ?? null,
         observed?.atrFrom ?? null,
         observed?.atrTo ?? null,
+        status,
+        observed?.slAlgoId ?? null,
       ],
     );
   } catch (caught) {
     throw toSyncError(caught, `记录移动止损未调整原因时出错：${key.symbol} ${key.entryOrderId}`);
+  }
+}
+
+/**
+ * 占用一个新的**止损单号**（档位序号），返回新占到的那个号（≥ 1）。
+ *
+ * **必须在下单之前调用**，而且号一旦用掉就作废——哪怕那次下单最终失败。
+ *
+ * 为什么不能等「挪成功了」再记号：Binance 不允许同时存在两张 `clientAlgoId` 相同的
+ * 挂单，而挪单是「先挂新、再撤旧」（§6.8 第 3 条）——旧单此刻还在交易所上。
+ * 于是「挂新 → 撤旧失败 → 下一轮重挂」这条路上，下一轮若沿用同一个号，
+ * 又会撞 `ClientOrderId is duplicated.`，**重试永远失败**，那条线就此卡死。
+ *
+ * 返回 `null` = **拿不到号**：记录已经不在移动止损阶段了（多半是止损刚成交、
+ * 记录已收敛成终态）。此时**不许再挂单**——给一个已经平掉的仓位挂止损，
+ * 会在交易所上留下一张没人认领的单。
+ */
+export async function reserveTrailStep(
+  pool: Pool,
+  key: { exchange: string; symbol: string; entryOrderId: string },
+  now: number,
+): Promise<number | null> {
+  try {
+    const result = await pool.query(
+      `UPDATE ${TABLE} SET trail_step = trail_step + 1, updated_at = $4
+       WHERE exchange = $1 AND symbol = $2 AND entry_order_id = $3
+         AND state IN ('partial_armed', 'trailing')
+       RETURNING trail_step`,
+      [key.exchange, key.symbol, key.entryOrderId, now],
+    );
+    const row = result.rows[0];
+    if (row === undefined) return null;
+    return Number(row['trail_step']);
+  } catch (caught) {
+    throw toSyncError(caught, `占用移动止损档位序号失败：${key.symbol} ${key.entryOrderId}`);
   }
 }
 
@@ -602,6 +695,9 @@ export async function markBracketTrailNotMoved(
  * 顺序由调用方保证（R-4.1），本函数只负责「落新的档位」。
  * 因此 `slAlgoId` 必填：没有它就说明新止损还没挂上，而把档位写成新价、
  * 却让交易所挂着旧价的单，是最坏的一种不一致。
+ *
+ * `trail_moves` 在这里 +1：它是「成功换过几档」，与「占用了几个号」（`trail_step`）
+ * 是一对——两者不等就说明「有尝试没成功」，对账据此判定移动止损在空转（§6.5）。
  */
 export async function markBracketTrailMoved(
   pool: Pool,
@@ -620,7 +716,8 @@ export async function markBracketTrailMoved(
     await pool.query(
       `UPDATE ${TABLE} SET trail_stop_price = $4, trail_extreme = $5, trail_atr = $6,
          trail_atr_from = $7, trail_atr_to = $8, trail_updated_at = $9, sl_algo_id = $10,
-         trail_last_error = NULL, updated_at = $9
+         trail_moves = trail_moves + 1, trail_last_error = NULL, trail_status = 'moved',
+         updated_at = $9
        WHERE exchange = $1 AND symbol = $2 AND entry_order_id = $3 AND state = 'trailing'`,
       [
         key.exchange,

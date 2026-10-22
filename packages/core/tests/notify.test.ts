@@ -348,6 +348,41 @@ describe('AlertDispatcher', () => {
     expect(rec.events).toHaveLength(1);
   });
 
+  it('不同作用域互不影响：推一个话题不会把另一个话题当成「问题消失了」', async () => {
+    // 2026-10-22 实测踩到：对账报了一次「移动止损换档失败」，移动止损修好之后，
+    // 对账不再报它了——但群里既没有「已恢复」，反而收到一条对账的**假**「已恢复」。
+    // 根因：一次 dispatch 只看得见自己这个作用域的条目，而「已恢复」是按
+    // 「上一轮有、这一轮没有」判定的。共用一份记账时，别的作用域的条目
+    // 会被当成「问题消失了」。
+    const rec = recorder();
+    const dispatcher = new AlertDispatcher({
+      channel: channelOf(rec.notifier),
+      now: () => 1_000,
+    });
+
+    // 对账这一轮报了一个差异。
+    await dispatcher.dispatch(() => [item], 'reconcile');
+    // 生命周期事件推了一条（另一个作用域）。
+    await dispatcher.dispatch(
+      () => [
+        {
+          fingerprint: 'trail-moved|BTCUSDT|1',
+          severity: 'info' as const,
+          title: 'BTCUSDT 止损挪到 81851.5',
+          oneShot: true,
+        },
+      ],
+      'trail-moved',
+    );
+
+    // 对账这一轮没有差异了 → 应当推一条「已恢复」。
+    const result = await dispatcher.dispatch(() => [], 'reconcile');
+    expect(result.recovered).toBe(1);
+    // 生命周期那一条是事件型（oneShot），它不在了**不代表**出了问题，
+    // 因此不该为它推「已恢复」。
+    expect(rec.events.filter((e) => e.title.includes('已恢复'))).toHaveLength(1);
+  });
+
   it('冷却期过了会再推一次（提醒「还没好」）', async () => {
     const rec = recorder();
     let now = 1_000;

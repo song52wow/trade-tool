@@ -34,6 +34,12 @@ function record(overrides: Partial<LocalBracket> = {}): LocalBracket {
     tp1Price: null,
     tp1FilledAt: null,
     trailStopPrice: null,
+    // 移动止损的档位序号与成功次数。默认「还没进过移动止损」＝两者都是 0。
+    trailStep: 0,
+    trailMoves: 0,
+    // 默认「还没进过移动止损」。移动止损跑起来之后每一轮都会改写它。
+    trailStatus: 'idle',
+    trailLastError: null,
     state: 'armed',
     lastError: null,
     updatedAt: NOW,
@@ -49,6 +55,10 @@ function trailing(overrides: Partial<LocalBracket> = {}): LocalBracket {
     filledQty: 1,
     trailStopPrice: 104,
     slAlgoId: 12,
+    // 已经成功挪过一档：占用了 1 个号、成功 1 次（两者相等 = 没有失败的尝试）。
+    trailStep: 1,
+    trailMoves: 1,
+    trailStatus: 'moved',
     ...overrides,
   });
 }
@@ -124,6 +134,88 @@ function consistent() {
     ],
   };
 }
+
+// v0.9.2：移动止损接管失败——**账面全绿、实际空转**的那一类故障。
+//
+// 2026-10-22 实测踩到：条件单的自定义号被复用，于是每次挪止损都被交易所以
+// 「ClientOrderId is duplicated」拒掉。症状是止损价永远停在入场那一档，
+// 而止损单确实在交易所上、触发价也确实与本地记录一致——
+// **price-mismatch 与 missing-stop-order 都不会报**，只有「试过几次 / 成功几次」
+// 这一对数能揭穿它。
+describe('移动止损接管失败', () => {
+  it('有换档尝试没成功 → 报差异（哪怕三方全绿）', () => {
+    const result = report({
+      local: [
+        trailing({
+          // 试了 3 次、成功 0 次：每一次尝试都没变成一次成功的换档。
+          trailStep: 3,
+          trailMoves: 0,
+          trailStatus: 'failed',
+          trailLastError: '移动止损本轮失败：EXCHANGE_ERROR: ClientOrderId is duplicated.',
+        }),
+      ],
+      positions: [position({ positionAmt: 1 })],
+      // 止损单在交易所上，价格就是本地记的那一档——**看不出任何异常**。
+      algoOrders: [algo({ triggerPrice: 104 })],
+    });
+
+    const item = result.differences.find((d) => d.kind === 'trail-move-failed');
+    expect(item).toBeDefined();
+    // 仓位此刻仍受止损保护（那张单还在），所以是「注意」而不是「紧急」。
+    expect(item?.severity).toBe('warning');
+    expect(item?.entryOrderId).toBe('1001');
+    expect(item?.evidence['trailStep']).toBe(3);
+    expect(item?.evidence['trailMoves']).toBe(0);
+    expect(item?.evidence['failedAttempts']).toBe(3);
+    // 失败原因要能看见：处置就靠它。
+    expect(item?.message).toContain('ClientOrderId is duplicated');
+    // **不能**同时报出「触发价对不上」——价格其实是对得上的。
+    expect(result.differences.some((d) => d.kind === 'price-mismatch')).toBe(false);
+  });
+
+  it('没有失败的尝试时不报（移动止损只是还没到该挪的时候）', () => {
+    const result = report({
+      local: [trailing({ trailStep: 1, trailMoves: 1, trailStatus: 'moved' })],
+      positions: [position({ positionAmt: 1 })],
+      algoOrders: [algo({ triggerPrice: 104 })],
+    });
+    expect(result.differences.some((d) => d.kind === 'trail-move-failed')).toBe(false);
+  });
+
+  it('曾经失败过、但最近一轮挪成了 → 不再报（累计差会在这里误报）', () => {
+    // 「尝试次数 − 成功次数」是个累计差：失败过一次就永远不归零。
+    // 移动止损早就修好了，对账却还在报「换档失败」——那是假警报。
+    const result = report({
+      local: [
+        trailing({
+          trailStep: 3,
+          trailMoves: 2,
+          trailStatus: 'moved',
+        }),
+      ],
+      positions: [position({ positionAmt: 1 })],
+      algoOrders: [algo({ triggerPrice: 104 })],
+    });
+    expect(result.differences.some((d) => d.kind === 'trail-move-failed')).toBe(false);
+  });
+
+  it('还没进过移动止损的行不参与这条判据', () => {
+    const result = report({
+      local: [record({ trailStep: 0, trailMoves: 0, trailStatus: 'idle' })],
+      positions: [position()],
+      algoOrders: [
+        algo(),
+        algo({
+          algoId: 11,
+          clientAlgoId: 'rsk-tp-1001',
+          orderType: 'TAKE_PROFIT',
+          triggerPrice: 108,
+        }),
+      ],
+    });
+    expect(result.differences.some((d) => d.kind === 'trail-move-failed')).toBe(false);
+  });
+});
 
 describe('一致的场景', () => {
   it('两边对得上时不报任何差异', () => {

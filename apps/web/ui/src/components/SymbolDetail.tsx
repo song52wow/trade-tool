@@ -29,7 +29,9 @@ export function SymbolDetail(props: {
       {/* K 线放在最上面：这个面板回答的第一个问题是「同步下来的数据长什么样」，
           合约规格是它的补充说明。 */}
       <div>
-        <h2 style={{ fontSize: 13, color: 'var(--muted)', fontWeight: 500 }}>K 线</h2>
+        <h3 className="section-head" style={{ marginTop: 0 }}>
+          K 线
+        </h3>
         <PriceChart
           symbol={props.detail.symbol}
           totalRows={state?.rows ?? null}
@@ -50,7 +52,7 @@ export function SymbolDetail(props: {
       />
 
       <div style={{ marginTop: 18 }}>
-        <h2 style={{ fontSize: 13, color: 'var(--muted)', fontWeight: 500 }}>合约与状态</h2>
+        <h3 className="section-head">合约与状态</h3>
         <dl className="kv">
           <dt>交易所</dt>
           <dd className="mono">{exchange}</dd>
@@ -135,38 +137,48 @@ export function SymbolDetail(props: {
 
       <ReconcilePanel key={props.detail.symbol} symbol={props.detail.symbol} tick={props.tick} />
 
-      <h2 style={{ fontSize: 13, color: 'var(--muted)', fontWeight: 500, marginTop: 18 }}>
-        缺口清单（{gaps.length}）
-      </h2>
+      <h3 className="section-head">缺口清单（{gaps.length}）</h3>
       {gaps.length === 0 ? (
         <p className="muted">没有登记中的缺口。</p>
       ) : (
-        <table>
-          <thead>
-            <tr>
-              <th>起点</th>
-              <th>终点</th>
-              <th>缺失行数</th>
-              <th>已尝试</th>
-              <th>最近尝试</th>
-              <th>最近错误</th>
-            </tr>
-          </thead>
-          <tbody>
-            {gaps.map((g) => (
-              <tr key={`${g.gapStart}-${g.gapEnd}`}>
-                <td className="mono">{fmtTime(g.gapStart)}</td>
-                <td className="mono">{fmtTime(g.gapEnd)}</td>
-                <td>{fmtNumber(g.missingRows)}</td>
-                <td>{g.attempts}</td>
-                <td className="muted">{fmtAgo(g.lastAttemptAt, props.now)}</td>
-                <td className="muted mono" style={{ whiteSpace: 'pre-wrap' }}>
-                  {g.lastError ?? '—'}
-                </td>
+        <div className="table-scroll">
+          <table>
+            <thead>
+              <tr>
+                <th>起点</th>
+                <th>终点</th>
+                <th>缺失行数</th>
+                <th>已尝试</th>
+                <th>最近尝试</th>
+                <th>最近错误</th>
               </tr>
-            ))}
-          </tbody>
-        </table>
+            </thead>
+            <tbody>
+              {gaps.map((g) => (
+                <tr key={`${g.gapStart}-${g.gapEnd}`}>
+                  <td className="mono" data-label="起点" data-cell="primary">
+                    {fmtTime(g.gapStart)}
+                  </td>
+                  <td className="mono" data-label="终点">
+                    {fmtTime(g.gapEnd)}
+                  </td>
+                  <td data-label="缺失行数">{fmtNumber(g.missingRows)}</td>
+                  <td data-label="已尝试">{g.attempts}</td>
+                  <td className="muted" data-label="最近尝试">
+                    {fmtAgo(g.lastAttemptAt, props.now)}
+                  </td>
+                  <td
+                    className="muted mono"
+                    style={{ whiteSpace: 'pre-wrap' }}
+                    data-label="最近错误"
+                  >
+                    {g.lastError ?? '—'}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
       )}
     </div>
   );
@@ -186,10 +198,15 @@ function DerivedTable(props: {
   onAggregate: () => void;
 }) {
   return (
-    <div className="verify-box" style={{ marginTop: 18 }}>
-      <div style={{ flex: 1, minWidth: 0 }}>
-        <strong>派生周期</strong>
-        <table style={{ marginTop: 6 }}>
+    <div
+      className="verify-box"
+      style={{ marginTop: 18, flexDirection: 'column', alignItems: 'stretch' }}
+    >
+      <h3 className="section-head" style={{ marginTop: 0 }}>
+        派生周期
+      </h3>
+      <div className="table-scroll">
+        <table>
           <thead>
             <tr>
               <th>周期</th>
@@ -208,7 +225,9 @@ function DerivedTable(props: {
               if (stats === undefined) {
                 return (
                   <tr key={interval}>
-                    <td className="mono">{interval}</td>
+                    <td className="mono" data-label="周期" data-cell="primary">
+                      {interval}
+                    </td>
                     <td colSpan={4} className="muted">
                       读取中…
                     </td>
@@ -218,7 +237,9 @@ function DerivedTable(props: {
               if ('withheldReason' in stats) {
                 return (
                   <tr key={interval}>
-                    <td className="mono">{interval}</td>
+                    <td className="mono" data-label="周期" data-cell="primary">
+                      {interval}
+                    </td>
                     <td colSpan={4} className="muted">
                       未启用派生（{interval} 不在 data.aggregateIntervals 里）
                     </td>
@@ -227,13 +248,21 @@ function DerivedTable(props: {
               }
               return (
                 <tr key={interval}>
-                  <td className="mono">{interval}</td>
-                  <td>{fmtNumber(stats.buckets)}</td>
-                  <td>{fmtNumber(stats.withheldNotClosed)}</td>
-                  <td style={stats.withheldIncomplete > 0 ? { color: 'var(--warn)' } : undefined}>
+                  <td className="mono" data-label="周期" data-cell="primary">
+                    {interval}
+                  </td>
+                  <td data-label="已入库桶">{fmtNumber(stats.buckets)}</td>
+                  <td data-label="未收盘扣留">{fmtNumber(stats.withheldNotClosed)}</td>
+                  <td
+                    data-label="未全覆盖扣留"
+                    style={stats.withheldIncomplete > 0 ? { color: 'var(--warn)' } : undefined}
+                  >
                     {fmtNumber(stats.withheldIncomplete)}
                   </td>
-                  <td style={stats.missingMinutes > 0 ? { color: 'var(--warn)' } : undefined}>
+                  <td
+                    data-label="缺失 1m 分钟"
+                    style={stats.missingMinutes > 0 ? { color: 'var(--warn)' } : undefined}
+                  >
                     {fmtNumber(stats.missingMinutes)}
                   </td>
                 </tr>
@@ -241,18 +270,20 @@ function DerivedTable(props: {
             })}
           </tbody>
         </table>
-        <p className="muted" style={{ margin: '6px 0 0', fontSize: 12 }}>
-          只写「已收盘且 1m 全覆盖」的桶；未收盘的等下一批，1m 有缺口的被扣留并在图上留白
-          （不插值、不写半截蜡烛）。数字由 SQL 从 1m 推导，库里没有单独的扣留表。
-        </p>
       </div>
-      <button
-        disabled={props.aggregating}
-        title="从库内 1m 重算全部派生桶（只写派生表，不拉数据、不消耗配额）"
-        onClick={props.onAggregate}
-      >
-        {props.aggregating ? '重建中…' : '重建派生表'}
-      </button>
+      <p className="muted" style={{ margin: '10px 0 0', fontSize: 12 }}>
+        只写「已收盘且 1m 全覆盖」的桶；未收盘的等下一批，1m 有缺口的被扣留并在图上留白
+        （不插值、不写半截蜡烛）。数字由 SQL 从 1m 推导，库里没有单独的扣留表。
+      </p>
+      <div className="row" style={{ marginTop: 10 }}>
+        <button
+          disabled={props.aggregating}
+          title="从库内 1m 重算全部派生桶（只写派生表，不拉数据、不消耗配额）"
+          onClick={props.onAggregate}
+        >
+          {props.aggregating ? '重建中…' : '重建派生表'}
+        </button>
+      </div>
     </div>
   );
 }

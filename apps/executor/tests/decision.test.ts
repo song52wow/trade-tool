@@ -155,6 +155,10 @@ function returningRow(p: unknown[]): Record<string, unknown> {
     trail_atr_to: null,
     trail_updated_at: null,
     trail_last_error: null,
+    // v0.9.2：移动止损的档位序号与成功次数。占坑时都还没有。
+    trail_step: 0,
+    trail_moves: 0,
+    trail_status: 'idle',
     closed_qty: 0,
     exit_notional: 0,
     fee_amount: p[17] ?? 0,

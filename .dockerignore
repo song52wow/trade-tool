@@ -40,3 +40,6 @@ deploy/build-image.sh
 # 不会失效，重建只重跑尾部几层（否则每次改注释都要重装一遍依赖）。
 deploy/Dockerfile
 .dockerignore
+# 本机在仓库内开的 git worktree：它是一个**嵌套仓库**（几百 MB），
+# 不排除的话会被 `COPY . /app` 一起拷进构建上下文，白白拖慢构建。
+.worktrees/
