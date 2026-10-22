@@ -1,9 +1,8 @@
 /**
- * jsdom 缺少的浏览器 API。recharts 的 `ResponsiveContainer` 在挂载时会用
- * `ResizeObserver` 量尺寸，jsdom 里没有它就会在**passive effect** 里抛
- * `ResizeObserver is not defined`。
+ * jsdom 缺少的浏览器 API。`CandleChart` 的 `useMeasuredWidth` 在挂载时会用
+ * `ResizeObserver` 量容器宽度。
  *
- * 这不只是测试的烦恼：effect 里抛出的异常会中止同一批次剩余的 effect，
+ * 这不只是测试的烦恼：**effect 里抛出的异常会中止同一批次剩余的 effect**，
  * 一个图表组件就能让整页的数据加载静默失效。所以这里的 stub 既是为了让用例能跑，
  * 也是在提醒「首屏取数不能依赖 passive effect 一定被执行」。
  */

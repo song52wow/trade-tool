@@ -13,9 +13,9 @@ import { SymbolDetail } from './SymbolDetail.js';
  * 不整页刷新——图表重新取数由 hash 变化驱动，不靠重载。
  *
  * 取数用 `useLayoutEffect` 而不是 `useEffect`：这张页面**可以是首屏**（直接粘地址栏
- * 进来），而它的子树里有 recharts。effect 里抛出的异常会中止同一次 commit 里剩下的
+ * 进来），而它的子树里有图表。effect 里抛出的异常会中止同一次 commit 里剩下的
  * 全部 effect，图表挂载时读 `ResizeObserver` 抛错，详情就永远停在「读取中…」，
- * 而且错误只进 console —— 正是 AGENTS.md 记的那个坑。
+ * 而且错误只进 console ——正是 AGENTS.md 记的那个坑。
  */
 export function SymbolPage(props: {
   symbol: string;
@@ -66,9 +66,13 @@ export function SymbolPage(props: {
   const next = index >= 0 && index < options.length - 1 ? options[index + 1] : null;
 
   return (
-    <div className="page">
-      {/* 详情页自己的标题栏：返回 + 切换标的 + 复制地址栏即可分享 */}
-      <div className="detail-head">
+    <>
+      {/*
+        详情页自己的标题栏：**吸顶**。这一页很长（K 线、派生表、合约状态、
+        止盈止损、策略、对账、缺口清单），滚到中段时也要知道自己在哪个标的、
+        还能不能往前翻一个。
+      */}
+      <div className="page-head">
         <button className="link" onClick={() => navigate(HOME_PATH)} title="回到首页">
           ← 首页
         </button>
@@ -130,6 +134,6 @@ export function SymbolPage(props: {
           />
         )}
       </div>
-    </div>
+    </>
   );
 }

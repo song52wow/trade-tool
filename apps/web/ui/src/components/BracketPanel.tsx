@@ -179,17 +179,23 @@ export function BracketPanel(props: { symbol: string; tick: number }) {
               <tbody>
                 {items.map((b) => (
                   <tr key={b.entryOrderId}>
-                    <td className="mono">{fmtDate(b.entryTime)}</td>
-                    <td className="mono">{b.positionSide}</td>
-                    <td>{fmtNumber(b.filledQty)}</td>
-                    <td className="mono">{fmtPrice(b.entryPrice)}</td>
-                    <td className="mono">
+                    <td className="mono" data-label="成交时间" data-cell="primary">
+                      {fmtDate(b.entryTime)}
+                    </td>
+                    <td className="mono" data-label="方向">
+                      {b.positionSide}
+                    </td>
+                    <td data-label="数量">{fmtNumber(b.filledQty)}</td>
+                    <td className="mono" data-label="入场价">
+                      {fmtPrice(b.entryPrice)}
+                    </td>
+                    <td className="mono" data-label="止盈价">
                       {fmtPrice(b.takeProfit)}
                       <div className="muted" style={{ fontSize: 11 }}>
                         {pctOf(b.entryPrice, b.takeProfit)}
                       </div>
                     </td>
-                    <td className="mono">
+                    <td className="mono" data-label="止损价">
                       {/* `trailing` 行要显示**当前生效的那一档**，而不是入场时的原始止损：
                           显示后者会让人以为移动止损一直没动过。 */}
                       {fmtPrice(
@@ -210,7 +216,7 @@ export function BracketPanel(props: { symbol: string; tick: number }) {
                         </div>
                       )}
                     </td>
-                    <td className="mono">
+                    <td className="mono" data-label="ATR">
                       {fmtNumber(b.atr)}
                       <div className="muted" style={{ fontSize: 11 }}>
                         {b.atrInterval} · {b.atrPeriod}
@@ -221,7 +227,7 @@ export function BracketPanel(props: { symbol: string; tick: number }) {
                         {fmtTime(b.atrWindowFrom)} → {fmtTime(b.atrWindowTo)}
                       </div>
                     </td>
-                    <td>
+                    <td data-label="状态">
                       <span className={STATE_CLASS[b.state]}>{STATE_LABEL[b.state]}</span>
                       <div className="muted" style={{ fontSize: 11 }}>
                         {b.state}
@@ -230,7 +236,7 @@ export function BracketPanel(props: { symbol: string; tick: number }) {
                     {/* 两张单要么都挂上要么都不挂（v0.4.0 规则 5）。因此「只有止盈号、
                         没有止损号」本身就是异常，必须显式说破，不能把 null 渲染成
                         和「已成交后被交易所撤单」同样的「—」。 */}
-                    <td className="mono">
+                    <td className="mono" data-label="订单号（止盈 / 止损）">
                       {fmtNumber(b.tpAlgoId)} / {fmtNumber(b.slAlgoId)}
                       {(b.tpAlgoId === null) !== (b.slAlgoId === null) ? (
                         <div style={{ color: 'var(--err)', fontSize: 11 }}>单号不成对</div>
@@ -238,6 +244,7 @@ export function BracketPanel(props: { symbol: string; tick: number }) {
                     </td>
                     <td
                       className="mono"
+                      data-label="最后错误"
                       style={
                         b.lastError !== null ? { color: 'var(--err)' } : { color: 'var(--muted)' }
                       }

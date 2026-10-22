@@ -30,6 +30,28 @@ type Pending =
   | { kind: 'aggregate'; symbol: string }
   | { kind: 'remove'; symbol: string; policy: RemovePolicy };
 
+/**
+ * 守护进程三态的中文标签。与 `OverviewCards` 里那份**逐字相同**——
+ * 两处各写一份的话，迟早会有一处先改掉，用户看到两个不同的说法。
+ */
+const DAEMON_LABEL: Record<OverviewDto['daemon']['state'], string> = {
+  running: '运行中',
+  stale: '心跳超时',
+  stopped: '未运行',
+};
+
+/**
+ * 迁移版本压成短形式：`015_restore_llm_params_check` → `015`。
+ *
+ * 只给**窄屏顶栏**用：完整的迁移名是排障时要看的东西（它写进了 `title`），
+ * 但把它整串摆进一行 390px 宽的顶栏，会把整行撑破、让页面横向溢出。
+ * 前缀数字已经足够区分「库里第几版」。
+ */
+function shortVersion(version: string): string {
+  const dash = version.indexOf('_');
+  return dash === -1 ? version : version.slice(0, dash);
+}
+
 export function App() {
   const [overview, setOverview] = useState<OverviewDto | null>(null);
   const [symbols, setSymbols] = useState<SymbolRowDto[]>([]);
@@ -97,10 +119,9 @@ export function App() {
    * 首屏取数**刻意用 layout effect**，不是普通的 useEffect。
    *
    * 原因不是洁癖：effect 里抛出的异常会中止同一次 commit 里剩下的全部 effect。
-   * 之前就踩过——recharts 的 `ResponsiveContainer` 挂载时读 `ResizeObserver`，
-   * 抛错后 `useEffect(() => refresh())` 根本没机会执行，页面永远停在「读取中」，
-   * 而错误只进 console 没人看，等于静默失败。layout effect 在 commit 阶段同步执行、
-   * 早于所有 passive effect，图表再怎么抽风都拖垮不了取数。
+   * 之前就踩过——图表挂载时读 `ResizeObserver`，抛错后 `useEffect(() => refresh())`
+   * 根本没机会执行，页面永远停在「读取中」，而错误只进 console 没人看，等于静默失败。
+   * layout effect 在 commit 阶段同步执行、早于所有 passive effect，图表再怎么抽风都拖垮不了取数。
    */
   useLayoutEffect(() => {
     void refresh();
@@ -255,388 +276,467 @@ export function App() {
 
   const now = overview?.now ?? Date.now();
   const schemaOk = overview?.schema.ok ?? false;
+  const daemonState = overview?.daemon.state ?? 'stopped';
 
   return (
     <div className="app">
-      <header className="top">
-        {/* 面包屑三态：它就是导航本身。点「首页」改 hash，不整页刷新。 */}
-        <nav className="crumbs" aria-label="面包屑">
-          <button
-            className={`link${route.kind === 'home' ? ' current' : ''}`}
-            onClick={() => navigate(HOME_PATH)}
-          >
-            首页
+      {/*
+        顶栏：品牌 + 两条顶层路径 + 常驻状态。
+
+        状态放在**每一页**都看得见的地方（原来只有首页有），因为「守护进程在不在」
+        决定了这个控制面现在还能不能做事——在详情页与设置页上同样要一眼看到。
+      */}
+      <header className="topbar">
+        <div className="topbar-inner">
+          {/*
+            品牌字。**title 不写「回到首页」**：详情页那个「← 首页」按钮已经用了这五个字，
+            两处同名会让按 title 找元素的人（或用例）拿到一堆候选。
+          */}
+          <button className="brand" onClick={() => navigate(HOME_PATH)} title="trade-tool 控制面">
+            <span className="brand-mark" aria-hidden="true">
+              TT
+            </span>
+            <span className="brand-text">trade-tool</span>
           </button>
-          {route.kind === 'symbol' ? (
-            <>
-              <span className="sep" aria-hidden="true">
-                /
+
+          <nav className="nav" aria-label="主导航">
+            <button
+              className={`nav-link${route.kind === 'settings' ? '' : ' current'}`}
+              onClick={() => navigate(HOME_PATH)}
+              aria-current={route.kind === 'settings' ? undefined : 'page'}
+            >
+              概览
+            </button>
+            <button
+              className={`nav-link${route.kind === 'settings' ? ' current' : ''}`}
+              onClick={() => navigate(SETTINGS_PATH)}
+              aria-current={route.kind === 'settings' ? 'page' : undefined}
+            >
+              设置
+            </button>
+          </nav>
+
+          <div className="status-cluster">
+            {/*
+              守护进程状态。
+
+              文字**整体是一段话**（「守护进程 运行中」）而不是拆成「标签 + 值」两个元素：
+              拆开的话，「运行中」会变成某个元素的全部文字，与概览卡片里的那个同名，
+              页面上同一件事就有了两个「唯一的」说法。合成一段话既避免了这件事，
+              也让读屏软件一次读到完整的状态描述。
+            */}
+            <span
+              className="status-pill"
+              data-state={daemonState}
+              title={`守护进程${DAEMON_LABEL[daemonState]}`}
+            >
+              <span className="status-dot" aria-hidden="true" />
+              {/*
+                「守护进程 运行中」是**一个文本节点**，不是两个元素的拼接。
+                拆成「标签元素 + 值元素」的话，那个值元素的全部文字就正好是「运行中」，
+                与概览卡片里的同名元素撞车——页面上同一件事会显得有两处独立来源。
+                一段话既避免了这件事，读屏软件也能一次读到完整的状态描述。
+              */}
+              守护进程 {DAEMON_LABEL[daemonState]}
+            </span>
+
+            {/*
+              schema 版本。**窄屏只显示版本号**：迁移名动辄二十几个字符
+              （`015_restore_llm_params_check`），整串摆进顶栏会把整行撑破、
+              让页面横向溢出。完整值放在 `title` 里，宽屏才展开成 `当前 / 最新`。
+            */}
+            <span
+              className={`tag ${schemaOk ? 'ok' : 'error'} schema-tag`}
+              title={`schema ${overview?.schema.current ?? '读取中'} / ${overview?.schema.latest ?? '读取中'}`}
+            >
+              <span className="schema-full">
+                schema{' '}
+                {overview ? `${overview.schema.current} / ${overview.schema.latest}` : '读取中'}
               </span>
-              <span className="mono current">{route.symbol}</span>
-            </>
-          ) : null}
-          {route.kind === 'settings' ? (
-            <>
-              <span className="sep" aria-hidden="true">
-                /
+              <span className="schema-short">
+                schema{' '}
+                {overview
+                  ? `${shortVersion(overview.schema.current)} / ${shortVersion(overview.schema.latest)}`
+                  : '读取中'}
               </span>
-              <span className="current">设置</span>
-            </>
-          ) : null}
-        </nav>
-        <h1 className="brand">trade-tool 控制面</h1>
-        <span className={`tag ${schemaOk ? 'ok' : 'error'}`}>
-          schema {overview ? `${overview.schema.current} / ${overview.schema.latest}` : '读取中'}
-        </span>
-        <div className="spacer" />
-        <label className="row" style={{ gap: 6, fontSize: 12 }}>
-          <input
-            type="checkbox"
-            checked={autoRefresh}
-            onChange={(e) => setAutoRefresh(e.target.checked)}
-          />
-          <span className="muted">每 {REFRESH_MS / 1000}s 自动刷新</span>
-        </label>
-        <button
-          onClick={() => navigate(SETTINGS_PATH)}
-          className={route.kind === 'settings' ? 'primary' : ''}
-        >
-          设置
-        </button>
-        <ThemeToggle />
-        <button onClick={() => void refresh()}>立即刷新</button>
+            </span>
+
+            <label className="switch" title={`每 ${REFRESH_MS / 1000}s 自动刷新`}>
+              <input
+                type="checkbox"
+                checked={autoRefresh}
+                onChange={(e) => setAutoRefresh(e.target.checked)}
+              />
+              <span className="switch-track" aria-hidden="true" />
+              <span className="switch-label">每 {REFRESH_MS / 1000}s 自动刷新</span>
+            </label>
+
+            <button
+              className="icon"
+              onClick={() => void refresh()}
+              title="立即刷新"
+              aria-label="立即刷新"
+            >
+              ⟳
+            </button>
+            <ThemeToggle />
+          </div>
+        </div>
       </header>
 
-      {loadError !== null ? (
-        <div className="banner">
-          读取状态失败：{loadError}
-          <div className="muted" style={{ fontSize: 12, marginTop: 4 }}>
-            每 5s 自动重试；点「立即刷新」可立刻重试。
+      <main className="page">
+        {loadError !== null ? (
+          <div className="banner">
+            读取状态失败：{loadError}
+            <div className="muted" style={{ fontSize: 12, marginTop: 4 }}>
+              每 5s 自动重试；点「立即刷新」可立刻重试。
+            </div>
           </div>
-        </div>
-      ) : null}
+        ) : null}
 
-      {overview && !schemaOk ? (
-        <div className="banner">
-          数据库 schema（{overview.schema.current}）与代码（{overview.schema.latest}
-          ）不一致，写操作可能失败。 先在命令行跑 <code>trade-tool db migrate</code>。
-        </div>
-      ) : null}
-      {overview?.schema.ahead.length ? (
-        <div className="banner">
-          数据库里有代码不认识的迁移：{overview.schema.ahead.join(', ')}。请更新代码而不是强行迁移。
-        </div>
-      ) : null}
-      {/* 守护进程不在线时，「开始同步」只写意图、没有任何进程去执行它。这条必须常驻可见：
-          否则用户看到「同步中」却等不到数据，只能自己猜原因。 */}
-      {overview && !daemonOnline ? (
-        <div className="banner">
-          守护进程未运行{overview.daemon.state === 'stale' ? '（心跳超时，可能已卡死）' : ''}：
-          <b>「开始同步」只会记录意图，不会拉数据</b>。
-          <div className="muted" style={{ fontSize: 12, marginTop: 4 }}>
-            在另一个终端启动常驻进程：
-            <code>pnpm --filter @trade-tool/sync start</code>
-            {overview.daemon.lastBeatAt !== null ? (
-              <> · 最后心跳 {fmtAgo(overview.daemon.lastBeatAt, now)}</>
-            ) : null}
+        {overview && !schemaOk ? (
+          <div className="banner">
+            数据库 schema（{overview.schema.current}）与代码（{overview.schema.latest}
+            ）不一致，写操作可能失败。 先在命令行跑 <code>trade-tool db migrate</code>。
           </div>
-        </div>
-      ) : null}
-
-      {/*
-        三条路由各自只渲染自己那部分内容：详情页不重复概览卡片，设置页也不。
-        概览卡片回答的是「全局现在怎么样」，详情页回答的是「这个标的怎么样」，
-        两者堆在一起只会让后者被前者压掉。
-      */}
-      {route.kind === 'home' ? (
-        <>
-          {overview ? (
-            <OverviewCards
-              summary={overview.summary}
-              exchangeCount={overview.exchange.count}
-              exchangeStale={overview.exchange.stale}
-              exchangeAgeMs={overview.exchange.ageMs}
-              daemon={overview.daemon}
-              now={now}
-              activeJobs={overview.jobs.active}
-            />
-          ) : (
-            <p className="muted">正在读取状态…</p>
-          )}
-          <div className="panel">
-            <h2>
-              进行中与最近作业
-              {activeJobs.length > 0 ? (
-                <span className="tag running">{activeJobs.length} 进行中</span>
+        ) : null}
+        {overview?.schema.ahead.length ? (
+          <div className="banner">
+            数据库里有代码不认识的迁移：{overview.schema.ahead.join(', ')}
+            。请更新代码而不是强行迁移。
+          </div>
+        ) : null}
+        {/* 守护进程不在线时，「开始同步」只写意图、没有任何进程去执行它。这条必须常驻可见：
+            否则用户看到「同步中」却等不到数据，只能自己猜原因。 */}
+        {overview && !daemonOnline ? (
+          <div className="banner">
+            守护进程未运行{overview.daemon.state === 'stale' ? '（心跳超时，可能已卡死）' : ''}：
+            <b>「开始同步」只会记录意图，不会拉数据</b>。
+            <div className="muted" style={{ fontSize: 12, marginTop: 4 }}>
+              在另一个终端启动常驻进程：
+              <code>pnpm --filter @trade-tool/sync start</code>
+              {overview.daemon.lastBeatAt !== null ? (
+                <> · 最后心跳 {fmtAgo(overview.daemon.lastBeatAt, now)}</>
               ) : null}
-            </h2>
-            {jobs.length === 0 ? (
-              <p className="muted">还没有作业。数据体检会在详情面板里发起。</p>
-            ) : (
-              <div className="table-scroll">
-                <table>
-                  <thead>
-                    <tr>
-                      <th>标的</th>
-                      <th>类型</th>
-                      <th>状态</th>
-                      <th>进度</th>
-                      <th>开始</th>
-                      <th>耗时</th>
-                      <th>结果 / 错误</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {jobs.slice(0, 8).map((job) => {
-                      const pct =
-                        job.progress.target && job.progress.target > 0 && job.progress.rows !== null
-                          ? Math.min(1, job.progress.rows / job.progress.target)
-                          : null;
-                      return (
-                        <tr key={job.id}>
-                          <td className="mono">{job.symbol}</td>
-                          <td>
-                            {job.kind === 'full'
-                              ? '全量/增量'
-                              : job.kind === 'verify'
-                                ? '全表校验'
-                                : '派生重建'}
-                          </td>
-                          <td>
-                            <span
-                              className={`tag ${
-                                job.status === 'running'
-                                  ? 'running'
-                                  : job.status === 'failed'
-                                    ? 'error'
-                                    : 'ok'
-                              }`}
-                            >
-                              {job.status}
-                            </span>
-                          </td>
-                          <td style={{ minWidth: 180 }}>
-                            {pct === null ? (
-                              <span className="muted">—</span>
-                            ) : (
-                              <>
-                                <div className="bar thin">
-                                  <i style={{ width: `${pct * 100}%` }} />
-                                </div>
-                                <span className="mono muted" style={{ fontSize: 11 }}>
-                                  {fmtNumber(job.progress.rows)} / {fmtNumber(job.progress.target)}{' '}
-                                  · {fmtPercent(pct)}
-                                </span>
-                              </>
-                            )}
-                          </td>
-                          <td className="muted mono">
-                            {new Date(job.startedAt).toLocaleTimeString('zh-CN', { hour12: false })}
-                          </td>
-                          <td className="muted">
-                            {job.finishedAt === null
-                              ? '进行中'
-                              : fmtDuration(job.finishedAt - job.startedAt)}
-                          </td>
-                          <td className="mono muted" style={{ whiteSpace: 'pre-wrap' }}>
-                            {job.error ? `[${job.error.code}] ${job.error.message}` : '—'}
-                          </td>
-                        </tr>
-                      );
-                    })}
-                  </tbody>
-                </table>
-              </div>
-            )}
+            </div>
           </div>
+        ) : null}
 
-          <div className="panel">
-            <h2>标的集合</h2>
-            <div className="row" style={{ marginBottom: 12 }}>
-              <SymbolPicker
-                options={knownSymbols}
-                value={newSymbol}
-                onChange={setNewSymbol}
-                onSubmit={(s) => void addSymbolNamed(s)}
+        {/*
+          三条路由各自只渲染自己那部分内容：详情页不重复概览卡片，设置页也不。
+          概览卡片回答的是「全局现在怎么样」，详情页回答的是「这个标的怎么样」，
+          两者堆在一起只会让后者被前者压掉。
+        */}
+        {route.kind === 'home' ? (
+          <>
+            {overview ? (
+              <OverviewCards
+                summary={overview.summary}
+                exchangeCount={overview.exchange.count}
+                exchangeStale={overview.exchange.stale}
+                exchangeAgeMs={overview.exchange.ageMs}
+                daemon={overview.daemon}
+                now={now}
+                activeJobs={overview.jobs.active}
               />
-              <button
-                className="primary"
-                onClick={() => void addSymbol()}
-                disabled={newSymbol.trim() === ''}
-              >
-                添加（默认 paused）
-              </button>
-              <span className="muted" style={{ fontSize: 12 }}>
-                新标的默认 paused —— 加进来不会自动拉数据，避免一次加多个引发回补风暴。
-              </span>
+            ) : (
+              <p className="muted">正在读取状态…</p>
+            )}
+            <div className="panel">
+              <h2>
+                进行中与最近作业
+                {activeJobs.length > 0 ? (
+                  <span className="tag running">{activeJobs.length} 进行中</span>
+                ) : null}
+              </h2>
+              {jobs.length === 0 ? (
+                <p className="muted">还没有作业。数据体检会在详情面板里发起。</p>
+              ) : (
+                <div className="table-scroll">
+                  <table>
+                    <thead>
+                      <tr>
+                        <th>标的</th>
+                        <th>类型</th>
+                        <th>状态</th>
+                        <th>进度</th>
+                        <th>开始</th>
+                        <th>耗时</th>
+                        <th>结果 / 错误</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {jobs.slice(0, 8).map((job) => {
+                        const pct =
+                          job.progress.target &&
+                          job.progress.target > 0 &&
+                          job.progress.rows !== null
+                            ? Math.min(1, job.progress.rows / job.progress.target)
+                            : null;
+                        return (
+                          <tr key={job.id}>
+                            <td className="mono" data-label="标的" data-cell="primary">
+                              {job.symbol}
+                            </td>
+                            <td data-label="类型">
+                              {job.kind === 'full'
+                                ? '全量/增量'
+                                : job.kind === 'verify'
+                                  ? '全表校验'
+                                  : '派生重建'}
+                            </td>
+                            <td data-label="状态">
+                              <span
+                                className={`tag ${
+                                  job.status === 'running'
+                                    ? 'running'
+                                    : job.status === 'failed'
+                                      ? 'error'
+                                      : 'ok'
+                                }`}
+                              >
+                                {job.status}
+                              </span>
+                            </td>
+                            <td style={{ minWidth: 180 }} data-label="进度">
+                              {pct === null ? (
+                                <span className="muted">—</span>
+                              ) : (
+                                <>
+                                  <div className="bar thin">
+                                    <i style={{ width: `${pct * 100}%` }} />
+                                  </div>
+                                  <span className="mono muted" style={{ fontSize: 11 }}>
+                                    {fmtNumber(job.progress.rows)} /{' '}
+                                    {fmtNumber(job.progress.target)} · {fmtPercent(pct)}
+                                  </span>
+                                </>
+                              )}
+                            </td>
+                            <td className="muted mono" data-label="开始">
+                              {new Date(job.startedAt).toLocaleTimeString('zh-CN', {
+                                hour12: false,
+                              })}
+                            </td>
+                            <td className="muted" data-label="耗时">
+                              {job.finishedAt === null
+                                ? '进行中'
+                                : fmtDuration(job.finishedAt - job.startedAt)}
+                            </td>
+                            <td
+                              className="mono muted"
+                              style={{ whiteSpace: 'pre-wrap' }}
+                              data-label="结果 / 错误"
+                            >
+                              {job.error ? `[${job.error.code}] ${job.error.message}` : '—'}
+                            </td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                </div>
+              )}
             </div>
-            <SymbolTable
-              items={symbols}
-              now={now}
-              selected={selected}
-              busy={busy}
-              daemonOnline={daemonOnline}
-              onSelect={(s) => navigate(symbolPath(s))}
-              onLifecycle={(s, a) => void runLifecycle(s, a)}
-              onStart={(s) => void askStart(s)}
-              onRemove={askRemove}
-              onAdopt={(s) => void addSymbolNamed(s)}
-            />
-          </div>
-        </>
-      ) : null}
 
-      {route.kind === 'symbol' ? (
-        <SymbolPage
-          symbol={route.symbol}
-          notify={notify}
-          symbols={symbols}
-          now={now}
-          verifying={verifyingSymbol === route.symbol}
-          onVerify={() => setPending({ kind: 'verify', symbol: route.symbol })}
-          aggregating={aggregatingSymbol === route.symbol}
-          onAggregate={() => setPending({ kind: 'aggregate', symbol: route.symbol })}
-          tick={tick}
-        />
-      ) : null}
-
-      {route.kind === 'settings' ? <SettingsPage symbols={symbols} notify={notify} /> : null}
-
-      {pending?.kind === 'startOffline' ? (
-        <ConfirmDialog
-          title={`${pending.symbol} 的守护进程没有在运行`}
-          confirmLabel="仍然记录意图"
-          busy={busy === pending.symbol}
-          onCancel={() => setPending(null)}
-          onConfirm={() => void confirmPending()}
-        >
-          <p>
-            这里的「开始同步」<b>只是把期望状态写进数据库</b>，真正拉数据的是独立的常驻进程
-            <code>apps/sync</code>。它现在没有运行，所以不会有任何请求发出去，行数不会变化。
-          </p>
-          <p className="muted" style={{ fontSize: 12 }}>
-            典型用法：先在这里把标的登记为同步中，再去启动守护进程接单——意图已经落库，
-            守护进程起来后会立刻接手。
-          </p>
-        </ConfirmDialog>
-      ) : null}
-
-      {pending?.kind === 'startFirstPull' ? (
-        <ConfirmDialog
-          title={`开始同步 ${pending.symbol}`}
-          confirmLabel="开始同步"
-          busy={busy === pending.symbol}
-          onCancel={() => setPending(null)}
-          onConfirm={() => void confirmPending()}
-        >
-          <p>
-            该标的库里还没有历史，守护进程会先<b>补全全部历史</b>（1m，起点取自该标的的运行时{' '}
-            <code>onboardDate</code>），之后每轮再增量拉取最新。
-          </p>
-          <div className="est-grid">
-            <div className="card">
-              <div className="label">目标行数</div>
-              <div className="value">{fmtNumber(pending.estimate.bars)}</div>
+            <div className="panel">
+              <h2>标的集合</h2>
+              <div className="row" style={{ marginBottom: 12 }}>
+                <SymbolPicker
+                  options={knownSymbols}
+                  value={newSymbol}
+                  onChange={setNewSymbol}
+                  onSubmit={(s) => void addSymbolNamed(s)}
+                />
+                <button
+                  className="primary"
+                  onClick={() => void addSymbol()}
+                  disabled={newSymbol.trim() === ''}
+                >
+                  添加（默认 paused）
+                </button>
+                <span className="muted" style={{ fontSize: 12 }}>
+                  新标的默认 paused —— 加进来不会自动拉数据，避免一次加多个引发回补风暴。
+                </span>
+              </div>
+              <SymbolTable
+                items={symbols}
+                now={now}
+                selected={selected}
+                busy={busy}
+                daemonOnline={daemonOnline}
+                onSelect={(s) => navigate(symbolPath(s))}
+                onLifecycle={(s, a) => void runLifecycle(s, a)}
+                onStart={(s) => void askStart(s)}
+                onRemove={askRemove}
+                onAdopt={(s) => void addSymbolNamed(s)}
+              />
             </div>
-            <div className="card">
-              <div className="label">已入库</div>
-              <div className="value">
-                {fmtNumber(symbols.find((s) => s.symbol === pending.symbol)?.state?.rows ?? 0)}
+          </>
+        ) : null}
+
+        {route.kind === 'symbol' ? (
+          <SymbolPage
+            symbol={route.symbol}
+            notify={notify}
+            symbols={symbols}
+            now={now}
+            verifying={verifyingSymbol === route.symbol}
+            onVerify={() => setPending({ kind: 'verify', symbol: route.symbol })}
+            aggregating={aggregatingSymbol === route.symbol}
+            onAggregate={() => setPending({ kind: 'aggregate', symbol: route.symbol })}
+            tick={tick}
+          />
+        ) : null}
+
+        {route.kind === 'settings' ? <SettingsPage symbols={symbols} notify={notify} /> : null}
+
+        {/*
+          弹窗与 toast 放在**页面内容之后**：确认按钮与行内按钮同名时，
+          按 DOM 顺序取到的最后一个才是弹窗里的那个（见 App.test.tsx）。
+        */}
+        {pending?.kind === 'startOffline' ? (
+          <ConfirmDialog
+            title={`${pending.symbol} 的守护进程没有在运行`}
+            confirmLabel="仍然记录意图"
+            busy={busy === pending.symbol}
+            onCancel={() => setPending(null)}
+            onConfirm={() => void confirmPending()}
+          >
+            <p>
+              这里的「开始同步」<b>只是把期望状态写进数据库</b>，真正拉数据的是独立的常驻进程
+              <code>apps/sync</code>。它现在没有运行，所以不会有任何请求发出去，行数不会变化。
+            </p>
+            <p className="muted" style={{ fontSize: 12 }}>
+              典型用法：先在这里把标的登记为同步中，再去启动守护进程接单——意图已经落库，
+              守护进程起来后会立刻接手。
+            </p>
+          </ConfirmDialog>
+        ) : null}
+
+        {pending?.kind === 'startFirstPull' ? (
+          <ConfirmDialog
+            title={`开始同步 ${pending.symbol}`}
+            confirmLabel="开始同步"
+            busy={busy === pending.symbol}
+            onCancel={() => setPending(null)}
+            onConfirm={() => void confirmPending()}
+          >
+            <p>
+              该标的库里还没有历史，守护进程会先<b>补全全部历史</b>（1m，起点取自该标的的运行时{' '}
+              <code>onboardDate</code>），之后每轮再增量拉取最新。
+            </p>
+            <div className="est-grid">
+              <div className="card">
+                <div className="label">目标行数</div>
+                <div className="value">{fmtNumber(pending.estimate.bars)}</div>
+              </div>
+              <div className="card">
+                <div className="label">已入库</div>
+                <div className="value">
+                  {fmtNumber(symbols.find((s) => s.symbol === pending.symbol)?.state?.rows ?? 0)}
+                </div>
+              </div>
+              <div className="card">
+                <div className="label">预计请求数</div>
+                <div className="value">{fmtNumber(pending.estimate.requests)} 次</div>
+              </div>
+              <div className="card">
+                {/* 权重与耗时都直接取服务端的估算值：单位换算（权重 → 毫秒）是后端的事，
+                    在这里再算一遍只会引入一份会漂移的副本。 */}
+                <div className="label">预计权重 / 耗时</div>
+                <div className="value">
+                  {fmtNumber(pending.estimate.weight)} · {fmtDuration(pending.estimate.estimatedMs)}
+                </div>
               </div>
             </div>
-            <div className="card">
-              <div className="label">预计请求数</div>
-              <div className="value">{fmtNumber(pending.estimate.requests)} 次</div>
+            <p className="muted" style={{ fontSize: 12 }}>
+              上面是<b>配额下限</b>
+              ，真实耗时受网络往返支配，通常明显更久。这是一次性操作，不提供「缩短范围」选项。
+            </p>
+          </ConfirmDialog>
+        ) : null}
+
+        {pending?.kind === 'verify' ? (
+          <ConfirmDialog
+            title={`数据体检 ${pending.symbol}`}
+            confirmLabel="开始体检"
+            busy={busy === pending.symbol}
+            onCancel={() => setPending(null)}
+            onConfirm={() => void confirmPending()}
+          >
+            <p>
+              会扫描该标的的<b>整张表</b>找缺口并重建「已验证到哪里」基线。行数多时是全表扫描，
+              耗时按数据量线性增长。
+            </p>
+            <p className="muted" style={{ fontSize: 12 }}>
+              例行同步只看最近 7 天，<b>更早的漏行只有它能发现</b>
+              。只读本地库，不出网、不消耗交易所配额。
+              缺口语义：只由真实数据填充，不插值、不跳过（R-11）。
+            </p>
+          </ConfirmDialog>
+        ) : null}
+
+        {pending?.kind === 'aggregate' ? (
+          <ConfirmDialog
+            title={`重建派生 K 线 ${pending.symbol}`}
+            confirmLabel="开始重建"
+            busy={busy === pending.symbol}
+            onCancel={() => setPending(null)}
+            onConfirm={() => void confirmPending()}
+          >
+            <p>
+              从库内已入库的 <b>1m K 线</b>重算 15m / 1h / 4h / 1d 全部桶（先删后算）。
+              <b>不出网、不消耗交易所配额</b>，也不改动 1m 与水位。
+            </p>
+            <p className="muted" style={{ fontSize: 12 }}>
+              通常<strong>不需要</strong>手动重建：缺口在下一轮同步被补上时，受影响的桶会自动出现。
+              重建用于「1m 被外部改动 / 派生表被篡改」这两种情况。
+            </p>
+          </ConfirmDialog>
+        ) : null}
+
+        {pending?.kind === 'remove' ? (
+          <ConfirmDialog
+            title={`移除 ${pending.symbol}`}
+            confirmLabel="移除"
+            danger
+            busy={busy === pending.symbol}
+            onCancel={() => setPending(null)}
+            onConfirm={() => void confirmPending()}
+          >
+            <p>
+              移除只改标的集合，<b>不会自动删数据</b>。已入库行的处置策略：
+            </p>
+            <div className="row" style={{ marginTop: 8 }}>
+              {(['keep', 'archive', 'delete'] as RemovePolicy[]).map((p) => (
+                <button
+                  key={p}
+                  className={pending.policy === p ? 'primary' : ''}
+                  onClick={() => setPending({ ...pending, policy: p })}
+                >
+                  {p}
+                </button>
+              ))}
             </div>
-            <div className="card">
-              {/* 权重与耗时都直接取服务端的估算值：单位换算（权重 → 毫秒）是后端的事，
-                  在这里再算一遍只会引入一份会漂移的副本。 */}
-              <div className="label">预计权重 / 耗时</div>
-              <div className="value">
-                {fmtNumber(pending.estimate.weight)} · {fmtDuration(pending.estimate.estimatedMs)}
-              </div>
+            <p className="muted" style={{ fontSize: 12, marginTop: 10 }}>
+              keep 保留数据与状态；archive 归档后同样保留；delete 才真正删除行。
+            </p>
+          </ConfirmDialog>
+        ) : null}
+
+        {/*
+          toast 栈：多条同时出现时**向上堆叠**而不是叠在同一个位置
+          （原来每条都 fixed 在右下角，后来的直接把先来的盖住了）。
+        */}
+        <div className="toasts" role="status" aria-live="polite">
+          {toasts.map((t) => (
+            <div key={t.id} className={`toast${t.kind === 'err' ? ' err' : ''}`}>
+              {t.text}
             </div>
-          </div>
-          <p className="muted" style={{ fontSize: 12 }}>
-            上面是<b>配额下限</b>
-            ，真实耗时受网络往返支配，通常明显更久。这是一次性操作，不提供「缩短范围」选项。
-          </p>
-        </ConfirmDialog>
-      ) : null}
-
-      {pending?.kind === 'verify' ? (
-        <ConfirmDialog
-          title={`数据体检 ${pending.symbol}`}
-          confirmLabel="开始体检"
-          busy={busy === pending.symbol}
-          onCancel={() => setPending(null)}
-          onConfirm={() => void confirmPending()}
-        >
-          <p>
-            会扫描该标的的<b>整张表</b>找缺口并重建「已验证到哪里」基线。行数多时是全表扫描，
-            耗时按数据量线性增长。
-          </p>
-          <p className="muted" style={{ fontSize: 12 }}>
-            例行同步只看最近 7 天，<b>更早的漏行只有它能发现</b>
-            。只读本地库，不出网、不消耗交易所配额。
-            缺口语义：只由真实数据填充，不插值、不跳过（R-11）。
-          </p>
-        </ConfirmDialog>
-      ) : null}
-
-      {pending?.kind === 'aggregate' ? (
-        <ConfirmDialog
-          title={`重建派生 K 线 ${pending.symbol}`}
-          confirmLabel="开始重建"
-          busy={busy === pending.symbol}
-          onCancel={() => setPending(null)}
-          onConfirm={() => void confirmPending()}
-        >
-          <p>
-            从库内已入库的 <b>1m K 线</b>重算 15m / 1h / 4h / 1d 全部桶（先删后算）。
-            <b>不出网、不消耗交易所配额</b>，也不改动 1m 与水位。
-          </p>
-          <p className="muted" style={{ fontSize: 12 }}>
-            通常<strong>不需要</strong>手动重建：缺口在下一轮同步被补上时，受影响的桶会自动出现。
-            重建用于「1m 被外部改动 / 派生表被篡改」这两种情况。
-          </p>
-        </ConfirmDialog>
-      ) : null}
-
-      {pending?.kind === 'remove' ? (
-        <ConfirmDialog
-          title={`移除 ${pending.symbol}`}
-          confirmLabel="移除"
-          danger
-          busy={busy === pending.symbol}
-          onCancel={() => setPending(null)}
-          onConfirm={() => void confirmPending()}
-        >
-          <p>
-            移除只改标的集合，<b>不会自动删数据</b>。已入库行的处置策略：
-          </p>
-          <div className="row" style={{ marginTop: 8 }}>
-            {(['keep', 'archive', 'delete'] as RemovePolicy[]).map((p) => (
-              <button
-                key={p}
-                className={pending.policy === p ? 'primary' : ''}
-                onClick={() => setPending({ ...pending, policy: p })}
-              >
-                {p}
-              </button>
-            ))}
-          </div>
-          <p className="muted" style={{ fontSize: 12, marginTop: 10 }}>
-            keep 保留数据与状态；archive 归档后同样保留；delete 才真正删除行。
-          </p>
-        </ConfirmDialog>
-      ) : null}
-
-      {toasts.map((t) => (
-        <div key={t.id} className={`toast${t.kind === 'err' ? ' err' : ''}`}>
-          {t.text}
+          ))}
         </div>
-      ))}
+      </main>
     </div>
   );
 }

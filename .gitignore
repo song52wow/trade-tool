@@ -35,6 +35,10 @@ logs/
 
 # deploy/build-image.sh 的本地产物（镜像 tar），可能几百 MB，只在搬运时存在。
 dist-deploy/
+# 本机在仓库内开的 git worktree（工具生成）。它是一个**嵌套仓库**：
+# 不忽略的话 `git add -A` 会把里面几百 MB 的源码一起提交，
+# `docker build` 的 `COPY . /app` 也会把它拷进构建上下文。
+.worktrees/
 .DS_Store
 .idea/
 .vscode/

@@ -16,8 +16,9 @@ export function SettingsPage(props: {
   notify: (text: string, kind?: 'ok' | 'err') => void;
 }) {
   return (
-    <div className="page">
-      <div className="detail-head">
+    <>
+      {/* 标题栏同样吸顶：这一页也有三块长表单，滚下去之后要还知道自己在设置页。 */}
+      <div className="page-head">
         <button className="link" onClick={() => navigate(HOME_PATH)} title="回到首页">
           ← 首页
         </button>
@@ -29,6 +30,6 @@ export function SettingsPage(props: {
         <NotifyPanel notify={props.notify} />
         <RiskPolicyPanel symbols={props.symbols.map((s) => s.symbol)} notify={props.notify} />
       </div>
-    </div>
+    </>
   );
 }

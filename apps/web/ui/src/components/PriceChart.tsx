@@ -147,31 +147,41 @@ export function PriceChart(props: {
 
   return (
     <div className="price-chart">
+      {/*
+        两组互斥选择：周期与区间。
+
+        以前它们是一排同样大小的小按钮，混在一起分不清哪个是「换周期」哪个是
+        「换区间」。现在分成两个**分段控件**，各自带一个标签——一眼就知道自己在动什么。
+      */}
       <div className="chart-head">
-        <span className="muted" style={{ fontSize: 12 }}>
-          {interval} K 线（读自本地库）
-        </span>
-        {ALL_INTERVALS.map((item) => (
-          <button
-            key={item}
-            className={interval === item ? 'chip active' : 'chip'}
-            onClick={() => onInterval(item)}
-            title={`切换到 ${item}`}
-          >
-            {item}
-          </button>
-        ))}
+        <span className="chart-label">{interval} K 线（读自本地库）</span>
+        <div className="segmented" role="group" aria-label="K 线周期">
+          {ALL_INTERVALS.map((item) => (
+            <button
+              key={item}
+              className={interval === item ? 'active' : ''}
+              onClick={() => onInterval(item)}
+              title={`切换到 ${item}`}
+              aria-pressed={interval === item}
+            >
+              {item}
+            </button>
+          ))}
+        </div>
         <div className="spacer" />
-        {RANGES.map((n) => (
-          <button
-            key={n}
-            className={range === n ? 'chip active' : 'chip'}
-            onClick={() => onRange(n)}
-            title={`最近 ${n.toLocaleString('zh-CN')} 根`}
-          >
-            {fmtDuration(n * barMs)}
-          </button>
-        ))}
+        <div className="segmented" role="group" aria-label="时间范围">
+          {RANGES.map((n) => (
+            <button
+              key={n}
+              className={range === n ? 'active' : ''}
+              onClick={() => onRange(n)}
+              title={`最近 ${n.toLocaleString('zh-CN')} 根`}
+              aria-pressed={range === n}
+            >
+              {fmtDuration(n * barMs)}
+            </button>
+          ))}
+        </div>
       </div>
 
       {error !== null ? (

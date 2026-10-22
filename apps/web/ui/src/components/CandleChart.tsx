@@ -9,12 +9,13 @@ export { gapStats, describeSpan, minutesToBars } from './gaps.js';
 export type { GapStats } from './gaps.js';
 
 /**
- * K 线（蜡烛图）。手写 SVG，不套 recharts。
+ * K 线（蜡烛图）。手写 SVG，不用图表库。
  *
  * 为什么不用图表库：库给的是「按序排列的一串 OHLC」，而这个页面真正要回答的问题是
  * **「同步下来的数据长什么样、哪里是空的」**。横轴必须按**时间**而不是按序号排布——
  * 按序号排会把缺口悄悄抹平，一段 3 天的空洞会显示成连续下跌，那是骗人的界面（R-4.4
  * 的同一个道理：缺的东西要看得见）。缺口统计因此直接写在图下方，不藏进 tooltip。
+ * 顺带少一个「挂载时读 ResizeObserver、jsdom 里抛错会拖垮整页取数」的雷。
  *
  * 桶宽 ``barMs`` 是**必填**：v0.2.0 起周期可以是 15m / 1h / 4h / 1d，
  * 写死 60_000 会让「缺一根 4h」被当成「缺一分钟」。
@@ -26,11 +27,18 @@ export const DEFAULT_BAR_MS = 60_000;
  *
  * 刻意**不**复用状态色（--ok/--err）：那套是「正常 / 故障」，这里说的是行情方向。
  * 中文用户的直觉是红涨绿跌，海外是绿涨红跌，方向颜色在图例里写明，不靠猜。
+ *
+ * 颜色走 CSS 变量而不是写死的 hex：写死的那一套是暗色底上的值，浅色主题下
+ * 网格线会变成一坨深灰、坐标轴文字则浅得看不见。两套主题各自调过对比度。
+ *
+ * ⚠️ SVG 上**必须写 `style={{ fill: … }}` 而不是 `fill="var(--…)"`**：SVG 的呈现属性
+ * （presentation attribute）在解析期求值，`var()` 在那里不保证被解析——写上去会静默
+ * 变成黑色。走 style 则是真正的 CSS，切换主题时图表跟着变。
  */
-const UP = '#f85149';
-const DOWN = '#3fb950';
-const GRID = '#2a2f3a';
-const AXIS = '#9aa3b2';
+const UP = 'var(--chart-up)';
+const DOWN = 'var(--chart-down)';
+const GRID = 'var(--chart-grid)';
+const AXIS = 'var(--chart-axis)';
 const GAP_FILL = '#2a2f3a';
 
 const DEFAULT_WIDTH = 900;
@@ -133,6 +141,19 @@ export function xOf(layout: CandleLayout, time: number): number {
 
 export function yOf(layout: CandleLayout, price: number): number {
   return layout.priceTop + ((layout.hi - price) / (layout.hi - layout.lo)) * layout.priceHeight;
+}
+
+/**
+ * 「最新价」标签会不会与「成交量」标签叠在一起。
+ *
+ * 两个标签都在绘图区右侧的同一条留白里：最新价在价格区，成交量在量能区上沿。
+ * 收盘价落在区间下沿时，最新价的基线正好压到量能区上沿，两个标签就叠成一团
+ * 糊字。判据用**基线距离**（两行文字高 10px，小于 12px 就算撞）。
+ */
+export function lastLabelCollides(layout: CandleLayout, lastClose: number): boolean {
+  const priceLabelY = yOf(layout, lastClose) + 3;
+  const volumeLabelY = layout.volTop - 4;
+  return Math.abs(priceLabelY - volumeLabelY) < 12;
 }
 
 /** 轴刻度取 1/2/5×10ⁿ 的「好看」步长，避免出现 0.0037 这种刻度。 */
@@ -310,13 +331,13 @@ export function CandleChart(props: {
               x2={plotRight}
               y1={yOf(layout, p)}
               y2={yOf(layout, p)}
-              stroke={GRID}
+              style={{ stroke: GRID }}
             />
             <text
               x={layout.plotLeft - 6}
               y={yOf(layout, p) + 3}
               textAnchor="end"
-              fill={AXIS}
+              style={{ fill: AXIS }}
               fontSize={10}
               className="mono"
             >
@@ -331,7 +352,7 @@ export function CandleChart(props: {
             x={xOf(layout, t)}
             y={height - 6}
             textAnchor="middle"
-            fill={AXIS}
+            style={{ fill: AXIS }}
             fontSize={10}
             className="mono"
           >
@@ -351,7 +372,7 @@ export function CandleChart(props: {
               y={layout.volTop + layout.volHeight - h}
               width={layout.bodyWidth}
               height={Math.max(MIN_BODY, h)}
-              fill={bar.close >= bar.open ? UP : DOWN}
+              style={{ fill: bar.close >= bar.open ? UP : DOWN }}
               opacity={0.55}
             />
           );
@@ -361,7 +382,7 @@ export function CandleChart(props: {
           x2={plotRight}
           y1={layout.volTop + layout.volHeight}
           y2={layout.volTop + layout.volHeight}
-          stroke={GRID}
+          style={{ stroke: GRID }}
         />
 
         {bars.map((bar) => {
@@ -378,7 +399,7 @@ export function CandleChart(props: {
                 x2={cx}
                 y1={yOf(layout, bar.high)}
                 y2={yOf(layout, bar.low)}
-                stroke={color}
+                style={{ stroke: color }}
                 strokeWidth={1}
               />
               <rect
@@ -388,17 +409,24 @@ export function CandleChart(props: {
                 width={layout.bodyWidth}
                 // 开盘价 == 收盘价（十字星）时高度为 0，SVG 上不可见；给 1px 让它仍然读得出来。
                 height={Math.max(MIN_BODY, bodyBottom - bodyTop)}
-                fill={color}
+                style={{ fill: color }}
               />
             </g>
           );
         })}
 
-        {last && layout.maxVolume > 0 ? (
+        {/*
+          最后一根的成交量。
+
+          ⚠️ 它与「最新价」标签**挤在同一条右侧留白里**：价格收在区间下沿时，
+          最新价标签正好落到量能区的上沿，两个标签会叠成一团。因此这里先算一次
+          是否会撞——**最新价是必看的，成交量只是补充**，撞上就让位给它。
+        */}
+        {last && layout.maxVolume > 0 && !lastLabelCollides(layout, last.close) ? (
           <text
             x={plotRight + 4}
             y={layout.volTop - 4}
-            fill={AXIS}
+            style={{ fill: AXIS }}
             fontSize={10}
             textAnchor="start"
             className="mono"
@@ -414,7 +442,7 @@ export function CandleChart(props: {
               x2={plotRight}
               y1={yOf(layout, last.close)}
               y2={yOf(layout, last.close)}
-              stroke={last.close >= last.open ? UP : DOWN}
+              style={{ stroke: last.close >= last.open ? UP : DOWN }}
               strokeDasharray="4 3"
               opacity={0.7}
             />
@@ -422,7 +450,7 @@ export function CandleChart(props: {
               x={plotRight + 4}
               y={yOf(layout, last.close) + 3}
               textAnchor="start"
-              fill={last.close >= last.open ? UP : DOWN}
+              style={{ fill: last.close >= last.open ? UP : DOWN }}
               fontSize={10}
               className="mono"
             >
@@ -438,7 +466,7 @@ export function CandleChart(props: {
               x2={xOf(layout, hovered.time)}
               y1={layout.priceTop}
               y2={layout.volTop + layout.volHeight}
-              stroke={AXIS}
+              style={{ stroke: AXIS }}
               strokeDasharray="2 2"
             />
             <line
@@ -446,7 +474,7 @@ export function CandleChart(props: {
               x2={plotRight}
               y1={yOf(layout, hovered.close)}
               y2={yOf(layout, hovered.close)}
-              stroke={AXIS}
+              style={{ stroke: AXIS }}
               strokeDasharray="2 2"
             />
           </g>

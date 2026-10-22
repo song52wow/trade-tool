@@ -25,9 +25,9 @@ export function ConfirmDialog(props: ConfirmDialogProps) {
 
   return (
     <dialog ref={ref} onCancel={props.onCancel}>
-      <h3 style={{ marginTop: 0 }}>{props.title}</h3>
-      {props.children}
-      <div className="row" style={{ justifyContent: 'flex-end', marginTop: 16 }}>
+      <h3>{props.title}</h3>
+      <div className="dialog-body">{props.children}</div>
+      <div className="dialog-actions">
         <button onClick={props.onCancel} disabled={props.busy}>
           取消
         </button>

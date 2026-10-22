@@ -40,7 +40,7 @@ export function SymbolTable(props: {
               <th>水位</th>
               <th>缺口</th>
               <th>最近成功</th>
-              <th style={{ textAlign: 'right' }}>操作</th>
+              <th className="cell-actions">操作</th>
             </tr>
           </thead>
           <tbody>
@@ -53,7 +53,11 @@ export function SymbolTable(props: {
                   className={`clickable${props.selected === symbol ? ' selected' : ''}`}
                   onClick={() => props.onSelect(symbol)}
                 >
-                  <td className="mono">
+                  {/*
+                    `data-label` 是**列名**，窄屏下由 CSS 变成行内标签（`::before`）。
+                    窄屏时这张表会变成卡片列表：一列一行，操作按钮不再藏在横滑的尽头。
+                  */}
+                  <td className="mono" data-label="标的" data-cell="primary">
                     {symbol}
                     {!row.inCollection ? (
                       <>
@@ -67,7 +71,7 @@ export function SymbolTable(props: {
                       </>
                     ) : null}
                   </td>
-                  <td>
+                  <td data-label="期望状态">
                     {row.desiredState === null ? (
                       <span className="tag muted">—</span>
                     ) : (
@@ -78,27 +82,36 @@ export function SymbolTable(props: {
                       </span>
                     )}
                   </td>
-                  <td>
+                  <td data-label="实际状态">
                     {state ? (
                       <span className={STATUS_TAG[state.status] ?? 'tag'}>{state.status}</span>
                     ) : (
                       <span className="tag muted">未开始</span>
                     )}
                   </td>
-                  <td>
+                  <td data-label="行数">
                     {row.hasHistory ? fmtNumber(state?.rows) : <span className="muted">无</span>}
                   </td>
-                  <td>{fmtBytes(state?.bytes)}</td>
-                  <td className="mono">{state?.watermark ? fmtTime(state.watermark) : '—'}</td>
-                  <td>
+                  <td data-label="占用">{fmtBytes(state?.bytes)}</td>
+                  <td className="mono" data-label="水位">
+                    {state?.watermark ? fmtTime(state.watermark) : '—'}
+                  </td>
+                  <td data-label="缺口">
                     {state && state.pendingGaps > 0 ? (
                       <span className="tag warn">{fmtNumber(state.pendingGaps)}</span>
                     ) : (
                       <span className="muted">0</span>
                     )}
                   </td>
-                  <td className="muted">{fmtAgo(state?.lastSuccessAt, props.now)}</td>
-                  <td style={{ textAlign: 'right' }} onClick={(e) => e.stopPropagation()}>
+                  <td className="muted" data-label="最近成功">
+                    {fmtAgo(state?.lastSuccessAt, props.now)}
+                  </td>
+                  <td
+                    className="cell-actions"
+                    data-label="操作"
+                    data-cell="actions"
+                    onClick={(e) => e.stopPropagation()}
+                  >
                     <div className="row" style={{ justifyContent: 'flex-end', gap: 6 }}>
                       {!row.inCollection ? (
                         <button

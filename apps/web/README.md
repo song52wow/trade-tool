@@ -52,6 +52,32 @@ pnpm --filter @trade-tool/web start    # 或 node apps/web/dist/main.js
 
 三块都遵守同一条安全线：**写操作过同源校验**（`checkOrigin`），**读路径永远拿不到明文**。
 
+## 界面
+
+设计系统写在 [`ui/src/styles.css`](ui/src/styles.css)，两套主题**几何完全一致**
+（切主题只换颜色、不换布局）。配色取两份参考的各一半：
+
+- **Apple** —— 信息层级与留白节奏。字号有明确台阶，卡片靠「发丝线 + 极轻投影」分层
+  而不是粗边框，顶栏固定在顶部并带一层毛玻璃，互斥选项（K 线周期、区间）用分段控件。
+- **Pundi X** —— 深色终端的气质。暗色下用霓虹青做唯一强调色，数字与代码用等宽，
+  标签是大写 + 字距的微型字，背景铺一层几乎看不见的网格。
+
+响应式分三档：**≥1180px** 双栏（设置页左窄右宽）、**≤860px** 表格整体变成卡片列表
+（`data-label` 提供行内标签，DOM 不复制表头）、**≤720px** 顶栏与导航拆成两层。
+窄屏下顶栏只显示迁移**版本号**（完整迁移名在 `title` 里），否则一行放不下。
+
+## 图表
+
+**一律手写 SVG / CSS，不用图表库**（运行期依赖只有 react / react-dom / hono）：
+
+- K 线：[`ui/src/components/CandleChart.tsx`](ui/src/components/CandleChart.tsx)。
+  横轴按**时间**排布，缺一根就是空一根（按序号排会把空洞压成连续走势，R-23 明令禁止）。
+- 状态分布：`OverviewCards.tsx` 里的 `.dist-bar`，一条按比例切开的横条。
+
+两个理由都还在：① 横轴必须按时间；② 图表库的 `ResponsiveContainer` 挂载时读
+`ResizeObserver`，jsdom 里抛错会**中止同一次 commit 里剩下的全部 effect**——
+首屏取数就此静默失效，页面永远停在「读取中」。
+
 ## 测试
 
 ```bash
@@ -63,5 +89,5 @@ pnpm --filter @trade-tool/web test
 - `tests/rows.test.ts` —— 集合∪状态的并集逻辑（纯函数）。
 - `tests/ui/App.test.tsx` —— jsdom 下挂载 `<App />`，断言它真的去取数并渲染真实数据。
 
-UI 用例需要 `ResizeObserver`（recharts 的 `ResponsiveContainer` 会用），由
+UI 用例需要 `ResizeObserver`（`CandleChart` 量容器宽度会用），由
 `tests/ui/setup.ts` 打桩。
