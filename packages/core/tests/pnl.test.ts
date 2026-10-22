@@ -59,9 +59,10 @@ describe('realizedPnl', () => {
       exitNotional: 220,
       feeAmount: 1.5,
     });
-    expect(pnl.gross).toBeCloseTo(20, 10);
-    expect(pnl.fee).toBeCloseTo(1.5, 10);
-    expect(pnl.net).toBeCloseTo(18.5, 10);
+    expect(pnl).not.toBeNull();
+    expect(pnl?.gross).toBeCloseTo(20, 10);
+    expect(pnl?.fee).toBeCloseTo(1.5, 10);
+    expect(pnl?.net).toBeCloseTo(18.5, 10);
   });
 
   it('空头：卖出价高于买回价才是赚', () => {
@@ -72,8 +73,9 @@ describe('realizedPnl', () => {
       exitNotional: 180,
       feeAmount: 1,
     });
-    expect(pnl.gross).toBeCloseTo(20, 10);
-    expect(pnl.net).toBeCloseTo(19, 10);
+    expect(pnl).not.toBeNull();
+    expect(pnl?.gross).toBeCloseTo(20, 10);
+    expect(pnl?.net).toBeCloseTo(19, 10);
   });
 
   it('亏的时候净盈亏是负的，而且手续费让它更亏', () => {
@@ -84,8 +86,9 @@ describe('realizedPnl', () => {
       exitNotional: 180,
       feeAmount: 1,
     });
-    expect(pnl.gross).toBeCloseTo(-20, 10);
-    expect(pnl.net).toBeCloseTo(-21, 10);
+    expect(pnl).not.toBeNull();
+    expect(pnl?.gross).toBeCloseTo(-20, 10);
+    expect(pnl?.net).toBeCloseTo(-21, 10);
   });
 
   it('分批的两段出场：按累计成交额算，中间那一段不能当成结账', () => {
@@ -98,8 +101,36 @@ describe('realizedPnl', () => {
       exitNotional: 110 + 90,
       feeAmount: 0.4,
     });
-    expect(pnl.gross).toBeCloseTo(0, 10);
-    expect(pnl.net).toBeCloseTo(-0.4, 10);
+    expect(pnl).not.toBeNull();
+    expect(pnl?.gross).toBeCloseTo(0, 10);
+    expect(pnl?.net).toBeCloseTo(-0.4, 10);
+  });
+
+  it('已平仓但没拿到出场成交额时：算不出来，不编一个假数', () => {
+    // 2026-10-22 实测的线上事故：出场价被当成 0 → 成交额 0 →
+    // 「毛利 = (0 − 入场价) × 数量」= −194 USDT 的假亏损。
+    // 这里必须返回 null，让调用方说「算不出」。
+    const pnl = realizedPnl({
+      positionSide: 'LONG',
+      entryPrice: 84466,
+      closedQty: 0.0023,
+      exitNotional: 0,
+      feeAmount: 0.15547621,
+    });
+    expect(pnl).toBeNull();
+  });
+
+  it('还没平仓（closedQty=0）时不算盈亏，也不返回 null', () => {
+    const pnl = realizedPnl({
+      positionSide: 'LONG',
+      entryPrice: 100,
+      closedQty: 0,
+      exitNotional: 0,
+      feeAmount: 0.5,
+    });
+    expect(pnl).not.toBeNull();
+    expect(pnl?.gross).toBeCloseTo(0, 10);
+    expect(pnl?.net).toBeCloseTo(-0.5, 10);
   });
 
   it('计价币是稳定币', () => {

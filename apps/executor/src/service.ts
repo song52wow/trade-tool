@@ -388,27 +388,61 @@ export function createExecutorService(deps: ExecutorServiceDeps): ExecutorServic
       exitNotional: after.exitNotional,
       feeAmount: after.feeAmount,
     });
-    await pushAlert('bracket-settled', () => ({
-      fingerprint: `settled|${after.symbol}|${after.entryOrderId}`,
-      // 类型「成交」：一轮买卖走完了。
-      category: 'trade',
-      // 亏了比赚了更值得看一眼——用「注意」而不是「提示」。
-      severity: pnl.net >= 0 ? 'info' : 'warning',
-      oneShot: true,
-      // 标题带净盈亏：推送预览里直接看到这一轮赚没赚。
-      title: `${after.symbol} 净盈亏 ${money(pnl.net)}`,
-      lines: [
-        `入场 ${after.entryPrice} → 出场 ${update.lastFilledPrice}`,
-        `已平 ${after.closedQty}（均价 ${(after.exitNotional / after.closedQty).toFixed(2)}）`,
-        `本轮${state === 'take_profit' ? '止盈' : '止损'}成交`,
-      ],
-      // 金额单独一段并加粗。
-      highlights: [
-        `毛利 ${money(pnl.gross)}`,
-        `手续费 ${money(pnl.fee)}`,
-        `净盈亏 ${money(pnl.net)}`,
-      ],
-    }));
+    // 「出场价」与「均价」都只在**真的有成交额**时才有意义。
+    // 成交额是 0 时显示 0 是最糟的写法：它看起来像个真实的数，而不是「没拿到」。
+    const avgExitPrice = after.closedQty > 0 ? after.exitNotional / after.closedQty : 0;
+    const priceLine =
+      update.lastFilledPrice > 0
+        ? `入场 ${after.entryPrice} → 出场 ${update.lastFilledPrice}`
+        : `入场 ${after.entryPrice} → 出场价没拿到`;
+    const qtyLine =
+      avgExitPrice > 0
+        ? `已平 ${after.closedQty}（均价 ${avgExitPrice.toFixed(2)}）`
+        : `已平 ${after.closedQty}（成交额没拿到，算不出均价）`;
+    const round = `本轮${state === 'take_profit' ? '止盈' : '止损'}成交`;
+    // 订单号是**排查用的钥匙**：出问题时拿着它去交易所的订单记录里查，
+    // 不用靠「哪个标的、什么时候」去猜是哪一张单。
+    // 入场单号是这一轮的锚（库里那一行的主键），出场单号是真正成交的那张。
+    const orderLine = `订单号：入场 ${after.entryOrderId}，出场 ${update.orderId}`;
+
+    await pushAlert('bracket-settled', () => {
+      // 盈亏**算不出来**时如实说算不出来，绝不拿 0 去凑一个「看起来精确」的数字。
+      if (pnl === null) {
+        return {
+          fingerprint: `settled|${after.symbol}|${after.entryOrderId}`,
+          category: 'trade',
+          // 算不出盈亏比亏了更值得看一眼：用「注意」。
+          severity: 'warning',
+          oneShot: true,
+          title: `${after.symbol} 一轮完成（盈亏算不出）`,
+          lines: [
+            priceLine,
+            qtyLine,
+            orderLine,
+            round,
+            '没拿到出场成交额，这一轮的盈亏暂时算不出来',
+          ],
+          highlights: [`已计手续费 ${money(after.feeAmount)}`],
+        };
+      }
+      return {
+        fingerprint: `settled|${after.symbol}|${after.entryOrderId}`,
+        // 类型「成交」：一轮买卖走完了。
+        category: 'trade',
+        // 亏了比赚了更值得看一眼——用「注意」而不是「提示」。
+        severity: pnl.net >= 0 ? 'info' : 'warning',
+        oneShot: true,
+        // 标题带净盈亏：推送预览里直接看到这一轮赚没赚。
+        title: `${after.symbol} 净盈亏 ${money(pnl.net)}`,
+        lines: [priceLine, qtyLine, orderLine, round],
+        // 金额单独一段并加粗。
+        highlights: [
+          `毛利 ${money(pnl.gross)}`,
+          `手续费 ${money(pnl.fee)}`,
+          `净盈亏 ${money(pnl.net)}`,
+        ],
+      };
+    });
   }
 
   /**
@@ -880,6 +914,9 @@ export function createExecutorService(deps: ExecutorServiceDeps): ExecutorServic
         `入场 ${update.averagePrice} × ${update.cumulativeQty}（${
           plan.positionSide === 'LONG' ? '多头' : '空头'
         }）`,
+        // 订单号是**排查用的钥匙**：出问题时拿着它去交易所的订单记录里查，
+        // 不用靠「哪个标的、什么时候」去猜是哪一张单。
+        `订单号：入场 ${entryOrderId}，止盈 ${tpAlgoId}，止损 ${slAlgoId}`,
         ...(plan.mode === 'partial' ? ['剩余仓位由移动止损了结，止损位只上移不放宽'] : []),
       ],
       // 金额单独一段并加粗。
@@ -969,6 +1006,8 @@ export function createExecutorService(deps: ExecutorServiceDeps): ExecutorServic
           : `${update.symbol} LLM 决策降级到配置档位`,
         lines: [
           `原因：${outcome.fallbackReason ?? '未知'}`,
+          // 单号：降级这一轮对应的是哪一笔入场，查仓位时用得上。
+          `订单号：入场 ${String(update.orderId)}`,
           outcome.refuse
             ? '按配置 llm.fallbackToPolicy=false，本次**没有挂单**——仓位当前是裸的，需要人工处理。'
             : '本次止盈止损按 risk_policy 的档位挂出，仓位仍受保护。',

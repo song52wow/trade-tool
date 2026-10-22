@@ -209,6 +209,24 @@ function requireNumber(value: unknown, field: string, where: string): number {
 }
 
 /**
+ * 可选数字：**缺失或不是数字时返回 `null`**，不抛错。
+ *
+ * 只给「交易所可能不给、但给了就必须是数字」的字段用（如末次成交价 `L`）：
+ * 缺失时由调用方按「拿不到」处理，而不是让**整条事件被丢掉**——
+ * 丢掉一笔真实成交比缺一个数严重得多。
+ *
+ * 与 `requireNumber` 的分工：后者用于「缺了就是 payload 形状不对」的必返字段
+ * （事件时间、成交量、手续费），缺了就必须报错。
+ */
+function optionalNumber(value: unknown): number | null {
+  if (typeof value === 'number' && Number.isFinite(value)) return value;
+  if (typeof value === 'string' && value.trim() !== '' && Number.isFinite(Number(value))) {
+    return Number(value);
+  }
+  return null;
+}
+
+/**
  * 把 `ORDER_TRADE_UPDATE` 解析成 `OrderTradeUpdate`；不是该事件返回 `null`。
  *
  * 独立成纯函数是为了能脱开网络逐条断言字段口径——解析错一个字段，
@@ -224,8 +242,25 @@ export function parseOrderTradeUpdate(payload: unknown): OrderTradeUpdate | null
   }
   const o = order as Record<string, unknown>;
   const where = `ORDER_TRADE_UPDATE ${String(o['s'])}`;
-  const lastFilledPrice = requireNumber(o['p'], 'o.p', where);
+  // `p` 是订单**原始**价格——市价单恒为 0。它**不是**成交价。
+  // 只校验它在（少一个字段说明 payload 形状不对），别拿它当成交价用。
+  requireNumber(o['p'], 'o.p', where);
+  // 官方 USDⓈ-M 合约的价字段口径（2026-10-22 核对官方《订单交易更新推送》）：
+  //   `p`  = 订单原始价格（市价单为 0）
+  //   `L`  = 订单**末次成交**价格  ← 本笔成交价
+  //   `ap` = 订单平均价格
+  //
+  // **取错字段的后果不是小数点错一位，而是一整轮盈亏凭空变成假账**：
+  // 入场是市价单、止损触发后也是市价成交，两者的 `p` 都是 0。
+  // 拿 `p` 当成交价 → 出场价 0 → 成交额 0 → 「毛利 = (0 − 入场价) × 数量」
+  // 变成一个巨大的负数（2026-10-22 实测：一轮真实止损被算成 −194 USDT，
+  // 飞书卡片上写着「出场 0」）。
+  const lastFilled = optionalNumber(o['L']);
   const average = requireNumber(o['ap'], 'o.ap', where);
+  // 末次成交价缺失或为 0（条件单触发后的成交有时只给均价）→ 退回均价。
+  // 两个都是 0 时**如实是 0**：那是「没拿到出场价」，由调用方去说「算不出」，
+  // 而不是在这里编一个数。
+  const lastFilledPrice = lastFilled !== null && lastFilled > 0 ? lastFilled : average;
   return {
     eventTime: requireNumber(root['E'], 'E', where),
     transactionTime: requireNumber(root['T'], 'T', where),
