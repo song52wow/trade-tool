@@ -8,7 +8,7 @@ trade-tool/
 │   ├── cli/                     @trade-tool/cli        命令行入口（一次性命令）
 │   ├── sync/                    @trade-tool/sync       常驻同步守护进程 + 控制原语
 │   ├── web/                     @trade-tool/web        控制面：HTTP API + 看板（直接 import 原语）
-│   ├── executor/                @trade-tool/executor   止盈止损：成交 → 净仓位 → ATR → 条件单（会真实下单）
+│   ├── executor/                @trade-tool/executor   止盈止损：成交 → 净仓位 → ATR → 条件单（会真实下单）＋ 执行 Agent 方案
 │   └── agent/                   @trade-tool/agent      分析师 + 交易员 Agent：分析 → 执行方案（默认不下单）
 ├── packages/
 │   ├── tsconfig/                @trade-tool/tsconfig   共享 tsconfig 预设
@@ -42,7 +42,8 @@ apps/agent ───> packages/data ───────> packages/core
 `apps/cli`、`apps/sync`、`apps/web`、`apps/executor`、`apps/agent` 是**五个独立入口**：CLI 只读 `sync status`、
 不改生命周期；控制面只写 `desired_state`（先落库再生效），真正拉数据的始终是 `apps/sync`
 守护进程；`apps/executor` 只做止盈止损，不碰行情同步的生命周期；
-`apps/agent` 只出方案，既不碰行情同步的生命周期，也**不下单**。
+`apps/agent` 只出方案，既不碰行情同步的生命周期，**下单也不由它做**——
+下单在 `apps/executor`（凭据与私有接口都在那边）。
 
 ## 环境要求
 
@@ -185,13 +186,15 @@ ATR 算（`deriveStagedPlan`）。这样价格计算保持是可复现的纯函�
 交易员 Agent：立场 → 进场方式 / 仓位大小 / 止损止盈                 → 方案落库
       ↓
 默认到此为止：**只出方案，不下单**
+      ↓
+（agent.execute.enabled = true 时）方案进 approved → apps/executor 变成真实订单
 ```
 
 **模型只输出比例，不输出价格与数量**。模型能说的只有分数、置信度、ATR 倍数、
 风险占权益的百分比、进场方式与偏移；**绝对价格、数量、名义金额一律由程序算**——
 价格走 `deriveBracketPlan`（`apps/executor` 挂单走 `deriveStagedPlan`，两者算式与对齐方向
 逐字相同），数量走
-「愿意亏多少钱 ÷ 每股亏多少」再按 `stepSize` 对齐。理由很实在：模型说「买 0.35 个」
+「愿意亏多少钱 ÷ 每股亏多少钱」再按 `stepSize` 对齐。理由很实在：模型说「买 0.35 个」
 完全可能是在算 3.5 个，而**没有任何一处会报错**；比例算错时绝对金额仍然可控。
 
 **总立场由程序合成，不由模型给**。模型给三个面的分数，`aggregateAnalystReport` 按权重算出
@@ -209,6 +212,7 @@ ATR 算（`deriveStagedPlan`）。这样价格计算保持是可复现的纯函�
 pnpm --filter @trade-tool/agent start                # 常驻（需 agent.enabled = true）
 pnpm --filter @trade-tool/cli start -- agent run     # 单跑一次
 pnpm --filter @trade-tool/cli start -- agent report  # 只读库，看最近一次报告与方案
+pnpm --filter @trade-tool/cli start -- agent plan 42 --approve  # 预先批准一份方案
 ```
 
 `agent run` 与守护进程**共用同一份编排**，口径一致；`agent report` 是纯读，
@@ -216,11 +220,18 @@ pnpm --filter @trade-tool/cli start -- agent report  # 只读库，看最近一�
 就连历史都看不了。
 
 ⚠️ **默认只出方案，不下单**：`agent.execute.enabled` 缺省 `false`，方案落库时
-`status = 'advisory'`，控制面与 CLI 都看得到，要真下单得人工审核后手动执行。
-**本期未实现自动执行路径**，因此把这个开关打开会让 `apps/agent` **启动即报错**——
-而不是「开着却什么也不做」，后者是最危险的一种失败。
+`status = 'advisory'`，控制面与 CLI 都看得到。
 
-细则见 [`apps/agent/README.md`](apps/agent/README.md) 与 `AGENTS.md` §6.11。
+⚠️ **打开这个开关就会真的下单**（v1.0.0 已实现）：Agent 产出的可执行方案直接进
+`approved`，由 `apps/executor` 消费并变成真实订单（**只支持市价进场**——
+限价单可能永远不成交，而不成交的仓位没有止损保护，因此**限价方案不自动批准**，
+控制面与 CLI 的人工批准也拒绝它）。
+下单走 executor 而不是 agent，因为下单要用交易所凭据，而凭据在 executor 那边。
+
+模型接入（地址 / 模型 / 密钥 / 超时）**可以在控制面设**（密文落库），改完下一轮就生效，
+不必重启进程；配置文件 + 环境变量降级为兜底档。
+
+细则见 [`apps/agent/README.md`](apps/agent/README.md) 与 `AGENTS.md` §6.11–§6.13。
 
 ## 交易对账（v0.6.0）
 
@@ -489,6 +500,8 @@ TS 与 Python 通过 `packages/data/src/bridge.ts` 交互。**v0.1.0 起，跨�
   `data sync` 必须显式给 `--symbol`。
 - **离线链路仍在**：`source: 'synthetic'` 走 `generate_series`，默认行为与既有测试不变。
 - 回测为单标的、单持仓，**信号在 `t` 收盘确认、成交在 `t+1` 开盘**，扣双边手续费与滑点。
-- **分析师 / 交易员 Agent 已实现**（v1.0.0）：常驻进程 + CLI 单跑，控制面有只读面板。
-  **默认只出方案、不下单**——自动执行路径本期未实现，打开 `agent.execute.enabled`
-  会让服务启动即报错，而不是「开着却什么也不做」。
+- **分析师 / 交易员 Agent 已实现**（v1.0.0）：常驻进程 + CLI 单跑，控制面有面板。
+  **默认只出方案、不下单**；`agent.execute.enabled = true` 时方案进 `approved`，
+  由 `apps/executor` 变成真实订单（**只支持市价进场**）。
+- **模型接入可以在控制面设**（v1.0.0）：地址 / 模型 / API 密钥 / 超时，密钥密文落库，
+  改完下一轮生效；配置文件 + 环境变量降级为兜底档。

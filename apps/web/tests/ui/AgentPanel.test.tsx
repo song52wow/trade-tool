@@ -68,6 +68,8 @@ function plan(overrides: Partial<TradingPlanDto> = {}): TradingPlanDto {
     failureReason: null,
     entryOrderId: null,
     executionFailureReason: null,
+    approvable: true,
+    approvableReason: null,
     ...overrides,
   };
 }
@@ -142,6 +144,29 @@ describe('AgentPanel', () => {
     expect(screen.getByText(/风险比例超过上限/)).toBeTruthy();
   });
 
+  it('方案不能批准：不给批准按钮，但说清为什么；驳回照常能用', async () => {
+    // 限价进场不能自动执行。判据在 core 里算好传过来（`approvable` / `approvableReason`），
+    // 页面不自己判一遍——那是第二份实现，措辞迟早漂移。
+    const reason = '限价进场暂不支持自动执行（只支持市价进场）';
+    stubFetch({
+      symbol: 'AAAUSDT',
+      report: null,
+      plan: plan({
+        entryType: 'limit',
+        approvable: false,
+        approvableReason: reason,
+      }),
+    } satisfies AgentViewDto);
+    render(<AgentPanel symbol="AAAUSDT" tick={0} />);
+
+    await waitFor(() => expect(screen.getByText(/BUY limit/)).toBeTruthy());
+    // 原因要显示出来：不给按钮却不解释，用户只会以为页面坏了
+    expect(screen.getByText(reason)).toBeTruthy();
+    expect(screen.queryByRole('button', { name: '批准' })).toBeNull();
+    // 驳回始终可用——不能用不代表不能拒
+    expect(screen.getByRole('button', { name: '驳回' })).toBeTruthy();
+  });
+
   it('方案失败：显示失败原因，而不是一片空白', async () => {
     stubFetch({
       symbol: 'AAAUSDT',
@@ -163,6 +188,8 @@ describe('AgentPanel', () => {
         failureReason: '分析师模型调用失败：超时',
         entryOrderId: null,
         executionFailureReason: null,
+        approvable: false,
+        approvableReason: '方案是「出不了方案」，没有可执行的进场，不能批准',
       }),
     } satisfies AgentViewDto);
     render(<AgentPanel symbol="AAAUSDT" tick={0} />);

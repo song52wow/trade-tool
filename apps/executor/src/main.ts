@@ -353,10 +353,7 @@ async function main(): Promise<void> {
         return unsettled.length > 0;
       },
     });
-    planTimer = startPlanExecutionTimer(
-      planExecutor,
-      config.agent.execute.pollIntervalMs,
-    );
+    planTimer = startPlanExecutionTimer(planExecutor, config.agent.execute.pollIntervalMs);
     console.error(
       `[executor] 自动下单已开启：每 ${String(config.agent.execute.pollIntervalMs / 1000)} 秒` +
         `检查一次已批准的方案（同时最多 ${String(config.agent.execute.maxOpenPlans)} 笔，` +

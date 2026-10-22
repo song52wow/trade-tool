@@ -1,5 +1,6 @@
 import { HOME_PATH, navigate } from '../router.js';
 import type { SymbolRowDto } from '../../../src/types';
+import { AgentLlmPanel } from './AgentLlmPanel.js';
 import { CredentialsPanel } from './CredentialsPanel.js';
 import { NotifyPanel } from './NotifyPanel.js';
 import { RiskPolicyPanel } from './RiskPolicyPanel.js';
@@ -7,9 +8,9 @@ import { RiskPolicyPanel } from './RiskPolicyPanel.js';
 /**
  * 运行期设置页（`#/settings`）。
  *
- * 只做组合：三个区块各自管自己的取数与错误，彼此不共享状态——凭据能不能存、
- * 通知地址配没配、ATR 倍数是多少是三件互不影响的事，耦在一起会让其中一个失败带倒
- * 另一个。
+ * 只做组合：四个区块各自管自己的取数与错误，彼此不共享状态——凭据能不能存、
+ * 通知地址配没配、模型接入在哪一档、ATR 倍数是多少是四件互不影响的事，
+ * 耦在一起会让其中一个失败带倒另一个。
  */
 export function SettingsPage(props: {
   symbols: SymbolRowDto[];
@@ -17,7 +18,7 @@ export function SettingsPage(props: {
 }) {
   return (
     <>
-      {/* 标题栏同样吸顶：这一页也有三块长表单，滚下去之后要还知道自己在设置页。 */}
+      {/* 标题栏同样吸顶：这一页也有几块长表单，滚下去之后要还知道自己在设置页。 */}
       <div className="page-head">
         <button className="link" onClick={() => navigate(HOME_PATH)} title="回到首页">
           ← 首页
@@ -29,6 +30,7 @@ export function SettingsPage(props: {
         <CredentialsPanel notify={props.notify} />
         <NotifyPanel notify={props.notify} />
         <RiskPolicyPanel symbols={props.symbols.map((s) => s.symbol)} notify={props.notify} />
+        <AgentLlmPanel notify={props.notify} />
       </div>
     </>
   );

@@ -20,6 +20,7 @@ export * from './db/sql-files.js';
 export * from './llm.js';
 /** Agent 的报告与方案落库（v1.0.0）：analyst_report / trading_plan。 */
 export * from './db/agent.js';
+export * from './db/llm-settings.js';
 /** 私有交易接口（签名 REST + 用户数据流），v0.4.0 `apps/executor` 的交易所侧适配。 */
 export * from './binance-private.js';
 /** 端点接线：把 `environment` 配置 + 环境变量接到私有客户端与 Python 子进程。 */

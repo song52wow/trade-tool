@@ -1,6 +1,8 @@
 import type { GapRecord, RemovePolicy, StoredInterval } from '@trade-tool/core';
 
 import type {
+  AgentLlmStatusDto,
+  AgentLlmWriteBody,
   AgentViewDto,
   BarsDto,
   BracketsDto,
@@ -18,6 +20,7 @@ import type {
   RiskPolicyWriteBody,
   SymbolDetailDto,
   SymbolRowDto,
+  TradingPlanDto,
 } from '../../src/types';
 
 /** 服务端错误一律带上 code，页面要显示它而不是笼统的「操作失败」。 */
@@ -143,6 +146,23 @@ export const api = {
       throw error;
     }),
   /**
+   * 批准 / 驳回一份执行方案（v1.0.0）。
+   *
+   * ⚠️ **批准本身不下单**：真正的下单由 `apps/executor` 消费 `approved` 的方案完成，
+   * 而 executor 只在 `agent.execute.enabled` 开着时才消费。开关关着时，批准只是
+   * 「预先批准」，不会有单下出去——页面必须把这句话写出来，否则用户会以为
+   * 「点了批准 = 立刻开仓」。
+   */
+  setTradingPlanStatus: (symbol: string, planId: string, status: 'approved' | 'rejected') =>
+    request<TradingPlanDto>(
+      `/api/symbols/${encodeURIComponent(symbol)}/agent/plans/${encodeURIComponent(planId)}`,
+      {
+        method: 'PUT',
+        headers: JSON_HEADERS,
+        body: JSON.stringify({ status }),
+      },
+    ),
+  /**
    * 最近一次**自动**对账快照（全账户范围）。纯读本地表，由 executor 写入，
    * 因此可以跟着刷新节奏走。从没跑过时服务端返回 `report: null`，
    * 页面据此显示「还没有自动对账记录」——不能拿空报告冒充「一致」。
@@ -246,6 +266,29 @@ export const api = {
   clearNotifySettings: () => request<NotifyStatusDto>('/api/settings/notify', { method: 'DELETE' }),
   /** 发一条测试消息（出网）。失败要如实报错——「看起来成功其实没发出去」最坑。 */
   testNotify: () => post<{ ok: boolean; sentAt: number }>('/api/settings/notify/test'),
+
+  // ------------------------------------------------- 模型接入设置（v1.0.0）
+  //
+  // 与凭据、通知同一条安全线：回包里**没有明文密钥**，只有「配没配 / 末 4 位 / 生效来源」。
+  // 所以页面**永远不要**把密钥回填进输入框——它手上根本没有这个值。
+
+  /** 生效来源是 `config`（配置文件 + 环境变量）时，密钥取自哪个环境变量。 */
+  agentLlmStatus: () => request<AgentLlmStatusDto>('/api/settings/agent-llm'),
+  /** 回包仍是状态而非设置：提交上去的密钥不会（也不可能）被回显。 */
+  writeAgentLlmSettings: (body: AgentLlmWriteBody) =>
+    request<AgentLlmStatusDto>('/api/settings/agent-llm', {
+      method: 'PUT',
+      headers: JSON_HEADERS,
+      body: JSON.stringify(body),
+    }),
+  /**
+   * 清空**控制面录入的那一份**，退回「配置文件 + 环境变量」。
+   *
+   * 它**不是「把模型关掉」**——关模型要用开关。两者混为一谈会让用户以为
+   * 清完之后模型还在跑，实际只是换了一个生效来源。
+   */
+  clearAgentLlmSettings: () =>
+    request<AgentLlmStatusDto>('/api/settings/agent-llm', { method: 'DELETE' }),
 
   /**
    * 策略总览。`symbol` 省略时 `resolved` 按全局默认算——设置页在还没选标的时也要能显示

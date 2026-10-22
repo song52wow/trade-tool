@@ -17,7 +17,7 @@
   └─ 结束：**默认不下单**。方案只是建议。
 ```
 
-## 三条边界
+## 四条边界
 
 1. **模型只输出比例，不输出价格与数量**。模型能说的只有：三个面的分数、置信度、
    止损 / 止盈的 ATR 倍数、风险占权益的百分比、进场方式与偏移。
@@ -35,6 +35,12 @@
 3. **失败必须留痕**。模型超时 / 输出不合法 / 方案算不出来——都落一条 `action='failed'`
    的方案并写明原因，**不静默跳过**。理由很实在：页面上要能回答「这个标的今天分析过没有」，
    而「分析过但没结论」与「压根没分析」是两件完全不同的事。
+
+4. **「可执行」的口径与执行器一致**。自动执行只支持**市价**进场，因此
+   **限价方案不自动批准**（落 `advisory` + 显眼日志）。批准一份执行不了的方案，
+   它会永远卡在 `approved`——每轮被捞出来又跳过，而页面上显示「已批准、等 executor 消费」，
+   看上去像是有一单在等着下。**三处口径必须一致**：agent 的自动批准、
+   控制面的人工批准、CLI 的人工批准。
 
 ## 方向与结论矛盾怎么办
 
@@ -104,27 +110,53 @@
 读不到权益**抛错，不返回 0**（0 会被当成「账户没钱」，于是算出 0 数量——
 一个看起来正常、实际什么都不做的方案）。
 
-## 默认只出方案，不下单
+## 默认只出方案；打开开关才真的下单
 
 `agent.execute.enabled` 缺省 `false`。方案落库时 `status = 'advisory'`，
-控制面与 CLI 都看得到，但要真下单得人工审核后手动执行。
+控制面与 CLI 都看得到，但**不会有单下出去**。
 
-⚠️ **本期未实现自动执行路径**（`apps/executor` 还不消费 `status='approved'` 的方案）。
-因此把这个开关打开时，`apps/agent` **启动即报错**而不是「开着却什么也不做」——
-后者是最危险的一种失败：日志写着「自动执行：开」，实际一笔单都没下。
-闸门在 `src/execute-guard.ts`，**守护进程与命令行共用同一道**
-（编排器里也有一道，两条路都被拦住，不会出现「守护进程拦了、命令行没拦」的缝）。
+开关打开时，`apps/agent` 产出的**可执行**方案（`action = 'enter'`）直接落
+`status = 'approved'`，由 `apps/executor` 消费并变成真实订单。
+
+⚠️ **自动下单走的是 `apps/executor`，不是 `apps/agent`**：下单要用交易所凭据，
+凭据在 executor 那边。因此要下单还必须 executor 那边有凭据。
+
+⚠️ **只支持市价进场**：限价单可能永远不成交，而不成交的仓位**没有止损保护**。
+因此**限价方案不自动批准**（落 `advisory` + 一条显眼日志）——
+批准一份执行不了的方案，它会永远卡在 `approved`，每轮被捞出来又跳过，
+而页面上显示「已批准、等 executor 消费」，看上去像是有一单在等着下。
+控制面与 CLI 的**人工**批准同样拒绝限价，三处口径一致。
+
+⚠️ **不许出现「两处开关」**：用户已经打开「允许自动下单」，还要再去控制面点一次
+批准，于是「开关打开了却没下单」看起来像是坏了。因此控制面与 CLI 的「批准」是
+**预先批准**——executor 在开关关着时压根不消费方案。
+
+执行器的细节（认领 → 下单 → 回填、幂等锚点、方案档位优先）见
+[`apps/executor/README.md`](../executor/README.md) 与 AGENTS.md §6.12。
+
+## 模型接入在控制面设
+
+模型地址 / 模型名 / API 密钥 / 超时现在可以在控制面录入（密文落库），
+改完**下一轮就生效**，不必重启进程。
+
+- 控制面那一档填全了 → 用控制面那份；否则回落到配置文件 + 环境变量。
+- 判据只有一份实现（`packages/data/src/db/llm-settings.ts` 的 `resolveAll`），
+  且**不看 `enabled`**（那是那一档内部的开关）。
+- 控制面的读路径**永远拿不到明文密钥**：只给「配没配 / 末 4 位 / 生效来源」。
+  主密钥没注入时状态是「不知道」，不是「没配」。
+
+详见 AGENTS.md §6.13。
 
 ## 文件
 
-| 文件                   | 职责                                                       |
-| ---------------------- | ---------------------------------------------------------- |
-| `src/service.ts`       | `createAgentService()`：一轮的编排（分析 → 方案 → 落库）   |
-| `src/daemon.ts`        | `createAgentDaemon()`：定时循环，标的逐个顺序跑            |
-| `src/equity.ts`        | `createEquityReader()`：读账户权益（读不到抛错，不返回 0） |
-| `src/execute-guard.ts` | 自动执行开关的闸门（本期未实现 → 开着就报错）              |
-| `src/main.ts`          | 进程入口（`bin: trade-tool-agent`）                        |
-| `src/index.ts`         | 对外 barrel                                                |
+| 文件             | 职责                                                            |
+| ---------------- | --------------------------------------------------------------- |
+| `src/service.ts` | `createAgentService()`：一轮的编排（分析 → 方案 → 落库）        |
+| `src/daemon.ts`  | `createAgentDaemon()`：定时循环，标的逐个顺序跑                 |
+| `src/equity.ts`  | `createEquityReader()`：读账户权益（读不到抛错，不返回 0）      |
+| `src/llm.ts`     | `createLlmResolver()`：每轮重新解析模型接入（控制面改完即生效） |
+| `src/main.ts`    | 进程入口（`bin: trade-tool-agent`）                             |
+| `src/index.ts`   | 对外 barrel                                                     |
 
 ## 运行
 
@@ -137,11 +169,16 @@ cp .env.example .env
 pnpm --filter @trade-tool/agent start
 ```
 
+模型接入也可以**在控制面设**（地址 / 模型 / 密钥 / 超时），此时配置文件里那一份
+只是兜底。
+
 单跑一次（与守护进程**同一份编排**，口径一致）：
 
 ```bash
 pnpm --filter @trade-tool/cli start -- agent run -s BTCUSDT
 pnpm --filter @trade-tool/cli start -- agent report        # 只读库，不调模型
+pnpm --filter @trade-tool/cli start -- agent plan 42 --approve  # 预先批准一份方案
+pnpm --filter @trade-tool/cli start -- agent plan 42 --reject   # 驳回一份方案
 ```
 
 前置条件：目标标的的**派生周期** K 线（`15m` / `1h` / `4h` / `1d`）已被 `apps/sync`
@@ -156,11 +193,18 @@ pnpm --filter @trade-tool/cli start -- agent report        # 只读库，不调�
   唯一索引 `(exchange, symbol, as_of_ms)`：同一份数据时刻的同一标的只留一份报告。
 - `trading_plan`：`action`（`enter` / `hold` / `failed`）、进场三件套、风险、权益来源、
   `adjustments`、`failure_reason`，以及 `status` 状态机
-  （`advisory` → `approved` / `rejected` / `expired` → `executed`）。
+  （`advisory` → `approved` / `rejected` / `expired` → `executing` → `executed` / `failed`）。
+  `executing` 与 `failed` 是补自动执行时扩出来的两个状态。
 
-**5 条表级 CHECK 约束**（另有各列自己的取值约束）各自守一条不变式：`enter` 三件套齐全、
-止损止盈分居两侧、`hold` 不许带原因、`failed` 必须带原因、`executed` 只能来自 `enter`。
+**表级 CHECK 约束**（另有各列自己的取值约束）各自守一条不变式：`enter` 三件套齐全、
+止损止盈分居两侧、`hold` 不许带原因、`action='failed'` 必须带原因、`executed` 只能来自 `enter`。
 它们是最后一道闸：页面上显示的方案是给人看的，库里那条是事实。
+
+⚠️ **「失败」有两个，守门人也得有两个**：`action='failed'` 是「这一轮**出不了方案**」
+（要说清 `failure_reason`），`status='failed'` 是「这一笔**没下出去**」
+（要说清 `execution_failure_reason`）。两条约束**必须并存**——写成同名的话，
+后一条的 `DROP CONSTRAINT` 会顺带删掉前一条，于是「出不了方案必须说为什么」
+这条守门人无声消失（AGENTS.md §5 第 12 条）。
 
 规则的完整版见 AGENTS.md §6.11。
 
@@ -180,7 +224,7 @@ pnpm --filter @trade-tool/cli start -- agent report        # 只读库，不调�
    页面上会有一份报告，而与之对应的方案永远不会有。
 3. 关连接池、退出码 0。
 
-启动失败（配置不合法、缺模型、开关打开但执行路径没实现）**不打印 Node 堆栈**，
+启动失败（配置不合法、缺模型）**不打印 Node 堆栈**，
 而是一行 `[agent] 启动失败：<错误码>: <说清怎么配的话>`，退出码 1
 （与 `apps/executor` 同一套写法）。
 
@@ -191,7 +235,7 @@ pnpm --filter @trade-tool/agent test
 ```
 
 - `tests/service.test.ts` —— 编排层的纯替身用例：问几次模型、顺序、失败留痕、
-  方向矛盾、以及**自动执行开关开着就报错**。
+  方向矛盾、以及**自动执行开关**（开着 → 方案落 `approved`；关着 → 落 `advisory`）。
 - `tests/daemon.test.ts` —— 守护进程的三条刻意选择：标的集合**每轮重读**、
   **单个标的出错不影响其它**、**不并发**（顺序跑），外加停止语义。
 - `tests/equity.test.ts` —— 权益读取：**读不到就抛错，绝不返回 0**
@@ -205,5 +249,6 @@ pnpm --filter @trade-tool/agent test
     用例还会断言「价格与数量是程序算的」：数量 = 风险金额 ÷ 止损距离，
     价格落在 tick 网格上，止损止盈分居进场价两侧。
 
-`tests/helpers/pg.ts` 与 `packages/data`、`apps/sync` 的同名 helper 同构：
-每次测试跑在独立 schema 上，结束时整段 DROP，**不得碰任何业务库**。
+真库隔离设施是**全仓唯一一份**：`packages/data/src/testing-pg.ts`（从 `@trade-tool/data`
+导出 `createTestSchema` / `TEST_PG` / `TestSchema`）。每次测试跑在独立 schema 上，
+结束时整段 DROP，**不得碰任何业务库**。

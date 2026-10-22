@@ -1140,6 +1140,8 @@ def test_migrations_are_idempotent(conn: DbConn, pg_dsn: str) -> None:
         "017_agent_decisions",
         # v1.0.0：方案变真实订单（执行态列 + agent-plan 决策来源）
         "018_agent_plan_execution",
+        # v1.0.0：模型接入的运行期设置（密文落库）
+        "019_agent_llm_settings",
     ]
     pg.ensure_schema(conn)
 

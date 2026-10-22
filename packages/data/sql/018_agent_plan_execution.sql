@@ -60,9 +60,21 @@ ALTER TABLE trading_plan
   );
 
 -- 下单失败必须留下原因。没原因的失败在页面上就是一行没有理由的 `failed`。
-ALTER TABLE trading_plan DROP CONSTRAINT IF EXISTS trading_plan_failed_has_reason_check;
+--
+-- ⚠️ **这条的名字不能与 017 的那条重名**：017 已经有一条
+-- `trading_plan_failed_has_reason_check`（`action = 'failed'` 必须带 `failure_reason`，
+-- 见 017 的「决定 ≠ 故障」一节）。同名的话，这句 `DROP CONSTRAINT` 会**顺带删掉**它，
+-- 于是「出不了方案必须说为什么」这条守门人无声消失——正是 AGENTS.md §5.12 记的那个坑。
+--
+-- 两条约束管的是**两件不同的事**，必须并存：
+--   * `action = 'failed'`  → 这**一轮出不了方案**（模型没给出可执行的东西），
+--     要说的是 `failure_reason`；
+--   * `status = 'failed'`  → 这**一笔没下出去**（执行器下单失败），
+--     要说的是 `execution_failure_reason`。
+-- 少了任何一条，对应的那种失败就会变成一行没有理由的 `failed`，排障的人无从下手。
+ALTER TABLE trading_plan DROP CONSTRAINT IF EXISTS trading_plan_execution_failed_has_reason_check;
 ALTER TABLE trading_plan
-  ADD CONSTRAINT trading_plan_failed_has_reason_check CHECK (
+  ADD CONSTRAINT trading_plan_execution_failed_has_reason_check CHECK (
     status <> 'failed' OR execution_failure_reason IS NOT NULL
   );
 

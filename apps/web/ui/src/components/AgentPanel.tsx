@@ -8,6 +8,7 @@ import type {
   AgentViewDto,
   TradingPlanDto,
 } from '../../../src/types';
+import { ConfirmDialog } from './ConfirmDialog.js';
 
 const EMPTY: AgentViewDto = { symbol: '', report: null, plan: null };
 
@@ -88,8 +89,99 @@ function FacetRow(props: { name: string; facet: AgentFacetDto }) {
   );
 }
 
-function PlanBlock(props: { plan: TradingPlanDto }) {
+/**
+ * 方案当前状态的一句话说明。
+ *
+ * 这几个态必须**分别**说清楚，因为它们对「仓位到底有没有建立」的含义完全不同：
+ * `executing` 是「已认领、正在下单」（那一单到底下没下还不知道），`failed` 是
+ * 「下单失败，仓位没建立、止损也没挂」，只有 `executed` 才有单号。
+ *
+ * 把它们混成一句「已处理」的话，人就没法判断现在该不该手动去交易所撤单。
+ */
+function PlanStatusLine(props: { plan: TradingPlanDto }) {
   const { plan } = props;
+  if (plan.status === 'executing') {
+    return (
+      <p className="mono" style={{ fontSize: 12, color: 'var(--warn)', margin: '4px 0 0' }}>
+        已认领，正在下单——这一单到底下没下还不知道。
+      </p>
+    );
+  }
+  if (plan.status === 'executed') {
+    return (
+      <p className="mono" style={{ fontSize: 12, color: 'var(--ok)', margin: '4px 0 0' }}>
+        已成交，交易所单号 {plan.entryOrderId ?? '—'}。
+      </p>
+    );
+  }
+  if (plan.status === 'failed') {
+    return (
+      <p className="mono" style={{ fontSize: 12, color: 'var(--err)', margin: '4px 0 0' }}>
+        下单失败：{plan.executionFailureReason ?? '（没写原因）'}——仓位没有建立，止损也没有挂。
+      </p>
+    );
+  }
+  if (plan.status === 'expired') {
+    return (
+      <p className="muted" style={{ fontSize: 12, margin: '4px 0 0' }}>
+        已过期：这份方案没被执行器接走，已经作废。
+      </p>
+    );
+  }
+  if (plan.status === 'rejected') {
+    return (
+      <p className="muted" style={{ fontSize: 12, margin: '4px 0 0' }}>
+        已驳回：这份方案被人工否决，不会下单。
+      </p>
+    );
+  }
+  if (plan.status === 'approved') {
+    return (
+      <p className="muted" style={{ fontSize: 12, margin: '4px 0 0' }}>
+        已批准：等 <code>apps/executor</code> 消费（<code>agent.execute.enabled</code>{' '}
+        开着才会下单）。
+      </p>
+    );
+  }
+  return null;
+}
+
+/**
+ * 执行方案（v1.0.0）。
+ *
+ * 批准 / 驳回要分开说三件事，少一件都会让人做错决定：
+ *
+ * 1. **批准本身不下单。** 真正的下单由 `apps/executor` 消费 `approved` 的方案完成，
+ *    而 executor 只在 `agent.execute.enabled` 开着时才消费。开关关着时，批准只是
+ *    「预先批准」，**不会有单下出去**。
+ * 2. **限价进场不给批准按钮。** 自动执行只支持市价进场——挂限价单要一直盯着成交，
+ *    那是另一套东西，不该混进「批准一下就自动跑」的流程里。
+ * 3. **状态如实显示。** 「已认领、正在下单」不等于「已成交」，单号只有真成交才有。
+ */
+function PlanBlock(props: { plan: TradingPlanDto; symbol: string; onChanged: () => void }) {
+  const { plan, symbol, onChanged } = props;
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [confirm, setConfirm] = useState<'approved' | 'rejected' | null>(null);
+
+  const decide = (next: 'approved' | 'rejected') => {
+    setBusy(true);
+    setError(null);
+    void api
+      .setTradingPlanStatus(symbol, plan.id, next)
+      .then(() => {
+        setConfirm(null);
+        // 重新读一遍：方案状态是服务端的事实，页面不自己复述「我批准了」。
+        onChanged();
+      })
+      .catch((e: unknown) => {
+        // 失败常驻显示，并保留方案原样（不假装状态已经改了）。
+        setError(reason(e));
+        setConfirm(null);
+      })
+      .finally(() => setBusy(false));
+  };
+
   if (plan.action === 'failed') {
     return (
       <div>
@@ -112,6 +204,13 @@ function PlanBlock(props: { plan: TradingPlanDto }) {
       </div>
     );
   }
+  // 只有「真能执行」的方案才谈得上批准：一份「这一轮不做」的记录没有进场可执行。
+  const canDecide = plan.status === 'advisory' || plan.status === 'approved';
+  // 「能不能批准」由**服务端**算好传过来（判据只有一份，在 core）：
+  // 页面自己判一遍就是第二份实现，措辞迟早漂移。
+  // ⚠️ 页面**不能** import `@trade-tool/core`：它的 barrel 带着 node:crypto / node:fs，
+  // 浏览器构建会直接失败。
+  const notApprovable = !plan.approvable;
   return (
     <div>
       <p style={{ margin: '4px 0' }}>
@@ -145,8 +244,73 @@ function PlanBlock(props: { plan: TradingPlanDto }) {
       ))}
       {plan.status === 'advisory' ? (
         <p className="muted" style={{ fontSize: 12, margin: '4px 0 0' }}>
-          这只是建议：自动执行关着，它不会变成真实订单。
+          这只是建议：还没被批准，不会变成真实订单。
         </p>
+      ) : null}
+      <PlanStatusLine plan={plan} />
+      {notApprovable ? (
+        <p className="muted" style={{ fontSize: 12, margin: '4px 0 0' }}>
+          {/* 原因用服务端算好的那一份（原样显示，别在页面里复述一遍）。 */}
+          {plan.approvableReason}
+        </p>
+      ) : null}
+      {error !== null ? (
+        <p className="mono" style={{ fontSize: 12, color: 'var(--err)', margin: '6px 0 0' }}>
+          批准 / 驳回失败：{error}
+          {/* 失败时方案原样保留，并明说没改：页面不自己复述一个没发生的状态变化。 */}
+          （方案状态未改变）
+        </p>
+      ) : null}
+      {canDecide ? (
+        <div className="row" style={{ marginTop: 8 }}>
+          {/* 不能批准的方案不给批准按钮（自动执行只支持市价进场）。驳回始终可用。 */}
+          {plan.approvable ? (
+            <button className="primary" disabled={busy} onClick={() => setConfirm('approved')}>
+              批准
+            </button>
+          ) : null}
+          <button className="danger" disabled={busy} onClick={() => setConfirm('rejected')}>
+            驳回
+          </button>
+          <span className="muted" style={{ fontSize: 12 }}>
+            点了批准只是「预先批准」——单由 <code>apps/executor</code> 在
+            <code>agent.execute.enabled</code> 开着时才下。
+          </span>
+        </div>
+      ) : null}
+
+      {confirm === 'approved' ? (
+        <ConfirmDialog
+          title="批准这份执行方案"
+          confirmLabel="确认批准"
+          busy={busy}
+          onCancel={() => setConfirm(null)}
+          onConfirm={() => decide('approved')}
+        >
+          <p>
+            批准<b>本身不下单</b>。真正的下单由 <code>apps/executor</code> 在
+            <code>agent.execute.enabled</code> 开着时消费已批准的方案完成。
+          </p>
+          <p className="muted" style={{ fontSize: 12 }}>
+            开关关着时，批准只是「预先批准」，<b>不会有单下出去</b>。
+          </p>
+        </ConfirmDialog>
+      ) : null}
+
+      {confirm === 'rejected' ? (
+        <ConfirmDialog
+          title="驳回这份执行方案"
+          confirmLabel="确认驳回"
+          danger
+          busy={busy}
+          onCancel={() => setConfirm(null)}
+          onConfirm={() => decide('rejected')}
+        >
+          <p>驳回之后这份方案不会被执行器消费，不会下单。</p>
+          <p className="muted" style={{ fontSize: 12 }}>
+            它只是被标成「已驳回」；要重新评估，等 Agent 跑下一轮出新的方案。
+          </p>
+        </ConfirmDialog>
       ) : null}
     </div>
   );
@@ -172,6 +336,13 @@ export function AgentPanel(props: { symbol: string; tick: number }) {
   const [data, setData] = useState<AgentViewDto>(EMPTY);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  /**
+   * 批准 / 驳回之后要重新读一遍。
+   *
+   * 方案状态是**服务端的事实**（executor 可能同时在改它），页面不自己复述
+   * 「我批准了」——那会在 executor 抢先一步时变成假话。
+   */
+  const [refresh, setRefresh] = useState(0);
   const { symbol, tick } = props;
 
   useLayoutEffect(() => {
@@ -204,7 +375,7 @@ export function AgentPanel(props: { symbol: string; tick: number }) {
     return () => {
       cancelled = true;
     };
-  }, [symbol, tick]);
+  }, [symbol, tick, refresh]);
 
   const report = data.report;
   const plan = data.plan;
@@ -281,7 +452,7 @@ export function AgentPanel(props: { symbol: string; tick: number }) {
                 两个号天然不一样，写清楚这份方案基于哪份报告才对得上。 */}
             {plan.reportId === null ? '' : `（基于报告 #${plan.reportId}）`}
           </h3>
-          <PlanBlock plan={plan} />
+          <PlanBlock plan={plan} symbol={symbol} onChanged={() => setRefresh((n) => n + 1)} />
         </>
       ) : null}
     </div>

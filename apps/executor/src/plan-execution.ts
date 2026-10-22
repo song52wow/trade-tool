@@ -20,8 +20,13 @@
  *
  * 限价进场（GTC）的生命周期是另一个题目：挂着不成交怎么办、过期怎么撤、
  * 部分成交怎么算——每一条都要有代码与状态。这里**明确不支持**：
- * 遇到限价方案就记一条**看得见的失败**（`status='failed'` + 原因），
+ * 遇到限价方案就**跳过并写明原因**（`details` 里有，`log.warn` 里也有），
  * 而不是悄悄跳过或者挂一个永远不成交的单。
+ *
+ * ⚠️ **跳过 ≠ 记失败**：限价方案停在 `approved`（不认领），因为认领是幂等锚点——
+ * 把一份永远执行不了的方案认领走，只会让它卡在 `executing` 变成一个「状态未知」，
+ * 那比跳过更糟。**正常路径上它压根不该到 `approved`**：agent 的自动批准与
+ * 控制面 / CLI 的人工批准都拒绝限价（三处口径一致），这里的跳过只是兜底。
  *
  * ## 止损与止盈不在这里挂
  *
@@ -31,7 +36,13 @@
  * 而「当时用的是哪套档位」也留了痕。
  */
 
-import { agentEntryClientOrderId, createLogger, parseAgentEntryClientOrderId } from '@trade-tool/core';
+import {
+  LIMIT_ENTRY_UNSUPPORTED,
+  agentEntryClientOrderId,
+  autoExecutableProblem,
+  createLogger,
+  parseAgentEntryClientOrderId,
+} from '@trade-tool/core';
 import {
   claimTradingPlan,
   listApprovedTradingPlans,
@@ -133,8 +144,17 @@ export interface PlanExecutionDetail {
   planId: string;
   symbol: string;
   outcome:
-    /** 已变成真实订单。 */
+    /** 已变成真实订单，且**单号已回填进库**。 */
     | 'executed'
+    /**
+     * 订单**真的下出去了**，但**单号没回填进库**。
+     *
+     * ⚠️ **它与 `executed` 分开是刻意的**：单确实下了（仓位真的建立了），
+     * 但库里那行还停在 `executing`。若把它算进「已执行」，只看汇总数字的人
+     * 会以为这事办完了，而下一轮它会被报成「状态未知」——
+     * 「看起来成功其实什么都没做」的近亲（约定 9）。
+     */
+    | 'executed-unrecorded'
     /** 没做，且**不是故障**（条件不满足、已被别人认领、不是可执行的方案）。 */
     | 'skipped'
     /** 下单失败。方案已记 `failed` + 原因。 */
@@ -152,6 +172,12 @@ export interface PlanExecutionDetail {
  * 「这轮没事」，于是那个状态永远没人看。
  */
 export interface PlanExecutionReport {
+  /**
+   * **单号已回填进库**的方案数。
+   *
+   * ⚠️ 「单下了但没回填」**不算**在这里（那是 `executed-unrecorded`）——
+   * 库里那行还停在 `executing`，把它算进来会让人以为这事办完了。
+   */
   executed: number;
   skipped: number;
   failed: number;
@@ -169,10 +195,11 @@ export interface PlanExecutor {
  *
  * 它是**给人看的**：写清楚「为什么不行」和「怎么办」，
  * 而不是只说「不支持」。方案页面上会原样显示它。
+ *
+ * ⚠️ **判据与这句话都在 `packages/core/src/agent-plan.ts`**——agent 的自动批准、
+ * 控制面的人工批准、CLI 的人工批准、这里，四处共用一份。
  */
-export const LIMIT_ENTRY_UNSUPPORTED =
-  '限价进场暂不支持自动执行（只支持市价进场）：限价单可能永远不成交，' +
-  '而挂着不成交的仓位没有止损保护。请改用市价进场，或在交易所手动下单。';
+export { LIMIT_ENTRY_UNSUPPORTED };
 
 function reasonOf(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
@@ -184,14 +211,15 @@ function reasonOf(error: unknown): string {
  * 这里的检查与库上的 CHECK 约束是**两道独立的闸**，不是同一份判据：
  * 约束挡的是「写进库就不合规的行」，这里挡的是「库里的行在执行时才发现不完整」。
  * 两道闸各管一段——库上那套治「写」，这套治「读」。
+ *
+ * ⚠️ 「能不能自动执行」这条判据（action 与进场方式）用 core 那一份
+ * （`autoExecutableProblem`），不在这儿重写；这里额外查的是**字段完整性**
+ * （方向、数量、止损价、止盈价），那些是「行残缺」，不是「类型不支持」。
  */
 function checkExecutable(plan: TradingPlanRow): string | null {
-  if (plan.action !== 'enter') {
-    return `方案是「这一轮不做」（action=${plan.action}），没有可执行的进场`;
-  }
+  const typeProblem = autoExecutableProblem(plan.entryType, plan.action);
+  if (typeProblem !== null) return typeProblem;
   if (plan.side === null) return '方案没有方向';
-  if (plan.entryType === null) return '方案没有进场类型';
-  if (plan.entryType === 'limit') return LIMIT_ENTRY_UNSUPPORTED;
   if (plan.quantity === null || plan.quantity <= 0) return '方案没有有效数量';
   if (plan.stopPrice === null) return '方案没有止损价';
   if (plan.takeProfitPrice === null) return '方案没有止盈价';
@@ -297,7 +325,8 @@ export function createPlanExecutor(deps: PlanExecutorDeps): PlanExecutor {
       // 已有仓位就不叠加（方案的风险敞口假设的是一笔干净开仓）。
       if (deps.hasOpenPosition?.(plan.symbol) === true) {
         skipped += 1;
-        const reason = '该标的当前已有未平掉的仓位，不再叠加开仓（方案的风险敞口假设的是一笔干净开仓）';
+        const reason =
+          '该标的当前已有未平掉的仓位，不再叠加开仓（方案的风险敞口假设的是一笔干净开仓）';
         details.push({ planId: plan.id, symbol: plan.symbol, outcome: 'skipped', reason });
         log.warn(`${plan.symbol} 方案 #${plan.id} 未执行：${reason}`);
         continue;
@@ -306,7 +335,8 @@ export function createPlanExecutor(deps: PlanExecutorDeps): PlanExecutor {
       // 已有未终结的保护就不开新仓（条件单保护的是整个净仓位）。
       if ((await deps.hasUnsettledBracket?.(plan.symbol)) === true) {
         skipped += 1;
-        const reason = '该标的已有未终结的止盈止损，不再开新仓（条件单保护的是整个净仓位，重复挂会出现多组触发价）';
+        const reason =
+          '该标的已有未终结的止盈止损，不再开新仓（条件单保护的是整个净仓位，重复挂会出现多组触发价）';
         details.push({ planId: plan.id, symbol: plan.symbol, outcome: 'skipped', reason });
         log.warn(`${plan.symbol} 方案 #${plan.id} 未执行：${reason}`);
         continue;
@@ -377,6 +407,12 @@ export function createPlanExecutor(deps: PlanExecutorDeps): PlanExecutor {
       }
 
       // 回填单号。**这一步失败很严重**：单已经下了，而库里没有单号。
+      //
+      // ⚠️ **它不算「已执行」**：单确实下了（仓位真的建立了），但库里那行还停在
+      // `executing`。只看汇总数字的人会以为这事办完了，而下一轮它会被报成
+      // 「状态未知」——「看起来成功其实什么都没做」的近亲（约定 9）。
+      // 所以单列一个 `executed-unrecorded`，`executed` 计数**不涨**。
+      let recorded = true;
       try {
         await markTradingPlanExecuted(deps.pool, {
           planId: plan.id,
@@ -384,6 +420,7 @@ export function createPlanExecutor(deps: PlanExecutorDeps): PlanExecutor {
           nowMs: now(),
         });
       } catch (error) {
+        recorded = false;
         // 不静默：方案停在 `executing`，下一轮会被报成「状态未知」。
         log.error(
           `${plan.symbol} 方案 #${plan.id} 的单已经下了（单号 ${String(orderId)}），` +
@@ -391,18 +428,23 @@ export function createPlanExecutor(deps: PlanExecutorDeps): PlanExecutor {
         );
       }
 
-      executed += 1;
       opened += 1;
+      if (recorded) {
+        executed += 1;
+      }
       details.push({
         planId: plan.id,
         symbol: plan.symbol,
-        outcome: 'executed',
-        reason: '已按方案下出市价进场单',
+        outcome: recorded ? 'executed' : 'executed-unrecorded',
+        reason: recorded
+          ? '已按方案下出市价进场单'
+          : '单已下出去，但**单号没回填进库**：方案停在「执行中」，需要人工确认',
         entryOrderId: String(orderId),
       });
       log.info(
         `${plan.symbol} 方案 #${plan.id} 已执行：${plan.side} ${String(plan.quantity)}，` +
-          `单号 ${String(orderId)}，自定义号 ${clientOrderId}`,
+          `单号 ${String(orderId)}，自定义号 ${clientOrderId}` +
+          (recorded ? '' : '（⚠ 单号没回填，方案停在「执行中」）'),
       );
       await pushAlert('agent-plan-executed', () => ({
         fingerprint: `agent-plan-executed|${plan.symbol}|${plan.id}`,
@@ -445,7 +487,7 @@ export async function resolveAgentPlanDecision(
   const parsed = parseAgentEntryClientOrderId(input.clientOrderId);
   if (parsed === null) return null;
 
-  const plan = await readTradingPlanById(pool, exchange, input.symbol, parsed.planId);
+  const plan = await readTradingPlanById(pool, exchange, parsed.planId);
   if (plan === null) {
     // 自定义号是我们格式，但库里没有这份方案。
     // 这说明方案被删了或库被换过——**不能静默当成「没方案」**，
@@ -453,6 +495,23 @@ export async function resolveAgentPlanDecision(
     log.error(
       `成交 ${input.clientOrderId} 认出来是 Agent 方案 #${parsed.planId} 的进场单，` +
         `但库里没有这份方案（${input.symbol}）`,
+    );
+    return null;
+  }
+  // ⚠️ **标的必须对上**。
+  //
+  // 方案号是全局的（`readTradingPlanById` 不按标的过滤），而这里拿到的是
+  // **成交回报**里的标的。两者不一致意味着「号是 A 方案的，标的是 B」——
+  // 若不挡，就会拿 A 标的的 ATR 倍数去挂 B 标的的止损，**仓位保护挂在错的位置**，
+  // 那是最贵的状态。
+  //
+  // 处置与上面一样：**不抛错**（抛错会让仓位裸奔），按配置档位挂单 +
+  // 显眼错误日志（§6.12.3）。
+  if (plan.symbol !== input.symbol) {
+    log.error(
+      `成交 ${input.clientOrderId} 认出来是 Agent 方案 #${plan.id} 的进场单，` +
+        `但方案标的是 ${plan.symbol}、成交标的是 ${input.symbol}——` +
+        '对不上，本次按配置档位挂单（方案档位可能挂到错的仓位上）',
     );
     return null;
   }

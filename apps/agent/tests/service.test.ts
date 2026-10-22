@@ -160,7 +160,7 @@ function setup(options: {
   const ctx = { ...fakeContext(), pool } as MarketContext;
   const service = createAgentService({
     ctx,
-    llm: llm.client,
+    resolveLlm: async () => llm.client,
     config: options.config ?? CONFIG,
     readEquity: options.equity ?? (async () => ({ equity: 10_000, source: 'config' })),
     loadContext: async () => bundle(),
@@ -175,6 +175,14 @@ function planAction(calls: readonly { sql: string; values: readonly unknown[] }[
   if (insert === undefined) throw new Error('没有写方案');
   // 列顺序见 db/agent.ts：exchange, symbol, report_id, as_of_ms, created_at_ms, action, …
   return String(insert.values[5]);
+}
+
+/** 从落库的 SQL 参数里取出 `status` 那一列。 */
+function planStatus(calls: readonly { sql: string; values: readonly unknown[] }[]): string {
+  const insert = calls.find((c) => c.sql.includes('INSERT INTO trading_plan'));
+  if (insert === undefined) throw new Error('没有写方案');
+  // 列顺序见 db/agent.ts：exchange, symbol, report_id, as_of_ms, created_at_ms, action, status, …
+  return String(insert.values[6]);
 }
 
 /** 从落库的 SQL 参数里取出 `failure_reason` 那一列。 */
@@ -272,8 +280,8 @@ describe('createAgentService', () => {
   });
 });
 
-describe('自动执行开关（本期未实现）', () => {
-  it('execute.enabled = true → 建服务就报错，不是一路跑到「以为在下单」', () => {
+describe('自动执行开关', () => {
+  it('execute.enabled = true → 正常建服务（自动执行路径已实现，由 executor 消费）', () => {
     const config: AgentConfig = agentSchema.parse({
       ...CONFIG,
       execute: { ...CONFIG.execute, enabled: true },
@@ -281,21 +289,100 @@ describe('自动执行开关（本期未实现）', () => {
     expect(() =>
       createAgentService({
         ctx: fakeContext(),
-        llm: { complete: async () => '{}' },
+        resolveLlm: async () => ({ complete: async () => '{}' }),
         config,
         readEquity: async () => ({ equity: 10_000, source: 'config' }),
       }),
-    ).toThrowError(/自动执行路径本期未实现/);
+    ).not.toThrow();
   });
 
   it('execute.enabled = false（缺省）→ 正常建服务', () => {
     expect(() =>
       createAgentService({
         ctx: fakeContext(),
-        llm: { complete: async () => '{}' },
+        resolveLlm: async () => ({ complete: async () => '{}' }),
         config: CONFIG,
         readEquity: async () => ({ equity: 10_000, source: 'config' }),
       }),
     ).not.toThrow();
+  });
+
+  it('开关打开 → 方案直接进「已批准」，等 executor 消费', async () => {
+    // 这是「自动执行」与「只出方案」的唯一区别，落在方案的初始状态上。
+    const config: AgentConfig = agentSchema.parse({
+      ...CONFIG,
+      execute: { ...CONFIG.execute, enabled: true },
+    });
+    const { service, calls } = setup({
+      outputs: { outputs: [JSON.stringify(ANALYST_OUTPUT), JSON.stringify(TRADER_OUTPUT)] },
+      config,
+    });
+
+    const result = await service.analyzeSymbol(SYMBOL);
+
+    expect(result.plan?.action).toBe('enter');
+    expect(planStatus(calls)).toBe('approved');
+  });
+
+  it('开关关着 → 方案停在「只是建议」', async () => {
+    const { service, calls } = setup({
+      outputs: { outputs: [JSON.stringify(ANALYST_OUTPUT), JSON.stringify(TRADER_OUTPUT)] },
+    });
+
+    const result = await service.analyzeSymbol(SYMBOL);
+
+    expect(result.plan?.action).toBe('enter');
+    expect(planStatus(calls)).toBe('advisory');
+  });
+
+  it('开关打开但这一轮「不做」→ 仍然不批准（没有可执行的进场）', async () => {
+    const config: AgentConfig = agentSchema.parse({
+      ...CONFIG,
+      execute: { ...CONFIG.execute, enabled: true },
+    });
+    // 分析师给中性 → 交易员与结论矛盾 → 方案是 failed
+    const { service, calls } = setup({
+      outputs: {
+        outputs: [
+          JSON.stringify({
+            technical: { score: 0, notes: [] },
+            sentiment: { score: 0, notes: [] },
+            fundamental: { score: 0, notes: [] },
+          }),
+          JSON.stringify(TRADER_OUTPUT),
+        ],
+      },
+      config,
+    });
+
+    await service.analyzeSymbol(SYMBOL);
+
+    expect(planAction(calls)).not.toBe('enter');
+    expect(planStatus(calls)).toBe('advisory');
+  });
+
+  it('开关打开但方案是限价进场 → 仍然不批准（自动执行只支持市价）', async () => {
+    // ⚠️ 这条锁的是一个真 bug：限价方案被批成 `approved` 之后，
+    // 执行器每轮都会把它捞出来又跳过（限价单可能永远不成交，
+    // 而不成交的仓位没有止损保护），而页面上显示「已批准、等 executor 消费」——
+    // 看上去像是有一单在等着下，实际永远不会下。
+    const config: AgentConfig = agentSchema.parse({
+      ...CONFIG,
+      execute: { ...CONFIG.execute, enabled: true },
+    });
+    const { service, calls } = setup({
+      outputs: {
+        outputs: [
+          JSON.stringify(ANALYST_OUTPUT),
+          JSON.stringify({ ...TRADER_OUTPUT, entryType: 'limit', entryOffsetAtrMult: 0.5 }),
+        ],
+      },
+      config,
+    });
+
+    await service.analyzeSymbol(SYMBOL);
+
+    expect(planAction(calls)).toBe('enter');
+    expect(planStatus(calls)).toBe('advisory');
   });
 });

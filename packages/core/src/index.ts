@@ -11,6 +11,8 @@ export * from './agent-analyst.js';
 export * from './agent-context.js';
 /** 交易员 Agent 的契约与纯函数（v1.0.0）：模型只提比例，钱与价格由程序算。 */
 export * from './agent-trader.js';
+/** 执行方案的可执行性判据（v1.0.0）：自动批准 / 人工批准 / 执行器共用一份。 */
+export * from './agent-plan.js';
 /** 条件单编号约定 + `orderType` 归类（v0.6.0 从 executor 上移，对账与下单共用一份）。 */
 export * from './clock-skew.js';
 export * from './net-position.js';

@@ -30,6 +30,7 @@ node apps/cli/dist/index.js <command>              # 构建产物
 | `backtest [-s -i -b --fast --slow --json]`   | 跑回测，报告写入 `<TRADE_TOOL_HOME>/reports/`       |
 | `agent run [-s <S>] [--json]`                | 跑一轮分析师 + 交易员 Agent（分析 → 出方案 → 落库） |
 | `agent report [-s <S>] [--limit N] [--json]` | **只读**：看库里最近一次报告与方案（不调模型）      |
+| `agent plan <id> --approve \| --reject`      | 预先批准 / 驳回一份方案（两个开关互斥）             |
 
 ## 约定
 
@@ -55,3 +56,22 @@ node apps/cli/dist/index.js <command>              # 构建产物
   否则看上去像「这次分析过了」，其实那一行是旧数据。
   方案行会写明它**基于哪份报告**（报告按数据时刻 upsert，id 不变；方案每轮新建，id 递增，
   两个号天然不一样，不写出来就像是对不上）。
+- `agent plan` 的批准 / 驳回是**预先批准**：自动执行开关（`agent.execute.enabled`）关着时，
+  executor **压根不消费**方案，所以「批准了」不等于「会有单下出去」——
+  命令输出会明确区分这两种情况，不让人误以为单已经下了。
+  限价方案在**批准时**就被拒绝并说明原因（限价单可能永远不成交，
+  而不成交的仓位没有止损保护）。
+
+## 测试
+
+```bash
+pnpm --filter @trade-tool/cli test
+```
+
+`tests/agent-plan.test.ts` —— `agent plan` 的批准 / 驳回（**真 PG**，真迁移）：
+限价方案被拒绝、市价方案被批准、标的对不上被拒绝。
+
+**为什么要有它**：批准路径原先只靠「人肉读代码」保证。判据本身住在
+`packages/core/src/agent-plan.ts`（一处判据，四处共用），
+而 core 的测试守的是**判据**；这里守的是「CLI 确实调用了它」。
+两者缺一不可——判据对了但没接上，等于没接上。

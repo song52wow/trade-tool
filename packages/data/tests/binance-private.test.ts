@@ -154,6 +154,97 @@ describe('私有 REST', () => {
     expect(called).toBe(false);
   });
 
+  // ------------------------------------------------ 市价进场单（v1.0.0 自动下单）
+  //
+  // ⚠️ **对着契约写死字面量**，不是对着自己的实现复述（AGENTS.md §10.1 第 1 条）。
+  // 这条锁的是**接缝的形状**：端点路径、请求字段名、回执字段名。
+  // 交易所改版时它们会变，而这里会红——那正是它存在的意义。
+  //
+  // 为什么另起一段而不是并进上面的条件单用例：**两套编号空间**。
+  // 条件单走 Algo Order API（回执 `algoId`），市价单走普通订单接口
+  // （回执 `orderId`）。拿普通 orderId 去撤条件单会得到「订单不存在」。
+  it('市价进场单：走普通订单接口，字段名与回执都对得上契约', async () => {
+    let seenUrl = '';
+    let seenHeaders: Record<string, string> = {};
+    const client = clientWith((async (url: string, init: RequestInit) => {
+      seenUrl = String(url);
+      seenHeaders = init.headers as Record<string, string>;
+      return jsonResponse({
+        orderId: 987654,
+        clientOrderId: 'agt-p1-a1',
+        symbol: 'BNBUSDT',
+        side: 'BUY',
+        status: 'FILLED',
+        avgPrice: '750.25',
+        executedQty: '0.02',
+      });
+    }) as unknown as typeof fetch);
+
+    const placed = await client.placeMarketOrder({
+      symbol: 'BNBUSDT',
+      side: 'BUY',
+      quantity: 0.02,
+      clientOrderId: 'agt-p1-a1',
+    });
+
+    // 端点：普通订单，**不是** Algo Order API
+    expect(seenUrl).toContain('/fapi/v1/order?');
+    expect(seenUrl).not.toContain('algoOrder');
+    // 请求字段名（Binance 的字面量）
+    expect(seenUrl).toContain('symbol=BNBUSDT');
+    expect(seenUrl).toContain('side=BUY');
+    expect(seenUrl).toContain('type=MARKET');
+    expect(seenUrl).toContain('quantity=0.02');
+    expect(seenUrl).toContain('newClientOrderId=agt-p1-a1');
+    // 签名请求带 API key 头
+    expect(seenHeaders['X-MBX-APIKEY']).toBe('key-123');
+    // 回执字段名
+    expect(placed.orderId).toBe(987654);
+    expect(placed.clientOrderId).toBe('agt-p1-a1');
+    expect(placed.avgPrice).toBe(750.25);
+    expect(placed.executedQty).toBe(0.02);
+  });
+
+  it('市价单回执里 avgPrice 是 "0" → 归为 null（没成交），不是成交价 0', async () => {
+    // 「0」表示**还没成交**，而「成交价是 0」是另一件事。
+    // 混起来会让止损按 0 算距离——那是最贵的状态。
+    const client = clientWith(async () =>
+      jsonResponse({
+        orderId: 1,
+        clientOrderId: 'agt-p1-a1',
+        symbol: 'BNBUSDT',
+        side: 'BUY',
+        status: 'NEW',
+        avgPrice: '0',
+        executedQty: '0',
+      }),
+    );
+    const placed = await client.placeMarketOrder({
+      symbol: 'BNBUSDT',
+      side: 'BUY',
+      quantity: 0.02,
+      clientOrderId: 'agt-p1-a1',
+    });
+    expect(placed.avgPrice).toBeNull();
+  });
+
+  it('市价单数量非正直接报错，不把 0 发到交易所', async () => {
+    let called = false;
+    const client = clientWith(async () => {
+      called = true;
+      return jsonResponse({});
+    });
+    await expect(
+      client.placeMarketOrder({
+        symbol: 'BNBUSDT',
+        side: 'BUY',
+        quantity: 0,
+        clientOrderId: 'agt-p1-a1',
+      }),
+    ).rejects.toThrow(SyncError);
+    expect(called).toBe(false);
+  });
+
   it('listenKey 请求不签名但仍带 API key 头', async () => {
     let seenUrl = '';
     let seenHeaders: Record<string, string> = {};

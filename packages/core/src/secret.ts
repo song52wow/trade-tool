@@ -178,3 +178,32 @@ export function openNotifyTarget(payload: SealedPayload, key: Buffer): SecretNot
   }
   return parsed as SecretNotifyTarget;
 }
+
+/**
+ * 模型接入的凭据（v1.0.0 控制面录入）：API 密钥。
+ *
+ * 形状比 `SecretCredentials` / `SecretNotifyTarget` 简单——只有一项。
+ * 之所以仍然走「打包成 JSON 再整体加密」而不是直接加密字符串：
+ * 形状校验（解开后必须是一段字符串）需要一段可校验的结构，
+ * 而 `open_` 只认 `SealedPayload`。多一层 JSON 换来的是
+ * 「解开了但内容不对」能**报错**而不是当成空串继续用。
+ */
+export interface SecretAgentLlmKey {
+  apiKey: string;
+}
+
+export function sealAgentLlmKey(target: SecretAgentLlmKey, key: Buffer): SealedPayload {
+  return seal(Buffer.from(JSON.stringify(target), 'utf8'), key);
+}
+
+export function openAgentLlmKey(payload: SealedPayload, key: Buffer): SecretAgentLlmKey {
+  const parsed = JSON.parse(open_(payload, key).toString('utf8')) as unknown;
+  if (
+    typeof parsed !== 'object' ||
+    parsed === null ||
+    typeof (parsed as SecretAgentLlmKey).apiKey !== 'string'
+  ) {
+    throw new SyncError('CONFIG_INVALID', '模型密钥密文解开后不是 {apiKey} 结构');
+  }
+  return parsed as SecretAgentLlmKey;
+}

@@ -240,7 +240,7 @@ describe('Agent 端到端（真 PG + 真 Python + 真 HTTP 模型）', () => {
     });
     const service = createAgentService({
       ctx: market,
-      llm,
+      resolveLlm: async () => llm,
       config: agentConfig,
       readEquity: async () => ({ equity: 10_000, source: 'config' }),
     });

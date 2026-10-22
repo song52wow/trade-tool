@@ -16,7 +16,13 @@
  * `--json` 输出纯 JSON 到 stdout，一切提示走 stderr。
  */
 
-import { SyncError, type AnalystVerdict } from '@trade-tool/core';
+import {
+  SyncError,
+  assertApprovable,
+  parseSecretKey,
+  SECRET_KEY_ENV,
+  type AnalystVerdict,
+} from '@trade-tool/core';
 import {
   listAnalystReports,
   listSymbolEntries,
@@ -25,10 +31,12 @@ import {
   readLatestAnalystReport,
   readLatestTradingPlan,
   readTradingPlanById,
+  updateTradingPlanStatus,
   type AnalystReportRow,
+  type Pool,
   type TradingPlanRow,
 } from '@trade-tool/data';
-import { createAgentService, createEquityReader } from '@trade-tool/agent';
+import { createAgentService, createEquityReader, createLlmResolver } from '@trade-tool/agent';
 
 import { withContext } from '../context.js';
 
@@ -133,16 +141,26 @@ function renderReport(
  * 标的：`-s` 指定 → 配置里的 `agent.symbols` → 库里正在同步的标的。
  */
 export async function runAgent(options: AgentRunOptions = {}): Promise<number> {
+  /**
+   * 读主密钥。**没有就返回 `null`**——它对控制面录入的那一份是可选的。
+   */
+  function readOptionalMasterKey(): Buffer | null {
+    const raw = process.env[SECRET_KEY_ENV];
+    if (raw === undefined || raw.trim() === '') return null;
+    return parseSecretKey(raw);
+  }
+
   return withContext(async (ctx) => {
     const { pool, config, exchange } = ctx;
-    if (!config.agent.llm.enabled) {
-      throw new SyncError(
-        'CONFIG_INVALID',
-        'agent.llm.enabled = false：没有模型就出不了方案。' +
-          '在配置里打开 agent.llm.enabled 并给出 baseUrl 与 model。',
-        { agentLlmEnabled: false },
-      );
-    }
+    // ⚠️ **这里不再看 `config.agent.llm.enabled`**。
+    //
+    // 模型接入现在可以在控制面配（v1.0.0）。用户在控制面填好、配置文件保持默认
+    // （`enabled` 缺省 false）时是**完全合法**的配置——守护进程认这一档
+    // （它走 `resolveAll`），命令行也必须认，否则「同一个配置，守护进程能跑、
+    // 命令行说没配模型」——那正是这个仓库最忌讳的「同一件事两个答案」。
+    //
+    // 判据只有一份：`createLlmResolver` → `resolveAgentLlmSettings` → `resolveAll`。
+    // 它报错时说清「生效来源是控制面录入还是配置文件」，由它下结论。
 
     const symbol = options.symbol?.trim();
     let symbols: string[];
@@ -165,15 +183,16 @@ export async function runAgent(options: AgentRunOptions = {}): Promise<number> {
       );
     }
 
-    const llm = (await import('@trade-tool/data')).createLlmClient({
-      baseUrl: config.agent.llm.baseUrl,
-      model: config.agent.llm.model,
-      apiKeyEnv: config.agent.llm.apiKeyEnv,
-      timeoutMs: config.agent.llm.timeoutMs,
+    // 模型客户端**每轮重新解析**（与守护进程共用同一份实现）：
+    // 控制面改了模型接入，命令行这一条路也立刻用新的那一份。
+    const resolveLlm = createLlmResolver({
+      pool,
+      masterKey: readOptionalMasterKey(),
+      config: config.agent.llm,
     });
     const service = createAgentService({
       ctx,
-      llm,
+      resolveLlm,
       config: config.agent,
       readEquity: createEquityReader({
         pool,
@@ -200,9 +219,7 @@ export async function runAgent(options: AgentRunOptions = {}): Promise<number> {
             ? null
             : await readAnalystReportById(pool, exchange, result.symbol, result.reportId);
         const plan =
-          result.planId === null
-            ? null
-            : await readTradingPlanById(pool, exchange, result.symbol, result.planId);
+          result.planId === null ? null : await readTradingPlanById(pool, exchange, result.planId);
         console.log(`=== ${result.symbol} ===`);
         if (result.failure !== null) {
           console.log(`本轮未出方案：${result.failure}`);
@@ -265,6 +282,107 @@ export async function runAgentReport(options: AgentReportOptions = {}): Promise<
       console.log(`=== ${report.symbol} ===`);
       renderReport(report, plan);
       console.log('');
+    }
+    return 0;
+  });
+}
+
+/** 批准 / 驳回一份执行方案。 */
+export interface AgentPlanOptions {
+  /** 方案号（全局唯一）。 */
+  planId: string;
+  /** `approved` = 批准；`rejected` = 驳回。 */
+  status: 'approved' | 'rejected';
+}
+
+/**
+ * 批准 / 驳回一份执行方案的**核心逻辑**（不碰 IO 之外的东西）。
+ *
+ * 单独抽出来是为了**能被测**：`runAgentPlan` 要连真库、读配置文件，
+ * 而「限价方案能不能批准」这条判据是纯的——
+ * 把它摊开成一个只依赖注入的函数，测试直接调用它，
+ * 不必起整个命令行环境。
+ *
+ * @param pool 连接池（真库）。
+ * @param exchange 交易所。
+ * @param planId 方案号。
+ * @param status 批准 / 驳回。
+ * @returns 批准后的方案行。
+ */
+export async function applyAgentPlanStatus(input: {
+  pool: Pool;
+  exchange: string;
+  planId: string;
+  status: 'approved' | 'rejected';
+}): Promise<TradingPlanRow | null> {
+  const { pool, exchange } = input;
+  const planId = input.planId.trim();
+  if (planId === '') {
+    throw new SyncError('CONFIG_INVALID', '方案号不能为空');
+  }
+  const plan = await readTradingPlanById(pool, exchange, planId);
+  if (plan === null) {
+    throw new SyncError('DB_UNIQUE_VIOLATION', `方案 ${planId} 不存在`, { planId });
+  }
+  // 只批准**真能执行**的方案。
+  //
+  // 批准一份「这一轮不做」「出不了方案」或「限价进场」的记录没有意义——
+  // 它没有能执行的进场，而执行器每轮都会把它捞出来又跳过。
+  // 与其让人以为自己批了个会执行的方案，不如在这里就说清楚。
+  //
+  // ⚠️ **判据用 core 那一份**（`packages/core/src/agent-plan.ts`），
+  // 不在这里自己写一遍：agent 的自动批准、控制面的人工批准、executor 的兜底
+  // 检查**四处共用**（§5 第 5 条：同一概念只有一个名字）。
+  if (input.status === 'approved') {
+    assertApprovable({ planId, entryType: plan.entryType, action: plan.action });
+  }
+
+  await updateTradingPlanStatus(pool, planId, input.status);
+  return await readTradingPlanById(pool, exchange, planId);
+}
+
+/**
+ * 批准 / 驳回一份执行方案。
+ *
+ * ⚠️ **批准本身不下单**。真正的下单由 `apps/executor` 消费 `approved` 的方案完成，
+ * 而 executor 只在 `agent.execute.enabled` 开着时才消费。因此：
+ *
+ * - 开关**关着**时：批准只是把方案标成 `approved`（为将来打开开关做准备），
+ *   executor 压根不看它——**不会有单下出去**；
+ * - 开关**打开**时：Agent 产出的方案本来就直接进 `approved`，executor 会消费它。
+ *
+ * 这句话必须说在屏幕上：用户点了「批准」却没看到单下出去，
+ * 最可能的原因就是开关还关着。
+ */
+export async function runAgentPlan(options: AgentPlanOptions): Promise<number> {
+  return withContext(async (ctx) => {
+    const { pool, exchange, config } = ctx;
+    const planId = options.planId.trim();
+    const plan = await readTradingPlanById(pool, exchange, planId);
+    if (plan === null) {
+      throw new SyncError('DB_UNIQUE_VIOLATION', `方案 ${planId} 不存在`, { planId });
+    }
+    const updated = await applyAgentPlanStatus({
+      pool,
+      exchange,
+      planId,
+      status: options.status,
+    });
+
+    const verb = options.status === 'approved' ? '已批准' : '已驳回';
+    console.log(`${verb}方案 #${planId}（${plan.symbol}）。`);
+    if (options.status === 'approved') {
+      console.log(
+        config.agent.execute.enabled
+          ? '  自动执行开着：executor 会在下一轮把它变成真实订单（成交后按方案的 ATR 倍数挂止损止盈）。'
+          : '  ⚠ 自动执行关着（agent.execute.enabled = false）：**不会有单下出去**。' +
+              '要真下单，先把那个开关打开。',
+      );
+    }
+    if (updated !== null && updated.status === 'approved') {
+      console.log(
+        `  状态：${updated.status}　方向 ${String(updated.side)}　数量 ${String(updated.quantity)}`,
+      );
     }
     return 0;
   });

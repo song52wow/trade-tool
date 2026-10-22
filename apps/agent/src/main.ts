@@ -1,9 +1,21 @@
 #!/usr/bin/env node
-import { loadConfigOrDefault, loadProjectEnv, SyncError } from '@trade-tool/core';
-import { buildContext, createLlmClient, createPool, listSymbolEntries } from '@trade-tool/data';
+import {
+  loadConfigOrDefault,
+  loadProjectEnv,
+  parseSecretKey,
+  SECRET_KEY_ENV,
+  SyncError,
+} from '@trade-tool/core';
+import {
+  buildContext,
+  createPool,
+  listSymbolEntries,
+  resolveAgentLlmSettings,
+} from '@trade-tool/data';
 
 import { createAgentDaemon } from './daemon.js';
 import { createEquityReader } from './equity.js';
+import { createLlmResolver } from './llm.js';
 import { createAgentService } from './service.js';
 
 // 必须在 loadConfigOrDefault / createPool 之前：配置路径、数据库密码与 API 密钥
@@ -12,6 +24,19 @@ loadProjectEnv();
 
 /** 停止信号。SIGINT / SIGTERM 置位，循环据此退出而不是被强杀。 */
 let stopRequested = false;
+
+/**
+ * 读主密钥。**没有就返回 `null`**——它对控制面录入的那一份是可选的。
+ *
+ * 与 `parseSecretKey` 的区别：那个在缺密钥时抛错（executor 需要主密钥，
+ * 它本来就在持续下单，配错了必须立刻失败）；这里的缺密钥只意味着
+ * 「用不了控制面录入的那一份」，而配置文件那一档仍然可用。
+ */
+function readOptionalMasterKey(): Buffer | null {
+  const raw = process.env[SECRET_KEY_ENV];
+  if (raw === undefined || raw.trim() === '') return null;
+  return parseSecretKey(raw);
+}
 
 async function main(): Promise<void> {
   const config = await loadConfigOrDefault();
@@ -52,16 +77,36 @@ async function main(): Promise<void> {
   const pool = createPool(config.database);
   const ctx = buildContext(pool, config);
 
-  const llm = createLlmClient({
-    baseUrl: config.agent.llm.baseUrl,
-    model: config.agent.llm.model,
-    apiKeyEnv: config.agent.llm.apiKeyEnv,
-    timeoutMs: config.agent.llm.timeoutMs,
+  /**
+   * 模型客户端**每轮重新解析**（v1.0.0）：控制面改了模型接入不必重启本进程。
+   *
+   * 主密钥是**可选**的：没注入就读不到控制面录入的那一份，
+   * 生效的必然是配置文件 + 环境变量那一档。
+   */
+  const masterKey = readOptionalMasterKey();
+  const resolveLlm = createLlmResolver({
+    pool,
+    masterKey,
+    config: config.agent.llm,
+  });
+  // 启动时解析一次，把「当前接的是哪个模型」打出来。
+  // 解析失败（模型没启用 / 密钥读不到）在这里就暴露，而不是等第一轮分析失败。
+  //
+  // ⚠️ **打的是**真正生效的那一份**，不是配置文件里那份。
+  // 模型接入可以在控制面配（v1.0.0），此时配置文件的值让位——
+  // 打配置文件那份的话，日志会显示**另一个模型**，而排障第一句要回答的
+  // 恰恰是「现在到底接的是哪个模型」。
+  const resolved = await resolveAgentLlmSettings({
+    pool,
+    masterKey,
+    config: config.agent.llm,
   });
   console.error(
-    `[agent] 模型已接入：${config.agent.llm.model} @ ${config.agent.llm.baseUrl}` +
-      `（超时 ${String(config.agent.llm.timeoutMs)}ms，` +
-      `${config.agent.llm.fallbackToTrade ? '失败记为「未出方案」' : '失败即报错'}）`,
+    `[agent] 模型已接入：${resolved.settings.model} @ ${resolved.settings.baseUrl}` +
+      `（超时 ${String(resolved.settings.timeoutMs)}ms，` +
+      `${config.agent.llm.fallbackToTrade ? '失败记为「未出方案」' : '失败即报错'}；` +
+      `生效来源：${resolved.source === 'panel' ? '控制面录入' : '配置文件 + 环境变量'}；` +
+      '控制面改了模型接入后下一轮生效，不必重启本进程）',
   );
 
   // 权益读取与 CLI 用的是**同一份实现**（「哪一份在生效」只有一个答案）。
@@ -74,7 +119,7 @@ async function main(): Promise<void> {
 
   const service = createAgentService({
     ctx,
-    llm,
+    resolveLlm,
     config: config.agent,
     readEquity,
   });

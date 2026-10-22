@@ -90,6 +90,9 @@ KNOWN_MIGRATION_VERSIONS: frozenset[str] = frozenset(
         # risk_bracket.decision_source 允许 agent-plan）。
         # 同样不读写，但版本闸门两个方向都要校。
         "018_agent_plan_execution",
+        # v1.0.0：模型接入的运行期设置（agent_llm_settings，密文落库）。
+        # 同样不读写，但版本闸门两个方向都要校。
+        "019_agent_llm_settings",
     }
 )
 

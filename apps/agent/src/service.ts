@@ -32,6 +32,7 @@
 
 import {
   aggregateAnalystReport,
+  autoExecutableProblem,
   buildAnalystPrompt,
   buildTraderPrompt,
   createLogger,
@@ -54,7 +55,6 @@ import {
   type MarketContext,
 } from '@trade-tool/data';
 
-
 /** 一份行情上下文 + 落库留痕要的原始载荷。 */
 export interface AgentContextBundle {
   context: AnalystContext;
@@ -72,8 +72,14 @@ export interface EquityReading {
 export interface AgentDeps {
   /** 行情上下文（PG 连接 + Python 桥接的基址）。 */
   ctx: MarketContext;
-  /** 模型客户端。 */
-  llm: LlmClient;
+  /**
+   * 取模型客户端。**每轮调一次**。
+   *
+   * 为什么是「取」而不是「给」：控制面可以改模型接入（地址 / 模型名 / 密钥 /
+   * 超时），改完不必重启进程——下一轮就用新的那一份（与通知设置同一套做法：
+   * 「每轮重新解析，改完不必重启」）。
+   */
+  resolveLlm: () => Promise<LlmClient>;
   /** Agent 配置段。 */
   config: AgentConfig;
   /** 读账户权益。读不到就抛错——**不返回 0**（0 会被当成「账户没钱」）。 */
@@ -128,7 +134,7 @@ const SYSTEM_MESSAGE = {
  * @throws SyncError 'CONFIG_INVALID' 配置不合法（由 `configSchema` 保证，这里不再重复校验）。
  */
 export function createAgentService(deps: AgentDeps): AgentService {
-  const { ctx, llm, config } = deps;
+  const { ctx, config } = deps;
   const now = deps.now ?? (() => Date.now());
   const log = deps.log ?? createLogger('agent');
   const loadContext = deps.loadContext ?? loadAgentContext;
@@ -209,6 +215,7 @@ export function createAgentService(deps: AgentDeps): AgentService {
       const analystPrompt = buildAnalystPrompt(bundle.context);
       let analystRaw: string;
       try {
+        const llm = await deps.resolveLlm();
         analystRaw = await llm.complete([SYSTEM_MESSAGE, { role: 'user', content: analystPrompt }]);
       } catch (error) {
         const reason = `分析师模型调用失败：${reasonOf(error)}`;
@@ -282,6 +289,7 @@ export function createAgentService(deps: AgentDeps): AgentService {
 
       let traderRaw: string;
       try {
+        const llm = await deps.resolveLlm();
         traderRaw = await llm.complete([SYSTEM_MESSAGE, { role: 'user', content: traderPrompt }]);
       } catch (error) {
         return recordFailure(
@@ -332,6 +340,13 @@ export function createAgentService(deps: AgentDeps): AgentService {
       }
 
       // ------------------------------------------------------------------ 落库
+      //
+      // 「这份方案能不能自动执行」先算出来（判据只有一份，见下），
+      // 落库时的初始状态与后面的日志都用它。
+      const executableProblem = autoExecutableProblem(
+        plan.action === 'enter' ? plan.entryType : null,
+        plan.action,
+      );
       const planId = await recordTradingPlan(ctx.pool, {
         exchange,
         symbol,
@@ -366,13 +381,18 @@ export function createAgentService(deps: AgentDeps): AgentService {
         // 用户已经明确打开了「允许自动下单」，还要再点一次批准，
         // 于是「开关打开了却没下单」看起来像是坏了。
         //
-        // `action !== 'enter'` 的方案（「这一轮不做」「出不了方案」）**不批准**：
-        // 它们没有可执行的进场，批准了也执行不了，只会在执行器那边
-        // 每轮被捞出来又跳过。
+        // ⚠️ **「可执行」用 `autoExecutableProblem` 判，不在这里自己写一遍**：
+        // 判据只有一份（`packages/core/src/agent-plan.ts`），控制面的人工批准、
+        // 命令行的人工批准、executor 的兜底检查**四处共用**。
+        //
+        // 不可执行的（「这一轮不做」「出不了方案」「限价进场」）一律落 `advisory`：
+        // 批准了它，执行器每轮都会把它捞出来又跳过，而页面上显示「已批准、
+        // 等 executor 消费」，看上去像是有一单在等着下。这正是「以为会做、
+        // 实际什么也没做」（约定 9）。
         //
         // 关着的时候一律 `advisory`：方案只是建议，控制面与 CLI 能看，
         // 真正下单要显式打开开关。
-        status: config.execute.enabled && plan.action === 'enter' ? 'approved' : 'advisory',
+        status: config.execute.enabled && executableProblem === null ? 'approved' : 'advisory',
       });
 
       if (plan.action === 'enter') {
@@ -384,6 +404,16 @@ export function createAgentService(deps: AgentDeps): AgentService {
         );
         for (const adjustment of plan.adjustments) {
           log.warn(`${symbol} 方案已调整：${adjustment}`);
+        }
+        // 不可自动执行的方案**要让人知道**：页面显示「已批准、等 executor 消费」的话，
+        // 看上去像是有一单在等着下，而它永远不会下——那正是「以为会做、实际什么也没做」。
+        //
+        // 原因用 `autoExecutableProblem` 给（判据只有一份），这里只补「怎么办」。
+        if (executableProblem !== null) {
+          log.warn(
+            `${symbol} 方案**未自动批准**：${executableProblem}。` +
+              '方案已落库（status=advisory），可在控制面查看。',
+          );
         }
       } else {
         log.info(`${symbol} 本轮不做：${plan.rationale}`);

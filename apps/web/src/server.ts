@@ -20,6 +20,7 @@ import { toErrorBody } from './errors.js';
 import type {
   AddSymbolBody,
   AgentViewDto,
+  AgentLlmStatusDto,
   TradingPlanDto,
   BarDto,
   BracketsDto,
@@ -31,6 +32,7 @@ import type {
   LifecycleAction,
   NotifyStatusDto,
   NotifyWriteBody,
+  AgentLlmWriteBody,
   OverviewDto,
   RemoveSymbolBody,
   RiskPolicyEntryDto,
@@ -136,6 +138,12 @@ export interface WebDeps {
     planId: string,
     status: 'approved' | 'rejected',
   ): Promise<TradingPlanDto>;
+  /** 模型接入的运行期设置（v1.0.0）。**没有明文密钥。** */
+  getAgentLlmStatus(): Promise<AgentLlmStatusDto>;
+  /** 写入模型接入设置。密钥**密文落库**，不回显。 */
+  writeAgentLlmSettings(body: AgentLlmWriteBody): Promise<AgentLlmStatusDto>;
+  /** 清空控制面录入的那一份（退回配置文件 + 环境变量）。 */
+  clearAgentLlmSettings(): Promise<AgentLlmStatusDto>;
   startJob(input: { kind: JobKind; symbol: string; target?: number | undefined }): Promise<JobDto>;
   listJobs(): Promise<JobDto[]>;
   getJob(id: string): Promise<JobDto | null>;
@@ -433,6 +441,49 @@ export function buildApp(deps: WebDeps): Hono {
   app.post('/api/settings/notify/test', async (c) => {
     assertSameOrigin(c);
     return c.json(await deps.testNotify());
+  });
+
+  // ------------------------------------------------- 模型接入设置（v1.0.0）
+
+  /**
+   * 模型接入的运行期设置。**回包里没有明文密钥**——只有「配没配」与末 4 位。
+   */
+  app.get('/api/settings/agent-llm', async (c) => c.json(await deps.getAgentLlmStatus()));
+
+  /**
+   * 写入模型接入设置。
+   *
+   * 密钥**直接填在这里**：它会加密落库，不会出现在配置文件、argv 或日志里
+   * （与通知 webhook 的做法同一套）。
+   */
+  app.put('/api/settings/agent-llm', async (c) => {
+    assertSameOrigin(c);
+    const body = await bodyOf<AgentLlmWriteBody>(c);
+    if (typeof body?.enabled !== 'boolean') {
+      throw new SyncError('CONFIG_INVALID', '缺少 enabled（必须是布尔值）');
+    }
+    if (typeof body?.baseUrl !== 'string') {
+      throw new SyncError('CONFIG_INVALID', '缺少 baseUrl（留空表示「保持原样」）');
+    }
+    if (typeof body?.model !== 'string') {
+      throw new SyncError('CONFIG_INVALID', '缺少 model（留空表示「保持原样」）');
+    }
+    if (body.apiKey !== undefined && typeof body.apiKey !== 'string') {
+      throw new SyncError('CONFIG_INVALID', 'apiKey 必须是字符串');
+    }
+    if (!Number.isInteger(body.timeoutMs) || body.timeoutMs <= 0) {
+      throw new SyncError(
+        'CONFIG_INVALID',
+        `timeoutMs 必须是正整数毫秒，收到：${String(body.timeoutMs)}`,
+      );
+    }
+    return c.json(await deps.writeAgentLlmSettings(body));
+  });
+
+  /** 清空控制面录入的那一份（退回配置文件 + 环境变量）。 */
+  app.delete('/api/settings/agent-llm', async (c) => {
+    assertSameOrigin(c);
+    return c.json(await deps.clearAgentLlmSettings());
   });
 
   /**

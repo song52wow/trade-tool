@@ -3,6 +3,8 @@ import {
   NOTIFY_KIND_INFO,
   NOTIFY_KINDS,
   SyncError,
+  assertApprovable,
+  autoExecutableProblem,
   createNotifier,
   loadConfigOrDefault,
   parseSecretKey,
@@ -50,6 +52,10 @@ import {
   readLatestTradingPlan,
   readTradingPlanById,
   updateTradingPlanStatus,
+  readAgentLlmStatus,
+  readAgentLlmPanelTarget,
+  writeAgentLlmSettings as writeAgentLlmSettingsRow,
+  clearAgentLlmSettings as clearAgentLlmSettingsRow,
   resolveActiveCredentials,
   resolveContract,
   runReconciliation,
@@ -108,6 +114,7 @@ import type {
   BracketsDto,
   CredentialStatusDto,
   NotifyStatusDto,
+  AgentLlmStatusDto,
   RiskPolicyEntryDto,
   RiskPolicyViewDto,
   TradingPlanDto,
@@ -342,45 +349,7 @@ export function createWebRuntime(config: TradeToolConfig): WebRuntime {
      * 页面必须把这两件事说清楚，否则用户会以为「点了批准 = 立刻开仓」。
      */
     async setTradingPlanStatus(symbol, planId, status): Promise<TradingPlanDto> {
-      if (status !== 'approved' && status !== 'rejected') {
-        throw new SyncError('CONFIG_INVALID', `不允许把方案状态改成 ${status}`, { status });
-      }
-      const plan = await readTradingPlanById(pool, ctx.exchange, symbol, planId);
-      if (plan === null) {
-        throw new SyncError('DB_UNIQUE_VIOLATION', `方案 ${planId} 不存在`, { planId });
-      }
-      if (status === 'approved') {
-        // 只批准**真能执行**的方案。
-        //
-        // 批准一份「这一轮不做」或「出不了方案」的记录没有意义——它没有进场可执行，
-        // 而执行器每轮都会把它捞出来又跳过。与其让用户以为自己批了个会执行的方案，
-        // 不如在这里就说清楚。
-        if (plan.action !== 'enter') {
-          throw new SyncError(
-            'CONFIG_INVALID',
-            `方案 ${planId} 是「${plan.action === 'hold' ? '这一轮不做' : '出不了方案'}」，` +
-              '没有可执行的进场，不能批准',
-            { planId, action: plan.action },
-          );
-        }
-        // 限价进场**暂不支持自动执行**（挂着的限价单可能永远不成交，
-        // 而不成交的仓位没有止损保护）。在这里就拒绝，
-        // 免得用户批了一份注定执行不了的方案。
-        if (plan.entryType === 'limit') {
-          throw new SyncError(
-            'CONFIG_INVALID',
-            '限价进场暂不支持自动执行（只支持市价进场）：限价单可能永远不成交，' +
-              '而挂着不成交的仓位没有止损保护。请改用市价进场，或在交易所手动下单。',
-            { planId, entryType: plan.entryType },
-          );
-        }
-      }
-      await updateTradingPlanStatus(pool, planId, status);
-      const updated = await readTradingPlanById(pool, ctx.exchange, symbol, planId);
-      if (updated === null) {
-        throw new SyncError('DB_UNIQUE_VIOLATION', `方案 ${planId} 读不到了`, { planId });
-      }
-      return toTradingPlanDto(updated);
+      return applyTradingPlanStatus({ pool, exchange: ctx.exchange, symbol, planId, status });
     },
 
     /**
@@ -506,6 +475,61 @@ export function createWebRuntime(config: TradeToolConfig): WebRuntime {
       // 写完重新读一遍状态：回包里的「生效来源」必须是从库里读出来的事实，
       // 而不是「我们刚写了什么」的自我复述。
       return this.getNotifyStatus();
+    },
+
+    /**
+     * 模型接入的运行期设置（v1.0.0）。
+     *
+     * **控制面录入优先**，配置文件 + 环境变量兜底——判据只有
+     * `resolveAgentLlmSettings` 一份实现（两处各判一次的话，
+     * 「哪一份在生效」就有两个答案）。
+     */
+    async getAgentLlmStatus(): Promise<AgentLlmStatusDto> {
+      const status = await readAgentLlmStatus({
+        pool,
+        masterKey: masterKeyOrNull(),
+        config: config.agent.llm,
+      });
+      return {
+        enabled: status.enabled,
+        baseUrl: status.baseUrl,
+        model: status.model,
+        timeoutMs: status.timeoutMs,
+        source: status.source,
+        apiKeyEnv: status.apiKeyEnv,
+        configKeyAvailable: status.configKeyAvailable,
+        panel: status.panel,
+        updatedAt: status.updatedAt,
+        masterKeyReady: masterKeyStatus().ok,
+      };
+    },
+
+    async writeAgentLlmSettings(body): Promise<AgentLlmStatusDto> {
+      const key = requireMasterKey();
+      // 面板那一档当前存着的值：「留空 = 保持原样」要靠它才成立。
+      const current = await readAgentLlmPanelTarget({ pool, masterKey: key });
+      await writeAgentLlmSettingsRow(
+        pool,
+        key,
+        {
+          enabled: body.enabled,
+          baseUrl: body.baseUrl,
+          model: body.model,
+          apiKey: body.apiKey,
+          clearApiKey: body.clearApiKey === true,
+          timeoutMs: body.timeoutMs,
+          now: Date.now(),
+        },
+        current,
+      );
+      // 写完重新读一遍状态：回包里的「生效来源」必须是从库里读出来的事实，
+      // 而不是「我们刚写了什么」的自我复述。
+      return this.getAgentLlmStatus();
+    },
+
+    async clearAgentLlmSettings(): Promise<AgentLlmStatusDto> {
+      await clearAgentLlmSettingsRow(pool);
+      return this.getAgentLlmStatus();
     },
 
     async clearNotifySettings(): Promise<NotifyStatusDto> {
@@ -683,6 +707,8 @@ function toAgentReportDto(row: AnalystReportRow): AgentReportDto {
 
 /** 数据库行 → 页面用的方案。 */
 function toTradingPlanDto(row: TradingPlanRow): TradingPlanDto {
+  // 「能不能批准」用 core 那一份判据算，页面只负责显示（§5 第 5 条）。
+  const approvableReason = autoExecutableProblem(row.entryType, row.action);
   return {
     id: row.id,
     symbol: row.symbol,
@@ -709,5 +735,57 @@ function toTradingPlanDto(row: TradingPlanRow): TradingPlanDto {
     failureReason: row.failureReason,
     entryOrderId: row.entryOrderId,
     executionFailureReason: row.executionFailureReason,
+    approvable: approvableReason === null,
+    approvableReason,
   };
+}
+
+/**
+ * 批准 / 驳回一份执行方案的**核心逻辑**（不碰 HTTP）。
+ *
+ * 单独抽出来是为了**能被测**：控制面的批准要走真库，
+ * 而「限价方案能不能批准」这条判据是纯的——摊成一个只依赖注入的函数，
+ * 测试直接调用它，不必起整个控制面。
+ *
+ * ⚠️ **判据用 core 那一份**（`packages/core/src/agent-plan.ts`），
+ * 不在这里自己写一遍：agent 的自动批准、CLI 的人工批准、executor 的兜底
+ * 检查**四处共用**（§5 第 5 条：同一概念只有一个名字）。
+ *
+ * @throws SyncError 'CONFIG_INVALID' 状态不合法 / 这份方案不能批准；
+ *   'DB_UNIQUE_VIOLATION' 方案不存在 / 标的对不上。
+ */
+export async function applyTradingPlanStatus(input: {
+  pool: Pool;
+  exchange: string;
+  symbol: string;
+  planId: string;
+  status: 'approved' | 'rejected';
+}): Promise<TradingPlanDto> {
+  const { pool, exchange, symbol, planId, status } = input;
+  if (status !== 'approved' && status !== 'rejected') {
+    throw new SyncError('CONFIG_INVALID', `不允许把方案状态改成 ${status}`, { status });
+  }
+  const plan = await readTradingPlanById(pool, exchange, planId);
+  if (plan === null) {
+    throw new SyncError('DB_UNIQUE_VIOLATION', `方案 ${planId} 不存在`, { planId });
+  }
+  // URL 里的标的必须与方案自己的对得上。方案号全局唯一，所以这一条拦的是
+  // 「拿 A 标的的 URL 去改 B 标的的方案」——不是安全边界（控制面无鉴权），
+  // 而是**防手滑**：改错标的的方案是不可逆的（它会变成真实订单）。
+  if (plan.symbol !== symbol) {
+    throw new SyncError(
+      'DB_UNIQUE_VIOLATION',
+      `方案 ${planId} 属于 ${plan.symbol}，不是 ${symbol}`,
+      { planId, symbol, planSymbol: plan.symbol },
+    );
+  }
+  if (status === 'approved') {
+    assertApprovable({ planId, entryType: plan.entryType, action: plan.action });
+  }
+  await updateTradingPlanStatus(pool, planId, status);
+  const updated = await readTradingPlanById(pool, exchange, planId);
+  if (updated === null) {
+    throw new SyncError('DB_UNIQUE_VIOLATION', `方案 ${planId} 读不到了`, { planId });
+  }
+  return toTradingPlanDto(updated);
 }

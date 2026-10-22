@@ -311,6 +311,25 @@ export interface NotifyWriteBody {
   repeatCooldownMs: number;
 }
 
+/**
+ * 模型接入设置的**写入体**。
+ *
+ * 密钥直接填在这里：它会**密文落库**，不会出现在配置文件、argv 或日志里
+ * （与通知 webhook 同一套做法，AGENTS.md 约定 2）。
+ */
+export interface AgentLlmWriteBody {
+  enabled: boolean;
+  /** 空 = 保持原样（第一次保存时必填）。 */
+  baseUrl: string;
+  /** 空 = 保持原样（第一次保存时必填）。 */
+  model: string;
+  /** 空 = 保持原样。 */
+  apiKey?: string;
+  /** 显式清除密钥。 */
+  clearApiKey?: boolean;
+  timeoutMs: number;
+}
+
 /** 止盈止损策略的**作用域**。`global` 是默认，`symbol` 是单标的覆盖。 */
 export type RiskPolicyScopeDto = 'global' | 'symbol';
 
@@ -491,6 +510,59 @@ export interface AgentReportDto {
 }
 
 /**
+ * 模型接入的运行期设置（v1.0.0）。
+ *
+ * **没有明文密钥**：控制面从设计上就没有回显它的能力。
+ * 密钥密文落库（与通知 webhook 同一套加密），页面只看得到「配没配」与末 4 位。
+ */
+export interface AgentLlmStatusDto {
+  /** 生效的那一档是否启用模型。 */
+  enabled: boolean;
+  /** 生效的那一档的 API 基址。 */
+  baseUrl: string;
+  /** 生效的那一档的模型名。 */
+  model: string;
+  /** 生效的那一档的单次调用超时（毫秒）。 */
+  timeoutMs: number;
+  /** 生效来源：`panel` = 控制面录入；`config` = 配置文件 + 环境变量。 */
+  source: 'panel' | 'config';
+  /** 生效来源是 `config` 时，密钥取自哪个环境变量（排障要看）。 */
+  apiKeyEnv: string;
+  /**
+   * 生效来源是 `config` 时，那个环境变量里的密钥**读到了没有**。
+   *
+   * `false` = 环境变量里没有密钥——这是最常见的配置错误，
+   * 页面要显示出来（并说清去补哪个变量），而不是笼统的「设置操作失败」。
+   */
+  configKeyAvailable: boolean;
+  /**
+   * 面板那一档的状态。**无论它是否生效都在这里**——
+   * 「面板里配过、但当前生效的是配置文件那一档」必须看得见。
+   */
+  panel: {
+    configured: boolean;
+    /** 密钥末 4 位，纯展示用，不是机密。 */
+    hint: string | null;
+    enabled: boolean;
+    baseUrl: string | null;
+    model: string | null;
+    timeoutMs: number | null;
+    updatedAt: number | null;
+    /**
+     * 有没有配密钥。
+     *
+     * `null` = **读不到**（主密钥没注入，解不开密文）。这时候必须说「不知道」，
+     * 而不能说「没配」——后者是猜测，而页面会照着它显示。
+     */
+    keyConfigured: boolean | null;
+  } | null;
+  /** 生效的那一档最后一次写入的时刻。 */
+  updatedAt: number | null;
+  /** 主密钥是否可用（没注入时控制面录入的那一份读不到、也写不了）。 */
+  masterKeyReady: boolean;
+}
+
+/**
  * 交易员执行方案（v1.0.0）。
  *
  * 价格与数量**不是模型给的**：模型只给比例，它们由 `deriveExecutionPlan` 算出来，
@@ -511,14 +583,7 @@ export interface TradingPlanDto {
    * 这两个态必须显示出来：`executing` 说明「那一单到底下没下还不知道」，
    * `failed` 说明「仓位没有建立、止损也没有挂」。
    */
-  status:
-    | 'advisory'
-    | 'approved'
-    | 'executing'
-    | 'executed'
-    | 'rejected'
-    | 'expired'
-    | 'failed';
+  status: 'advisory' | 'approved' | 'executing' | 'executed' | 'rejected' | 'expired' | 'failed';
   side: 'BUY' | 'SELL' | null;
   entryType: 'market' | 'limit' | null;
   entryPrice: number | null;
@@ -542,6 +607,17 @@ export interface TradingPlanDto {
   entryOrderId: string | null;
   /** 下单失败的原因（`status = 'failed'` 时有值）。 */
   executionFailureReason: string | null;
+  /**
+   * 这份方案**能不能批准**。
+   *
+   * 判据在 `packages/core/src/agent-plan.ts`（`autoExecutableProblem`），
+   * **由服务端算好传过来**：页面不自己判，也不 import core——
+   * core 的 barrel 里带着 `node:crypto` / `node:fs`，浏览器构建会直接失败，
+   * 而且在页面里再写一遍判据就是**第二份实现**（§5 第 5 条）。
+   */
+  approvable: boolean;
+  /** 不能批准的原因（能批准时为 `null`）。页面上要原样显示，别自己复述。 */
+  approvableReason: string | null;
 }
 
 /** `/agent` 的回包。`report` / `plan` 各自可能为 `null`（还没分析过）。 */

@@ -42,15 +42,18 @@ pnpm format:check                 # 任意文件（Prettier；Python 侧另有 p
 
 最容易踩的几个坑：
 
-| 坑                                    | 症状                                                | 见               |
-| ------------------------------------- | --------------------------------------------------- | ---------------- |
-| pnpm 版本与 `packageManager` 不一致   | 仓库内**任何** pnpm 命令都失败（连 `pnpm -v` 也是） | §2.4             |
-| 新增进程入口忘了调 `loadProjectEnv()` | 读不到 `.env`，表现为「配置明明填了却说没配」       | §2.2             |
-| 凭据 / DSN 走了 argv 或配置文件       | 密码出现在 `ps` 与 git 里                           | §5 第 2 条       |
-| 失败时返回空值 / 默认值而不是抛错     | 「看起来成功了，其实什么都没做」，最难查            | §5 第 9 条       |
-| 判据被抄成第二份实现                  | 两个出口结论不一致，此后没人再敢信任何一份          | §6.1、§6.2、§6.5 |
-| 让模型直接输出价格 / 数量             | 算错一个数量级也不报错，亏损跟着错一个数量级        | §5 第 13 条      |
-| 开关打开却没有实现它                  | 日志说「开了」，实际什么也没发生                    | §6.11.1 第 6 条  |
+| 坑                                    | 症状                                                   | 见               |
+| ------------------------------------- | ------------------------------------------------------ | ---------------- |
+| pnpm 版本与 `packageManager` 不一致   | 仓库内**任何** pnpm 命令都失败（连 `pnpm -v` 也是）    | §2.4             |
+| 新增进程入口忘了调 `loadProjectEnv()` | 读不到 `.env`，表现为「配置明明填了却说没配」          | §2.2             |
+| 凭据 / DSN 走了 argv 或配置文件       | 密码出现在 `ps` 与 git 里                              | §5 第 2 条       |
+| 失败时返回空值 / 默认值而不是抛错     | 「看起来成功了，其实什么都没做」，最难查               | §5 第 9 条       |
+| 判据被抄成第二份实现                  | 两个出口结论不一致，此后没人再敢信任何一份             | §6.1、§6.2、§6.5 |
+| 让模型直接输出价格 / 数量             | 算错一个数量级也不报错，亏损跟着错一个数量级           | §5 第 13 条      |
+| 开关打开却没有实现它                  | 日志说「开了」，实际什么也没发生                       | §6.11.1 第 6 条  |
+| **批准的口径与执行器不一致**          | 批了一份执行不了的方案，它永远卡在「已批准」           | §6.12.2 第 1 条  |
+| 新迁移用了**旧迁移同名的**约束        | `DROP CONSTRAINT` 顺带删掉上一条守门人，且**一声不响** | §5 第 12 条      |
+| 下单成功但回填前崩了                  | 下一轮重复下单，仓位翻倍而日志与库里都看不出异常       | §6.12.1          |
 
 ## 1 这个仓库是什么
 
@@ -119,18 +122,18 @@ apps/executor/src/main.ts   apps/agent/src/main.ts
 
 ### 2.3 变量总表
 
-| 变量                                                    | 作用 / 坑                                                                                                                                                                                     |
-| ------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `TRADE_TOOL_HOME`                                       | 工作根：配置文件、`data/cache`、`data/raw`、`data/meta`、`reports/`。**必须绝对路径**（相对路径按 cwd 解析，而各处 cwd 不同）                                                                 |
-| `TRADE_TOOL_PG_{HOST,PORT,USER,DATABASE,PASSWORD}`      | 本地 PG，默认与 [`compose.yaml`](compose.yaml) 同源（`trade` / `trade_tool` / 5432）                                                                                                          |
-| `TRADE_TOOL_PG_DSN`                                     | 交给 Python 的完整连接串，由 TS 拼好注入。**只经环境变量，不进 argv**（不进 `.env.example`）                                                                                                  |
-| `TRADE_TOOL_WEB_{HOST,PORT}`                            | 控制面监听（默认 `127.0.0.1:8787`）。**不要改成 `0.0.0.0`**：本期无鉴权，见 §6.6                                                                                                              |
-| `TRADE_TOOL_BINANCE_BASE_URL`                           | 覆盖交易所 **REST** 基址，Python 侧读它（`quant_data/http.py`）。**不要拿它切环境**：本地跑 Demo 用 `executor.environment = demo`，那时由 TS 往子进程注入 demo 基址；测试用它指向本地假交易所 |
-| `TRADE_TOOL_BINANCE_DEMO_STREAM_URL`                    | Demo 用户数据流**基址**（不带 `/private/ws?listenKey=`）。只在 `executor.environment = demo` 时必填，本仓库**不内置默认值**                                                                   |
-| `TRADE_TOOL_BINANCE_API_KEY` / `_API_SECRET`            | 行情同步**不需要**；只有 `apps/executor` 下单用。名字可由 `executor.apiKeyEnv` / `apiSecretEnv` 改                                                                                            |
-| `TRADE_TOOL_SECRET_KEY`                                 | 凭据静态加密主密钥（32 字节 = 64 位 hex 或 44 位 base64）。**丢了就解不开库里的密文**，只能重新录入，见 §6.4                                                                                  |
-| `TRADE_TOOL_FEISHU_WEBHOOK_URL` / `_SECRET`             | 飞书自定义机器人的 webhook 地址（**它本身就是凭据**）与可选的签名密钥。只在 `notify.enabled = true` 时需要，见 §6.9                                                                           |
-| `TRADE_TOOL_TEST_PG_{HOST,PORT,DATABASE,USER,PASSWORD}` | 测试库连接参数覆盖（默认同上）。Python 侧另认 `TRADE_TOOL_TEST_PG_DSN`                                                                                                                        |
+| 变量                                                    | 作用 / 坑                                                                                                                                                                                                                        |
+| ------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `TRADE_TOOL_HOME`                                       | 工作根：配置文件、`data/cache`、`data/raw`、`data/meta`、`reports/`。**必须绝对路径**（相对路径按 cwd 解析，而各处 cwd 不同）                                                                                                    |
+| `TRADE_TOOL_PG_{HOST,PORT,USER,DATABASE,PASSWORD}`      | 本地 PG，默认与 [`compose.yaml`](compose.yaml) 同源（`trade` / `trade_tool` / 5432）                                                                                                                                             |
+| `TRADE_TOOL_PG_DSN`                                     | 交给 Python 的完整连接串，由 TS 拼好注入。**只经环境变量，不进 argv**（不进 `.env.example`）                                                                                                                                     |
+| `TRADE_TOOL_WEB_{HOST,PORT}`                            | 控制面监听（默认 `127.0.0.1:8787`）。**不要改成 `0.0.0.0`**：本期无鉴权，见 §6.6                                                                                                                                                 |
+| `TRADE_TOOL_BINANCE_BASE_URL`                           | 覆盖交易所 **REST** 基址，Python 侧读它（`quant_data/http.py`）。**不要拿它切环境**：本地跑 Demo 用 `executor.environment = demo`，那时由 TS 往子进程注入 demo 基址；测试用它指向本地假交易所                                    |
+| `TRADE_TOOL_BINANCE_DEMO_STREAM_URL`                    | Demo 用户数据流**基址**（不带 `/private/ws?listenKey=`）。只在 `executor.environment = demo` 时必填，本仓库**不内置默认值**                                                                                                      |
+| `TRADE_TOOL_BINANCE_API_KEY` / `_API_SECRET`            | 行情同步**不需要**；只有 `apps/executor` 下单用。名字可由 `executor.apiKeyEnv` / `apiSecretEnv` 改                                                                                                                               |
+| `TRADE_TOOL_SECRET_KEY`                                 | 凭据静态加密主密钥（32 字节 = 64 位 hex 或 44 位 base64）。**丢了就解不开库里的密文**，只能重新录入，见 §6.4。**控制面录入的模型密钥也用它加密**（v1.0.0，§6.13）——没有它，控制面那一档读不出来，只能用配置文件 + 环境变量那一档 |
+| `TRADE_TOOL_FEISHU_WEBHOOK_URL` / `_SECRET`             | 飞书自定义机器人的 webhook 地址（**它本身就是凭据**）与可选的签名密钥。只在 `notify.enabled = true` 时需要，见 §6.9                                                                                                              |
+| `TRADE_TOOL_TEST_PG_{HOST,PORT,DATABASE,USER,PASSWORD}` | 测试库连接参数覆盖（默认同上）。Python 侧另认 `TRADE_TOOL_TEST_PG_DSN`                                                                                                                                                           |
 
 只在 `deploy/` 里出现、本机开发用不到的：`TRADE_TOOL_IMAGE`、`TRADE_TOOL_PG_BIND`、
 `TRADE_TOOL_{HTTP,HTTPS,NO}_PROXY`、`TRADE_TOOL_NODE_OPTIONS`、`TRADE_TOOL_PG_WAIT_SECONDS`、
@@ -170,31 +173,35 @@ apps/executor/src/main.ts   apps/agent/src/main.ts
 
 ## 4 新代码放哪儿
 
-| 新东西                                        | 放哪                                                                      |
-| --------------------------------------------- | ------------------------------------------------------------------------- |
-| 领域类型、配置 schema、错误码、纯函数判据     | `packages/core/src`                                                       |
-| 行情接入、缓存、Python 调用                   | `packages/data/src`                                                       |
-| **数据库表结构 / 迁移（唯一来源）**           | **`packages/data/sql/`**                                                  |
-| PG 客户端、schema 闸门、查询层                | `packages/data/src/db`                                                    |
-| **派生周期（桶对齐 / 覆盖判据 / 聚合）**      | **`python/packages/quant-data/src/quant_data/aggregate.py`**              |
-| **带时间锚的取数（如「按成交时刻算 ATR」）**  | **`python/packages/quant-data/src/quant_data/risk.py`**                   |
-| **技术指标公式（全仓唯一一份）**              | **`python/packages/quant-core/src/quant_core/indicators.py`**             |
-| **私有交易接口（下单 / 用户数据流）**         | **`packages/data/src/binance-private.ts`**                                |
-| 止盈止损编排、幂等、执行记录                  | `apps/executor/src` + `packages/data/src/db/risk.ts`                      |
-| **凭据静态加密**                              | **`packages/core/src/secret.ts`** + `packages/data/src/db/credentials.ts` |
-| **告警通道（飞书推送、去重与冷却）**          | **`packages/core/src/notify.ts`**（转换在 `apps/executor/src/alert.ts`）  |
-| **通知设置的读写与「哪一份在生效」**          | **`packages/data/src/db/notify.ts`**（密文落库 + 优先级解析）             |
-| **新策略 / 回测引擎**                         | **`python/packages/quant-backtest/src/`**                                 |
-| **分析师 Agent 的契约与纯函数（合成立场）**   | **`packages/core/src/agent-analyst.ts`**                                  |
-| **交易员 Agent 的契约与纯函数（算仓位与价）** | **`packages/core/src/agent-trader.ts`**                                   |
-| **行情上下文的跨语言契约（载荷 schema）**     | **`packages/core/src/agent-context.ts`**                                  |
-| **技术面现算 + 情绪面取数**                   | **`python/packages/quant-data/src/quant_data/market_context.py`**         |
-| **Agent 的编排与守护循环**                    | **`apps/agent/src`**（`service.ts` 编排 + `daemon.ts` 循环）              |
-| **Agent 报告与方案的读写**                    | **`packages/data/src/db/agent.ts`**                                       |
-| 命令行命令                                    | `apps/cli/src/commands/`                                                  |
-| 常驻同步、生命周期、控制原语                  | `apps/sync/src`                                                           |
-| 控制面 HTTP 路由与前端页面                    | `apps/web/src` + `apps/web/ui`                                            |
-| **部署镜像与编排（服务器）**                  | **`deploy/`**（根 [`compose.yaml`](compose.yaml) 只是本机开发库）         |
+| 新东西                                                 | 放哪                                                                        |
+| ------------------------------------------------------ | --------------------------------------------------------------------------- |
+| 领域类型、配置 schema、错误码、纯函数判据              | `packages/core/src`                                                         |
+| 行情接入、缓存、Python 调用                            | `packages/data/src`                                                         |
+| **数据库表结构 / 迁移（唯一来源）**                    | **`packages/data/sql/`**                                                    |
+| PG 客户端、schema 闸门、查询层                         | `packages/data/src/db`                                                      |
+| **派生周期（桶对齐 / 覆盖判据 / 聚合）**               | **`python/packages/quant-data/src/quant_data/aggregate.py`**                |
+| **带时间锚的取数（如「按成交时刻算 ATR」）**           | **`python/packages/quant-data/src/quant_data/risk.py`**                     |
+| **技术指标公式（全仓唯一一份）**                       | **`python/packages/quant-core/src/quant_core/indicators.py`**               |
+| **私有交易接口（下单 / 用户数据流）**                  | **`packages/data/src/binance-private.ts`**                                  |
+| 止盈止损编排、幂等、执行记录                           | `apps/executor/src` + `packages/data/src/db/risk.ts`                        |
+| **凭据静态加密**                                       | **`packages/core/src/secret.ts`** + `packages/data/src/db/credentials.ts`   |
+| **告警通道（飞书推送、去重与冷却）**                   | **`packages/core/src/notify.ts`**（转换在 `apps/executor/src/alert.ts`）    |
+| **通知设置的读写与「哪一份在生效」**                   | **`packages/data/src/db/notify.ts`**（密文落库 + 优先级解析）               |
+| **新策略 / 回测引擎**                                  | **`python/packages/quant-backtest/src/`**                                   |
+| **分析师 Agent 的契约与纯函数（合成立场）**            | **`packages/core/src/agent-analyst.ts`**                                    |
+| **交易员 Agent 的契约与纯函数（算仓位与价）**          | **`packages/core/src/agent-trader.ts`**                                     |
+| **方案「能不能自动执行」的判据（一处判据，各处共用）** | **`packages/core/src/agent-plan.ts`**                                       |
+| **行情上下文的跨语言契约（载荷 schema）**              | **`packages/core/src/agent-context.ts`**                                    |
+| **技术面现算 + 情绪面取数**                            | **`python/packages/quant-data/src/quant_data/market_context.py`**           |
+| **Agent 的编排与守护循环**                             | **`apps/agent/src`**（`service.ts` 编排 + `daemon.ts` 循环）                |
+| **Agent 报告与方案的读写**                             | **`packages/data/src/db/agent.ts`**                                         |
+| **自动下单的执行状态机与认领**                         | **`apps/executor/src/plan-execution.ts`** + `packages/data/src/db/agent.ts` |
+| **模型接入设置的读写与「哪一份在生效」**               | **`packages/data/src/db/llm-settings.ts`**（密文落库 + 优先级解析）         |
+| **模型设置的每轮解析（控制面改完下一轮生效）**         | **`apps/agent/src/llm.ts`**                                                 |
+| 命令行命令                                             | `apps/cli/src/commands/`                                                    |
+| 常驻同步、生命周期、控制原语                           | `apps/sync/src`                                                             |
+| 控制面 HTTP 路由与前端页面                             | `apps/web/src` + `apps/web/ui`                                              |
+| **部署镜像与编排（服务器）**                           | **`deploy/`**（根 [`compose.yaml`](compose.yaml) 只是本机开发库）           |
 
 `packages/backtest` 已退场，不要再往 TS 侧放回测或指标。
 
@@ -260,6 +267,18 @@ apps/executor/src/main.ts   apps/agent/src/main.ts
     **新迁移退役任何一列之前，先 `SELECT conname, pg_get_constraintdef(oid) FROM pg_constraint
 WHERE conrelid = '<table>'::regclass` 查一遍**，被顺带删掉的约束要用新迁移补回来
     （补回来的那条**语义要一样**，只是少了已退役的字段）。
+    ⚠️ **同一个坑的另一个形态：`DROP CONSTRAINT` 也会删掉同名的那条**。
+    新迁移想「扩枚举」（给 `status` 多加两个取值）时，最省事的写法是
+    `DROP CONSTRAINT IF EXISTS <旧名>` + `ADD CONSTRAINT <旧名> ...`——
+    但如果旧名的**语义**与新的不是一回事（哪怕只是判据的字段换了），
+    这条旧守门人就**无声消失**了。2026-10-22 实测踩到：迁移 `018` 用
+    `trading_plan_failed_has_reason_check` 这个名字去表达「下单失败必须带原因」，
+    而 `017` 已经用**同名**表达了「出不了方案必须带原因」——`018` 的 `DROP` 顺带删掉了它，
+    于是「出不了方案必须说为什么」这条守门人消失了。
+    **两条语义不同的约束必须用两个名字**（`..._failed_has_reason_check` 与
+    `..._execution_failed_has_reason_check`）；**扩枚举时保留旧名、把旧值也列进去**
+    （那是「扩」，不是「换」）。**改完迁移后，用空库跑一遍全部迁移，
+    把 `pg_constraint` 里的约束逐条列出来核对**——那是唯一能发现「少了谁」的办法。
 13. **模型只提「比例」，钱和价格由程序算**（v1.0.0 Agent 层）：LLM 参与下单决策时，
     它能说的只有**比例类**参数——风险占权益的百分之几、止损离几倍 ATR、进场挂在现价
     几个 ATR 之外。**绝对价格、数量、名义金额一律由程序算**：
@@ -281,18 +300,20 @@ WHERE conrelid = '<table>'::regclass` 查一遍**，被顺带删掉的约束要�
 `R-*` / `AC-*` 编号出自 [`docs/`](docs/README.md) 的需求文档。**引用时带版本前缀**
 （写成「v0.1.0 R-3.3」），因为编号在不同版本文档里各用各的。
 
-| 层                        | 版本   | 需求 / 设计文档                                                                  | 细节                                                                  |
-| ------------------------- | ------ | -------------------------------------------------------------------------------- | --------------------------------------------------------------------- |
-| 数据底座与同步            | v0.1.0 | [`docs/v0.1.0-…`](docs/v0.1.0-binance-perp-market-sync.md)                       | `packages/data/README.md`、`apps/sync/README.md`                      |
-| 派生周期                  | v0.2.0 | [`docs/v0.2.0-…`](docs/v0.2.0-multi-timeframe-klines.md)                         | §6.1                                                                  |
-| 技术指标                  | v0.3.0 | [`docs/v0.3.0-…`](docs/v0.3.0-technical-indicators.md)                           | §6.2                                                                  |
-| 止盈止损                  | v0.4.0 | **无需求文档**                                                                   | [`apps/executor/README.md`](apps/executor/README.md)、§6.3            |
-| 凭据与运行期设置          | v0.5.0 | **无需求文档**                                                                   | [`sql/007`](packages/data/sql/007_executor_settings.sql) 头注释、§6.4 |
-| 交易对账                  | v0.6.0 | **无需求文档**                                                                   | [`README.md`](README.md) 的对账一节、§6.5                             |
-| 两段止盈与移动止损        | v0.7.0 | [`docs/v0.7.0-…`](docs/v0.7.0-staged-take-profit-trailing-stop.md)（**已实现**） | §6.8                                                                  |
-| 通知层（飞书告警）        | v0.8.0 | **无需求文档**                                                                   | §6.9                                                                  |
-| LLM 决策（止盈止损档位）  | v0.9.0 | **无需求文档**                                                                   | §6.10                                                                 |
-| **分析师 / 交易员 Agent** | v1.0.0 | **无需求文档**                                                                   | [`apps/agent/README.md`](apps/agent/README.md)、§6.11                 |
+| 层                              | 版本   | 需求 / 设计文档                                                                  | 细节                                                                  |
+| ------------------------------- | ------ | -------------------------------------------------------------------------------- | --------------------------------------------------------------------- |
+| 数据底座与同步                  | v0.1.0 | [`docs/v0.1.0-…`](docs/v0.1.0-binance-perp-market-sync.md)                       | `packages/data/README.md`、`apps/sync/README.md`                      |
+| 派生周期                        | v0.2.0 | [`docs/v0.2.0-…`](docs/v0.2.0-multi-timeframe-klines.md)                         | §6.1                                                                  |
+| 技术指标                        | v0.3.0 | [`docs/v0.3.0-…`](docs/v0.3.0-technical-indicators.md)                           | §6.2                                                                  |
+| 止盈止损                        | v0.4.0 | **无需求文档**                                                                   | [`apps/executor/README.md`](apps/executor/README.md)、§6.3            |
+| 凭据与运行期设置                | v0.5.0 | **无需求文档**                                                                   | [`sql/007`](packages/data/sql/007_executor_settings.sql) 头注释、§6.4 |
+| 交易对账                        | v0.6.0 | **无需求文档**                                                                   | [`README.md`](README.md) 的对账一节、§6.5                             |
+| 两段止盈与移动止损              | v0.7.0 | [`docs/v0.7.0-…`](docs/v0.7.0-staged-take-profit-trailing-stop.md)（**已实现**） | §6.8                                                                  |
+| 通知层（飞书告警）              | v0.8.0 | **无需求文档**                                                                   | §6.9                                                                  |
+| LLM 决策（止盈止损档位）        | v0.9.0 | **无需求文档**                                                                   | §6.10                                                                 |
+| **分析师 / 交易员 Agent**       | v1.0.0 | **无需求文档**                                                                   | [`apps/agent/README.md`](apps/agent/README.md)、§6.11                 |
+| **自动下单（方案 → 真实订单）** | v1.0.0 | **无需求文档**                                                                   | §6.12                                                                 |
+| **模型接入的控制面配置**        | v1.0.0 | **无需求文档**                                                                   | §6.13                                                                 |
 
 ### 6.0 迁移与表的索引
 
@@ -307,25 +328,27 @@ web / sync / executor 三个容器同时启动，三个容器各自在入口里�
 按 schema 划分），把并发迁移串行化。**别删这把锁，也别改成 try 版本**：
 try 版本会让第二个进程「拿不到锁就跳过」，那正是「库还是旧的就启动了」的静默失败。
 
-| 迁移                           | 内容                                                                                                                                                                                                                                               |
-| ------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `001_init`                     | `klines_1m`、`gaps`、`symbols`、`sync_state`、`contract_spec`、`weight_budget`、`schema_migrations`                                                                                                                                                |
-| `002_sync_plan`                | `sync_state.plan_*`（首次全量的规模预估，开启之前就写进去）                                                                                                                                                                                        |
-| `003_daemon_heartbeat`         | `daemon_heartbeat`                                                                                                                                                                                                                                 |
-| `004_klines_agg`               | `klines_{15m,1h,4h,1d}`（列与 `klines_1m` 逐列一致）                                                                                                                                                                                               |
-| `005_indicators`               | `indicator_{ma,macd,rsi,boll,kdj,atr,obv}`                                                                                                                                                                                                         |
-| `006_risk_bracket`             | `risk_bracket`（幂等锚点 + ATR 快照 + `last_error`）                                                                                                                                                                                               |
-| `007_executor_settings`        | `executor_credentials`（密文 + 末 4 位提示）、`risk_policy`（global / symbol 两作用域）                                                                                                                                                            |
-| `008_algo_order_ids`           | `risk_bracket` 的条件单编号列改名（Algo 编号空间，与普通 orderId 不通）                                                                                                                                                                            |
-| `009_reconcile_run`            | `reconcile_run`（观测快照）                                                                                                                                                                                                                        |
-| `010_risk_trailing`            | 两段止盈的阶段（`partial_armed` / `trailing`）与移动止损档位。**v0.7.0 设计，未落地**                                                                                                                                                              |
-| `011_notify_settings`          | 飞书通知通道的运行期设置（v0.8.0）：地址与签名密钥**密文**落库 + 开关与参数。**新增迁移，两侧都要登记**                                                                                                                                            |
-| `012_trade_pnl`                | 盈亏的**事实**（v0.8.0）：`risk_bracket` 增累计平仓量 / 成交额 / 手续费；通知内容类型扩到 11 种                                                                                                                                                    |
-| `013_llm_decision`             | LLM 决策的留痕（v0.9.0）：`risk_bracket` 增决策来源 / 生效档位 / 理由 / 降级原因                                                                                                                                                                   |
-| `014_take_profit_single_mult`  | 止盈倍数**合并成一个**（v0.9.0）：退役 `risk_policy.take_profit1_atr_mult` 与 `risk_bracket.decision_take_profit1_atr_mult`；`take_profit1_ratio` 的 CHECK 收紧为 `< 1`。**新增迁移，两侧都要登记**                                                |
-| `015_restore_llm_params_check` | 补回「LLM 决策的数必须齐全」那条**联合约束**（v0.9.0）：014 用 `DROP COLUMN` 退役 `decision_take_profit1_atr_mult` 时，PostgreSQL **自动删掉了引用它的 CHECK**，于是这条守门人无声消失。**删列前先看有没有约束提到它**。**新增迁移，两侧都要登记** |
-| `016_trail_step`               | 移动止损的**档位序号**（`risk_bracket` 增 `trail_step` / `trail_moves`）+ 通知内容类型扩容到 14 种（v0.9.2）。**新增迁移，两侧都要登记**                                                                                                           |
-| `017_agent_decisions`          | 分析师报告与执行方案（v1.0.0）：`analyst_report`（三面分数 + 合成立场 + 理由 + 上下文留痕）、`trading_plan`（进场 / 仓位 / 止损 / 风险金额 / 调整记录 / 失败原因）。**新增迁移，两侧都要登记**（Python 侧不读写这两张表，但版本闸门两个方向都要校） |
+| 迁移                           | 内容                                                                                                                                                                                                                                                        |
+| ------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `001_init`                     | `klines_1m`、`gaps`、`symbols`、`sync_state`、`contract_spec`、`weight_budget`、`schema_migrations`                                                                                                                                                         |
+| `002_sync_plan`                | `sync_state.plan_*`（首次全量的规模预估，开启之前就写进去）                                                                                                                                                                                                 |
+| `003_daemon_heartbeat`         | `daemon_heartbeat`                                                                                                                                                                                                                                          |
+| `004_klines_agg`               | `klines_{15m,1h,4h,1d}`（列与 `klines_1m` 逐列一致）                                                                                                                                                                                                        |
+| `005_indicators`               | `indicator_{ma,macd,rsi,boll,kdj,atr,obv}`                                                                                                                                                                                                                  |
+| `006_risk_bracket`             | `risk_bracket`（幂等锚点 + ATR 快照 + `last_error`）                                                                                                                                                                                                        |
+| `007_executor_settings`        | `executor_credentials`（密文 + 末 4 位提示）、`risk_policy`（global / symbol 两作用域）                                                                                                                                                                     |
+| `008_algo_order_ids`           | `risk_bracket` 的条件单编号列改名（Algo 编号空间，与普通 orderId 不通）                                                                                                                                                                                     |
+| `009_reconcile_run`            | `reconcile_run`（观测快照）                                                                                                                                                                                                                                 |
+| `010_risk_trailing`            | 两段止盈的阶段（`partial_armed` / `trailing`）与移动止损档位。**v0.7.0 设计，未落地**                                                                                                                                                                       |
+| `011_notify_settings`          | 飞书通知通道的运行期设置（v0.8.0）：地址与签名密钥**密文**落库 + 开关与参数。**新增迁移，两侧都要登记**                                                                                                                                                     |
+| `012_trade_pnl`                | 盈亏的**事实**（v0.8.0）：`risk_bracket` 增累计平仓量 / 成交额 / 手续费；通知内容类型扩到 11 种                                                                                                                                                             |
+| `013_llm_decision`             | LLM 决策的留痕（v0.9.0）：`risk_bracket` 增决策来源 / 生效档位 / 理由 / 降级原因                                                                                                                                                                            |
+| `014_take_profit_single_mult`  | 止盈倍数**合并成一个**（v0.9.0）：退役 `risk_policy.take_profit1_atr_mult` 与 `risk_bracket.decision_take_profit1_atr_mult`；`take_profit1_ratio` 的 CHECK 收紧为 `< 1`。**新增迁移，两侧都要登记**                                                         |
+| `015_restore_llm_params_check` | 补回「LLM 决策的数必须齐全」那条**联合约束**（v0.9.0）：014 用 `DROP COLUMN` 退役 `decision_take_profit1_atr_mult` 时，PostgreSQL **自动删掉了引用它的 CHECK**，于是这条守门人无声消失。**删列前先看有没有约束提到它**。**新增迁移，两侧都要登记**          |
+| `016_trail_step`               | 移动止损的**档位序号**（`risk_bracket` 增 `trail_step` / `trail_moves`）+ 通知内容类型扩容到 14 种（v0.9.2）。**新增迁移，两侧都要登记**                                                                                                                    |
+| `017_agent_decisions`          | 分析师报告与执行方案（v1.0.0）：`analyst_report`（三面分数 + 合成立场 + 理由 + 上下文留痕）、`trading_plan`（进场 / 仓位 / 止损 / 风险金额 / 调整记录 / 失败原因）。**新增迁移，两侧都要登记**（Python 侧不读写这两张表，但版本闸门两个方向都要校）         |
+| `018_agent_plan_execution`     | 让「批准的方案」变成真实订单（v1.0.0）：`trading_plan` 增执行态列（单号 / 尝试次数 / 认领时刻 / 下单失败原因）、`status` 扩出 `executing` 与 `failed`、`risk_bracket.decision_source` 允许 `agent-plan`、通知内容类型扩到 16 种。**新增迁移，两侧都要登记** |
+| `019_agent_llm_settings`       | 模型接入的运行期设置（v1.0.0）：`agent_llm_settings` 单行表（地址 / 模型 / 超时 / API 密钥**密文**）。**新增迁移，两侧都要登记**                                                                                                                            |
 
 ### 6.1 派生周期层（v0.2.0）
 
@@ -941,6 +964,7 @@ v0.7.0 的原文把止盈拆成「整段倍数 `takeProfitAtrMult`」与「第�
    那时必须**立刻用旧价挂回去**（旧价刚被交易所接受过，所以几乎不会失败），
    并把账面指向恢复出来的那张单（`sl_algo_id` 会变，价不变、档位不推进）。
    恢复也失败 → 裸仓：记可见原因，等对账的 `missing-stop-order`（紧急）报出来。
+
 ### 6.9 通知层（v0.8.0）
 
 把「系统里发生的事」推到**人看得到的地方**。这个仓库里最贵的故障不是报错，而是
@@ -1160,14 +1184,20 @@ warn，而日志没人盯着。
 5. **失败必须留痕**。模型超时 / 输出不合法 / 方案算不出来——都落一条 `action='failed'`
    的方案并写明原因。**不静默跳过**（§5 第 9 条）。理由很实在：页面上要能回答
    「这个标的今天分析过没有」，而「分析过但没结论」与「压根没分析」是两件完全不同的事。
-6. **默认只出方案，不下单**。`agent.execute.enabled` 缺省 `false`，方案只落库
-   （`trading_plan.status = 'advisory'`），控制面与 CLI 看得到。
-   ⚠️ **本期未实现自动执行路径**（`apps/executor` 还不消费 `approved` 方案），
-   因此把这个开关打开时 `apps/agent` **启动即报错**，而不是「开着却什么也不做」——
-   后者是 §5 第 9 条点名的最危险的一种失败。
-   闸门在 `apps/agent/src/execute-guard.ts`，**守护进程与 CLI 共用同一道**
-   （编排器里也有一道）：两处各判一次，迟早有一处忘了加，而那一处恰好就是
-   操作者以为在下单的那次运行。
+6. **默认只出方案，不下单；打开开关才真的下单**。`agent.execute.enabled` 缺省 `false`，
+   方案只落库（`trading_plan.status = 'advisory'`），控制面与 CLI 看得到。
+   开关打开时 `apps/agent` 产出的**可执行**方案直接落 `approved`，由 `apps/executor`
+   消费并变成真实订单（细节见 §6.12）。
+   ⚠️ **开关打开时不许出现「两处开关」**：用户已经打开「允许自动下单」，
+   还要再去控制面点一次批准，于是「开关打开了却没下单」看起来像是坏了。
+   控制面与 CLI 的「批准」因此是**预先批准**（executor 在开关关着时压根不消费）。
+   ⚠️ **「可执行」必须与执行器的口径一致**：自动执行**只支持市价进场**，
+   因此**限价方案不自动批准**（落 `advisory` 并写一条显眼日志）。
+   批准一份执行不了的方案，它就会永远卡在 `approved`——每轮被捞出来又跳过，
+   而页面上显示「已批准、等 executor 消费」，看上去像是有一单在等着下。
+   这是「以为会做、实际什么也没做」（§5 第 9 条）。
+   ⚠️ **判据只有一份**（`packages/core/src/agent-plan.ts`），**四处共用**：
+   agent 的自动批准、控制面的人工批准、CLI 的人工批准、executor 的兜底检查。
 
 #### 6.11.2 数据的来源与「取不到」的两种待遇
 
@@ -1216,12 +1246,19 @@ warn，而日志没人盯着。
   唯一索引 `(exchange, symbol, as_of_ms)`：同一份数据时刻的同一标的只留一份报告。
 - `trading_plan`：`action`（`enter` / `hold` / `failed`）、进场三件套、风险、权益来源、
   `adjustments`、`failure_reason`，以及 `status` 状态机
-  （`advisory` → `approved` / `rejected` / `expired` → `executed`）。
+  （`advisory` → `approved` / `rejected` / `expired` → `executing` → `executed` / `failed`）。
+  `executing` 与 `failed` 是 v1.0.0 补自动执行时扩出来的两个状态（§6.12）。
 
-**5 条表级 CHECK 约束**（另有各列自己的取值约束）各自守一条不变式：
-`enter` 三件套齐全、止损止盈分居两侧、`hold` 不许带原因、`failed` 必须带原因、
+**表级 CHECK 约束**各自守一条不变式：
+`enter` 三件套齐全、止损止盈分居两侧、`hold` 不许带原因、`action='failed'` 必须带原因、
 `executed` 只能来自 `enter`。它们是**最后一道闸**——页面上显示的方案是给人看的，
 而库里那条是事实。
+
+⚠️ **「失败」有两个，别把两条约束写成同名**：`action='failed'` 是「这一轮**出不了方案**」，
+要说清的是 `failure_reason`；`status='failed'` 是「这一笔**没下出去**」，
+要说清的是 `execution_failure_reason`。两件事各自的守门人**必须并存**——
+用同名约束的话，后一条的 `DROP CONSTRAINT` 会**顺带删掉**前一条，
+于是「出不了方案必须说为什么」这条守门人无声消失（§5 第 12 条）。
 
 **两个 id 的语义不一样，别把它们当成一对**：报告按 `(exchange, symbol, as_of_ms)`
 **upsert**（同一份行情时刻只有一份报告，id 不变），方案**每轮新建**（id 递增）。
@@ -1250,23 +1287,155 @@ warn，而日志没人盯着。
 
 #### 6.11.6 代码位置
 
-| 东西                    | 在哪                                                            |
-| ----------------------- | --------------------------------------------------------------- |
-| 分析师契约与纯函数      | `packages/core/src/agent-analyst.ts`                            |
-| 交易员契约与纯函数      | `packages/core/src/agent-trader.ts`                             |
-| 行情上下文契约（zod）   | `packages/core/src/agent-context.ts`                            |
-| 技术面现算 + 情绪面取数 | `python/packages/quant-data/src/quant_data/market_context.py`   |
-| 上下文组装 + 落库读写   | `packages/data/src/market.ts` + `packages/data/src/db/agent.ts` |
-| 编排 / 守护 / 权益      | `apps/agent/src`（`service.ts` / `daemon.ts` / `equity.ts`）    |
-| 自动执行开关的闸门      | `apps/agent/src/execute-guard.ts`                               |
-| 控制面只读面板          | `apps/web/ui/src/components/AgentPanel.tsx`                     |
-| 表结构                  | `packages/data/sql/017_agent_decisions.sql`                     |
+| 东西                                   | 在哪                                                            |
+| -------------------------------------- | --------------------------------------------------------------- |
+| 分析师契约与纯函数                     | `packages/core/src/agent-analyst.ts`                            |
+| 交易员契约与纯函数                     | `packages/core/src/agent-trader.ts`                             |
+| **方案可执行性判据（一处，四处共用）** | `packages/core/src/agent-plan.ts`                               |
+| 行情上下文契约（zod）                  | `packages/core/src/agent-context.ts`                            |
+| 技术面现算 + 情绪面取数                | `python/packages/quant-data/src/quant_data/market_context.py`   |
+| 上下文组装 + 落库读写                  | `packages/data/src/market.ts` + `packages/data/src/db/agent.ts` |
+| 编排 / 守护 / 权益                     | `apps/agent/src`（`service.ts` / `daemon.ts` / `equity.ts`）    |
+| 控制面面板（可批准 / 驳回）            | `apps/web/ui/src/components/AgentPanel.tsx`                     |
+| **自动下单的执行器**                   | **`apps/executor/src/plan-execution.ts`**（§6.12）              |
+| **模型设置面板**                       | **`apps/web/ui/src/components/AgentLlmPanel.tsx`**（§6.13）     |
+| 表结构                                 | `packages/data/sql/017_agent_decisions.sql`                     |
 
 #### 6.11.7 三个新错误码
 
 `AGENT_REPORT_INVALID`（模型输出不合法）、`AGENT_PLAN_INVALID`（方向矛盾 / 数量低于
 最小下单量 / 盈亏比夹不动）、`AGENT_CONTEXT_UNAVAILABLE`（行情上下文取不到）。
 它们加在 `SyncErrorCode` 上，控制面映射成 HTTP 502。
+
+### 6.12 自动下单：把「批准的方案」变成真实订单（v1.0.0）
+
+自动下单放在 **`apps/executor`**，不是 `apps/agent`：下单要用交易所凭据，而凭据在
+executor 那边；且 executor 本来就持有私有接口、净仓跟踪与成交处理器。
+`apps/agent` 只负责**出方案**，executor 负责**执行方案**，两边不重叠（§1 的职责表）。
+
+#### 6.12.1 三步：认领 → 下单 → 回填
+
+中间那一步（下单）会出网，是唯一不可回滚的一步。
+
+- **认领**（`approved → executing`）：**幂等锚点**。
+- **下单**：市价进场（`POST /fapi/v1/order`，回执 `orderId`）。
+- **回填**：写回单号与时刻（`executing → executed`）。
+
+⚠️ **为什么不能只有「下单 → 回填」两步**：下单成功但回填前进程崩掉的话，那一单已经
+真实存在，而库里没有任何东西记着它。下一轮再跑一次就是**重复下单**——仓位翻倍，
+而日志与库里都看不出异常。认领把「这一份方案归我了」先写进库，崩在中间时方案停在
+`executing`，**不会被自动重试**（那一单到底下没下只有交易所知道），执行器把它当
+「状态未知」报出来等人确认。**宁可停下来问，也不要重复下单。**
+
+#### 6.12.2 四条不许省的规矩
+
+1. **只支持市价进场**。限价单可能永远不成交，而不成交的仓位**没有止损保护**。
+   判据**只有一份**（`packages/core/src/agent-plan.ts` 的 `autoExecutableProblem` /
+   `assertApprovable`），**四处共用**，不许各写一遍：
+   - agent 的**自动批准**：限价方案落 `advisory` + 一条显眼日志（不自动批准）；
+   - 控制面与 CLI 的**人工批准**：**在批准时**就拒绝并说明原因；
+   - executor 兜底：万一有 `approved` 的限价方案漏进来（历史数据 / 绕过批准路径），
+     它**不认领**、直接跳过并写明原因——**不认领**是因为认领是幂等锚点，
+     把一份永远执行不了的方案认领走只会让它卡在 `executing` 变成「状态未知」，
+     那比跳过更糟。
+   - **控制面页面**：它**不自己判**，而是由服务端用同一条判据算好，随 DTO 一起回给页面
+     （`approvable` / `approvableReason`）。页面拿到 `approvable = false` 就不给「批准」按钮，
+     并把 `approvableReason` 原样显示出来。
+     ⚠️ **页面不能 import `@trade-tool/core`**：core 的 barrel 带着 `node:crypto` / `node:fs`，
+     浏览器构建会**直接失败**（`createHmac is not exported by __vite-browser-external`），
+     实测过。前端要 import core 的东西，只能是**类型**（`import type`，编译期擦除）。
+
+   ⚠️ **各处各写一遍的后果**：迟早有一处忘了改，而那一处恰好就是
+   「批了一份永远执行不了的方案」的地方——它会永远卡在 `approved`，
+   每轮被捞出来又跳过，而页面上显示「已批准、等 executor 消费」，
+   看上去像是有一单在等着下（§5 第 9 条）。
+
+2. **自定义号带尝试次数**：`agt-p<方案id>-a<次数>`。Binance 不允许两张同
+   `clientOrderId` 的挂单同时存在，沿用同一个号重试必然撞「重复」——
+   与止损单号复用是同一个坑（§6.8.4）。
+3. **已有仓位不叠加、已有未终结保护不开新仓**：条件单保护的是**整个净仓位**，
+   重复挂会出现多组触发价互相撤销。
+4. **方案档位优先于配置档位与模型决策**（`decision_source='agent-plan'`）。
+   理由：方案是**人批准时看到的**，配置档位随时会被改；让人批准的数和实际挂单的数
+   必须是同一个。**价格仍由 `deriveStagedPlan` 按实际成交价算**
+   （方案里的进场价是估算值）。
+
+#### 6.12.3 反查失败不抛错
+
+成交回报带 `clientOrderId`（`o['c']`，必返），执行器据此反查方案。
+**反查失败时抛错会让仓位裸奔**（最贵的状态），因此改为：按配置档位挂单 +
+**显眼错误日志**。仓位有保护，比档位完全对得上更要紧。
+
+#### 6.12.4 `executed` 只能由执行器写
+
+`updateTradingPlanStatus` 只允许 `approved` / `rejected` / `expired`。
+`executed` 只能由执行器在**真的下过单之后**写，而且必须同时写下单号与时刻
+（表上的 CHECK 守着这条）。让控制面也能置 `executed` 的话，
+页面上点一下就能造出一条「已下单」的假记录。
+
+#### 6.12.5 代码位置
+
+| 东西                         | 在哪                                                                   |
+| ---------------------------- | ---------------------------------------------------------------------- |
+| 执行器（认领 / 下单 / 回填） | `apps/executor/src/plan-execution.ts`                                  |
+| 状态机与认领的落库           | `packages/data/src/db/agent.ts`                                        |
+| 市价进场单                   | `packages/data/src/binance-private.ts`（`placeMarketOrder`）           |
+| 自定义号                     | `packages/core/src/risk-ids.ts`                                        |
+| 控制面批准 / 驳回            | `apps/web/src/server.ts` + `apps/web/ui/src/components/AgentPanel.tsx` |
+| CLI 批准 / 驳回              | `apps/cli/src/commands/agent.ts`（`trade-tool agent plan`）            |
+
+### 6.13 模型接入的配置在控制面录入（v1.0.0）
+
+模型接入（地址 / 模型名 / API 密钥 / 超时）从「只写在配置文件」改成
+**控制面录入 + 密文落库**，配置文件与环境变量降级为**兜底档**。
+
+#### 6.13.1 哪一份在生效：判据只有一份实现
+
+`packages/data/src/db/llm-settings.ts` 的 `resolveAll` 是**唯一**判据：
+控制面那一档填全了 + 主密钥可用 → **用控制面那份**；否则 → 用配置文件 + 环境变量。
+
+- **判据不看 `enabled`**：`enabled` 是**那一档内部**的开关。
+  把它混进优先级会出现「我在控制面关了模型，Agent 还在调模型」。
+- **留空 = 保持原样**：只想改超时，不想重填密钥时，留空即可（不覆盖已存的密文）。
+- **「清空控制面这一份」≠「关掉模型」**：前者退回配置文件 + 环境变量，
+  后者取消勾选再保存。两者混为一谈会让用户以为模型还在跑。
+
+#### 6.13.2 控制面读路径永远拿不到明文
+
+`readAgentLlmStatus` 只给「配没配 / 末 4 位 / 生效来源」。
+主密钥没注入时 `keyConfigured` 是 `null`（= **不知道**），不能显示成「没配」——
+「不知道」与「没配」在处置上完全不同。
+
+⚠️ **读状态这条路不因「密钥读不到」而失败**：生效来源是配置文件那一档、
+而那个环境变量里没有密钥时，这是**最常见的配置错误**。若读状态也抛错，
+控制面整个面板就取不到东西，页面只显示一句「模型接入设置操作失败」——
+用户连「生效的是哪一份」都看不到，更不知道该去补哪个变量。
+所以读状态时把「读不到」如实报进 `configKeyAvailable`（页面显示「密钥读不到」
+并说清去补哪个变量）；**真要调模型时仍然抛错**（`resolveAgentLlmSettings` 那条路）
+——拿着空串去请求只会得到一个语焉不详的 401。
+
+#### 6.13.3 每轮重新解析
+
+`apps/agent/src/llm.ts` 的 `createLlmResolver` 每轮调一次，
+所以控制面改完**下一轮就生效**，不必重启进程（与通知设置同一套做法）。
+
+⚠️ **不许再拿配置文件的 `agent.llm.enabled` 当前置闸门**：模型接入可以在控制面配，
+用户在控制面填好、配置文件保持默认（`enabled` 缺省 `false`）是**完全合法**的配置。
+若守护进程与 CLI 各自拿 `config.agent.llm.enabled` 先判一遍，就会出现
+「同一个配置，守护进程能跑、命令行说没配模型」——**同一件事两个答案**，
+正是这个仓库最忌讳的形态（§6.11.1 说的「CLI 与守护进程共用同一份编排」）。
+判据只有 `resolveAll` 一份；它报错时说清「生效来源是控制面录入还是配置文件」。
+
+#### 6.13.4 代码位置
+
+| 东西                 | 在哪                                                                 |
+| -------------------- | -------------------------------------------------------------------- |
+| 设置读写与优先级解析 | `packages/data/src/db/llm-settings.ts`                               |
+| 密钥加解密           | `packages/core/src/secret.ts`（`sealAgentLlmKey`）                   |
+| 每轮解析             | `apps/agent/src/llm.ts`                                              |
+| 控制面路由           | `apps/web/src/server.ts`（`GET/PUT/DELETE /api/settings/agent-llm`） |
+| 控制面面板           | `apps/web/ui/src/components/AgentLlmPanel.tsx`                       |
+| 表结构               | `packages/data/sql/019_agent_llm_settings.sql`                       |
 
 ## 7 已知漂移与技术债
 
@@ -1327,17 +1496,39 @@ beforeAll 级；Python 侧是 session 级、按 PID 命名），从空库执行 
 **首屏取数用 `useLayoutEffect`**：effect 里抛异常会中止同一次 commit 里剩下的全部 effect，
 图表组件一个 `ResizeObserver` 就能让整页停在「读取中」。加载失败必须**常驻可见**（§5 第 9 条）。
 
+### 8.4 「判据在 core，用例在用它的那个包」
+
+一条判据住在 `packages/core`（纯函数），**用它的那个包也要有用例**——
+core 的测试守的是「判据本身对不对」，包的测试守的是「这个包确实调用了它」。
+**两者缺一不可**：判据对了但没接上，等于没接上；而判据只有 core 那一份测试守着时，
+接错了地方也没人发现。
+
+本仓库现成的例子：方案「能不能自动执行」这条判据在
+`packages/core/src/agent-plan.ts`，**四个包**都用它
+（`apps/agent` 自动批准、`apps/web` 人工批准、`apps/cli` 人工批准、`apps/executor` 兜底），
+于是四个包各有一条用例守着「我确实用了它」（§6.12.2）。
+
+⚠️ **前端页面是第五个使用者，但它不能直接 import core**（core 的 barrel 带 node 内置模块，
+浏览器构建会失败）。页面的做法是：**服务端算好，随 DTO 传过去**。
+所以「页面也用这条判据」这件事，靠的是 `apps/web` 的用例守住的——
+它守的是「服务端算出来的 `approvable` / `approvableReason` 对不对」，
+页面再守一条「拿到 `approvable = false` 就不给批准按钮、但把原因显示出来」。
+
+⚠️ `apps/cli` 原本**没有测试设施**（没有 `test` 脚本、没有 vitest）。
+补上它很容易（照 `apps/executor` 加 devDep + 脚本 + `tsconfig` 含 `tests`），
+但别以为「这个包没测试所以没人动它」——那正是它悄悄漂移的原因。
+
 ## 9 进程入口、常用命令与部署
 
-| 入口                                            | 说明                                                               |
-| ----------------------------------------------- | ------------------------------------------------------------------ |
-| `pnpm --filter @trade-tool/cli start -- <命令>` | 源码直跑（tsx）。`--help` 有命令表                                 |
-| `node apps/cli/dist/index.js <命令>`            | 构建产物（也是 `package.json` 的 `bin`）                           |
-| `pnpm --filter @trade-tool/sync start`          | 常驻同步守护进程                                                   |
-| `pnpm --filter @trade-tool/web start`           | 控制面 `http://127.0.0.1:8787`（地址由 `.env` 决定）               |
-| `pnpm --filter @trade-tool/executor start`      | 止盈止损，需 `executor.enabled = true`，**会真下单**               |
-| `pnpm --filter @trade-tool/agent start`         | 分析师 + 交易员 Agent，需 `agent.enabled = true`，**默认只出方案** |
-| `pnpm --filter @trade-tool/cli start -- doctor` | 自检 node / pnpm / uv / git                                        |
+| 入口                                            | 说明                                                                                                                                               |
+| ----------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `pnpm --filter @trade-tool/cli start -- <命令>` | 源码直跑（tsx）。`--help` 有命令表                                                                                                                 |
+| `node apps/cli/dist/index.js <命令>`            | 构建产物（也是 `package.json` 的 `bin`）                                                                                                           |
+| `pnpm --filter @trade-tool/sync start`          | 常驻同步守护进程                                                                                                                                   |
+| `pnpm --filter @trade-tool/web start`           | 控制面 `http://127.0.0.1:8787`（地址由 `.env` 决定）                                                                                               |
+| `pnpm --filter @trade-tool/executor start`      | 止盈止损，需 `executor.enabled = true`，**会真下单**                                                                                               |
+| `pnpm --filter @trade-tool/agent start`         | 分析师 + 交易员 Agent，需 `agent.enabled = true`，**默认只出方案**；`agent.execute.enabled = true` 时产出的方案直接进 `approved`，由 executor 下单 |
+| `pnpm --filter @trade-tool/cli start -- doctor` | 自检 node / pnpm / uv / git                                                                                                                        |
 
 Agent 的两个入口（守护进程 / CLI 单跑一次）共用 `@trade-tool/agent` 的同一份编排：
 
@@ -1345,10 +1536,14 @@ Agent 的两个入口（守护进程 / CLI 单跑一次）共用 `@trade-tool/ag
 pnpm --filter @trade-tool/cli start -- agent run              # 跑一轮
 pnpm --filter @trade-tool/cli start -- agent run -s BTCUSDT   # 只跑一个标的
 pnpm --filter @trade-tool/cli start -- agent report            # 只看库里最近的报告与方案
+pnpm --filter @trade-tool/cli start -- agent plan 42 --approve  # 预先批准一份方案
+pnpm --filter @trade-tool/cli start -- agent plan 42 --reject   # 驳回一份方案
 ```
 
 `agent run` 与守护进程的**唯一区别**是「跑一次就停」；口径完全一致。
 `agent report` 是**纯读**——它不调模型、也不写库。
+`agent plan` 的批准/驳回是**预先批准**：自动执行开关关着时，executor 压根不消费方案，
+所以「批准了」不等于「会有单下出去」——命令输出会明确说清这一点。
 
 stdout 是命令结果（日志走 stderr），`--json` 时输出纯 JSON。**生命周期变更不走 CLI**，
 走 `@trade-tool/sync` 的控制原语（`addSymbol` / `removeSymbol` / `listSymbols` /

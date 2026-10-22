@@ -841,11 +841,10 @@ export class BinancePrivateClient {
    */
   async placeMarketOrder(request: MarketOrderRequest): Promise<PlacedMarketOrder> {
     if (!Number.isFinite(request.quantity) || request.quantity <= 0) {
-      throw new SyncError(
-        'CONFIG_INVALID',
-        `市价单数量必须为正：${String(request.quantity)}`,
-        { symbol: request.symbol, quantity: request.quantity },
-      );
+      throw new SyncError('CONFIG_INVALID', `市价单数量必须为正：${String(request.quantity)}`, {
+        symbol: request.symbol,
+        quantity: request.quantity,
+      });
     }
     const body = await this.request<Record<string, unknown>>('POST', '/fapi/v1/order', {
       signed: true,

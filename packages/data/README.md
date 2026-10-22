@@ -29,9 +29,26 @@
 - `db/agent.ts` — 分析师报告与执行方案的读写（v1.0.0，迁移 `017_agent_decisions`）。
   `recordAnalystReport` 按 `(exchange, symbol, as_of_ms)` **幂等 upsert**
   （同一份数据时刻的同一标的只留一份报告）；`recordTradingPlan` / `updateTradingPlanStatus`
-  管 `advisory → approved / rejected / expired → executed` 这条状态机。
-  表上的 5 条**表级** CHECK 约束各自守一条不变式（`enter` 三件套齐全、止损止盈分居两侧、
-  `hold` 不许带原因、`failed` 必须带原因、`executed` 只能来自 `enter`）。
+  管 `advisory → approved / rejected / expired` 这条状态机。
+  ⚠️ **`executed` 不由 `updateTradingPlanStatus` 写**：它只能由执行器在**真的下过单之后**
+  写（`markTradingPlanExecuted`），且必须同时写下单号与时刻。让控制面也能置 `executed` 的话，
+  页面上点一下就能造出一条「已下单」的假记录。
+  另有 `claimTradingPlan`（`approved → executing` 的**幂等锚点**，带乐观锁）、
+  `markTradingPlanExecutionFailed`（失败必须带原因）、`listApprovedTradingPlans` /
+  `listExecutingTradingPlans`。
+  表上的**表级** CHECK 约束各自守一条不变式（`enter` 三件套齐全、止损止盈分居两侧、
+  `hold` 不许带原因、`action='failed'` 必须带原因、`executed` 只能来自 `enter`）。
+  ⚠️ **「失败」有两个，守门人也得有两个**：`action='failed'`（这一轮出不了方案，说清
+  `failure_reason`）与 `status='failed'`（这一笔没下出去，说清 `execution_failure_reason`）
+  各自的约束**必须并存**——写成同名的话，后一条的 `DROP CONSTRAINT` 会**顺带删掉**前一条
+  （AGENTS.md §5 第 12 条）。
+- `db/llm-settings.ts` — 模型接入的运行期设置（v1.0.0，迁移 `019_agent_llm_settings`）。
+  地址 / 模型 / 超时明文存，API 密钥**密文**落库。`resolveAll()` 是「**哪一份在生效**」
+  的唯一实现（控制面录入优先，配置文件 + 环境变量兜底），与 `db/notify.ts` 同一套形状。
+  ⚠️ **判据不看 `enabled`**：`enabled` 是那一档内部的开关，混进优先级会出现
+  「我在控制面关了模型，Agent 还在调模型」。
+  `readAgentLlmStatus()` 给控制面，**不含明文**；`resolveAgentLlmSettings()` 给 agent 进程，
+  含明文。
 - `market.ts` — 控制面唯一需要认识的东西：调 Python 干活 + 查 PG 看状态，收敛成结构化输入输出。
   `loadAgentContext()` 是 v1.0.0 的入口：调 Python 的 `market-context` 子命令，
   再读库内 `contract_spec` 快照，拼成 `ContractFacts` 交给 core 的

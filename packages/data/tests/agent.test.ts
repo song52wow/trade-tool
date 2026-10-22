@@ -15,8 +15,10 @@
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
 import {
+  claimTradingPlan,
   listAnalystReports,
   listTradingPlans,
+  markTradingPlanExecuted,
   readLatestAnalystReport,
   readLatestTradingPlan,
   recordAnalystReport,
@@ -195,9 +197,19 @@ describe('trading_plan', () => {
 
   it('状态只能往前走：已执行的方案不能改回 advisory', async () => {
     const id = await recordTradingPlan(schema.pool, plan({ asOfMs: NOW + 10 }));
-    await updateTradingPlanStatus(schema.pool, id, 'executed');
+    await updateTradingPlanStatus(schema.pool, id, 'approved');
+    await claimTradingPlan(schema.pool, {
+      planId: id,
+      expectedAttempt: 0,
+      clientOrderId: 'agt-p1-a1',
+      nowMs: NOW,
+    });
+    await markTradingPlanExecuted(schema.pool, { planId: id, entryOrderId: '777', nowMs: NOW });
     const row = await readLatestTradingPlan(schema.pool, 'binance', SYMBOL);
     expect(row?.status).toBe('executed');
+    // 已执行是**终点**：改回 advisory / approved / rejected 都不许。
     await expect(updateTradingPlanStatus(schema.pool, id, 'advisory')).rejects.toThrowError();
+    await expect(updateTradingPlanStatus(schema.pool, id, 'approved')).rejects.toThrowError();
+    await expect(updateTradingPlanStatus(schema.pool, id, 'rejected')).rejects.toThrowError();
   });
 });

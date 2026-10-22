@@ -148,6 +148,60 @@ function fakeDeps(overrides: Partial<WebDeps> = {}): WebDeps & { calls: string[]
       calls.push(`agent:${symbol}`);
       return { symbol, report: null, plan: null };
     },
+    getAgentLlmStatus: async () => {
+      calls.push('agentLlm:get');
+      return {
+        enabled: false,
+        baseUrl: '',
+        model: '',
+        timeoutMs: 8000,
+        source: 'config',
+        apiKeyEnv: 'TRADE_TOOL_LLM_API_KEY',
+        configKeyAvailable: true,
+        panel: null,
+        updatedAt: null,
+        masterKeyReady: true,
+      };
+    },
+    writeAgentLlmSettings: async (body) => {
+      calls.push(`agentLlm:write:${body.baseUrl}`);
+      return {
+        enabled: body.enabled,
+        baseUrl: body.baseUrl,
+        model: body.model,
+        timeoutMs: body.timeoutMs,
+        source: 'panel',
+        apiKeyEnv: 'TRADE_TOOL_LLM_API_KEY',
+        configKeyAvailable: true,
+        panel: {
+          configured: true,
+          hint: 'test',
+          enabled: body.enabled,
+          baseUrl: body.baseUrl,
+          model: body.model,
+          timeoutMs: body.timeoutMs,
+          updatedAt: NOW,
+          keyConfigured: true,
+        },
+        updatedAt: NOW,
+        masterKeyReady: true,
+      };
+    },
+    clearAgentLlmSettings: async () => {
+      calls.push('agentLlm:clear');
+      return {
+        enabled: false,
+        baseUrl: '',
+        model: '',
+        timeoutMs: 8000,
+        source: 'config',
+        apiKeyEnv: 'TRADE_TOOL_LLM_API_KEY',
+        configKeyAvailable: true,
+        panel: null,
+        updatedAt: null,
+        masterKeyReady: true,
+      };
+    },
     setTradingPlanStatus: async (symbol, planId, status) => {
       calls.push(`plan:${symbol}:${planId}:${status}`);
       return {
@@ -176,6 +230,8 @@ function fakeDeps(overrides: Partial<WebDeps> = {}): WebDeps & { calls: string[]
         failureReason: null,
         entryOrderId: null,
         executionFailureReason: null,
+        approvable: true,
+        approvableReason: null,
       };
     },
     latestReconciliation: async () => {
@@ -1275,6 +1331,8 @@ describe('GET /api/symbols/:symbol/agent（分析师 / 交易员，只读）', (
             failureReason: null,
             entryOrderId: null,
             executionFailureReason: null,
+            approvable: true,
+            approvableReason: null,
           },
         }),
       }),

@@ -5,7 +5,12 @@ import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/re
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { App } from '../../ui/src/App';
-import type { CredentialStatusDto, NotifyStatusDto, RiskPolicyViewDto } from '../../src/types';
+import type {
+  AgentLlmStatusDto,
+  CredentialStatusDto,
+  NotifyStatusDto,
+  RiskPolicyViewDto,
+} from '../../src/types';
 import { navigate } from '../../ui/src/router';
 import { baseHandlers, stubFetch, symbolHandlers, symbolRow } from './fixtures';
 
@@ -70,12 +75,35 @@ function policy(overrides: Partial<RiskPolicyViewDto> = {}): RiskPolicyViewDto {
   };
 }
 
+/**
+ * 模型接入设置的桩（v1.0.0）。
+ *
+ * 默认是「控制面没录入、生效来源是配置文件那一档」——最常见的那种状态。
+ */
+function agentLlm(overrides: Partial<AgentLlmStatusDto> = {}): AgentLlmStatusDto {
+  return {
+    enabled: false,
+    baseUrl: '',
+    model: '',
+    timeoutMs: 8000,
+    source: 'config',
+    apiKeyEnv: 'TRADE_TOOL_LLM_API_KEY',
+    configKeyAvailable: true,
+    panel: null,
+    updatedAt: null,
+    masterKeyReady: true,
+    ...overrides,
+  };
+}
+
 function handlers(extra: Record<string, unknown> = {}) {
   return baseHandlers({
     '/api/symbols': { items: [symbolRow('AAAUSDT'), symbolRow('BBBUSDT')] },
     '/api/settings/credentials': credential(),
     '/api/settings/notify': notify(),
     '/api/settings/risk-policy': policy(),
+    // 模型接入那一块（v1.0.0）也在这一页上，缺了桩它会显示一条 404 错误横幅。
+    '/api/settings/agent-llm': agentLlm(),
     ...extra,
   });
 }

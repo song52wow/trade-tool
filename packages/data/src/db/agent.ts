@@ -407,13 +407,12 @@ export async function readLatestTradingPlan(
 export async function readTradingPlanById(
   pool: Pool,
   exchange: string,
-  symbol: string,
   id: string,
 ): Promise<TradingPlanRow | null> {
-  const result = await pool.query(
-    `SELECT * FROM ${PLAN_TABLE} WHERE exchange = $1 AND symbol = $2 AND id = $3`,
-    [exchange, symbol, id],
-  );
+  const result = await pool.query(`SELECT * FROM ${PLAN_TABLE} WHERE exchange = $1 AND id = $2`, [
+    exchange,
+    id,
+  ]);
   const row = result.rows[0];
   return row === undefined ? null : toPlanRow(row);
 }
@@ -547,10 +546,14 @@ export async function markTradingPlanExecuted(
     if ((result.rowCount ?? 0) === 0) {
       // 已经不在 `executing` 说明有人改过它。这不是「下单失败」——
       // 单已经下了，只是状态被别人动了。必须报出来，不能悄悄吞掉。
-      throw new SyncError('DB_UNIQUE_VIOLATION', `方案 ${input.planId} 不在「执行中」状态，无法回填单号`, {
-        planId: input.planId,
-        entryOrderId: input.entryOrderId,
-      });
+      throw new SyncError(
+        'DB_UNIQUE_VIOLATION',
+        `方案 ${input.planId} 不在「执行中」状态，无法回填单号`,
+        {
+          planId: input.planId,
+          entryOrderId: input.entryOrderId,
+        },
+      );
     }
   } catch (error) {
     throw toSyncError(error, `回填执行方案失败：${input.planId}`);
@@ -579,9 +582,13 @@ export async function markTradingPlanExecutionFailed(
       [input.planId, input.reason],
     );
     if ((result.rowCount ?? 0) === 0) {
-      throw new SyncError('DB_UNIQUE_VIOLATION', `方案 ${input.planId} 不在「执行中」状态，无法记失败`, {
-        planId: input.planId,
-      });
+      throw new SyncError(
+        'DB_UNIQUE_VIOLATION',
+        `方案 ${input.planId} 不在「执行中」状态，无法记失败`,
+        {
+          planId: input.planId,
+        },
+      );
     }
   } catch (error) {
     throw toSyncError(error, `记执行失败失败：${input.planId}`);
@@ -639,7 +646,6 @@ export async function listExecutingTradingPlans(
     throw toSyncError(error, '读取执行中的方案失败');
   }
 }
-
 
 function toNotes(value: unknown, where: string): string[] {
   if (!Array.isArray(value)) {

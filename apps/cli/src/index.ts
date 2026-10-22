@@ -1,8 +1,8 @@
 #!/usr/bin/env node
-import { createLogger, isSyncError, loadProjectEnv } from '@trade-tool/core';
+import { createLogger, isSyncError, loadProjectEnv, SyncError } from '@trade-tool/core';
 import { Command } from 'commander';
 
-import { runAgent, runAgentReport } from './commands/agent.js';
+import { runAgent, runAgentPlan, runAgentReport } from './commands/agent.js';
 import { runBacktestCommand } from './commands/backtest.js';
 import { initConfig, showConfig } from './commands/config.js';
 import {
@@ -323,6 +323,27 @@ agentCmd
   .option('--json', '输出 JSON')
   .action(async (options: { symbol?: string; json?: boolean }) => {
     process.exitCode = await runAgent(options).catch((error: unknown) => {
+      fail(error);
+      return 1;
+    });
+  });
+
+agentCmd
+  .command('plan')
+  .description('批准 / 驳回一份执行方案（批准本身不下单，由 executor 消费）')
+  .argument('<planId>', '方案号（`trade-tool agent report` 里能看到）')
+  .option('--approve', '批准这份方案')
+  .option('--reject', '驳回这份方案')
+  .action(async (planId: string, options: { approve?: boolean; reject?: boolean }) => {
+    // 两个开关**互斥**：同时给或都不给都是说不清的意思，直接问清楚。
+    // `fail()` 自己会写 stderr、设退出码并抛错——它后面那两行是死代码。
+    if ((options.approve === true) === (options.reject === true)) {
+      fail(new SyncError('CONFIG_INVALID', '必须且只能给一个：--approve 或 --reject'));
+    }
+    process.exitCode = await runAgentPlan({
+      planId,
+      status: options.approve === true ? 'approved' : 'rejected',
+    }).catch((error: unknown) => {
       fail(error);
       return 1;
     });
