@@ -67,6 +67,16 @@ openssl rand -hex 32            # 写进 .env 的 TRADE_TOOL_SECRET_KEY
 vi .env                         # 至少改 TRADE_TOOL_PG_PASSWORD
 ```
 
+⚠️ **`.env` 里必须有 `TRADE_TOOL_BINANCE_DEMO_STREAM_URL`**（模板里已带好）。
+部署配置固定 `executor.environment = "demo"`，而 demo 的用户数据流地址**不内置代码默认值**——
+缺它时 web / sync / executor 三个服务**全部**以
+`CONFIG_INVALID: exchange.environment = demo 但没有给 Demo 用户数据流地址` 启动失败
+（2026-10-22 部署实测踩到）。它是**基址**，不带 `/private/ws?listenKey=`。
+
+⚠️ **改完 `.env` 要重建容器，`restart` 不够**：`restart` 只重启同一个容器，
+**不重读 `env_file`**——表现是「变量明明写进去了，进程却说没有」。
+用 `docker compose up -d`（会重建容器）而不是 `docker compose restart`。
+
 配置文件由本机一并带过去（`deploy/config/trade-tool.config.json`）。注意它**同时**通过
 「改值」和「删键（用缺省）」两种方式偏离 `config init` 的默认产物——看 `git diff` 时
 别只盯着改过的值，删掉的键同样是意图：
