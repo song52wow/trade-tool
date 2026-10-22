@@ -144,6 +144,10 @@ function fakeDeps(overrides: Partial<WebDeps> = {}): WebDeps & { calls: string[]
         },
       };
     },
+    listAgentView: async (symbol) => {
+      calls.push(`agent:${symbol}`);
+      return { symbol, report: null, plan: null };
+    },
     latestReconciliation: async () => {
       calls.push('latest-reconcile');
       return null;
@@ -1166,5 +1170,116 @@ describe('GET /api/reconcile/latest', () => {
     await buildApp(deps).request('/api/reconcile/latest');
     await buildApp(deps).request('/api/reconcile/latest');
     expect(deps.calls.filter((c) => c === 'latest-reconcile')).toHaveLength(2);
+  });
+});
+
+describe('GET /api/symbols/:symbol/agent（分析师 / 交易员，只读）', () => {
+  it('没分析过时返回 200 与空状态，不是 404', async () => {
+    const app = buildApp(fakeDeps());
+    const res = await app.request('/api/symbols/AAAUSDT/agent');
+    const body = (await res.json()) as {
+      symbol: string;
+      report: unknown;
+      plan: unknown;
+    };
+
+    expect(res.status).toBe(200);
+    // 「还没被分析过」是完全正常的状态，不能显示成报错
+    expect(body.symbol).toBe('AAAUSDT');
+    expect(body.report).toBeNull();
+    expect(body.plan).toBeNull();
+  });
+
+  it('透传标的：路由拿到的就是 URL 里那个', async () => {
+    const deps = fakeDeps();
+    await buildApp(deps).request('/api/symbols/AAAUSDT/agent');
+    expect(deps.calls).toContain('agent:AAAUSDT');
+  });
+
+  it('有报告与方案时按 DTO 形状回传', async () => {
+    const app = buildApp(
+      fakeDeps({
+        listAgentView: async (symbol) => ({
+          symbol,
+          report: {
+            id: '1',
+            symbol,
+            interval: '1h',
+            asOfMs: NOW,
+            createdAtMs: NOW,
+            stance: 'bullish',
+            confidence: 0.72,
+            bias: 0.61,
+            agreement: 0.88,
+            technical: { score: 0.7, notes: ['均线多头排列'] },
+            sentiment: { score: 0.4, notes: [] },
+            fundamental: { score: 0.1, notes: [] },
+            atr: 2.5,
+            lastClose: 100,
+            rationale: '趋势与情绪同向。',
+            degraded: false,
+          },
+          plan: {
+            id: '9',
+            symbol,
+            reportId: '1',
+            createdAtMs: NOW,
+            action: 'enter',
+            status: 'advisory',
+            side: 'BUY',
+            entryType: 'market',
+            entryPrice: 100,
+            stopPrice: 95,
+            takeProfitPrice: 110,
+            quantity: 2,
+            notional: 200,
+            riskAmount: 10,
+            equity: 1000,
+            equitySource: 'exchange',
+            riskFraction: 0.01,
+            riskReward: 2,
+            stance: 'bullish',
+            confidence: 0.72,
+            rationale: '顺势进场。',
+            adjustments: [],
+            failureReason: null,
+          },
+        }),
+      }),
+    );
+
+    const res = await app.request('/api/symbols/AAAUSDT/agent');
+    const body = (await res.json()) as {
+      report: { stance: string; agreement: number } | null;
+      plan: { side: string; reportId: string; status: string } | null;
+    };
+
+    expect(res.status).toBe(200);
+    expect(body.report?.stance).toBe('bullish');
+    expect(body.report?.agreement).toBe(0.88);
+    expect(body.plan?.side).toBe('BUY');
+    // 方案要带上它基于哪份报告：报告按数据时刻 upsert、方案每轮新建，
+    // 两个号天然不一样，不带出来页面上就对不上
+    expect(body.plan?.reportId).toBe('1');
+    // 默认只出方案、不下单
+    expect(body.plan?.status).toBe('advisory');
+  });
+
+  it('行情上下文取不到 → 502 并带出错误码（不是 500）', async () => {
+    const app = buildApp(
+      fakeDeps({
+        listAgentView: async () => {
+          throw new SyncError('AGENT_CONTEXT_UNAVAILABLE', '库里没有派生 K 线', {
+            symbol: 'AAAUSDT',
+          });
+        },
+      }),
+    );
+
+    const res = await app.request('/api/symbols/AAAUSDT/agent');
+    const body = (await res.json()) as { error: { code: string } };
+
+    expect(res.status).toBe(502);
+    expect(body.error.code).toBe('AGENT_CONTEXT_UNAVAILABLE');
   });
 });

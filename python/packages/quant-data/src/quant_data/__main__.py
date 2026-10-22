@@ -12,6 +12,7 @@
 - ``aggregate``：由库内 1m 派生 15m / 1h / 4h / 1d（补齐 / ``--rebuild`` / ``--check``）
 - ``indicators``：由库内**已收盘的派生 K 线**物化技术指标（补齐 / ``--rebuild`` / ``--check``）
 - ``risk-atr``：按成交时刻从库里算 Wilder ATR（``apps/executor`` 止盈止损的唯一输入）
+- ``market-context``：分析师 Agent 的输入——库内 K 线现算技术面 + 公开接口取情绪面（v1.0.0）
 """
 
 from __future__ import annotations
@@ -25,7 +26,7 @@ from pathlib import Path
 from quant_core import INTERVALS, interval_to_ms, series_to_dicts
 from quant_core.io import dump_json, log
 
-from . import indicators, sync
+from . import indicators, market_context, sync
 from . import risk as risk_mod
 from .errors import SyncError
 from .metadata import DEFAULT_TTL_MS
@@ -267,10 +268,7 @@ def _build_parser() -> argparse.ArgumentParser:
     risk.add_argument(
         "--interval",
         default=None,
-        help=(
-            "算 ATR 的周期（1m/15m/1h/4h/1d），缺省 1m。"
-            "未实现的周期（5m 等）直接报错，不回落"
-        ),
+        help=("算 ATR 的周期（1m/15m/1h/4h/1d），缺省 1m。未实现的周期（5m 等）直接报错，不回落"),
     )
     risk.add_argument(
         "--period", type=int, default=risk_mod.DEFAULT_ATR_PERIOD, help="ATR 周期长度，缺省 14"
@@ -299,6 +297,20 @@ def _build_parser() -> argparse.ArgumentParser:
         default=risk_mod.DEFAULT_WINDOW_BARS,
         help="参与计算的连续 bar 数上限，缺省 240",
     )
+
+    ctx = sub.add_parser(
+        "market-context",
+        help="分析师 Agent 的输入：库内 K 线现算技术面 + 公开接口取情绪面",
+    )
+    ctx.add_argument("--symbol", required=True)
+    ctx.add_argument(
+        "--interval",
+        default="1h",
+        choices=["15m", "1h", "4h", "1d"],
+        help="分析周期（只支持派生周期；1m 上做指标是容量结论）",
+    )
+    ctx.add_argument("--bars", type=int, default=300, help="参与计算的已收盘 K 线根数，缺省 300")
+    _add_weight_option(ctx)
 
     return parser
 
@@ -486,6 +498,19 @@ def _cmd_risk_atr(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_market_context(args: argparse.Namespace) -> int:
+    dump_json(
+        market_context.run_market_context(
+            symbol=args.symbol,
+            interval=args.interval,
+            bars=args.bars,
+            weight_budget=args.weight_budget,
+            dsn=None,
+        )
+    )
+    return 0
+
+
 _COMMANDS = {
     "symbols": _cmd_symbols,
     "resolve": _cmd_resolve,
@@ -496,9 +521,8 @@ _COMMANDS = {
     "aggregate": _cmd_aggregate,
     "indicators": _cmd_indicators,
     "risk-atr": _cmd_risk_atr,
+    "market-context": _cmd_market_context,
 }
-
-
 
 
 def _emit_error(error: SyncError) -> None:

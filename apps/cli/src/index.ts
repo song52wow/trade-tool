@@ -2,6 +2,7 @@
 import { createLogger, isSyncError, loadProjectEnv } from '@trade-tool/core';
 import { Command } from 'commander';
 
+import { runAgent, runAgentReport } from './commands/agent.js';
 import { runBacktestCommand } from './commands/backtest.js';
 import { initConfig, showConfig } from './commands/config.js';
 import {
@@ -309,6 +310,32 @@ program
   .option('--json', '输出 JSON')
   .action(async (options: { symbol?: string; json?: boolean }) => {
     process.exitCode = await runReconcile(options).catch((error: unknown) => {
+      fail(error);
+      return 1;
+    });
+  });
+
+const agentCmd = program.command('agent').description('分析师 / 交易员 Agent（v1.0.0）');
+agentCmd
+  .command('run')
+  .description('现在跑一轮：分析 → 出方案 → 落库（只出方案，不下单）')
+  .option('-s, --symbol <symbol>', '只跑单个标的；缺省跑配置里 / 库里正在同步的标的')
+  .option('--json', '输出 JSON')
+  .action(async (options: { symbol?: string; json?: boolean }) => {
+    process.exitCode = await runAgent(options).catch((error: unknown) => {
+      fail(error);
+      return 1;
+    });
+  });
+
+agentCmd
+  .command('report')
+  .description('看最近存下来的分析师报告与执行方案（只读，不调模型）')
+  .option('-s, --symbol <symbol>', '只看单个标的；缺省看最近的')
+  .option('--limit <count>', '看最近多少条', '10')
+  .option('--json', '输出 JSON')
+  .action(async (options: { symbol?: string; limit?: string; json?: boolean }) => {
+    process.exitCode = await runAgentReport(options).catch((error: unknown) => {
       fail(error);
       return 1;
     });

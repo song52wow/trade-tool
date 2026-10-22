@@ -46,6 +46,10 @@ ErrorCode = Literal[
     # 「本轮不移动止损、保留上一档」。合并成一个码会把两种严重度不同的处置方式
     # 一起改掉，而且事后没法从错误行判断当初拒的是哪一件事（R-6.5）。
     "RISK_TRAIL_EXTREME_UNAVAILABLE",
+    # Agent（v1.0.0）：行情上下文取不到——库里的派生 K 线不够，算不出技术面。
+    # 与 CONFIG_INVALID 分开：前者是「数据还没同步上来」，后者是「参数写错了」，
+    # 处置完全不同（前者去同步标的，后者改配置）。
+    "AGENT_CONTEXT_UNAVAILABLE",
     # 数据库（R-21.6 / R-1.3）
     "DB_CONNECTION_FAILED",
     "DB_UNIQUE_VIOLATION",

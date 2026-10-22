@@ -179,6 +179,77 @@ describe('normalizeTakeProfit1Ratio', () => {
   });
 });
 
+describe('两个算价的函数必须给出**同一个价**（Agent 与 executor 的对齐保证）', () => {
+  /**
+   * 为什么有这条：Agent 的执行方案走 `deriveBracketPlan`，
+   * 而 `apps/executor` 挂单走 `deriveStagedPlan`——**两个不同的函数**。
+   *
+   * 文档里写着「方案上的止损价与交易所上的止损价不会差一个 tick」，
+   * 那这句话就必须由**代码**担保，而不是由一句注释担保：
+   * 一旦哪天有人改了其中一个的对齐方向，方案上的价就会与真挂出去的那张单差一格，
+   * 而**没有任何一处会报错**——那正是「看起来成功了，其实什么都没做」的形态。
+   *
+   * 口径：`deriveStagedPlan` 明确「止损的算式完全复用 v0.4.0 的口径，不另抄一遍」，
+   * 而 v0.4.0 的口径就是 `deriveBracketPlan`；两者的 tick 对齐方向也相同
+   * （多头向下、空头向上）。下面这条断言就是把这个「复用」钉死。
+   */
+  const cases = [
+    { name: '多头 / 不分批', side: 'BUY' as const, ratio: 0 },
+    { name: '多头 / 分批', side: 'BUY' as const, ratio: 0.5 },
+    { name: '空头 / 不分批', side: 'SELL' as const, ratio: 0 },
+    { name: '空头 / 分批', side: 'SELL' as const, ratio: 0.5 },
+  ];
+
+  for (const c of cases) {
+    it(`${c.name}：止损价与止盈价逐字相同`, () => {
+      const common = {
+        side: c.side,
+        entryPrice: 100,
+        atr: 2,
+        atrPeriod: 14,
+        tickSize: 0.01,
+        stopAtrMult: 2,
+        takeProfitAtrMult: 3,
+      };
+      const bracket = deriveBracketPlan(common);
+      const stagedPlan = deriveStagedPlan({
+        ...common,
+        stepSize: 0.001,
+        filledQty: 1,
+        takeProfit1Ratio: c.ratio,
+      });
+
+      expect(stagedPlan.stopPrice).toBe(bracket.stopPrice);
+      expect(stagedPlan.takeProfitPrice).toBe(bracket.takeProfitPrice);
+      expect(stagedPlan.stopDistance).toBe(bracket.stopDistance);
+    });
+  }
+
+  it('ATR 相对 tick 很小时也一样（对齐方向不同才会暴露差异）', () => {
+    // ATR = 0.013、tick = 0.01：两个价都落在 tick 网格上但不在整格里，
+    // 任何「差一格」的偏差都会在这里现形。
+    const common = {
+      side: 'BUY' as const,
+      entryPrice: 100,
+      atr: 0.013,
+      atrPeriod: 14,
+      tickSize: 0.01,
+      stopAtrMult: 2,
+      takeProfitAtrMult: 3,
+    };
+    const bracket = deriveBracketPlan(common);
+    const stagedPlan = deriveStagedPlan({
+      ...common,
+      stepSize: 0.001,
+      filledQty: 1,
+      takeProfit1Ratio: 0.5,
+    });
+
+    expect(stagedPlan.stopPrice).toBe(bracket.stopPrice);
+    expect(stagedPlan.takeProfitPrice).toBe(bracket.takeProfitPrice);
+  });
+});
+
 describe('deriveStagedPlan', () => {
   it('比例 0：不分批，一次全平', () => {
     const plan = deriveStagedPlan({ ...staged, takeProfit1Ratio: 0 });

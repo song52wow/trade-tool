@@ -8,7 +8,8 @@ trade-tool/
 │   ├── cli/                     @trade-tool/cli        命令行入口（一次性命令）
 │   ├── sync/                    @trade-tool/sync       常驻同步守护进程 + 控制原语
 │   ├── web/                     @trade-tool/web        控制面：HTTP API + 看板（直接 import 原语）
-│   └── executor/                @trade-tool/executor   止盈止损：成交 → 净仓位 → ATR → 条件单（会真实下单）
+│   ├── executor/                @trade-tool/executor   止盈止损：成交 → 净仓位 → ATR → 条件单（会真实下单）
+│   └── agent/                   @trade-tool/agent      分析师 + 交易员 Agent：分析 → 执行方案（默认不下单）
 ├── packages/
 │   ├── tsconfig/                @trade-tool/tsconfig   共享 tsconfig 预设
 │   ├── core/                    @trade-tool/core       领域模型 / 配置 / 错误码（**无指标实现**）
@@ -16,7 +17,7 @@ trade-tool/
 ├── python/                      uv workspace（根）
 │   └── packages/
 │       ├── quant-core/          数据结构 + **7 组技术指标的唯一实现**
-│       ├── quant-data/          行情网络层 + 增量续传 + 派生聚合 + 指标物化 + PG 批量写入 + risk-atr
+│       ├── quant-data/          行情网络层 + 增量续传 + 派生聚合 + 指标物化 + PG 批量写入 + risk-atr + market-context
 │       └── quant-backtest/      **唯一的回测实现**（信号 t 收盘确认、成交 t+1 开盘）
 ├── packages/data/sql/           版本化数据库迁移（schema 的唯一来源）
 ├── pnpm-workspace.yaml          TS 侧 workspace + 构建脚本白名单
@@ -31,15 +32,17 @@ apps/cli ─────> packages/data ───────> packages/core
 apps/sync ────> packages/data ───────> packages/core
 apps/web ─────> packages/sync ───────> packages/data ──> packages/core
 apps/executor ─> packages/data ───────> packages/core
+apps/agent ───> packages/data ───────> packages/core
                       │
                       └─(唯一跨语言接缝: python -m quant_data)─> python/quant-*
 ```
 
 规则：`core` 不依赖任何 workspace 包；包之间只依赖 `core`；跨语言只允许从 `packages/data` 出去；
 `apps/sync` 与 `apps/web` **不得**绕过 `packages/data` 直接连 PG 读写。
-`apps/cli`、`apps/sync`、`apps/web`、`apps/executor` 是**四个独立入口**：CLI 只读 `sync status`、
+`apps/cli`、`apps/sync`、`apps/web`、`apps/executor`、`apps/agent` 是**五个独立入口**：CLI 只读 `sync status`、
 不改生命周期；控制面只写 `desired_state`（先落库再生效），真正拉数据的始终是 `apps/sync`
-守护进程；`apps/executor` 只做止盈止损，不碰行情同步的生命周期。
+守护进程；`apps/executor` 只做止盈止损，不碰行情同步的生命周期；
+`apps/agent` 只出方案，既不碰行情同步的生命周期，也**不下单**。
 
 ## 环境要求
 
@@ -51,8 +54,9 @@ Node >= 22、pnpm >= 11、uv >= 0.11、PostgreSQL >= 16。运行 `pnpm --filter 
 cp .env.example .env      # 按本机情况改，主要是 TRADE_TOOL_HOME 与 TRADE_TOOL_PG_PASSWORD
 ```
 
-`.env` 已被 `.gitignore` 忽略，`.env.example` 是入库的模板。`apps/cli` 与 `apps/sync`
-启动时会自动加载仓库根的 `.env`（`packages/core` 的 `loadProjectEnv()`，底层是 Node 内置的
+`.env` 已被 `.gitignore` 忽略，`.env.example` 是入库的模板。五个入口（`apps/cli`、`apps/sync`、
+`apps/web`、`apps/executor`、`apps/agent`）启动时会自动加载仓库根的 `.env`
+（`packages/core` 的 `loadProjectEnv()`，底层是 Node 内置的
 `process.loadEnvFile`），因此连同 Python 子进程（`bridge.ts` 透传 `process.env`）都能拿到密码。
 **已存在的环境变量不会被 `.env` 覆盖**，CI 与生产注入的值始终优先。
 
@@ -163,6 +167,60 @@ ATR 算（`deriveStagedPlan`）。这样价格计算保持是可复现的纯函�
 代价是**裸仓窗口**：模型响应时间不可控，而它在「成交 → 挂单」之间。
 `executor.llm.timeoutMs`（缺省 8 秒）是这个窗口的上限。
 细则见 `AGENTS.md` §6.10。
+
+## 分析师 / 交易员 Agent（`apps/agent`，v1.0.0）
+
+两个 Agent 回答两个问题：
+
+- **分析师**：这个标的**值不值得碰**，以及**凭什么**——技术面（价格结构与指标）+
+  情绪面（持仓者的钱往哪边压：资金费率、基差、持仓量、多空比、主动买卖比）+
+  基本面（合约规格、流动性、持有成本），各打一个分。
+- **交易员**：既然值得做，**怎么做**——进场方式、仓位多大、止损放哪。
+
+```
+行情上下文（Python 现算技术面 + 公开接口取情绪面 + 库里取合约规格）
+      ↓
+分析师 Agent：三个面各打一个分 → 纯函数合成立场 / 信心 / 一致性   → 报告落库
+      ↓
+交易员 Agent：立场 → 进场方式 / 仓位大小 / 止损止盈                 → 方案落库
+      ↓
+默认到此为止：**只出方案，不下单**
+```
+
+**模型只输出比例，不输出价格与数量**。模型能说的只有分数、置信度、ATR 倍数、
+风险占权益的百分比、进场方式与偏移；**绝对价格、数量、名义金额一律由程序算**——
+价格走 `deriveBracketPlan`（`apps/executor` 挂单走 `deriveStagedPlan`，两者算式与对齐方向
+逐字相同），数量走
+「愿意亏多少钱 ÷ 每股亏多少」再按 `stepSize` 对齐。理由很实在：模型说「买 0.35 个」
+完全可能是在算 3.5 个，而**没有任何一处会报错**；比例算错时绝对金额仍然可控。
+
+**总立场由程序合成，不由模型给**。模型给三个面的分数，`aggregateAnalystReport` 按权重算出
+立场 / 信心 / 一致性。否则「报告里写着看多、库里记的是看空」这类漂移无从查起。
+三个面互相矛盾时，一致性会折进信心——互相矛盾的面本来就不该被当成高置信度结论。
+
+**方向与结论矛盾就不出方案**：分析师看多而交易员做空，是两个 Agent 读同一份数据得出相反
+结论，出方案等于把矛盾变成真钱。「中性」不算矛盾，但**风险敞口减半**。
+
+**失败必须留痕**：模型超时、输出不合法、方案算不出来，都落一条 `action='failed'` 的方案并写明
+原因。页面上要能回答「这个标的今天分析过没有」，而「分析过但没结论」与「压根没分析」
+是两件完全不同的事。
+
+```bash
+pnpm --filter @trade-tool/agent start                # 常驻（需 agent.enabled = true）
+pnpm --filter @trade-tool/cli start -- agent run     # 单跑一次
+pnpm --filter @trade-tool/cli start -- agent report  # 只读库，看最近一次报告与方案
+```
+
+`agent run` 与守护进程**共用同一份编排**，口径一致；`agent report` 是纯读，
+不调模型也不写库——它是「上周那笔到底怎么决定的」的答案来源，不该因为模型今天挂了
+就连历史都看不了。
+
+⚠️ **默认只出方案，不下单**：`agent.execute.enabled` 缺省 `false`，方案落库时
+`status = 'advisory'`，控制面与 CLI 都看得到，要真下单得人工审核后手动执行。
+**本期未实现自动执行路径**，因此把这个开关打开会让 `apps/agent` **启动即报错**——
+而不是「开着却什么也不做」，后者是最危险的一种失败。
+
+细则见 [`apps/agent/README.md`](apps/agent/README.md) 与 `AGENTS.md` §6.11。
 
 ## 交易对账（v0.6.0）
 
@@ -343,8 +401,9 @@ docker compose down       # 停库，保留数据卷
 ```
 
 镜像在本机构建、`docker save` / `docker load` 搬运，目标机不需要 git / pnpm / uv。
-`deploy/compose.yaml` 里四个应用服务共用同一个镜像、只靠 `command` 区分；
+`deploy/compose.yaml` 里三个应用服务（web / sync / executor）共用同一个镜像、只靠 `command` 区分；
 止盈止损放在 `executor` profile 里，`docker compose up -d` 不会启动它。
+`apps/agent`（分析师 / 交易员 Agent）暂不在部署编排里——它默认只出方案、不下单。
 完整的搬运步骤、环境变量、排查表见 [`deploy/README.md`](deploy/README.md)。
 
 ## 常驻同步（v0.1.0）
@@ -424,4 +483,7 @@ TS 与 Python 通过 `packages/data/src/bridge.ts` 交互。**v0.1.0 起，跨�
   默认配置里的 `market.symbol`（`BTCUSDT`）只服务**离线合成源与回测**，同步链路不读它——
   `data sync` 必须显式给 `--symbol`。
 - **离线链路仍在**：`source: 'synthetic'` 走 `generate_series`，默认行为与既有测试不变。
-- 回测为单标的、单持仓、收盘成交模型，扣双边手续费与滑点。
+- 回测为单标的、单持仓，**信号在 `t` 收盘确认、成交在 `t+1` 开盘**，扣双边手续费与滑点。
+- **分析师 / 交易员 Agent 已实现**（v1.0.0）：常驻进程 + CLI 单跑，控制面有只读面板。
+  **默认只出方案、不下单**——自动执行路径本期未实现，打开 `agent.execute.enabled`
+  会让服务启动即报错，而不是「开着却什么也不做」。

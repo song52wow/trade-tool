@@ -60,6 +60,16 @@ export type SyncErrorCode =
   // LLM 决策（v0.9.0）：调用模型本身失败（超时、网络、HTTP 错误）。
   // 与 LLM_DECISION_INVALID 分开：一个是「说错了」，一个是「没说成」。
   | 'LLM_CALL_FAILED'
+  // Agent（v1.0.0）：分析师的报告不合法（越界、缺字段、不是 JSON）。
+  // 与 LLM_DECISION_INVALID 分开：那份是「止盈止损档位」，这一份是「行情分析报告」，
+  // 字段与处置完全不同（前者降级到 risk_policy，后者这一轮不出方案）。
+  | 'AGENT_REPORT_INVALID'
+  // Agent（v1.0.0）：交易员的执行提议不合法，或与分析师的结论矛盾。
+  | 'AGENT_PLAN_INVALID'
+  // Agent（v1.0.0）：行情上下文取不到（库里的 K 线不够、情绪面数据缺失）。
+  // 与 CONFIG_INVALID 分开：前者是「数据还没同步上来」，后者是「参数写错了」，
+  // 处置完全不同（前者去同步标的，后者改配置）。
+  | 'AGENT_CONTEXT_UNAVAILABLE'
   // 数据库（R-21.6 / R-1.3）
   | 'DB_CONNECTION_FAILED'
   | 'DB_UNIQUE_VIOLATION'

@@ -449,3 +449,86 @@ export interface StartJobBody {
   /** 首次全量时带上规模预估的目标行数，用于校验用户看没看过确认弹窗。 */
   target: number | null;
 }
+
+// ------------------------------------------------- 分析师 / 交易员 Agent（v1.0.0）
+
+/** 分析师报告里的一个面。 */
+export interface AgentFacetDto {
+  /** `-1`（极空）… `+1`（极多）。 */
+  score: number;
+  /** 支撑这个分数的理由。 */
+  notes: string[];
+}
+
+/**
+ * 分析师报告（v1.0.0）。
+ *
+ * `stance` / `confidence` 是**程序合成**的结果（`aggregateAnalystReport`），
+ * 不是模型直接给的——页面上显示的立场与库里存的、CLI 打的是同一个值。
+ */
+export interface AgentReportDto {
+  id: string;
+  symbol: string;
+  interval: string;
+  /** 数据的时刻（epoch ms）。 */
+  asOfMs: number;
+  /** 报告生成的时刻（epoch ms）。 */
+  createdAtMs: number;
+  stance: 'bullish' | 'bearish' | 'neutral';
+  confidence: number;
+  /** 加权综合分，`[-1, 1]`。 */
+  bias: number;
+  /** 三个面之间的一致性 `[0, 1]`。 */
+  agreement: number;
+  technical: AgentFacetDto;
+  sentiment: AgentFacetDto;
+  fundamental: AgentFacetDto;
+  atr: number | null;
+  lastClose: number | null;
+  rationale: string;
+  /** 情绪面有接口没取到——这一轮的情绪面分数仅供参考。 */
+  degraded: boolean;
+}
+
+/**
+ * 交易员执行方案（v1.0.0）。
+ *
+ * 价格与数量**不是模型给的**：模型只给比例，它们由 `deriveExecutionPlan` 算出来，
+ * 因此这里的每个价都与「真正挂出去的那张单」逐字一致。
+ */
+export interface TradingPlanDto {
+  id: string;
+  symbol: string;
+  /** 这份方案基于哪份分析师报告。报告按数据时刻 upsert（id 不变），方案每轮新建。 */
+  reportId: string | null;
+  createdAtMs: number;
+  /** `enter` = 有可执行方案；`hold` = 这一轮不做；`failed` = 出不了方案。 */
+  action: 'enter' | 'hold' | 'failed';
+  status: 'advisory' | 'approved' | 'executed' | 'rejected' | 'expired';
+  side: 'BUY' | 'SELL' | null;
+  entryType: 'market' | 'limit' | null;
+  entryPrice: number | null;
+  stopPrice: number | null;
+  takeProfitPrice: number | null;
+  quantity: number | null;
+  notional: number | null;
+  riskAmount: number | null;
+  equity: number | null;
+  equitySource: 'exchange' | 'config' | null;
+  riskFraction: number | null;
+  riskReward: number | null;
+  stance: 'bullish' | 'bearish' | 'neutral';
+  confidence: number;
+  rationale: string;
+  /** 为了合规而做的调整（风险被夹住、止盈被抬高、量被缩小…）。 */
+  adjustments: string[];
+  /** 出不了方案的原因。 */
+  failureReason: string | null;
+}
+
+/** `/agent` 的回包。`report` / `plan` 各自可能为 `null`（还没分析过）。 */
+export interface AgentViewDto {
+  symbol: string;
+  report: AgentReportDto | null;
+  plan: TradingPlanDto | null;
+}

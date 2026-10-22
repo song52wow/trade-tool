@@ -1134,6 +1134,8 @@ def test_migrations_are_idempotent(conn: DbConn, pg_dsn: str) -> None:
         "014_take_profit_single_mult",
         # v0.9.0：补回「LLM 决策的数必须齐全」那条约束
         "015_restore_llm_params_check",
+        # v1.0.0：分析师报告 + 交易员执行方案
+        "016_agent_decisions",
     ]
     pg.ensure_schema(conn)
 

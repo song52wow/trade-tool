@@ -46,14 +46,18 @@ import {
   readDerivedIntervals,
   readLatestBars,
   readLatestReconciliation,
+  readLatestAnalystReport,
+  readLatestTradingPlan,
   resolveActiveCredentials,
   resolveContract,
   runReconciliation,
   schemaStatus,
   syncSymbol,
   verifySymbol,
+  type AnalystReportRow,
   type MarketContext,
   type Pool,
+  type TradingPlanRow,
   exchangeEndpointsFromEnv,
 } from '@trade-tool/data';
 import { createSyncService, HEARTBEAT_INTERVAL_MS, type SyncService } from '@trade-tool/sync';
@@ -96,12 +100,15 @@ function masterKeyOrNull(): Buffer | null {
   return requireMasterKey();
 }
 import type {
+  AgentReportDto,
+  AgentViewDto,
   BarDto,
   BracketsDto,
   CredentialStatusDto,
   NotifyStatusDto,
   RiskPolicyEntryDto,
   RiskPolicyViewDto,
+  TradingPlanDto,
   DaemonStatusDto,
   ReconcileReport,
   ExchangeListDto,
@@ -296,6 +303,28 @@ export function createWebRuntime(config: TradeToolConfig): WebRuntime {
 
     // 预估要出网读元数据但**不写库**（R-8.3），所以由确认弹窗按需单独触发。
     estimate: (symbol) => estimateFirstPull(ctx, symbol),
+
+    /**
+     * 分析师报告与执行方案（v1.0.0）：**只读**本地表。
+     *
+     * 纯读：只打 PG，不调模型、不出网、不下单，因此能挂在页面的 5s 刷新节奏上。
+     *
+     * 报告与方案**分别**取「最近一条」：方案可能来自上一份报告（这一轮分析师失败时，
+     * 只会写一条 `action = 'failed'` 的方案而没有新报告）。因此页面上要能同时看到
+     * 「最新报告」与「最新方案」，而不是把它们捆在一起——捆在一起会让人以为
+     * 那份方案就是基于那份报告做的。
+     */
+    async listAgentView(symbol): Promise<AgentViewDto> {
+      const [report, plan] = await Promise.all([
+        readLatestAnalystReport(pool, ctx.exchange, symbol),
+        readLatestTradingPlan(pool, ctx.exchange, symbol),
+      ]);
+      return {
+        symbol,
+        report: report === null ? null : toAgentReportDto(report),
+        plan: plan === null ? null : toTradingPlanDto(plan),
+      };
+    },
 
     /**
      * 交易对账（v0.6.0）：**只读**地比对交易所与本地，绝不下单/撤单/写库。
@@ -563,5 +592,63 @@ function toPolicyDto(row: {
     exchange: row.exchange ?? '',
     symbol: row.symbol ?? '',
     updatedAt: row.updatedAt ?? 0,
+  };
+}
+
+// ------------------------------------------- Agent 报告与方案的 DTO 转换（v1.0.0）
+
+/**
+ * 数据库行 → 页面用的报告。
+ *
+ * **只搬运，不加工**：分数、立场、信心都是 core 的纯函数算出来的，这里原样透出。
+ * 加工（例如把分数映射成颜色）属于展示层的事，那是页面的活。
+ */
+function toAgentReportDto(row: AnalystReportRow): AgentReportDto {
+  return {
+    id: row.id,
+    symbol: row.symbol,
+    interval: row.interval,
+    asOfMs: row.asOfMs,
+    createdAtMs: row.createdAtMs,
+    stance: row.stance,
+    confidence: row.confidence,
+    bias: row.bias,
+    agreement: row.agreement,
+    technical: { score: row.technical.score, notes: row.technical.notes },
+    sentiment: { score: row.sentiment.score, notes: row.sentiment.notes },
+    fundamental: { score: row.fundamental.score, notes: row.fundamental.notes },
+    atr: row.atr,
+    lastClose: row.lastClose,
+    rationale: row.rationale,
+    degraded: row.degraded,
+  };
+}
+
+/** 数据库行 → 页面用的方案。 */
+function toTradingPlanDto(row: TradingPlanRow): TradingPlanDto {
+  return {
+    id: row.id,
+    symbol: row.symbol,
+    reportId: row.reportId,
+    createdAtMs: row.createdAtMs,
+    action: row.action,
+    status: row.status,
+    side: row.side,
+    entryType: row.entryType,
+    entryPrice: row.entryPrice,
+    stopPrice: row.stopPrice,
+    takeProfitPrice: row.takeProfitPrice,
+    quantity: row.quantity,
+    notional: row.notional,
+    riskAmount: row.riskAmount,
+    equity: row.equity,
+    equitySource: row.equitySource,
+    riskFraction: row.riskFraction,
+    riskReward: row.riskReward,
+    stance: row.stance,
+    confidence: row.confidence,
+    rationale: row.rationale,
+    adjustments: row.adjustments,
+    failureReason: row.failureReason,
   };
 }

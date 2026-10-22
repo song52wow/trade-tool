@@ -1,6 +1,7 @@
 import type { GapRecord, RemovePolicy, StoredInterval } from '@trade-tool/core';
 
 import type {
+  AgentViewDto,
   BarsDto,
   BracketsDto,
   CredentialStatusDto,
@@ -121,6 +122,22 @@ export const api = {
         throw new ApiError(
           'CONTROL_PLANE_STALE',
           '控制面没有 /brackets 路由：它还是改动前启动的旧进程。重启 trade-tool 控制面后刷新页面即可。',
+        );
+      }
+      throw error;
+    }),
+  /**
+   * 分析师报告与执行方案（v1.0.0）。纯读本地表，由 `apps/agent` 写入，
+   * 因此可以跟着刷新节奏走。
+   *
+   * 404 单列成「控制面还是旧进程」：路由在进程启动时注册，不重启就看不到它。
+   */
+  agent: (s: string) =>
+    request<AgentViewDto>(`/api/symbols/${encodeURIComponent(s)}/agent`).catch((error: unknown) => {
+      if (error instanceof ApiError && error.status === 404) {
+        throw new ApiError(
+          'CONTROL_PLANE_STALE',
+          '控制面没有 /agent 路由：它还是改动前启动的旧进程。重启 trade-tool 控制面后刷新页面即可。',
         );
       }
       throw error;

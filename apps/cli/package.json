@@ -29,7 +29,8 @@
   "dependencies": {
     "@trade-tool/core": "workspace:*",
     "@trade-tool/data": "workspace:*",
-    "commander": "^12.1.0"
+    "commander": "^12.1.0",
+    "@trade-tool/agent": "workspace:*"
   },
   "devDependencies": {
     "@trade-tool/tsconfig": "workspace:*",

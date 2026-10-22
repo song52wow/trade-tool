@@ -77,6 +77,10 @@ KNOWN_MIGRATION_VERSIONS: frozenset[str] = frozenset(
         # v0.9.0：补回「LLM 决策的数必须齐全」那条约束（014 删列时顺带删掉了它）。
         # 同样不读写该表，但版本闸门两个方向都要校。
         "015_restore_llm_params_check",
+        # v1.0.0：分析师报告 + 交易员执行方案（analyst_report / trading_plan）。
+        # Python 侧不读写这两张表，但版本闸门两个方向都要校，漏登记会让
+        # **所有**碰 PG 的用例报「库比代码新」。
+        "016_agent_decisions",
     }
 )
 

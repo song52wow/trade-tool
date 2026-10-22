@@ -26,7 +26,16 @@
   地址与签名密钥**密文**落库；`resolveAll()` 是「**哪一份在生效**」的唯一实现
   （控制面录入优先，配置文件 + 环境变量兜底），面板状态、executor 的生效设置、
   测试发送用的地址都从它派生。
+- `db/agent.ts` — 分析师报告与执行方案的读写（v1.0.0，迁移 `016_agent_decisions`）。
+  `recordAnalystReport` 按 `(exchange, symbol, as_of_ms)` **幂等 upsert**
+  （同一份数据时刻的同一标的只留一份报告）；`recordTradingPlan` / `updateTradingPlanStatus`
+  管 `advisory → approved / rejected / expired → executed` 这条状态机。
+  表上的 5 条**表级** CHECK 约束各自守一条不变式（`enter` 三件套齐全、止损止盈分居两侧、
+  `hold` 不许带原因、`failed` 必须带原因、`executed` 只能来自 `enter`）。
 - `market.ts` — 控制面唯一需要认识的东西：调 Python 干活 + 查 PG 看状态，收敛成结构化输入输出。
+  `loadAgentContext()` 是 v1.0.0 的入口：调 Python 的 `market-context` 子命令，
+  再读库内 `contract_spec` 快照，拼成 `ContractFacts` 交给 core 的
+  `buildAnalystContext` 做纯映射。
 - `bridge.ts` — `python -m quant_data` 子进程调用。**只传控制信息**，不传数据。
 - `provider.ts` / `cache.ts` — 既有离线合成链路（`source: 'synthetic'`），行为未变。
 
@@ -57,3 +66,9 @@ pnpm --filter @trade-tool/data test
 独立 schema 上，从空库执行迁移，结束时整段 `DROP SCHEMA … CASCADE`——**不会碰到任何业务表**。
 `sync-integration.test.ts` 会拉起一个本地假交易所，让**真实的 Python 引擎**跑完整接缝，
 全程不访问真实网络。
+
+`agent-context.test.ts` 是分析师 Agent 的行情上下文端到端用例：真 PG + 真 Python 引擎
+
+- 假交易所，验的是「派生 K 线 → `market-context` → stdout 的 JSON → zod 契约 → 纯映射」
+  这条链路。它能抓到替身抓不到的问题：Python 改了字段名，载荷是**拼进提示词的字符串**，
+  字段一错模型照样会给出看起来合理的结论——**整条错误链没有一处会报错**。

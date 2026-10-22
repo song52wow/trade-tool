@@ -9,8 +9,15 @@
 | `sync`     | trade-tool:deploy | 常驻同步守护进程                            | 是                       |
 | `executor` | trade-tool:deploy | 买入成交 → ATR → 止盈止损（**会真实下单**） | **否**，需显式开 profile |
 
-四个应用服务跑**同一个镜像**、只靠 `command` 区分：它们共用同一份 workspace 产物与同一个
-Python venv，拆成四个镜像只会让 save/load 的传输量翻倍。
+三个应用服务（web / sync / executor）跑**同一个镜像**、只靠 `command` 区分：它们共用同一份
+workspace 产物与同一个 Python venv，拆成三个镜像只会让 save/load 的传输量翻倍。
+（`postgres` 是另一个镜像——它不是本仓库的应用。）
+
+> **分析师 / 交易员 Agent（v1.0.0）暂不在部署编排里**。`apps/agent` 已在镜像里
+> （workspace 产物是一份），但 compose 没有它的服务项：它默认只出方案、不下单，
+> 且要用模型密钥（`TRADE_TOOL_LLM_API_KEY`）与交易所凭据来算仓位。
+> 要在服务器上跑，先按 `apps/agent/README.md` 配好，再照 `executor` 的 profile
+> 做法加一个服务项。
 
 ## 0. 前置
 

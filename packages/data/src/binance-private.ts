@@ -437,6 +437,66 @@ function requireFilters(rawExchangeInfoEntry: unknown, symbol: string): unknown[
 }
 
 /**
+ * 从 exchangeInfo 的原始条目里取最小下单数量（`LOT_SIZE.minQty`）。
+ *
+ * 交易员 Agent 要按「风险金额 ÷ 止损距离」算数量，算出来的数量可能**低于**交易所的
+ * 最小下单量——那笔单根本不存在，因此必须先知道这个下限。
+ */
+export function parseMinQty(rawExchangeInfoEntry: unknown, symbol: string): number {
+  for (const filter of requireFilters(rawExchangeInfoEntry, symbol)) {
+    if (typeof filter !== 'object' || filter === null) continue;
+    const entry = filter as Record<string, unknown>;
+    if (entry['filterType'] !== 'LOT_SIZE') continue;
+    const minQty = entry['minQty'];
+    if (typeof minQty !== 'string' || minQty.trim() === '' || !Number.isFinite(Number(minQty))) {
+      throw new SyncError('CONFIG_INVALID', `${symbol} 的 minQty 不是合法数字：${String(minQty)}`, {
+        symbol,
+        minQty: String(minQty),
+      });
+    }
+    if (Number(minQty) < 0) {
+      throw new SyncError('CONFIG_INVALID', `${symbol} 的 minQty 不能为负：${minQty}`, {
+        symbol,
+        minQty,
+      });
+    }
+    return Number(minQty);
+  }
+  throw new SyncError('CONFIG_INVALID', `${symbol} 的 exchangeInfo 快照里没有 LOT_SIZE`, {
+    symbol,
+  });
+}
+
+/**
+ * 从 exchangeInfo 的原始条目里取最小名义金额（`MIN_NOTIONAL.notional`）。
+ *
+ * **取不到返回 0**（而不是报错）：不是所有标的都有这条限制，而「没有限制」与
+ * 「限制是 0」在这条语义下是同一件事。其它解析函数取不到都报错，是因为那里
+ * 「取不到」意味着「不知道」，而这里「没有这条 filter」就是「没有这条限制」。
+ */
+export function parseMinNotional(rawExchangeInfoEntry: unknown, symbol: string): number {
+  for (const filter of requireFilters(rawExchangeInfoEntry, symbol)) {
+    if (typeof filter !== 'object' || filter === null) continue;
+    const entry = filter as Record<string, unknown>;
+    if (entry['filterType'] !== 'MIN_NOTIONAL') continue;
+    const notional = entry['notional'];
+    if (
+      typeof notional !== 'string' ||
+      notional.trim() === '' ||
+      !Number.isFinite(Number(notional))
+    ) {
+      throw new SyncError(
+        'CONFIG_INVALID',
+        `${symbol} 的 MIN_NOTIONAL 不是合法数字：${String(notional)}`,
+        { symbol, notional: String(notional) },
+      );
+    }
+    return Number(notional);
+  }
+  return 0;
+}
+
+/**
  * 私有 REST 客户端。
  *
  * 签名 = HMAC-SHA256(queryString, apiSecret) 的 hex。查询串里的键按字典序拼接，
@@ -735,6 +795,46 @@ export class BinancePrivateClient {
   //   因此「某标的没出现在结果里」= 无仓位也无挂单，这恰好是对账要用的语义。
   // * `GET /fapi/v1/openAlgoOrders`（带 symbol 权重 1，不带 **40**）。条件单查询走的是
   //   Algo Order API 这一套，与下单 / 撤单同一个家族（`/fapi/v1/algoOrder`）。
+
+  /**
+   * 账户余额（`GET /fapi/v2/balance`，权重 5）。
+   *
+   * 交易员 Agent 要按「账户权益的百分之几」算仓位，因此必须知道权益是多少。
+   * Binance 文档给 `balance` 的口径是 **钱包余额 + 未实现盈亏**，也就是该资产上的
+   * 账户权益——这正是「我能亏多少」的分母。
+   *
+   * 只取计价资产（USDT）那一档：多币种账户的保证金是共享的，把别的币种也加进来
+   * 会把「最多亏多少」算大。取不到就报错，**不返回 0**——0 会被当成「这个账户没钱」，
+   * 于是仓位算成 0，一个看起来正常、实际什么都不做的方案。
+   */
+  async accountBalance(asset = 'USDT'): Promise<number> {
+    const body = await this.request<unknown[]>('GET', '/fapi/v2/balance', { signed: true });
+    if (!Array.isArray(body)) {
+      throw new SyncError('EXCHANGE_ERROR', '/fapi/v2/balance 返回的不是数组', {
+        body: JSON.stringify(body).slice(0, 200),
+      });
+    }
+    for (const [index, raw] of body.entries()) {
+      if (typeof raw !== 'object' || raw === null) {
+        throw new SyncError('EXCHANGE_ERROR', `/fapi/v2/balance 第 ${String(index)} 条不是对象`);
+      }
+      const row = raw as Record<string, unknown>;
+      if (row['asset'] !== asset) continue;
+      const balance = requireNumber(row['balance'], 'balance', `balance[${String(index)}]`);
+      if (balance < 0) {
+        throw new SyncError('EXCHANGE_ERROR', `${asset} 的账户余额为负：${String(balance)}`, {
+          asset,
+          balance,
+        });
+      }
+      return balance;
+    }
+    throw new SyncError(
+      'EXCHANGE_ERROR',
+      `/fapi/v2/balance 的返回里没有 ${asset} 这一档：算不出账户权益`,
+      { asset },
+    );
+  }
 
   /**
    * 当前持仓。

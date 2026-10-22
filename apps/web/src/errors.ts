@@ -48,6 +48,15 @@ const STATUS_BY_CODE = {
   // 仓位始终受保护。绝不能降级成 200——那会让调用方以为「决策成功了」。
   LLM_DECISION_INVALID: 502,
   LLM_CALL_FAILED: 502,
+  // Agent（v1.0.0）——与上面两个 LLM 码同构：**上游（模型服务 / 行情上下文）**有问题，
+  // 而不是用户请求写错了，因此都是 502。
+  //   * AGENT_REPORT_INVALID       分析师这一轮说了句不合法的话；
+  //   * AGENT_PLAN_INVALID         交易员的提议不合法，或与分析师结论矛盾；
+  //   * AGENT_CONTEXT_UNAVAILABLE  行情上下文取不到（库里没 K 线 / 没合约规格）。
+  // 绝不能降级成 200——那会让调用方以为「分析成功了」。
+  AGENT_REPORT_INVALID: 502,
+  AGENT_PLAN_INVALID: 502,
+  AGENT_CONTEXT_UNAVAILABLE: 502,
   // 数据库
   DB_CONNECTION_FAILED: 503,
   DB_DEADLOCK: 503,

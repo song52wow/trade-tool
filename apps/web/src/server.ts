@@ -19,6 +19,7 @@ import { toErrorBody } from './errors.js';
 
 import type {
   AddSymbolBody,
+  AgentViewDto,
   BarDto,
   BracketsDto,
   CredentialStatusDto,
@@ -114,6 +115,15 @@ export interface WebDeps {
   writeRiskPolicy(body: RiskPolicyWriteBody): Promise<RiskPolicyEntryDto>;
   deleteRiskPolicy(input: { scope: RiskPolicyScopeDto; symbol: string }): Promise<{ ok: true }>;
   estimate(symbol: string): Promise<SymbolDetailDto['estimate']>;
+  /**
+   * 分析师报告与交易员执行方案（v1.0.0），**只读本地库**。
+   *
+   * 纯读：只打 PG，不调模型、不出网、不下单，因此可以挂在页面的刷新节奏上。
+   *
+   * 从没分析过时 `report` / `plan` 都是 `null`——「还没分析过」与「分析过但没出方案」
+   * 在界面上必须能分开说，因此不返回空报告冒充。
+   */
+  listAgentView(symbol: string): Promise<AgentViewDto>;
   startJob(input: { kind: JobKind; symbol: string; target?: number | undefined }): Promise<JobDto>;
   listJobs(): Promise<JobDto[]>;
   getJob(id: string): Promise<JobDto | null>;
@@ -413,11 +423,25 @@ export function buildApp(deps: WebDeps): Hono {
     return c.json(await deps.testNotify());
   });
 
-  /** 策略总览：全局默认 + 全部标的覆盖 + 该标的最终生效的那一套。 */
-  app.get('/api/settings/risk-policy', async (c) => {
-    const symbol = c.req.query('symbol');
-    return c.json(await deps.getRiskPolicy(symbol === undefined ? null : symbol));
+  /**
+   * 分析师报告与执行方案（v1.0.0）：**只读本地库**。
+   *
+   * 纯读，因此可以挂在页面的刷新节奏上——与 `/bars` 同性质。
+   * 没分析过时返回 `{ report: null, plan: null }`（200），不是 404：
+   * 「这个标的还没被分析过」是完全正常的状态，页面要如实显示空状态。
+   */
+  app.get('/api/symbols/:symbol/agent', async (c) => {
+    const symbol = normalizeSymbol(c.req.param('symbol'));
+    return c.json(await deps.listAgentView(symbol));
   });
+
+  /** 策略总览：全局默认 + 全部标的覆盖 + 该标的最终生效的那一套。 */ app.get(
+    '/api/settings/risk-policy',
+    async (c) => {
+      const symbol = c.req.query('symbol');
+      return c.json(await deps.getRiskPolicy(symbol === undefined ? null : symbol));
+    },
+  );
 
   app.put('/api/settings/risk-policy', async (c) => {
     assertSameOrigin(c);
