@@ -67,11 +67,11 @@ openssl rand -hex 32            # 写进 .env 的 TRADE_TOOL_SECRET_KEY
 vi .env                         # 至少改 TRADE_TOOL_PG_PASSWORD
 ```
 
-⚠️ **`.env` 里必须有 `TRADE_TOOL_BINANCE_DEMO_STREAM_URL`**（模板里已带好）。
-部署配置固定 `executor.environment = "demo"`，而 demo 的用户数据流地址**不内置代码默认值**——
-缺它时 web / sync / executor 三个服务**全部**以
-`CONFIG_INVALID: exchange.environment = demo 但没有给 Demo 用户数据流地址` 启动失败
-（2026-10-22 部署实测踩到）。它是**基址**，不带 `/private/ws?listenKey=`。
+部署配置固定 `executor.environment = "live"`——目标机跑**主网**。用户数据流地址是代码里的
+常量，**不需要**在 `.env` 里配 `TRADE_TOOL_BINANCE_DEMO_STREAM_URL`；那个变量只在把环境
+切回 demo 时才要填（demo 的 WS 地址**不内置代码默认值**，缺它时 web / sync / executor
+三个服务**全部**以 `CONFIG_INVALID: exchange.environment = demo 但没有给 Demo 用户数据流地址`
+启动失败，2026-10-22 部署实测踩到）。它是**基址**，不带 `/private/ws?listenKey=`。
 
 ⚠️ **改完 `.env` 要重建容器，`restart` 不够**：`restart` 只重启同一个容器，
 **不重读 `env_file`**——表现是「变量明明写进去了，进程却说没有」。
@@ -118,6 +118,10 @@ docker compose logs -f web sync
 
 1. `.env` 填 `TRADE_TOOL_BINANCE_API_KEY` / `TRADE_TOOL_BINANCE_API_SECRET`
    （只开「交易」权限，不要开「提现」）与 `TRADE_TOOL_SECRET_KEY`；
+   **IP 白名单**：合约 key **不强制**要设（Binance「IP 存取限制」里可以选 Unlimited），
+   但目标机出网必须走代理，代理的出口 IP 又**会轮换**（见 §6 第 5 条），而白名单只收
+   **单条 IP**、填不完。**正解是把代理固定到单一出口节点**（办法见 §6 第 6 条），
+   再把那一个固定 IP 填进白名单；固定不了就退一步——**去掉** IP 限制（代价见 §6 第 5 条）；
 2. `config/trade-tool.config.json` 里 `executor.enabled` 改成 `true`；
 3. 确认 ATR 口径与倍数（`atrInterval` / `stopAtrMult` / `takeProfitAtrMult`），
    并先用控制面的**交易对账**看一眼有没有「本地记着已挂单、交易所却没有」的差异。
@@ -125,6 +129,11 @@ docker compose logs -f web sync
 ```bash
 docker compose --profile executor up -d executor
 ```
+
+⚠️ **换密钥后要重建容器**：`executor` 在**启动时**读一次凭据，之后不再重读。
+控制面「设置」页换完密钥，要 `docker compose --profile executor up -d executor` 重建；
+`docker compose restart executor` 不够——它不重读 `env_file`。
+凭据的优先级是「控制面录入的密文 > `.env` 里的环境变量」，两者都配了时改 `.env` 不算数。
 
 ## 5. 运维
 
@@ -167,6 +176,37 @@ TRADE_TOOL_NODE_OPTIONS=--use-env-proxy
    代理抖动时那是最先断的一环。
 4. 代理节点若开了访问控制，填进 URL 的用户名密码会**以明文存在目标机 `.env`**（权限 600）。
    更稳的做法是在代理侧关掉认证、改用「访问控制」按 IP 只放行目标机 IP。
+5. **出口 IP 会轮换**（2026-10-23 实测）：目标机的请求全部经代理出去，币安看到的
+   `request ip` 在 `107.148.79.89`~`107.148.79.93` 之间来回跳——同一台机器、同一分钟
+   都可能是两个地址。而 **Binance 的 API key 白名单只收单条 IP**（不收网段，最多 30 条），
+   所以轮换的出口**填不满白名单**。三条选择：
+
+   - **首选：把代理固定到单一出口节点**（办法见下一条），再把那一个 IP 填进白名单；
+   - **退路：去掉 key 的 IP 限制**。合约 key **不强制**要设白名单——「IP 存取限制」里
+     可以选 Unlimited，只勾「允许合约」照样能下单。代价有两条：① key 泄露后任何地址
+     都能用它下单；② 有一条「**未设 IP 限制的系统生成 HMAC key，权限可能只能设为
+     『允许读取』**」的规则（2023-01-30 起）——若在你账号上成立，这把 key 就**直接
+     不能下单**。去掉白名单前，先在页面上确认「允许合约」还能勾上；
+   - **唯一被强制的那条**：**提现权限必须先设 IP 限制**才能开。所以不设白名单的 key
+     结构上就提不了钱——对自动化来说这反而是件好事。
+
+   日志里出现 `request ip: x.x.x.x` 时，那个地址**随时会变**，别把它当常量抄进配置。
+
+6. **怎么把出口固定成单一节点**（2026-10-23 实测这台代理是 **Clash 系**：7890 是
+   mixed 口、9090 是 `external-controller`，控制口要 `secret`）：
+
+   - **持久做法**：在代理机上找到配置文件（Clash Verge / Clash for Windows 在
+     `~/.config/clash/`；mihomo 独立部署看启动参数 `-d` 指向的目录；OpenClash 在
+     `/etc/openclash/config/`），把出口策略组的 `type` 从 `url-test` / `fallback` /
+     `load-balance` 改成 **`select`**，再选死一个节点。`url-test` 会定时重新测速、
+     自动换节点——**出口 IP 跳来跳去正是它干的**；
+   - **想保留负载均衡**：改用 `type: load-balance` + `strategy: consistent-hashing`。
+     一致性哈希按**目标域名**分配，同一个域名（`fapi.binance.com`）永远落到同一个
+     节点，于是对币安的出口是固定的；
+   - **先看现在选的是谁**：控制口要配置里的 `secret`，
+     `curl -H "Authorization: Bearer <secret>" http://192.168.1.79:9090/proxies/<组名>`
+     的 `now` 字段就是当前节点。⚠️ 对 `url-test` 组用 `PUT` 手动选是**留不住的**
+     ——自动策略会把它顶回去，这也是为什么必须改配置而不是只点一下。
 
 **小写代理变量会把大写的顶掉（2026-10-21 实测踩到）。**
 Node 的 `fetch`（undici 的 `EnvHttpProxyAgent`）**优先读小写的 `http_proxy` / `https_proxy`**，
@@ -195,22 +235,27 @@ docker compose exec -T web node -e "fetch('https://fapi.binance.com/fapi/v1/ping
 curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8787/api/overview   # 之前是 502
 ```
 
-用户数据流（executor 用的 WebSocket）走的是 Node **内置全局 WebSocket**，
-它是否跟随环境代理**没有验证过**。要上 executor 请先确认透明代理能覆盖 WebSocket
-（把目标机网关指向代理设备），或先在真实账户上观察连接是否稳定。
+用户数据流（executor 用的 WebSocket）走的是 Node **内置全局 WebSocket**。
+**已验证（2026-10-23）**：容器里带着 `NODE_OPTIONS=--use-env-proxy` 时它**会**跟随代理——
+在目标机的 web 容器里连 `wss://fstream.binance.com/ws/btcusdt@trade` 直接 OPEN，
+和 REST 走的是同一套 `EnvHttpProxyAgent`。所以「REST 通、WS 不通」这种半通状态不会发生；
+真出问题时先查代理本身，别怀疑 WS。
 
 ## 7. 排查
 
-| 现象                                                 | 多半是                                                                                                                                |
-| ---------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------- |
-| 容器反复重启，日志停在「等待 PostgreSQL」            | PG 没起来或 `TRADE_TOOL_PG_PASSWORD` 与库不一致；`docker compose logs postgres`                                                       |
-| `EISDIR: illegal operation on a directory, read`     | `/data/trade-tool.config.json` 被挂成了**目录**：宿主机上那个路径当时不存在，Docker 就地建了同名目录。确认文件已 `scp` 过去再 `up -d` |
-| 控制面起不来，日志说 schema 版本对不上               | 迁移没跑成。入口每次启动都迁移，这里多半是它自己也连不上库                                                                            |
-| 同步进程起来了但一条数据没进                         | `sync.symbols` 为空、或全是 `paused`；控制面「标的」页看状态                                                                          |
-| 首次同步卡很久                                       | 首次全量是几十分钟量级，属正常。控制面能看 `sync_state` 的进度                                                                        |
-| `Loaded image` 后仍然 `pull_policy` 报错             | 镜像标签与 `.env` 的 `TRADE_TOOL_IMAGE` 不一致                                                                                        |
-| 容器日志只有一句 `启动失败：TypeError: fetch failed` | 代理被小写变量遮蔽了（Node 优先读小写的 `http_proxy`）。见 §6 的「小写代理变量会把大写的顶掉」                                        |
-| 同一分钟里既有「迁移失败」又有「迁移成功」           | 多个容器同时跑迁移撞了 duplicate key。已由迁移锁修掉；旧镜像需重新构建                                                                |
+| 现象                                                    | 多半是                                                                                                                                                                                                                                                                 |
+| ------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 容器反复重启，日志停在「等待 PostgreSQL」               | PG 没起来或 `TRADE_TOOL_PG_PASSWORD` 与库不一致；`docker compose logs postgres`                                                                                                                                                                                        |
+| `EISDIR: illegal operation on a directory, read`        | `/data/trade-tool.config.json` 被挂成了**目录**：宿主机上那个路径当时不存在，Docker 就地建了同名目录。确认文件已 `scp` 过去再 `up -d`                                                                                                                                  |
+| 控制面起不来，日志说 schema 版本对不上                  | 迁移没跑成。入口每次启动都迁移，这里多半是它自己也连不上库                                                                                                                                                                                                             |
+| 同步进程起来了但一条数据没进                            | `sync.symbols` 为空、或全是 `paused`；控制面「标的」页看状态                                                                                                                                                                                                           |
+| 首次同步卡很久                                          | 首次全量是几十分钟量级，属正常。控制面能看 `sync_state` 的进度                                                                                                                                                                                                         |
+| `Loaded image` 后仍然 `pull_policy` 报错                | 镜像标签与 `.env` 的 `TRADE_TOOL_IMAGE` 不一致                                                                                                                                                                                                                         |
+| 容器日志只有一句 `启动失败：TypeError: fetch failed`    | 代理被小写变量遮蔽了（Node 优先读小写的 `http_proxy`）。见 §6 的「小写代理变量会把大写的顶掉」                                                                                                                                                                         |
+| 同一分钟里既有「迁移失败」又有「迁移成功」              | 多个容器同时跑迁移撞了 duplicate key。已由迁移锁修掉；旧镜像需重新构建                                                                                                                                                                                                 |
+| 日志刷 `Invalid API-key, IP, or permissions for action` | 密钥本身与**运行的环境**对不上。三种可能报的是同一句话：`executor.environment` 与密钥所属环境不一致（目标机是 `live`，只认主网密钥）；密钥设了 IP 白名单而出口 IP 是代理的（见 §6 第 5、6 条）——**出口 IP 会轮换，填白名单前先把代理固定到单一节点**；密钥没开交易权限 |
+| 控制面换了密钥，executor 还在用旧的                     | 凭据**只在启动时读一次**（`apps/executor/src/main.ts`）。改完要重建容器：`docker compose --profile executor up -d executor`——`restart` 不重读 `env_file`                                                                                                               |
+| 改了 `.env` 的密钥却没生效                              | 控制面「设置」页录入的那份**优先于** `.env`（`resolveActiveCredentials` 的优先级）。要改 `.env` 就先在控制面「清空」，否则改白改；`.env` 里两个密钥变量为空时更是只有控制面那一档可用                                                                                  |
 
 macOS 本机用 colima 跑这套 compose 时注意：colima 默认只挂 `/Users`，
 **不挂 `/Volumes`**。仓库在 `/Volumes/data/...` 时，配置文件绑定会被 Docker

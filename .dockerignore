@@ -43,3 +43,6 @@ deploy/Dockerfile
 # 本机在仓库内开的 git worktree：它是一个**嵌套仓库**（几百 MB），
 # 不排除的话会被 `COPY . /app` 一起拷进构建上下文，白白拖慢构建。
 .worktrees/
+# 本机构建产物目录（deploy/build-image.sh 导出的镜像 tar，几百 MB）。
+# 它不是构建输入，不排除的话会被拷进构建上下文——每次构建都白搬一遍。
+dist-deploy/

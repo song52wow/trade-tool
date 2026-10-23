@@ -411,13 +411,17 @@ BOLL 的 `k` 以**千分之一整数** `kMilli` 存（浮点参数不得进主�
    Binance 已于 2025-08-27 关停老 Futures Testnet，`testnet.binancefuture.com` 只在
    **尚未更新的单 endpoint 文档页**里出现；权威来源是 General Info 页——它同时也是上面
    那个 demo host 的权威来源。
-   **本仓库只跑 demo，不接主网**（2026-10-21 用户明确要求）：`executor.environment` 一律
-   `demo`，验证也在 Demo Trading 上做（虚拟资金，但挂单 / 成交 / 对账链路与主网逐字相同）。
-   **不要**把它改成 `live`、也不要用主网凭据做验证。
+   **环境按机器分，不按仓库分**：**本地开发机只跑 demo**（不接主网、不用主网凭据做验证），
+   **目标机（192.168.1.90）只跑主网**。这是 2026-10-21 用户提出的分工、2026-10-23 澄清的边界：
+   「只跑 demo」说的是**本地**，生产机是主网。
+   ⚠️ **别把生产机也改成 demo**：那是「密钥换了却不生效」最常见的根因——沙箱不认主网密钥，
+   而 `Invalid API-key, IP, or permissions for action` 这句报错**不区分**「环境不对」
+   「IP 白名单不匹配」「没开交易权限」三种情况（2026-10-23 实测：90 机器的
+   `executor.environment` 一直是 `demo`，于是行情与下单都在沙箱，配的却是主网密钥）。
    ⚠️ `executorSchema.environment` 的**缺省仍是 `live`**（schema 的缺省是生产部署那条路的
    语义，不在这里动），所以「配置里漏写这个字段」= 连主网下真单。因此**每一份配置文件都要
-   显式写出来**：`.local/trade-tool.config.json` 与 `deploy/config/trade-tool.config.json`
-   都写着 `demo`。新增配置文件时同样要写，别靠缺省。
+   显式写出来**：`.local/trade-tool.config.json` 写 `demo`，`deploy/config/trade-tool.config.json`
+   写 `live`。新增配置文件时同样要写，别靠缺省。
 7. **开仓 / 减仓 / 平仓由净仓位的符号判定，不由成交方向判定**（v0.4.1 支持做空时新增）。
    「一笔 SELL 是开空仓还是平多仓」不能只看方向——交易所的净仓位才是事实。
    v0.4.0 的「`side !== 'BUY'` 即忽略」在只做多时成立，支持做空后它是**错的**：
