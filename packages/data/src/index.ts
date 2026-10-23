@@ -15,6 +15,8 @@ export * from './db/credentials.js';
 export * from './db/risk-policy.js';
 /** 飞书通知通道的运行期设置（v0.8.0）：密文落库 + 「哪一份在生效」的解析。 */
 export * from './db/notify.js';
+/** 提示词镜像的运行时（v1.0.0）：把发给模型的那一组消息同步推到飞书群。 */
+export * from './prompt-mirror.js';
 export * from './db/sql-files.js';
 /** LLM 客户端（v0.9.0）：OpenAI 兼容协议，带硬超时。解析在 core。 */
 export * from './llm.js';

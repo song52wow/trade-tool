@@ -31,6 +31,7 @@
  */
 
 import {
+  AGENT_SYSTEM_MESSAGE,
   aggregateAnalystReport,
   autoExecutableProblem,
   buildAnalystPrompt,
@@ -41,6 +42,7 @@ import {
   parseTraderProposal,
   SyncError,
   type AgentConfig,
+  type AgentPromptMessage,
   type AnalystContext,
   type AnalystVerdict,
   type ExecutionLimits,
@@ -53,6 +55,7 @@ import {
   recordTradingPlan,
   type LlmClient,
   type MarketContext,
+  type PromptMirrorInput,
 } from '@trade-tool/data';
 
 /** 一份行情上下文 + 落库留痕要的原始载荷。 */
@@ -91,6 +94,15 @@ export interface AgentDeps {
   ) => Promise<AgentContextBundle>;
   /** 时钟（epoch ms）。测试可注入固定值。 */
   now?: () => number;
+  /**
+   * 把提示词镜像到飞书群（v1.0.0）。
+   *
+   * 缺省 = 不镜像。给了就**在调模型之前**把那一组消息发出去——
+   * 模型超时或崩了，群里那条提示词仍然在，而那正是排障最需要的东西。
+   *
+   * ⚠️ **它必须不抛错**：镜像坏了不该让分析停下来。实现见 `prompt-mirror.ts`。
+   */
+  mirrorPrompt?: (input: PromptMirrorInput) => Promise<void>;
   /** 日志出口。默认走 core 的 logger（写 stderr，stdout 留给命令结果）。 */
   log?: Logger;
 }
@@ -120,13 +132,15 @@ function reasonOf(error: unknown): string {
   return String(error);
 }
 
-/** 模型要看到的系统提示。两个 Agent 共用一句：**只输出 JSON**。 */
-const SYSTEM_MESSAGE = {
-  role: 'system' as const,
-  content:
-    '你只输出 JSON 对象。不要输出任何解释性文字，不要用 markdown 代码块标记。' +
-    '不要输出你没被要求输出的字段。',
-};
+/**
+ * 一轮要发给模型的那一组消息。
+ *
+ * **同一个数组既用来调模型、也用来镜像**——这样群里那条与模型看见的**逐字相同**。
+ * 重新拼一份的话，两边一旦有出入，这条排障线索就废了。
+ */
+function promptMessages(userContent: string): AgentPromptMessage[] {
+  return [AGENT_SYSTEM_MESSAGE, { role: 'user', content: userContent }];
+}
 
 /**
  * 建编排器。
@@ -213,10 +227,17 @@ export function createAgentService(deps: AgentDeps): AgentService {
 
       // ---------------------------------------------------------------- 分析师
       const analystPrompt = buildAnalystPrompt(bundle.context);
+      const analystMessages = promptMessages(analystPrompt);
+      // 镜像**在调模型之前**：模型超时或崩了，群里那条提示词仍然在。
+      await deps.mirrorPrompt?.({
+        symbol,
+        source: 'agent-analyst',
+        messages: analystMessages,
+      });
       let analystRaw: string;
       try {
         const llm = await deps.resolveLlm();
-        analystRaw = await llm.complete([SYSTEM_MESSAGE, { role: 'user', content: analystPrompt }]);
+        analystRaw = await llm.complete(analystMessages);
       } catch (error) {
         const reason = `分析师模型调用失败：${reasonOf(error)}`;
         if (!config.llm.fallbackToTrade) {
@@ -287,10 +308,17 @@ export function createAgentService(deps: AgentDeps): AgentService {
         baseline: bundle.context.baseline,
       });
 
+      const traderMessages = promptMessages(traderPrompt);
+      // 镜像**在调模型之前**（理由同上）。
+      await deps.mirrorPrompt?.({
+        symbol,
+        source: 'agent-trader',
+        messages: traderMessages,
+      });
       let traderRaw: string;
       try {
         const llm = await deps.resolveLlm();
-        traderRaw = await llm.complete([SYSTEM_MESSAGE, { role: 'user', content: traderPrompt }]);
+        traderRaw = await llm.complete(traderMessages);
       } catch (error) {
         return recordFailure(
           symbol,

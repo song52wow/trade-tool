@@ -19,8 +19,7 @@
 import {
   SyncError,
   assertApprovable,
-  parseSecretKey,
-  SECRET_KEY_ENV,
+  readOptionalSecretKey,
   type AnalystVerdict,
 } from '@trade-tool/core';
 import {
@@ -37,6 +36,7 @@ import {
   type TradingPlanRow,
 } from '@trade-tool/data';
 import { createAgentService, createEquityReader, createLlmResolver } from '@trade-tool/agent';
+import { createNotifyChannelResolver, createPromptMirror } from '@trade-tool/data';
 
 import { withContext } from '../context.js';
 
@@ -141,15 +141,6 @@ function renderReport(
  * 标的：`-s` 指定 → 配置里的 `agent.symbols` → 库里正在同步的标的。
  */
 export async function runAgent(options: AgentRunOptions = {}): Promise<number> {
-  /**
-   * 读主密钥。**没有就返回 `null`**——它对控制面录入的那一份是可选的。
-   */
-  function readOptionalMasterKey(): Buffer | null {
-    const raw = process.env[SECRET_KEY_ENV];
-    if (raw === undefined || raw.trim() === '') return null;
-    return parseSecretKey(raw);
-  }
-
   return withContext(async (ctx) => {
     const { pool, config, exchange } = ctx;
     // ⚠️ **这里不再看 `config.agent.llm.enabled`**。
@@ -185,11 +176,27 @@ export async function runAgent(options: AgentRunOptions = {}): Promise<number> {
 
     // 模型客户端**每轮重新解析**（与守护进程共用同一份实现）：
     // 控制面改了模型接入，命令行这一条路也立刻用新的那一份。
+    const masterKey = readOptionalSecretKey();
     const resolveLlm = createLlmResolver({
       pool,
-      masterKey: readOptionalMasterKey(),
+      masterKey,
       config: config.agent.llm,
     });
+
+    /**
+     * 提示词镜像（v1.0.0）：与守护进程**同一份实现**。
+     *
+     * ⚠️ 命令行与守护进程必须**行为一致**：同一个配置，守护进程往群里发提示词
+     * 而命令行不发，那就会出现「同一件事两个答案」——这个仓库最忌讳的形态。
+     */
+    const mirror = createPromptMirror({
+      resolveChannel: createNotifyChannelResolver({
+        pool,
+        masterKey,
+        config: config.notify,
+      }),
+    });
+
     const service = createAgentService({
       ctx,
       resolveLlm,
@@ -200,6 +207,7 @@ export async function runAgent(options: AgentRunOptions = {}): Promise<number> {
         exchange,
         executor: config.executor,
       }),
+      mirrorPrompt: (input) => mirror.mirror(input),
     });
 
     const results = [];

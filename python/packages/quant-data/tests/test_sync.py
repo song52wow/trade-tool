@@ -1142,6 +1142,8 @@ def test_migrations_are_idempotent(conn: DbConn, pg_dsn: str) -> None:
         "018_agent_plan_execution",
         # v1.0.0：模型接入的运行期设置（密文落库）
         "019_agent_llm_settings",
+        # v1.0.0：通知内容类型多一种「Agent 提示词」
+        "020_agent_prompt_notify",
     ]
     pg.ensure_schema(conn)
 

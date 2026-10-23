@@ -49,6 +49,12 @@
   「我在控制面关了模型，Agent 还在调模型」。
   `readAgentLlmStatus()` 给控制面，**不含明文**；`resolveAgentLlmSettings()` 给 agent 进程，
   含明文。
+- `sql/020_agent_prompt_notify.sql` — 「要通知哪些内容」多**两种**：「Agent 提示词」
+  与「止盈止损档位提示词」（`notify_settings.kinds` 扩枚举）。
+  ⚠️ **扩枚举**：旧值一个不少、约束名也不改
+  （AGENTS.md §5 第 12 条），而且**新插入的行默认不勾**它们——提示词带着行情与账户权益，
+  默认就发等于「装了包就把仓位信息交给第三方群」。迁移也**不动**已经配好的那一份：
+  要发得用户自己在控制面勾上。
 - `market.ts` — 控制面唯一需要认识的东西：调 Python 干活 + 查 PG 看状态，收敛成结构化输入输出。
   `loadAgentContext()` 是 v1.0.0 的入口：调 Python 的 `market-context` 子命令，
   再读库内 `contract_spec` 快照，拼成 `ContractFacts` 交给 core 的

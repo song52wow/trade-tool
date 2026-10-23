@@ -10,7 +10,7 @@
  * 跑在随机命名的独立 schema 上（helpers/pg.ts），**绝不连生产库**。
  */
 
-import { NOTIFY_KINDS, SyncError, type NotifyConfig } from '@trade-tool/core';
+import { AGENT_PROMPT_KIND, NOTIFY_KINDS, SyncError, type NotifyConfig } from '@trade-tool/core';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import {
@@ -458,6 +458,28 @@ describe('通知设置：schema 闸门', () => {
          VALUES (1, false, ''::bytea, ''::bytea, ''::bytea, '', ARRAY['fatal']::text[], 1000, 1)`,
       ),
     ).rejects.toThrow();
+  });
+
+  it('「Agent 提示词」这一种**写得进库**（迁移 020 扩了枚举）', async () => {
+    // 它与「未知的通知内容」只差一个迁移：写不进去就说明 schema 忘了扩。
+    await expect(
+      schema.pool.query(
+        `INSERT INTO notify_settings (id, enabled, iv, auth_tag, ciphertext, key_hint,
+                                    kinds, repeat_cooldown_ms, updated_at)
+         VALUES (1, false, ''::bytea, ''::bytea, ''::bytea, '', ARRAY['agent-prompt']::text[], 1000, 1)`,
+      ),
+    ).resolves.toBeDefined();
+  });
+
+  it('新插入的行**默认不勾**提示词镜像（提示词带着账户权益，不能默认就发）', async () => {
+    // 不给 kinds，用列的默认值
+    await schema.pool.query(
+      `INSERT INTO notify_settings (id, enabled, iv, auth_tag, ciphertext, key_hint,
+                                    repeat_cooldown_ms, updated_at)
+       VALUES (1, false, ''::bytea, ''::bytea, ''::bytea, '', 1000, 1)`,
+    );
+    const row = await schema.pool.query<{ kinds: string[] }>('SELECT kinds FROM notify_settings');
+    expect(row.rows[0]?.kinds ?? []).not.toContain(AGENT_PROMPT_KIND);
   });
 
   it('负的冷却时间写不进库', async () => {

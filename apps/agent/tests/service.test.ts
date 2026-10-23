@@ -13,7 +13,7 @@
  */
 
 import { agentSchema, type AgentConfig } from '@trade-tool/core';
-import type { LlmClient, MarketContext, Pool } from '@trade-tool/data';
+import type { LlmClient, MarketContext, Pool, PromptMirrorInput } from '@trade-tool/data';
 import { describe, expect, it } from 'vitest';
 
 import { createAgentService, type AgentContextBundle } from '../src/service.js';
@@ -80,18 +80,22 @@ const TRADER_OUTPUT = {
  */
 type FakeLlmSpec = { outputs: readonly string[] } | { fail: string };
 
-function fakeLlm(spec: FakeLlmSpec) {
+function fakeLlm(spec: FakeLlmSpec, onCall?: () => void) {
   const prompts: string[] = [];
+  /** 每次调用**完整**的那一组消息（镜像要与之逐字比对）。 */
+  const sentMessages: { role: string; content: string }[][] = [];
   const client: LlmClient = {
     complete: async (messages) => {
+      onCall?.();
       prompts.push(messages[messages.length - 1]?.content ?? '');
+      sentMessages.push(messages.map((m) => ({ role: m.role, content: m.content })));
       if ('fail' in spec) throw new Error(spec.fail);
       const next = spec.outputs[prompts.length - 1];
       if (next === undefined) throw new Error('模型被调用次数超出预期');
       return next;
     },
   };
-  return { client, prompts };
+  return { client, prompts, sentMessages };
 }
 
 function bundle(): AgentContextBundle {
@@ -154,9 +158,13 @@ function setup(options: {
   outputs: FakeLlmSpec;
   equity?: () => Promise<{ equity: number; source: 'exchange' | 'config' }>;
   config?: AgentConfig;
+  /** 提示词镜像的替身。不给 = 不镜像。 */
+  mirrorPrompt?: (input: PromptMirrorInput) => Promise<void>;
+  /** 每次调模型时触发（用来验证「镜像在调模型之前」）。 */
+  onModelCall?: () => void;
 }) {
   const { pool, calls } = fakePool();
-  const llm = fakeLlm(options.outputs);
+  const llm = fakeLlm(options.outputs, options.onModelCall);
   const ctx = { ...fakeContext(), pool } as MarketContext;
   const service = createAgentService({
     ctx,
@@ -165,8 +173,9 @@ function setup(options: {
     readEquity: options.equity ?? (async () => ({ equity: 10_000, source: 'config' })),
     loadContext: async () => bundle(),
     now: () => NOW,
+    ...(options.mirrorPrompt === undefined ? {} : { mirrorPrompt: options.mirrorPrompt }),
   });
-  return { service, calls, prompts: llm.prompts };
+  return { service, calls, prompts: llm.prompts, sentMessages: llm.sentMessages };
 }
 
 /** 从落库的 SQL 参数里取出 `action` 那一列。 */
@@ -213,6 +222,32 @@ describe('createAgentService', () => {
     // 落库：一份报告 + 一份方案
     expect(calls.some((c) => c.sql.includes('INSERT INTO analyst_report'))).toBe(true);
     expect(planAction(calls)).toBe('enter');
+  });
+
+  it('提示词镜像：发出去的那一组与模型看见的**逐字相同**，且镜像在调模型之前', async () => {
+    const mirrored: { role: string; content: string }[][] = [];
+    const sources: string[] = [];
+    const order: string[] = [];
+    const { service, sentMessages } = setup({
+      outputs: { outputs: [JSON.stringify(ANALYST_OUTPUT), JSON.stringify(TRADER_OUTPUT)] },
+      onModelCall: () => order.push('model'),
+      mirrorPrompt: async (input: PromptMirrorInput) => {
+        order.push('mirror');
+        sources.push(input.source);
+        mirrored.push(input.messages.map((m) => ({ role: m.role, content: m.content })));
+      },
+    });
+
+    await service.analyzeSymbol(SYMBOL);
+
+    // 两个 Agent 各一条
+    expect(sources).toEqual(['agent-analyst', 'agent-trader']);
+    expect(mirrored).toHaveLength(2);
+    // **逐字相同**：群里那条就是模型看见的那条（同一个数组，不是重新拼的）
+    expect(mirrored[0]).toEqual(sentMessages[0]);
+    expect(mirrored[1]).toEqual(sentMessages[1]);
+    // 镜像**在调模型之前**：模型超时或崩了，群里那条仍然在
+    expect(order).toEqual(['mirror', 'model', 'mirror', 'model']);
   });
 
   it('分析师失败 → 落一条 failed 方案并写明原因，不落报告', async () => {

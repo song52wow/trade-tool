@@ -2,7 +2,7 @@ import { z } from 'zod';
 
 import { EXCHANGE_ENVIRONMENTS } from './exchange-endpoints.js';
 import { llmEndpointSchema, refineLlmEndpoint } from './llm-endpoint.js';
-import { NOTIFY_KINDS } from './notify.js';
+import { DEFAULT_NOTIFY_KINDS, NOTIFY_KINDS } from './notify.js';
 import { normalizeTakeProfit1Ratio } from './risk-policy.js';
 import { INTERVALS } from './types.js';
 
@@ -427,14 +427,15 @@ export const notifySchema = z.object({
    *
    * 取值是**通知内容类型**（`NOTIFY_KINDS`），也就是「哪种事发生时才叫我」——
    * 交易对账的差异类型（8 种）加上交易生命周期事件（止盈止损挂上、一轮走完）。
-   * 缺省 = 全部都要。
+   * 缺省 = {@link DEFAULT_NOTIFY_KINDS}（**不含**「Agent 提示词」——那一档默认不勾，
+   * 理由见 `notify.ts` 的 `DEFAULT_NOTIFY_KINDS`）。
    *
    * 为什么不用「最低严重度」一刀切：严重度对同一个类型是固定的，粗暴的阈值等于
    * 「全都要」或「只要三个紧急的」，用户真正想做的是「我只想知道哪几种事」——
    * 比如「止盈单没了」这种噪音就别烦我了，但「仓位没有止损保护」一定要说。
    * 逐项勾选能表达，而阈值表达不了。
    */
-  kinds: z.array(z.enum(NOTIFY_KINDS)).default([...NOTIFY_KINDS]),
+  kinds: z.array(z.enum(NOTIFY_KINDS)).default([...DEFAULT_NOTIFY_KINDS]),
   /**
    * 同一条告警的重复推送冷却时间（毫秒）。
    *

@@ -320,6 +320,76 @@ describe('LLM 决策：模型给出的档位会真的变成挂单价', () => {
   });
 });
 
+describe('LLM 决策：提示词镜像（v1.0.0）', () => {
+  /** 完整的 LLM 配置与基准档位（字段多，直接照 schema 补全）。 */
+  const LLM_CONFIG = BASE_CONFIG.executor.llm;
+  const BASELINE = {
+    stopAtrMult: 2,
+    takeProfitAtrMult: 3,
+    takeProfit1Ratio: 0,
+    trailAtrMult: 2,
+    breakevenAfterTp1: true,
+  };
+
+  it('镜像的那一组与模型看见的**逐字相同**，且镜像在调模型之前', async () => {
+    const mirrored: { role: string; content: string }[][] = [];
+    const sources: string[] = [];
+    const order: string[] = [];
+    const sent: { role: string; content: string }[][] = [];
+    const decider = createRiskDecider({
+      llm: {
+        complete: async (messages) => {
+          order.push('model');
+          sent.push(messages.map((m) => ({ role: m.role, content: m.content })));
+          return JSON.stringify(VALID_DECISION);
+        },
+      },
+      config: { ...LLM_CONFIG, enabled: true },
+      mirrorPrompt: async (input) => {
+        order.push('mirror');
+        sources.push(input.source);
+        mirrored.push(input.messages.map((m) => ({ role: m.role, content: m.content })));
+      },
+    });
+
+    await decider.decide({
+      symbol: 'BTCUSDT',
+      side: 'BUY',
+      entryPrice: 100,
+      atr: 10,
+      atrPeriod: 14,
+      atrInterval: '1m',
+      baseline: BASELINE,
+      recentReturns: [0.1, -0.2],
+    });
+
+    expect(sources).toEqual(['executor-decision']);
+    expect(mirrored).toHaveLength(1);
+    // **逐字相同**：群里那条就是模型看见的那条
+    expect(mirrored[0]).toEqual(sent[0]);
+    // 镜像**在调模型之前**：模型超时或崩了，群里那条仍然在
+    expect(order).toEqual(['mirror', 'model']);
+  });
+
+  it('没给镜像器 → 照常决策（缺省不发，不是必填项）', async () => {
+    const decider = createRiskDecider({
+      llm: llmReturning(JSON.stringify(VALID_DECISION)),
+      config: { ...LLM_CONFIG, enabled: true },
+    });
+    const out = await decider.decide({
+      symbol: 'BTCUSDT',
+      side: 'BUY',
+      entryPrice: 100,
+      atr: 10,
+      atrPeriod: 14,
+      atrInterval: '1m',
+      baseline: BASELINE,
+      recentReturns: [0.1],
+    });
+    expect(out.source).toBe('llm');
+  });
+});
+
 describe('LLM 决策：模型不可靠时不能做出危险的事', () => {
   it('模型调用失败 → 降级到配置档位，仓位仍然受保护', async () => {
     const { service, placer, pool } = makeService({ llm: llmFailing('连接超时') });

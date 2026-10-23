@@ -93,6 +93,9 @@ KNOWN_MIGRATION_VERSIONS: frozenset[str] = frozenset(
         # v1.0.0：模型接入的运行期设置（agent_llm_settings，密文落库）。
         # 同样不读写，但版本闸门两个方向都要校。
         "019_agent_llm_settings",
+        # v1.0.0：通知内容类型多一种「Agent 提示词」（notify_settings.kinds 扩枚举）。
+        # 同样不读写，但版本闸门两个方向都要校。
+        "020_agent_prompt_notify",
     }
 )
 

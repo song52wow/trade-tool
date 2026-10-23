@@ -25,6 +25,7 @@ import {
   resolvePolicy,
   exchangeEndpointsFromEnv,
   createLlmClient,
+  createPromptMirror,
   readBars,
 } from '@trade-tool/data';
 
@@ -165,6 +166,17 @@ async function main(): Promise<void> {
 
   const alerts = new AlertDispatcher({ channel: resolveChannel });
 
+  /**
+   * 提示词镜像（v1.0.0）：把问模型要档位时的那一组消息推到群里。
+   *
+   * **复用上面那个通道解析器**：「哪一份在生效」只有一份实现（§6.9.1 规则 1），
+   * 而镜像与告警本来就是同一个通道。
+   *
+   * ⚠️ 这一档在通知清单里**默认不勾**，而且它**每次成交**一条——
+   * 勾上就是「每笔成交往群里发一条」。用户自己决定要不要。
+   */
+  const mirror = createPromptMirror({ resolveChannel });
+
   const ctx = buildContext(pool, config);
   const client = new BinancePrivateClient({
     credentials,
@@ -201,6 +213,10 @@ async function main(): Promise<void> {
           timeoutMs: config.executor.llm.timeoutMs,
         }),
         config: config.executor.llm,
+        // 提示词镜像（v1.0.0）：与 Agent 共用同一份实现。
+        // ⚠️ 这一档在通知清单里**默认不勾**，而且它**每次成交**一条——
+        // 勾上就是「每笔成交往群里发一条」，用户自己决定要不要。
+        mirrorPrompt: (input) => mirror.mirror(input),
       })
     : undefined;
   if (decider !== undefined) {

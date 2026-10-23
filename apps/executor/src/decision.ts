@@ -50,12 +50,13 @@ import {
   mergeDecisionIntoPolicy,
   parseLlmDecision,
   validateLlmDecision,
+  type AgentPromptMessage,
   type DecisionPromptContext,
   type DecisionSource,
   type LlmDecision,
   type LlmConfig,
 } from '@trade-tool/core';
-import type { LlmClient } from '@trade-tool/data';
+import type { LlmClient, PromptMirrorInput } from '@trade-tool/data';
 
 const log = createLogger('executor');
 
@@ -118,6 +119,16 @@ export interface CreateDeciderOptions {
   llm?: LlmClient;
   /** LLM 配置。 */
   config: LlmConfig;
+  /**
+   * 把提示词镜像到飞书群（v1.0.0）。
+   *
+   * 缺省 = 不镜像。这一档在通知清单里**默认不勾**
+   * （而且它**每次成交**一条，比 Agent 的频繁得多）——见 core 的
+   * `DEFAULT_NOTIFY_KINDS` 与 `PROMPT_MIRROR_KINDS`。
+   *
+   * ⚠️ **它必须不抛错**：镜像坏了不该让挂单停下来。
+   */
+  mirrorPrompt?: (input: PromptMirrorInput) => Promise<void>;
 }
 
 function reasonOf(error: unknown): string {
@@ -169,16 +180,26 @@ export function createRiskDecider(options: CreateDeciderOptions): RiskDecider {
         baseline: input.baseline,
       };
       const prompt = buildDecisionPrompt(promptContext);
+      // **同一个数组**既用来调模型、也用来镜像——群里那条与模型看见的逐字相同。
+      const messages: AgentPromptMessage[] = [
+        {
+          role: 'system',
+          content: '你只输出 JSON 对象。不要输出任何解释性文字，不要用 markdown 代码块标记。',
+        },
+        { role: 'user', content: prompt },
+      ];
+
+      // 提示词镜像（v1.0.0）：**在调模型之前**——模型超时或崩了，群里那条仍然在。
+      // 缺省没有镜像器 = 不发（这一档默认不勾，见 core 的 `DEFAULT_NOTIFY_KINDS`）。
+      await options.mirrorPrompt?.({
+        symbol: input.symbol,
+        source: 'executor-decision',
+        messages,
+      });
 
       let raw: string;
       try {
-        raw = await llm.complete([
-          {
-            role: 'system',
-            content: '你只输出 JSON 对象。不要输出任何解释性文字，不要用 markdown 代码块标记。',
-          },
-          { role: 'user', content: prompt },
-        ]);
+        raw = await llm.complete(messages);
       } catch (error) {
         // 调用失败（超时 / 网络 / 服务端错误）。
         return fallback(

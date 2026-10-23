@@ -2,13 +2,14 @@
 import {
   loadConfigOrDefault,
   loadProjectEnv,
-  parseSecretKey,
-  SECRET_KEY_ENV,
+  readOptionalSecretKey,
   SyncError,
 } from '@trade-tool/core';
 import {
   buildContext,
+  createNotifyChannelResolver,
   createPool,
+  createPromptMirror,
   listSymbolEntries,
   resolveAgentLlmSettings,
 } from '@trade-tool/data';
@@ -24,19 +25,6 @@ loadProjectEnv();
 
 /** 停止信号。SIGINT / SIGTERM 置位，循环据此退出而不是被强杀。 */
 let stopRequested = false;
-
-/**
- * 读主密钥。**没有就返回 `null`**——它对控制面录入的那一份是可选的。
- *
- * 与 `parseSecretKey` 的区别：那个在缺密钥时抛错（executor 需要主密钥，
- * 它本来就在持续下单，配错了必须立刻失败）；这里的缺密钥只意味着
- * 「用不了控制面录入的那一份」，而配置文件那一档仍然可用。
- */
-function readOptionalMasterKey(): Buffer | null {
-  const raw = process.env[SECRET_KEY_ENV];
-  if (raw === undefined || raw.trim() === '') return null;
-  return parseSecretKey(raw);
-}
 
 async function main(): Promise<void> {
   const config = await loadConfigOrDefault();
@@ -83,7 +71,7 @@ async function main(): Promise<void> {
    * 主密钥是**可选**的：没注入就读不到控制面录入的那一份，
    * 生效的必然是配置文件 + 环境变量那一档。
    */
-  const masterKey = readOptionalMasterKey();
+  const masterKey = readOptionalSecretKey();
   const resolveLlm = createLlmResolver({
     pool,
     masterKey,
@@ -117,11 +105,29 @@ async function main(): Promise<void> {
     executor: config.executor,
   });
 
+  /**
+   * 提示词镜像（v1.0.0）：把发给模型的那一组消息同步推到飞书群。
+   *
+   * **默认不发**：提示词是全部通知内容里**唯二默认不勾**的两种（提示词里带着行情与
+   * 账户权益）。用户在控制面「设置 → 通知」里勾上「Agent 提示词」才开始推；
+   * executor 那一种（「止盈止损档位提示词」）是**另一个勾选项**，与本进程互不影响。
+   *
+   * 通道**每条提示词解析一次**，因此控制面改完设置不必重启本进程。
+   */
+  const mirror = createPromptMirror({
+    resolveChannel: createNotifyChannelResolver({
+      pool,
+      masterKey,
+      config: config.notify,
+    }),
+  });
+
   const service = createAgentService({
     ctx,
     resolveLlm,
     config: config.agent,
     readEquity,
+    mirrorPrompt: (input) => mirror.mirror(input),
   });
 
   /**
