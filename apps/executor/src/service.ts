@@ -39,6 +39,8 @@ import {
   NetPositionTracker,
   bracketClientOrderId,
   estimateBracketPnl,
+  feeInQuoteAsset,
+  feePriceSymbol,
   realizedPnl,
   type AlertChannel,
   type AlertDispatcher,
@@ -195,6 +197,19 @@ export interface ExecutorServiceDeps {
    * 不会出现「同一件事，对账那边压住了、这边又推一遍」。
    */
   alerts?: AlertDispatcher;
+  /**
+   * 取标记价（v0.9.3）。**把非计价币的手续费折成计价币时用它**。
+   *
+   * 币安的手续费不一定用计价币收——开了 BNB 抵扣就用 BNB 收。而盈亏公式
+   * （`realizedPnl`）只认计价币，所以不折算就是把「0.00009805 BNB」当成
+   * 「0.00009805 USDT」记进去，差着几百倍。
+   *
+   * **可选**：不传时，遇到非计价币的手续费会**大声报错并跳过那一笔手续费**
+   * （宁可少算，也不写一个错的数进去），而**不会**因此拒绝算这一轮的盈亏。
+   *
+   * @param symbol 交易对，如 `'BNBUSDT'`。
+   */
+  markPrice?: (symbol: string) => Promise<number>;
 }
 
 /** 从库里解析出来的一份策略参数。字段名与 `deriveStagedPlan` 入参一一对应。 */
@@ -293,6 +308,22 @@ function money(amount: number): string {
   return `${amount.toFixed(2)} ${QUOTE_ASSET}`;
 }
 
+/**
+ * 一次手续费折算的结果（v0.9.3）。
+ *
+ * `amount` 永远是**计价币**的金额；`asset` / `fxRate` 是折算的痕迹。
+ */
+interface FeeInQuote {
+  /** 折成计价币的金额。折算失败时是 `0`——那一笔**没有**计入。 */
+  amount: number;
+  /** 原币种（非计价币时才有，比如 `'BNB'`）。 */
+  asset: string | null;
+  /** 折算用的汇率（1 个原币种值多少计价币）。折算失败时是 `null`。 */
+  fxRate: number | null;
+  /** 折算失败的原因（人可读）。成功时是 `null`。 */
+  error: string | null;
+}
+
 export function createExecutorService(deps: ExecutorServiceDeps): ExecutorService {
   const { pool, config, placer, atr } = deps;
   const settings: ExecutorConfig = config.executor;
@@ -304,6 +335,109 @@ export function createExecutorService(deps: ExecutorServiceDeps): ExecutorServic
   /** 标的过滤：配置为空 = 全部。 */
   function inScope(symbol: string): boolean {
     return settings.symbols.length === 0 || settings.symbols.includes(symbol);
+  }
+
+  /**
+   * 把一笔手续费折成**计价币**（v0.9.3）。
+   *
+   * 币安的手续费不一定用计价币收——开了 BNB 抵扣就用 BNB 收。而盈亏公式只认
+   * 计价币，于是不折算就是把「0.00009805 BNB」当成「0.00009805 USDT」记，
+   * 差着几百倍（2026-10-23 实测踩到，净盈亏因此虚高）。
+   *
+   * **折算失败时怎么办**：**跳过那一笔手续费，但绝不拒绝算这一轮的盈亏**。
+   *
+   * 这条边界是刻意画的：
+   *   * 拒绝算 → 出场事实整个丢了，账面上「这一轮没结束」，而仓位可能已经平了——
+   *     那是最坏的一种错（「看起来还在跑，实际没人管」）；
+   *   * 按原数量硬记 → 又回到「差几百倍」的错，而且看不出来。
+   *
+   * 所以：**少算 + 大声报错**。少算的那一笔会在库里留下痕迹
+   * （`fee_asset` 有值而 `fee_fx_rate` 为空），错误也会打到日志与飞书通知里。
+   */
+  async function commissionInQuote(update: OrderTradeUpdate): Promise<FeeInQuote> {
+    const asset = update.commissionAsset.trim().toUpperCase();
+    if (asset === '') {
+      // 币种都没有 = 交易所没给。这是**形状不对**，不能猜（猜成计价币就是那个 bug）。
+      const error = '成交事件没有带手续费币种';
+      log.error(
+        `${update.symbol} ${error}（手续费 ${update.commission}）：这一笔不计入。` +
+          `宁可少算，也不写一个错的数进去。`,
+      );
+      return { amount: 0, asset: null, fxRate: null, error };
+    }
+    if (asset === QUOTE_ASSET) {
+      // 本来就是计价币，不用折算，也不用取价。
+      return { amount: update.commission, asset: null, fxRate: null, error: null };
+    }
+    const provider = deps.markPrice;
+    if (provider === undefined) {
+      const error = '没有取价能力，无法把非计价币手续费折成计价币';
+      log.error(
+        `${update.symbol} ${update.commission} ${asset} → ${QUOTE_ASSET}：${error}。` +
+          `这一笔不计入。宁可少算，也不写一个错的数进去。`,
+      );
+      return { amount: 0, asset, fxRate: null, error };
+    }
+    try {
+      const price = await markPriceOf(feePriceSymbol(asset));
+      const amount = feeInQuoteAsset(update.commission, asset, price);
+      log.info(
+        `${update.symbol} 手续费折算：${update.commission} ${asset} × ${price} = ${amount} ${QUOTE_ASSET}`,
+      );
+      return { amount, asset, fxRate: price, error: null };
+    } catch (error) {
+      const reason = reasonOf(error);
+      log.error(
+        `${update.symbol} ${update.commission} ${asset} → ${QUOTE_ASSET} 折算失败：${reason}。` +
+          `这一笔不计入。宁可少算，也不写一个错的数进去。`,
+      );
+      return { amount: 0, asset, fxRate: null, error: reason };
+    }
+  }
+
+  /**
+   * 取标记价，带一个**短缓存**。
+   *
+   * 为什么要有缓存：开了 BNB 抵扣之后，**每一笔成交**都要折算，于是每一笔成交
+   * 都要问交易所一次价。成交是连续发生的（入场那笔与出场那笔常常只隔几秒），
+   * 而标记价在几十秒内基本不动——为同一秒里的两个数跑两趟交易所纯属浪费，
+   * 也会让出网路径多一个可能卡住的地方。
+   *
+   * 缓存还有个好处：**同一笔交易里的几笔手续费会用同一个价**，
+   * 于是「这一轮的手续费是多少」这个问题只有一个答案。
+   *
+   * TTL 取 30 秒：够覆盖「入场那笔与出场那笔之间」的间隔，又短到不会拿着
+   * 一分钟前的价去折算后来的成交。
+   */
+  const MARK_PRICE_TTL_MS = 30_000;
+  const markPriceCache = new Map<string, { price: number; at: number }>();
+
+  async function markPriceOf(symbol: string): Promise<number> {
+    const cached = markPriceCache.get(symbol);
+    if (cached !== undefined && now() - cached.at < MARK_PRICE_TTL_MS) {
+      return cached.price;
+    }
+    const provider = deps.markPrice;
+    if (provider === undefined) {
+      throw new SyncError('CONFIG_INVALID', '没有取价能力，无法把非计价币手续费折成计价币');
+    }
+    const price = await provider(symbol);
+    markPriceCache.set(symbol, { price, at: now() });
+    return price;
+  }
+
+  /**
+   * 把折算结果拼成落库用的手续费字段。
+   *
+   * `feeAsset` 与 `feeFxRate` 是**可选**的：折算失败时前者要记（那是「有一笔
+   * 没折算」的痕迹），后者不记（没有价就没有汇率）。
+   */
+  function feeFields(fee: FeeInQuote): { fee: number; feeAsset?: string; feeFxRate?: number } {
+    return {
+      fee: fee.amount,
+      ...(fee.asset === null ? {} : { feeAsset: fee.asset }),
+      ...(fee.fxRate === null ? {} : { feeFxRate: fee.fxRate }),
+    };
   }
 
   /**
@@ -352,16 +486,19 @@ export function createExecutorService(deps: ExecutorServiceDeps): ExecutorServic
     }
 
     const state: BracketState = tag === TP_TAG ? 'take_profit' : 'stop_loss';
+    // 手续费先折算（v0.9.3）。**折算失败也不拦着结算**——这一轮必须了结，
+    // 少算的那一笔由 `feeFields` 里的 0 与 `fee_asset` 痕迹来交代。
+    const fee = await commissionInQuote(update);
     try {
       const settled = await markBracketSettled(pool, key, state, now(), {
         price: update.lastFilledPrice,
         qty: update.lastFilledQty,
-        fee: update.commission,
+        ...feeFields(fee),
       });
       log.info(`${update.symbol} 止盈止损成交（${tag}），记录置为 ${state}`);
       // 只有**真的**结算了那一行才通知：事件重放时行早已终结（settled = 0），
       // 再推一次就会把同一轮的战报发两遍。
-      if (settled > 0) await notifySettled(update, record, state);
+      if (settled > 0) await notifySettled(update, record, state, fee.error);
       return 'settled';
     } catch (error) {
       // 状态回填失败**不能**反过来影响交易结果：单已经成交了，
@@ -384,6 +521,8 @@ export function createExecutorService(deps: ExecutorServiceDeps): ExecutorServic
     update: OrderTradeUpdate,
     record: BracketRecord,
     state: 'take_profit' | 'stop_loss',
+    /** v0.9.3：手续费折算失败的原因。有值时通知里要**说人话**，不能假装一切正常。 */
+    feeError?: string | null,
   ): Promise<void> {
     const after = await readBracket(pool, exchange, record.symbol, record.entryOrderId);
     if (after === null) return;
@@ -410,6 +549,12 @@ export function createExecutorService(deps: ExecutorServiceDeps): ExecutorServic
     // 不用靠「哪个标的、什么时候」去猜是哪一张单。
     // 入场单号是这一轮的锚（库里那一行的主键），出场单号是真正成交的那张。
     const orderLine = `订单号：入场 ${after.entryOrderId}，出场 ${update.orderId}`;
+    // v0.9.3：折算失败时，通知里必须**说清楚**「有一笔手续费没算进去」。
+    // 不说的话，看板上那个偏高的净盈亏就是骗人的。
+    const feeNote =
+      feeError === null || feeError === undefined
+        ? null
+        : `有一笔手续费没折算成${QUOTE_ASSET}（${feeError}），没计入本轮：净盈亏偏高`;
 
     await pushAlert('bracket-settled', () => {
       // 盈亏**算不出来**时如实说算不出来，绝不拿 0 去凑一个「看起来精确」的数字。
@@ -427,6 +572,7 @@ export function createExecutorService(deps: ExecutorServiceDeps): ExecutorServic
             orderLine,
             round,
             '没拿到出场成交额，这一轮的盈亏暂时算不出来',
+            ...(feeNote === null ? [] : [feeNote]),
           ],
           highlights: [`已计手续费 ${money(after.feeAmount)}`],
         };
@@ -436,11 +582,12 @@ export function createExecutorService(deps: ExecutorServiceDeps): ExecutorServic
         // 类型「成交」：一轮买卖走完了。
         category: 'trade',
         // 亏了比赚了更值得看一眼——用「注意」而不是「提示」。
-        severity: pnl.net >= 0 ? 'info' : 'warning',
+        // 手续费没折算成功也算「有问题」，哪怕这一轮是赚的。
+        severity: pnl.net >= 0 && feeNote === null ? 'info' : 'warning',
         oneShot: true,
         // 标题带净盈亏：推送预览里直接看到这一轮赚没赚。
         title: `${after.symbol} 净盈亏 ${money(pnl.net)}`,
-        lines: [priceLine, qtyLine, orderLine, round],
+        lines: [priceLine, qtyLine, orderLine, round, ...(feeNote === null ? [] : [feeNote])],
         // 金额单独一段并加粗。
         highlights: [
           `毛利 ${money(pnl.gross)}`,
@@ -482,13 +629,16 @@ export function createExecutorService(deps: ExecutorServiceDeps): ExecutorServic
     record: BracketRecord,
   ): Promise<HandleOutcome> {
     const key = { exchange, symbol: record.symbol, entryOrderId: record.entryOrderId };
+    // 手续费先折算（v0.9.3）。折算失败也不拦着记事实——**成交了就是成交了**，
+    // 少算的那一笔由 `feeFields` 里的 0 与 `fee_asset` 痕迹来交代。
+    const fee = await commissionInQuote(update);
     // **先落「TP1 已成交」这个事实**，再算移动止损。
     //
     // 幂等（`WHERE tp1_filled_at IS NULL`）：用户数据流会重投事件，重投不重复累加。
     await recordBracketTp1Fill(
       pool,
       key,
-      { price: update.lastFilledPrice, qty: update.lastFilledQty, fee: update.commission },
+      { price: update.lastFilledPrice, qty: update.lastFilledQty, ...feeFields(fee) },
       now(),
     ).catch((error: unknown) => {
       log.error(`${record.symbol} 记录第一段止盈成交事实失败：${reasonOf(error)}`);
@@ -1424,6 +1574,9 @@ export function createExecutorService(deps: ExecutorServiceDeps): ExecutorServic
       return 'skipped-existing-bracket';
     }
 
+    // 入场这笔的手续费也是这一轮的成本：只扣出场那笔，收益会算虚高。
+    // 先折成计价币（v0.9.3）：BNB 计价的手续费按原数量记进去会差几百倍。
+    const fee = await commissionInQuote(update);
     // 占坑。冲突 = 已处理过，直接跳过——幂等的唯一实现点。
     const claimed = await claimBracket(pool, {
       exchange,
@@ -1433,8 +1586,9 @@ export function createExecutorService(deps: ExecutorServiceDeps): ExecutorServic
       entryTime: update.tradeTime,
       filledQty: update.cumulativeQty,
       positionSide: plan.positionSide,
-      // 入场这笔的手续费也是这一轮的成本：只扣出场那笔，收益会算虚高。
-      entryFeeAmount: update.commission,
+      entryFeeAmount: fee.amount,
+      ...(fee.asset === null ? {} : { entryFeeAsset: fee.asset }),
+      ...(fee.fxRate === null ? {} : { entryFeeFxRate: fee.fxRate }),
       atr: snapshot.atr,
       atrPeriod: snapshot.period,
       atrInterval: snapshot.interval,

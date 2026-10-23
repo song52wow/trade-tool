@@ -82,6 +82,11 @@ KNOWN_MIGRATION_VERSIONS: frozenset[str] = frozenset(
         # Python 侧两表都不读写，但版本闸门两个方向都要校，
         # 漏登记会让**所有**碰 PG 的用例报「库比代码新」。
         "016_trail_step",
+        # v0.9.3：手续费的币种与折算汇率（risk_bracket 增 fee_asset / fee_fx_rate）。
+        # Python 侧不读写 risk_bracket，但版本闸门两个方向都要校，
+        # 漏登记会让**所有**碰 PG 的用例报「库比代码新」。
+        # 编号跳到 021：017~020 已被另一条在研分支占用（agent 相关的表）。
+        "021_fee_asset",
     }
 )
 

@@ -62,6 +62,9 @@ interface FakeClaim {
   closedQty?: number;
   exitNotional?: number;
   feeAmount?: number;
+  /** v0.9.3：手续费的原币种与折算汇率（折算痕迹）。 */
+  feeAsset?: string | null;
+  feeFxRate?: number | null;
 }
 
 /** 记录调用顺序的 PG 替身：把 claimBracket 的幂等语义原样模拟出来。 */
@@ -91,6 +94,9 @@ function fakePool() {
       const tp1Qty = p[15] as number | null;
       const tp1Price = p[16] as number | null;
       const entryFee = p[17] as number;
+      // v0.9.3：再往后面插 fee_asset / fee_fx_rate 两列（手续费的折算痕迹）。
+      const feeAsset = p[18] as string | null;
+      const feeFxRate = p[19] as number | null;
       // created_at / updated_at 是**最后**两个参数：后面还会加列（v0.9.0 的决策列），
       // 按固定下标取会在每次加列时错位——错位的样子是「created_at 不是整数」。
       const now = p[p.length - 1] as number;
@@ -109,6 +115,8 @@ function fakePool() {
         tp1Qty,
         tp1Price,
         entryFee,
+        feeAsset,
+        feeFxRate,
       });
       // 入场那笔的手续费也是这一轮的成本。
       state.claims.get(key)!.feeAmount = entryFee;
@@ -152,6 +160,9 @@ function fakePool() {
             closed_qty: 0,
             exit_notional: 0,
             fee_amount: 0,
+            // v0.9.3：手续费的折算痕迹。
+            fee_asset: feeAsset,
+            fee_fx_rate: feeFxRate,
             // v0.9.0：LLM 决策的记录列（本用例走的是「没有决策」的路径）。
             decision_source: 'config',
             decision_stop_atr_mult: null,
@@ -218,6 +229,8 @@ function fakePool() {
               closed_qty: row.closedQty ?? 0,
               exit_notional: row.exitNotional ?? 0,
               fee_amount: row.feeAmount ?? 0,
+              fee_asset: row.feeAsset ?? null,
+              fee_fx_rate: row.feeFxRate ?? null,
               decision_source: 'config',
               decision_stop_atr_mult: null,
               decision_take_profit_atr_mult: null,
@@ -286,6 +299,8 @@ function fakePool() {
             closed_qty: row.closedQty ?? 0,
             exit_notional: row.exitNotional ?? 0,
             fee_amount: row.feeAmount ?? 0,
+            fee_asset: row.feeAsset ?? null,
+            fee_fx_rate: row.feeFxRate ?? null,
             decision_source: 'config',
             decision_stop_atr_mult: null,
             decision_take_profit_atr_mult: null,
@@ -321,6 +336,12 @@ function fakePool() {
           exitNotional: (row.exitNotional ?? 0) + Number(notional),
           feeAmount: (row.feeAmount ?? 0) + Number(fee),
         });
+        // v0.9.3：折算痕迹只在「这一段是非计价币」时才覆盖（对齐真库的 CASE 语义）。
+        const feeAsset = params[8] as string | null;
+        if (feeAsset !== null && feeAsset !== undefined) {
+          row.feeAsset = feeAsset;
+          row.feeFxRate = (params[9] as number | null) ?? null;
+        }
         return { rows: [], rowCount: 1 };
       }
       return { rows: [], rowCount: 0 };
@@ -336,6 +357,12 @@ function fakePool() {
         row.closedQty = (row.closedQty ?? 0) + Number(qty ?? 0);
         row.exitNotional = (row.exitNotional ?? 0) + Number(notional ?? 0);
         row.feeAmount = (row.feeAmount ?? 0) + Number(fee ?? 0);
+        // v0.9.3：折算痕迹只在「这一段是非计价币」时才覆盖（对齐真库的 CASE 语义）。
+        const feeAsset = params[8] as string | null;
+        if (feeAsset !== null && feeAsset !== undefined) {
+          row.feeAsset = feeAsset;
+          row.feeFxRate = (params[9] as number | null) ?? null;
+        }
       }
       return { rows: [], rowCount: 1 };
     }
@@ -1669,5 +1696,241 @@ describe('v0.9.1：第一段止盈成交之后', () => {
     expect(row?.slOrderId).not.toBe(12);
     // 这一轮是「失败」：对账据此报「移动止损换档失败」。
     expect(row?.trailStatus).toBe('failed');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// v0.9.3：非计价币手续费（BNB 抵扣）折成计价币
+// ---------------------------------------------------------------------------
+
+/**
+ * 币安的手续费**不一定**用计价币收——开了 BNB 抵扣就用 BNB 收。
+ * 而盈亏公式只认计价币，不折算就是把「0.00009805 BNB」当成「0.00009805 USDT」
+ * 记进去（2026-10-23 目标机上真实发生过，净盈亏因此虚高几百倍）。
+ *
+ * 这里锁三件事：
+ *   1. **按标记价折算**再落库，落的是 USDT 的值；
+ *   2. 折算用的**币种与汇率**留痕，事后能回答「这个数怎么来的」；
+ *   3. **折算失败也不拒绝算盈亏**：保护照样挂、账照样结，只是那一笔没计入，
+ *      而且这件事必须**看得见**（库里留痕 + 通知里说人话）。
+ */
+describe('v0.9.3：手续费折算', () => {
+  /** BNB 的标记价（1 BNB = 590 USDT）。 */
+  const BNB_PRICE = 590;
+
+  it('入场那笔 BNB 手续费按标记价折成 USDT 落库，并记下币种与汇率', async () => {
+    const fake = fakePool();
+    const placer = fakePlacer();
+    const asked: string[] = [];
+    const service = createExecutorService({
+      pool: fake.pool,
+      config: makeConfig(),
+      placer,
+      atr: fakeAtr(),
+      markPrice: async (symbol) => {
+        asked.push(symbol);
+        return BNB_PRICE;
+      },
+    });
+
+    const outcome = await service.handleFill(
+      fill({ commission: 0.00009805, commissionAsset: 'BNB' }),
+    );
+    // 保护照挂——手续费折算与挂不挂单无关。
+    expect(outcome).toBe('armed');
+    expect(placer.placed).toHaveLength(2);
+    // 取价用的是 BNB 自己的交易对。
+    expect(asked).toEqual(['BNBUSDT']);
+
+    const row = fake.state.claims.get('binance/BTCUSDT/42');
+    // 落库的是**折算后**的 USDT 值，不是 0.00009805。
+    expect(row?.feeAmount).toBeCloseTo(0.00009805 * BNB_PRICE, 12);
+    expect(row?.feeAmount).not.toBeCloseTo(0.00009805, 12);
+    // 折算的痕迹留下：币种与汇率。
+    expect(row?.feeAsset).toBe('BNB');
+    expect(row?.feeFxRate).toBeCloseTo(BNB_PRICE, 10);
+  });
+
+  it('计价币手续费不取价（不为一笔 USDT 手续费白跑一趟交易所）', async () => {
+    const fake = fakePool();
+    const asked: string[] = [];
+    const service = createExecutorService({
+      pool: fake.pool,
+      config: makeConfig(),
+      placer: fakePlacer(),
+      atr: fakeAtr(),
+      markPrice: async (symbol) => {
+        asked.push(symbol);
+        return BNB_PRICE;
+      },
+    });
+
+    expect(await service.handleFill(fill())).toBe('armed');
+    expect(asked).toEqual([]);
+    const row = fake.state.claims.get('binance/BTCUSDT/42');
+    expect(row?.feeAmount).toBeCloseTo(0.04, 10);
+    // 全是计价币 → 没有折算痕迹（null，不是 'USDT'）。
+    expect(row?.feeAsset).toBeNull();
+    expect(row?.feeFxRate).toBeNull();
+  });
+
+  it('折算失败：保护照挂、那一笔不计入、痕迹留下（**不拒绝算盈亏**）', async () => {
+    const fake = fakePool();
+    const placer = fakePlacer();
+    const service = createExecutorService({
+      pool: fake.pool,
+      config: makeConfig(),
+      placer,
+      atr: fakeAtr(),
+      markPrice: async () => {
+        throw new SyncError('EXCHANGE_ERROR', '模拟取价失败');
+      },
+    });
+
+    const outcome = await service.handleFill(
+      fill({ commission: 0.00009805, commissionAsset: 'BNB' }),
+    );
+    // 关键：**不能**因为折算失败就不挂保护——仓位还在裸奔。
+    expect(outcome).toBe('armed');
+    expect(placer.placed).toHaveLength(2);
+
+    const row = fake.state.claims.get('binance/BTCUSDT/42');
+    // 宁可少算，也不写一个错的数进去。
+    expect(row?.feeAmount).toBe(0);
+    // 「少算了」必须看得见：有币种、没有汇率。
+    expect(row?.feeAsset).toBe('BNB');
+    expect(row?.feeFxRate).toBeNull();
+  });
+
+  it('没有取价能力时同样不拒绝算盈亏（只是那一笔不计入）', async () => {
+    const fake = fakePool();
+    const placer = fakePlacer();
+    // **不传** markPrice
+    const service = createExecutorService({
+      pool: fake.pool,
+      config: makeConfig(),
+      placer,
+      atr: fakeAtr(),
+    });
+
+    const outcome = await service.handleFill(
+      fill({ commission: 0.00009805, commissionAsset: 'BNB' }),
+    );
+    expect(outcome).toBe('armed');
+    expect(placer.placed).toHaveLength(2);
+
+    const row = fake.state.claims.get('binance/BTCUSDT/42');
+    expect(row?.feeAmount).toBe(0);
+    expect(row?.feeAsset).toBe('BNB');
+  });
+
+  it('结算那一段也按折算后的值累加', async () => {
+    const fake = fakePool();
+    const service = createExecutorService({
+      pool: fake.pool,
+      config: makeConfig(),
+      placer: fakePlacer(),
+      atr: fakeAtr(),
+      markPrice: async () => BNB_PRICE,
+    });
+
+    // 先开仓（入场那笔是 USDT 计价）
+    expect(await service.handleFill(fill())).toBe('armed');
+    // 再让止盈单成交（那一段是 BNB 计价）
+    const outcome = await service.handleFill(
+      fill({
+        clientOrderId: bracketClientOrderId('tp', '42'),
+        side: 'SELL',
+        lastFilledPrice: 60_300,
+        lastFilledQty: 0.1,
+        commission: 0.0001,
+        commissionAsset: 'BNB',
+      }),
+    );
+    expect(outcome).toBe('settled');
+
+    const row = fake.state.claims.get('binance/BTCUSDT/42');
+    // 入场 0.04 USDT + 出场 0.0001 BNB × 590 = 0.059 USDT
+    expect(row?.feeAmount).toBeCloseTo(0.04 + 0.0001 * BNB_PRICE, 12);
+    expect(row?.feeAsset).toBe('BNB');
+    expect(row?.feeFxRate).toBeCloseTo(BNB_PRICE, 10);
+  });
+
+  it('短缓存：入场与出场两笔手续费只问交易所一次价', async () => {
+    const fake = fakePool();
+    const asked: string[] = [];
+    const service = createExecutorService({
+      pool: fake.pool,
+      config: makeConfig(),
+      placer: fakePlacer(),
+      atr: fakeAtr(),
+      markPrice: async (symbol) => {
+        asked.push(symbol);
+        return BNB_PRICE;
+      },
+    });
+
+    // 入场那笔与出场那笔都是 BNB 计价，两笔之间只隔几秒。
+    expect(await service.handleFill(fill({ commission: 0.00009805, commissionAsset: 'BNB' }))).toBe(
+      'armed',
+    );
+    expect(
+      await service.handleFill(
+        fill({
+          clientOrderId: bracketClientOrderId('tp', '42'),
+          side: 'SELL',
+          lastFilledPrice: 60_300,
+          lastFilledQty: 0.1,
+          commission: 0.0001,
+          commissionAsset: 'BNB',
+        }),
+      ),
+    ).toBe('settled');
+
+    // 标记价几十秒内基本不动，没必要为同一笔交易问两次交易所。
+    expect(asked).toEqual(['BNBUSDT']);
+    const row = fake.state.claims.get('binance/BTCUSDT/42');
+    expect(row?.feeAmount).toBeCloseTo((0.00009805 + 0.0001) * BNB_PRICE, 12);
+  });
+
+  it('结算时折算失败：账照样结，通知里说清「有一笔手续费没计入」', async () => {
+    const fake = fakePool();
+    const { alerts, items } = fakeAlerts(['bracket-settled']);
+    const service = createExecutorService({
+      pool: fake.pool,
+      config: makeConfig(),
+      placer: fakePlacer(),
+      atr: fakeAtr(),
+      alerts,
+      markPrice: async () => {
+        throw new SyncError('EXCHANGE_ERROR', '模拟取价失败');
+      },
+    });
+
+    expect(await service.handleFill(fill())).toBe('armed');
+    const outcome = await service.handleFill(
+      fill({
+        clientOrderId: bracketClientOrderId('tp', '42'),
+        side: 'SELL',
+        lastFilledPrice: 60_300,
+        lastFilledQty: 0.1,
+        commission: 0.0001,
+        commissionAsset: 'BNB',
+      }),
+    );
+    // 关键：**不因为折算失败就拒绝结算**。
+    expect(outcome).toBe('settled');
+
+    const row = fake.state.claims.get('binance/BTCUSDT/42');
+    expect(row?.state).toBe('take_profit');
+    expect(row?.feeAmount).toBeCloseTo(0.04, 12);
+
+    // 通知里必须说人话：净盈亏偏高是因为少算了一笔手续费。
+    const settled = items.find((item) => item.title.includes('净盈亏'));
+    expect(settled).toBeDefined();
+    const lines = settled?.lines ?? [];
+    expect(lines.some((line) => line.includes('没折算'))).toBe(true);
+    // 少算了手续费 → 这条通知不能是「一切正常」的级别。
+    expect(settled?.severity).toBe('warning');
   });
 });

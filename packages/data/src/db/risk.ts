@@ -46,7 +46,7 @@ const COLUMNS = `exchange, symbol, entry_order_id, entry_price, entry_time, fill
   decision_take_profit1_ratio, decision_trail_atr_mult,
   decision_breakeven_after_tp1, decision_rationale, decision_fallback_reason,
   decision_raw, decision_at,
-  closed_qty, exit_notional, fee_amount`;
+  closed_qty, exit_notional, fee_amount, fee_asset, fee_fx_rate`;
 
 /**
  * 七个状态。**未终结**的四个：`armed` / `partial_armed` / `trailing` / `failed`。
@@ -103,6 +103,21 @@ export interface BracketClaim {
    */
   entryFeeAmount?: number;
   /**
+   * 入场那笔手续费的**原币种**（v0.9.3）。
+   *
+   * 只有**非计价币**才需要记（比如 `'BNB'`）；本来就是计价币就传 `undefined`，
+   * 于是 `fee_asset` 保持 NULL——「这一轮没发生过折算」是件值得知道的事。
+   */
+  entryFeeAsset?: string;
+  /**
+   * 那次折算用的汇率（v0.9.3）：**1 个原币种值多少计价币**。
+   *
+   * 折算**失败**时是 `undefined`：那一笔手续费**没有**计入 `fee_amount`
+   * （宁可少算，也不写一个错的数进去）。`fee_asset` 有值而 `fee_fx_rate` 为空
+   * 就是「折算失败」的痕迹，可查询。
+   */
+  entryFeeFxRate?: number;
+  /**
    * 决策留痕（v0.9.0）。**整组可不带**——不带时 `decision_source` 落默认值
    * `'config'`，也就是「按配置挂的」，这与 v0.9.0 之前的行为逐字一致。
    *
@@ -128,6 +143,18 @@ export interface CloseLeg {
   qty: number;
   /** 这一段的手续费（计价币，正数）。 */
   fee: number;
+  /**
+   * 这一段手续费的**原币种**（v0.9.3）。
+   *
+   * 只有**非计价币**才需要记（比如 `'BNB'`）；本来就是计价币就传 `undefined`。
+   */
+  feeAsset?: string;
+  /**
+   * 那次折算用的汇率（v0.9.3）：**1 个原币种值多少计价币**。
+   *
+   * 折算**失败**时是 `undefined`——那一笔手续费**没有**计入 `fee_amount`。
+   */
+  feeFxRate?: number;
 }
 
 /**
@@ -229,6 +256,18 @@ export interface BracketRecord {
   exitNotional: number;
   /** 累计手续费（计价币）：入场 + 各段平仓。 */
   feeAmount: number;
+  // ---- v0.9.3：手续费的币种与折算痕迹。金额恒为计价币，这两列记的是「怎么折的」。
+  /**
+   * 这一轮里**出现过非计价币手续费**时的那个币种（通常 `'BNB'`）。
+   * 全是计价币时为 `null`（「没发生过折算」与「折算过但没成功」是两件事）。
+   */
+  feeAsset: string | null;
+  /**
+   * 该币种折算计价币用的汇率（最后一次）。`null` = 没折算成功过。
+   *
+   * `feeAsset` 有值而这里为 `null` ⇒ **有一笔手续费没折算、也没计入**。
+   */
+  feeFxRate: number | null;
   // ---- v0.9.0：决策留痕。回答「这次挂单用的档位是模型定的还是人配的」。
   /** 决策来源。`'llm'` = 模型定的，`'config'` = 按配置，`'config-fallback'` = 降级兜底。 */
   decisionSource: DecisionSource;
@@ -341,6 +380,8 @@ function toRecord(row: Record<string, unknown>): BracketRecord {
     closedQty: num(row, 'closed_qty', where),
     exitNotional: num(row, 'exit_notional', where),
     feeAmount: num(row, 'fee_amount', where),
+    feeAsset: optionalStr(row, 'fee_asset', where),
+    feeFxRate: optionalNum(row, 'fee_fx_rate', where),
     decisionSource: str(row, 'decision_source', where) as DecisionSource,
     decisionStopAtrMult: optionalNum(row, 'decision_stop_atr_mult', where),
     decisionTakeProfitAtrMult: optionalNum(row, 'decision_take_profit_atr_mult', where),
@@ -384,6 +425,8 @@ export async function claimBracket(pool: Pool, claim: BracketClaim): Promise<Bra
     claim.tp1Qty ?? null,
     claim.tp1Price ?? null,
     claim.entryFeeAmount ?? 0,
+    claim.entryFeeAsset ?? null,
+    claim.entryFeeFxRate ?? null,
     decision?.source ?? 'config',
     decision?.decision?.stopAtrMult ?? null,
     decision?.decision?.takeProfitAtrMult ?? null,
@@ -401,13 +444,15 @@ export async function claimBracket(pool: Pool, claim: BracketClaim): Promise<Bra
     const result = await pool.query<Record<string, unknown>>(
       `INSERT INTO ${TABLE} (exchange, symbol, entry_order_id, entry_price, entry_time, filled_qty,
          position_side, atr, atr_period, atr_interval, atr_window_from, atr_window_to,
-         stop_price, take_profit, tp1_algo_id, tp1_qty, tp1_price, fee_amount, state,
+         stop_price, take_profit, tp1_algo_id, tp1_qty, tp1_price, fee_amount,
+         fee_asset, fee_fx_rate, state,
          decision_source, decision_stop_atr_mult, decision_take_profit_atr_mult,
          decision_take_profit1_ratio, decision_trail_atr_mult,
          decision_breakeven_after_tp1, decision_rationale, decision_fallback_reason,
          decision_raw, decision_at, created_at, updated_at)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, 'failed',
-               $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18,
+               $19, $20, 'failed',
+               $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32)
        ON CONFLICT (exchange, symbol, entry_order_id) DO NOTHING
        RETURNING ${COLUMNS}`,
       values,
@@ -502,6 +547,8 @@ export async function recordBracketTp1Fill(
          closed_qty = closed_qty + $6,
          exit_notional = exit_notional + $7,
          fee_amount = fee_amount + $8,
+         fee_asset = CASE WHEN $9::text IS NULL THEN fee_asset ELSE $9::text END,
+         fee_fx_rate = CASE WHEN $9::text IS NULL THEN fee_fx_rate ELSE $10::double precision END,
          updated_at = $5
        WHERE exchange = $1 AND symbol = $2 AND entry_order_id = $3
          AND tp1_filled_at IS NULL`,
@@ -514,6 +561,8 @@ export async function recordBracketTp1Fill(
         leg.qty,
         leg.price * leg.qty,
         leg.fee,
+        leg.feeAsset ?? null,
+        leg.feeFxRate ?? null,
       ],
     );
     return result.rowCount ?? 0;
@@ -801,7 +850,9 @@ export async function markBracketSettled(
       `UPDATE ${TABLE} SET state = $4, updated_at = $5,
          closed_qty = closed_qty + $6,
          exit_notional = exit_notional + $7,
-         fee_amount = fee_amount + $8
+         fee_amount = fee_amount + $8,
+         fee_asset = CASE WHEN $9::text IS NULL THEN fee_asset ELSE $9::text END,
+         fee_fx_rate = CASE WHEN $9::text IS NULL THEN fee_fx_rate ELSE $10::double precision END
        WHERE exchange = $1 AND symbol = $2 AND entry_order_id = $3
          AND state IN ('armed', 'partial_armed', 'trailing', 'failed')`,
       [
@@ -813,6 +864,8 @@ export async function markBracketSettled(
         leg?.qty ?? 0,
         leg === undefined ? 0 : leg.price * leg.qty,
         leg?.fee ?? 0,
+        leg?.feeAsset ?? null,
+        leg?.feeFxRate ?? null,
       ],
     );
     return result.rowCount ?? 0;

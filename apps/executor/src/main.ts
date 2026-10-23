@@ -290,6 +290,9 @@ async function main(): Promise<void> {
     config,
     placer: client,
     atr,
+    // v0.9.3：非计价币手续费（BNB 抵扣）折成计价币时用它取标记价。
+    // 走的是公开接口 `/fapi/v1/premiumIndex`，与私有接口同一条出网路径。
+    markPrice: (symbol) => client.markPrice(symbol),
     // 与周期对账共用**同一个**派发器：去重与冷却的记账因此是同一份，
     // 不会出现「同一件事，对账那边压住了、这边又推一遍」。
     alerts,

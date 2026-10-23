@@ -297,6 +297,7 @@ try 版本会让第二个进程「拿不到锁就跳过」，那正是「库还�
 | `014_take_profit_single_mult`  | 止盈倍数**合并成一个**（v0.9.0）：退役 `risk_policy.take_profit1_atr_mult` 与 `risk_bracket.decision_take_profit1_atr_mult`；`take_profit1_ratio` 的 CHECK 收紧为 `< 1`。**新增迁移，两侧都要登记**                                                |
 | `015_restore_llm_params_check` | 补回「LLM 决策的数必须齐全」那条**联合约束**（v0.9.0）：014 用 `DROP COLUMN` 退役 `decision_take_profit1_atr_mult` 时，PostgreSQL **自动删掉了引用它的 CHECK**，于是这条守门人无声消失。**删列前先看有没有约束提到它**。**新增迁移，两侧都要登记** |
 | `016_trail_step`               | 移动止损的**档位序号**（`risk_bracket` 增 `trail_step` / `trail_moves`）+ 通知内容类型扩容到 14 种（v0.9.2）。**新增迁移，两侧都要登记**                                                                                                           |
+| `021_fee_asset`                | 手续费的**币种与折算汇率**（`risk_bracket` 增 `fee_asset` / `fee_fx_rate`）：BNB 计价的手续费折成 USDT 时把「用的哪个价」留下来（v0.9.3）。**编号跳号**：017~020 已被另一条在研分支占用。**新增迁移，两侧都要登记**                                |
 
 ### 6.1 派生周期层（v0.2.0）
 
@@ -1044,6 +1045,15 @@ warn，而日志没人盯着。
    （**必返**字段，缺了要报错——不能当成 0）。
 4. **分批要累加**：v0.7.0 的两段模型里一轮平两段（第一段止盈 + 移动止损了结），
    成交额与手续费都**累加**。只算最后一段，净盈亏就只算了一半。
+5. **非计价币手续费要先折算**（v0.9.3）：币安的手续费**不一定**用计价币收——开了
+   BNB 抵扣就用 BNB 收。不折算就是把「0.00009805 BNB」当成「0.00009805 USDT」
+   记进 `fee_amount`，差着几百倍（2026-10-23 实测踩到，净盈亏因此虚高）。
+   折算按**标记价**（`/fapi/v1/premiumIndex`），纯算术在
+   `packages/core/src/pnl.ts` 的 `feeInQuoteAsset()`，取价在
+   `packages/data/src/binance-private.ts` 的 `markPrice()`。
+   **折算失败时跳过那一笔，但绝不因此拒绝算盈亏**：保护照挂、账照样结，
+   少算的那一笔在库里留下痕迹（`fee_asset` 有值而 `fee_fx_rate` 为空），
+   通知里也要说人话。宁可少算，也不写一个错的数进去。
 
 另有两条边界：
 

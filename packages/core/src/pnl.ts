@@ -11,6 +11,8 @@
  * 两个函数都是**纯函数**：不读时钟、不做 IO、不用随机数。
  */
 
+import { SyncError } from './market-sync.js';
+
 /** 计价币。USDⓈ-M 永续的成交价与手续费都以它计价。 */
 export const QUOTE_ASSET = 'USDT';
 
@@ -91,4 +93,67 @@ export function realizedPnl(input: {
   const cost = input.entryPrice * input.closedQty;
   const gross = (input.exitNotional - cost) * sign;
   return { gross, fee: input.feeAmount, net: gross - input.feeAmount };
+}
+
+/**
+ * 把以 `asset` 计的手续费折成**计价币**。
+ *
+ * 为什么需要折算：币安的手续费**不一定**用计价币收——开了 BNB 抵扣就用 BNB 收。
+ * 而盈亏公式（`realizedPnl`）只认计价币。不折算就是把「0.00009805 BNB」
+ * 当成「0.00009805 USDT」记进 `risk_bracket.fee_amount`，差着 BNB 的汇率几百倍
+ * （2026-10-23 实测踩到：目标机上那笔 BNB 计价的手续费被当成 USDT 记，
+ * 净盈亏因此虚高）。
+ *
+ * **纯函数**：不读时钟、不做 IO、不用随机数。取价是调用方的事——
+ * 这里只负责「乘」。
+ *
+ * @param amount 手续费金额（以 `asset` 计）。
+ * @param asset 手续费币种。**为空就是异常**——宁可报错，也不要默默当成计价币。
+ * @param price 「1 个 `asset` 值多少计价币」。`asset` 就是计价币时传 1。
+ */
+export function feeInQuoteAsset(amount: number, asset: string, price: number): number {
+  const trimmed = asset.trim();
+  if (trimmed === '') {
+    throw new SyncError('CONFIG_INVALID', '手续费事件没有带币种，无法折算成计价币');
+  }
+  if (!Number.isFinite(amount) || amount < 0) {
+    throw new SyncError('CONFIG_INVALID', `手续费金额必须是非负有限数：${String(amount)}`, {
+      amount: String(amount),
+    });
+  }
+  if (!Number.isFinite(price) || price <= 0) {
+    throw new SyncError('CONFIG_INVALID', `${trimmed} 的价格必须是正有限数：${String(price)}`, {
+      asset: trimmed,
+      price: String(price),
+    });
+  }
+  return amount * price;
+}
+
+/**
+ * 手续费币种 → 取价用的**交易对符号**。
+ *
+ * 折算要有一个「1 个 BNB 值多少 USDT」的价，而这个价只能从
+ * 「BNBUSDT 这个交易对的标记价」拿。因此这里把币种拼成交易对：
+ * `BNB` → `BNBUSDT`。
+ *
+ * **纯函数**：不读时钟、不做 IO、不用随机数。取价是调用方的事。
+ *
+ * @param asset 手续费币种。
+ * @param quote 计价币，缺省 USDT。
+ */
+export function feePriceSymbol(asset: string, quote: string = QUOTE_ASSET): string {
+  const a = asset.trim().toUpperCase();
+  const q = quote.trim().toUpperCase();
+  if (a === '') {
+    throw new SyncError('CONFIG_INVALID', '手续费事件没有带币种，无法折算成计价币');
+  }
+  if (q === '') {
+    throw new SyncError('CONFIG_INVALID', '计价币不能为空，无法折算手续费');
+  }
+  if (a === q) {
+    // 本来就是计价币，**不需要**折算——拼出 'USDTUSDT' 只会让调用方拿到一个不存在的交易对。
+    throw new SyncError('CONFIG_INVALID', `手续费币种就是计价币（${q}），不需要折算`);
+  }
+  return `${a}${q}`;
 }

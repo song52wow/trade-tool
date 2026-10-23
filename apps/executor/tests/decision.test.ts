@@ -93,10 +93,11 @@ function fakePool() {
       // v0.9.1 合并成一个止盈倍数后，决策列少了一列——下标也跟着前移。
       claimed.push({
         symbol: String(p[1]),
-        decisionSource: p[18] === null ? null : String(p[18]),
-        stopAtrMult: p[19] === null ? null : Number(p[19]),
-        fallbackReason: p[25] === null ? null : String(p[25]),
-        rationale: p[24] === null ? null : String(p[24]),
+        // v0.9.3：fee_asset / fee_fx_rate 插在 fee_amount 之后，决策列整体后移 2 位。
+        decisionSource: p[20] === null ? null : String(p[20]),
+        stopAtrMult: p[21] === null ? null : Number(p[21]),
+        fallbackReason: p[27] === null ? null : String(p[27]),
+        rationale: p[26] === null ? null : String(p[26]),
       });
       // RETURNING 必须给出**完整一行**：读侧逐列校验，缺列会报 NULL_NOT_ALLOWED。
       return { rows: [returningRow(p)], rowCount: 1 };
@@ -162,20 +163,23 @@ function returningRow(p: unknown[]): Record<string, unknown> {
     closed_qty: 0,
     exit_notional: 0,
     fee_amount: p[17] ?? 0,
-    decision_source: p[18],
-    decision_stop_atr_mult: p[19],
-    decision_take_profit_atr_mult: p[20],
-    decision_take_profit1_ratio: p[21],
-    decision_trail_atr_mult: p[22],
-    decision_breakeven_after_tp1: p[23],
-    decision_rationale: p[24],
-    decision_fallback_reason: p[25],
-    decision_raw: p[26],
-    decision_at: p[27],
+    // v0.9.3：手续费的折算痕迹（这两列之后，决策列整体后移 2 位）。
+    fee_asset: p[18] ?? null,
+    fee_fx_rate: p[19] ?? null,
+    decision_source: p[20],
+    decision_stop_atr_mult: p[21],
+    decision_take_profit_atr_mult: p[22],
+    decision_take_profit1_ratio: p[23],
+    decision_trail_atr_mult: p[24],
+    decision_breakeven_after_tp1: p[25],
+    decision_rationale: p[26],
+    decision_fallback_reason: p[27],
+    decision_raw: p[28],
+    decision_at: p[29],
     state: 'failed',
     last_error: null,
-    created_at: p[28],
-    updated_at: p[29],
+    created_at: p[30],
+    updated_at: p[31],
   };
 }
 

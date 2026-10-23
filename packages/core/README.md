@@ -13,6 +13,7 @@
 | `net-position.ts`       | 流内增量净额（`NetPositionTracker`）                                  |
 | `risk-ids.ts`           | 条件单编号约定 + `orderType` 归类（对账与下单共用一份）               |
 | `risk-policy.ts`        | 止盈止损策略的纯函数（`deriveBracketPlan`、`deriveStagedPlan` 等）    |
+| `pnl.ts`                | 盈亏口径（`estimateBracketPnl`、`realizedPnl`、`feeInQuoteAsset`）    |
 | `reconcile.ts`          | 交易对账判据（纯函数，只报告不动手）                                  |
 | `secret.ts`             | 凭据静态加密（AES-256-GCM）                                           |
 | `clock-skew.ts`         | 进程启动时测量与交易所的时钟偏移                                      |
@@ -50,3 +51,20 @@ v0.9.1 起只有这一个止盈倍数。原因是分批形态下**「整段止�
   所以它必须等于交易所上那张单的价格。
 - **分批时那一个倍数就是「先兑现那一段」的目标**（不是「整段目标」）。剩余仓位由
   `trailAtrMult` 管的移动止损了结。
+
+## 手续费折算（`feeInQuoteAsset`）
+
+币安的手续费**不一定**用计价币收——开了 BNB 抵扣就用 BNB 收。而盈亏公式只认计价币，
+所以**折算这一步不能省**：不折算就是把「0.00009805 BNB」当成「0.00009805 USDT」记，
+差着几百倍。
+
+这个模块只负责**乘**：`feeInQuoteAsset(amount, asset, price)` 把「以 `asset` 计的金额」
+按「1 个 `asset` 值多少计价币」折成计价币。**取价不是它的事**——那是调用方的事
+（IO 不进 core）。`feePriceSymbol(asset)` 把币种拼成取价用的交易对（`BNB` → `BNBUSDT`）。
+
+三条边界：
+
+- 币种**为空就报错**。宁可报错，也不要默默当成计价币——那正是这个 bug 的成因。
+- 金额必须是**非负有限数**，价格必须是**正有限数**。0 或负价会把手续费变成 0 或负数，
+  两样都是「看起来正常、其实错了」的数字。
+- 币种就是计价币时**不需要折算**（`feePriceSymbol` 会直接报错），那种情况按原价记。
