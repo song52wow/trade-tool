@@ -232,7 +232,12 @@ export interface ExecutorService {
   correctPositions(
     updates: readonly { symbol: string; positionAmt: number; transactionTime: number }[],
   ): Promise<void>;
-  /** 重连 / 启动播种后的兜底收敛，只处理净仓位确为 0 的标的。 */
+  /**
+   * 重连 / 启动播种后的兜底收敛。
+   *
+   * `flat` 只是**候选提示**：真正的判据是「交易所说这个标的没有仓位」，
+   * 候选集由本方法自己从库里取「有未终结记录的标的」补全（见实现注释）。
+   */
   convergeFlatPositions(flat: readonly { symbol: string }[]): Promise<void>;
   /** 最近一次算出的计划，仅供测试与诊断。 */
   readonly lastPlan: StagedPlan | null;
@@ -1564,11 +1569,30 @@ export function createExecutorService(deps: ExecutorServiceDeps): ExecutorServic
      *
      * 拿不到净仓位就不猜：宁可留着 `armed` 让对账报 critical，
      * 也不要把一条仍受保护的仓位误标成已结清。
+     *
+     * ⚠️ **判据在「交易所说这个标的没有仓位」，不在「调用方传了哪些标的」**（2026-10-23
+     * 实测踩到，账户在主网、仓位早就平了、本地那条 `armed` 记录却永远收不掉，
+     * 对账每 5 分钟报一次紧急差异）。两处都要改，缺一个就照样失效：
+     *
+     * 1. **候选集**：本方法自己从库里取「有未终结记录的标的」，而不是只信调用方给的那份。
+     *    币安在一个完全没有仓位的账户上 `positionRisk` 返回**空数组**，于是调用方
+     *    「交易所说空仓的标的」是空集——收敛根本没被触发。
+     *    **交易所没给行 = 该标的没有仓位**，这是明确的答复，不是「拿不到」；
+     *    拿不到时（请求失败）播种会抛错，压根走不到这里，两件事必须分开。
+     * 2. **判定**：`positions.get()` 对没跟踪过的标的返回 `undefined`，而 `undefined`
+     *    同样意味着「没有仓位」。早先写的是 `!== 0`，于是 undefined 被判成「不是 0」
+     *    而跳过——与第 1 点叠在一起，账户完全没有仓位时收敛**完全**失效。
      */
     async convergeFlatPositions(flat: readonly { symbol: string }[]): Promise<void> {
-      for (const item of flat) {
-        if (positions.get(item.symbol) !== 0) continue;
-        await closeOutside(item.symbol, '重连后核对：仓位已空且本地无未终结记录');
+      const candidates = new Set(flat.map((item) => item.symbol));
+      for (const record of await listUnsettledBrackets(pool, exchange)) {
+        candidates.add(record.symbol);
+      }
+      for (const symbol of candidates) {
+        // `?? 0`：跟踪器刚被交易所的 positionRisk 快照重置并播种过，
+        // 它没跟踪的标的**就是**没有仓位（`undefined` 与 0 同义）。
+        if ((positions.get(symbol) ?? 0) !== 0) continue;
+        await closeOutside(symbol, '重连后核对：交易所已无该标的仓位');
       }
     },
 

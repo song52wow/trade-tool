@@ -270,6 +270,11 @@ async function main(): Promise<void> {
       // 此刻**没有任何在途事件**，是唯一适合兜底收敛的时刻：接住
       // 「断线期间成交事件整个丢了」——仓位已空而记录还停在 armed。
       // 事件流里不做这件事，因为那里会与止盈止损的 settle() 并发抢同一行。
+      //
+      // 这里给的只是**候选提示**。`positionRisk` 在一个完全没有仓位的账户上返回
+      // **空数组**（那是明确的「没有仓位」，不是「拿不到」）——所以候选集由
+      // `convergeFlatPositions` 自己从库里取「有未终结记录的标的」补全，
+      // 别在这里替它筛掉「没出现在返回里」的标的（2026-10-23 实测踩到）。
       await service.convergeFlatPositions(
         rows.filter((r) => r.positionAmt === 0).map((r) => ({ symbol: r.symbol })),
       );

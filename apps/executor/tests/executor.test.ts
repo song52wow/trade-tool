@@ -1014,6 +1014,47 @@ describe('仓位事实决定开仓 / 减仓 / 平仓', () => {
     expect(pool.state.claims.get('binance/BTCUSDT/42')?.state).toBe('armed');
   });
 
+  it('交易所一个仓位都没给时（positionRisk 空数组），本地未终结记录照样收敛', async () => {
+    const pool = fakePool();
+    const positions = new NetPositionTracker();
+    const service = createExecutorService({
+      pool: pool.pool,
+      config: makeConfig(),
+      placer: fakePlacer(),
+      atr: fakeAtr(),
+      positions,
+    });
+    await service.handleFill(fill());
+    expect(pool.state.claims.get('binance/BTCUSDT/42')?.state).toBe('armed');
+
+    // 重连后重新播种：交易所说这个账户**一个仓位都没有** → `positionRisk` 返回空数组，
+    // 于是调用方给的候选清单是空的。此时那条 `armed` 记录必须被收敛掉——
+    // 否则对账会每 5 分钟报一次 `missing-stop-order`（紧急），而账户早就平仓了。
+    // （2026-10-23 实测踩到：主网账户早已平仓，那条 10-10 的记录永远收不掉。）
+    positions.reset();
+    await service.convergeFlatPositions([]);
+    expect(pool.state.claims.get('binance/BTCUSDT/42')?.state).toBe('cancelled');
+  });
+
+  it('跟踪器里没有的标的（undefined）也算「没有仓位」，不是「不是 0」', async () => {
+    const pool = fakePool();
+    const positions = new NetPositionTracker();
+    const service = createExecutorService({
+      pool: pool.pool,
+      config: makeConfig(),
+      placer: fakePlacer(),
+      atr: fakeAtr(),
+      positions,
+    });
+    await service.handleFill(fill());
+
+    // 重连后重新播种，交易所**没给**这个标的的行 → 跟踪器里没有它 →
+    // `get()` 返回 undefined。undefined 与 0 同义（都没有仓位），不能被当成「不是 0」。
+    positions.reset();
+    await service.convergeFlatPositions([{ symbol: 'BTCUSDT' }]);
+    expect(pool.state.claims.get('binance/BTCUSDT/42')?.state).toBe('cancelled');
+  });
+
   it('ACCOUNT_UPDATE 只覆盖它推了的标的，不当成全量快照', async () => {
     const placer = fakePlacer();
     const service = createExecutorService({
