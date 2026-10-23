@@ -18,11 +18,15 @@ import { SyncControl } from './primitives.js';
 /**
  * 常驻调度循环（R-17 … R-21）。
  *
- * 三条不变量：
+ * 四条不变量：
  *   1. **单标的失败不扩散**：任一标的出错只写进它自己的状态，其它标的继续（R-21.1 / AC-18）。
  *   2. **单写者**：同一标的同一时刻只有一个任务（R-3.3 / AC-19）。
  *   3. **进程只在全局性错误时退出**：配置非法、PG 不可连、元数据无法获取且无缓存、
  *      schema 版本不匹配（Python 侧以 `SCHEMA_VERSION_MISMATCH` 等错误码上报）。单标的错误一律不退出。
+ *   4. **慢标的不堵住别人**：一个标的的首次全量回补（实测一轮 11~15 分钟）
+ *      **不得**拖慢其它标的的调度节奏——它们必须照旧每轮都轮到。
+ *      （这条是 2026-10-23 实测踩出来的：BNBUSDT 的回补让 BTCUSDT / SOLUSDT
+ *      的 1m K 线落后了 10~15 分钟。实现见 {@link SyncDaemon.tick}。）
  */
 
 const log = createLogger('sync');
@@ -46,10 +50,15 @@ const GLOBAL_FATAL_CODES = new Set([
 /**
  * 心跳刷新间隔。
  *
- * 必须**独立于同步轮次**用定时器写，不能只在 `loop()` 每轮开头写一次：一轮首次全量
- * 可以跑几十分钟（实测 BTCUSDT 预算 12.9 分钟、受延迟支配约 40 分钟），期间
- * `loop()` 一直卡在 `await this.tick()` 里不会回到循环，轮次边界的心跳会因此变旧，
+ * 必须**独立于同步轮次**用定时器写，不能只在 `loop()` 每轮开头写一次：
+ * `loop()` 自己也会被**数据库查询**卡住（`tick()` 里的 `selectBatch` 是查库），
+ * 那一卡就是好几秒到几十秒，期间轮次边界的心跳会变旧，
  * 控制面就会在同步**正在进行中**把它误判成离线。
+ *
+ * （2026-10-23 之前这里还写着「一轮首次全量可以跑几十分钟，loop() 一直卡在
+ * `await this.tick()` 里」——那说的是旧的「一轮等所有标的跑完」的写法。
+ * 调度改成「启动即返回」之后，那条卡顿没有了，但心跳仍然独立：**查库**照样会卡，
+ * 而心跳的职责是「进程在」，不该由任何一次查库的快慢决定。）
  *
  * 10s 的取值理由：与 `sync.pollIntervalMs`（默认 15s）同量级但更密，短到进程刚崩
  * 就能很快被看出异常，长到不会给 PG 带来可察觉的写入压力（6 次/分钟，单行 upsert）。
@@ -107,6 +116,26 @@ export class SyncDaemon {
   private loopPromise: Promise<void> | null = null;
   private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
   private readonly heartbeatIntervalMs: number;
+  /**
+   * **在途任务**：symbol → promise。
+   *
+   * 这里存的是「已经启动、还没跑完」的同步任务。**只登记、不等待**——
+   * 等它就等于「一轮等所有标的跑完」，那正是慢标的堵住全体的根因（见 {@link tick}）。
+   *
+   * 任务跑完后自己从表里摘掉，于是它的并发名额**立刻**让给别的标的。
+   */
+  private readonly inflightTasks = new Map<string, Promise<void>>();
+  /**
+   * 异步任务里撞到的**全局性错误**。
+   *
+   * 任务不再由 `tick()` 等待，失败也就没法从 `tick()` 的返回值里拿到。
+   * 但「全局性错误必须让进程退出」（R-14.5）这条硬约束不能因此丢掉：
+   * 任务把错误记在这里，循环**下一轮**检查到就退出。
+   *
+   * 代价是退出最多晚一个轮询周期（默认 15 秒）。可以接受——那段时间里进程还在，
+   * 心跳照刷，页面看到的是「还在跑」，而不是「静默死掉」。
+   */
+  private fatalError: SyncError | null = null;
 
   constructor(ctx: MarketContext, options: DaemonOptions) {
     this.ctx = ctx;
@@ -185,57 +214,111 @@ export class SyncDaemon {
         return a.symbol < b.symbol ? -1 : a.symbol > b.symbol ? 1 : 0;
       });
 
-    const slotsFree = Math.max(0, this.config.sync.concurrency - this.inflightCount());
+    const slotsFree = Math.max(0, this.config.sync.concurrency - this.busyCount());
     return eligible.slice(0, slotsFree);
   }
 
-  private inflightCount(): number {
-    return Object.values(this.control.slotsSnapshot()).filter((slot) => slot.inflight).length;
-  }
-
-  /** 跑一轮。返回本轮各标的的失败原因，供测试断言。 */
+  /**
+   * 跑一轮：**启动**该跑的标的，然后立刻返回。
+   *
+   * ## 为什么不等它们跑完
+   *
+   * 原来的写法是「等这一轮**全部**标的跑完才进下一轮」（`await Promise.all(workers)`）。
+   * 于是一个标的的**首次全量回补**会把整个调度循环钉住：
+   *
+   *   * 一轮 = 把「上次水位 → 现在」的数据一次拉完（`batch-size` 只是**写库**的批次大小，
+   *     不是拉取上限）→ 首次全量是几百页 HTTP 请求，实测一轮 11~15 分钟；
+   *   * 循环要等它跑完 → **其它标的十几分钟才被调度一次**。
+   *
+   * 2026-10-23 在目标机上实测到：BTCUSDT / SOLUSDT 的 1m K 线因此落后 10~15 分钟
+   * （用户看到的是「同步停在 7 分钟前」），而根因只是**另一个**标的（BNBUSDT）
+   * 正在做它的首次全量回补。数据没坏、程序没卡死——只是队列被一个慢任务堵住了。
+   *
+   * 现在的做法：**启动即返回**。每个标的各跑各的，跑完自己摘掉名额；
+   * 循环每 {@link config.sync.pollIntervalMs} 扫一次，把空闲名额分给还没跑的标的。
+   * 慢标的照旧占着自己的名额（并发上限依然成立），但**不再挡住别人**。
+   *
+   * ## 失败怎么办
+   *
+   * 任务不再由本方法等待，失败就拿不到返回值了。两条去处：
+   *   * 单标的失败 → 照旧只写它自己的状态（`runOnce` 内部已经写库），日志里报一行；
+   *   * 全局性错误 → 记进 {@link fatalError}，循环下一轮检查到就退出（R-14.5 不丢）。
+   */
   async tick(): Promise<Map<string, string>> {
     const nowMs = this.now();
     const batch = await this.selectBatch(nowMs);
     if (batch.length === 0) return new Map();
 
-    log.info(`本轮调度 ${batch.length} 个标的：${batch.map((e) => e.symbol).join(', ')}`);
-    const failures = new Map<string, string>();
+    const started: string[] = [];
+    for (const entry of batch) {
+      // 上一轮启动的、还没跑完的标的：**这一轮不碰它**。
+      // `selectBatch` 已经用 `isSchedulable` 滤掉了 inflight 的标的，这一道是防
+      // 「启动到 runOnce 真的设上 inflight 之间」的窗口——那个窗口里槽位还没被占上。
+      if (this.inflightTasks.has(entry.symbol)) continue;
+      if (this.stopping) break;
+      this.startSymbol(entry);
+      started.push(entry.symbol);
+    }
 
-    // 按 sync.concurrency 放行并发（R-20.5）。此前是串行 for-await，
-    // 于是「并发度可配置」形同虚设：inflightCount() 恒为 0，上限永远用不满也提不高。
-    // 批量回补仍然是「排队通过统一限速器」（R-20.6）——并发只是同时在途的标的数上限。
-    const limit = Math.max(1, Math.min(this.config.sync.concurrency, batch.length));
-    let cursor = 0;
-    const worker = async (): Promise<void> => {
-      for (;;) {
-        const index = cursor;
-        cursor += 1;
-        const entry = batch[index];
-        if (!entry || this.stopping) return;
-        // 错误隔离：runOnce 自己吞掉异常并返回错误码，这里不 throw。
-        // 外面再兜一层是因为「单标的失败不得终止进程」是硬约束（R-14.4 / R-21.1）：
-        // 万一 runOnce 真的抛了，Promise.all 会把整个 tick 带崩，进而杀掉守护进程。
-        let error: SyncError | null;
-        try {
-          error = await this.control.runOnce(entry.symbol, this.now());
-        } catch (unexpected) {
-          error =
-            unexpected instanceof SyncError
-              ? unexpected
-              : new SyncError(
-                  'INTERNAL_ERROR',
-                  unexpected instanceof Error ? unexpected.message : String(unexpected),
-                );
-        }
-        if (error) {
-          failures.set(entry.symbol, error.code);
-          log.warn(`${entry.symbol} 同步失败 [${error.code}]：${error.message}`);
-        }
+    if (started.length > 0) {
+      log.info(`本轮启动 ${started.length} 个标的：${started.join(', ')}`);
+    }
+    // 失败由任务自己处理（见 {@link startSymbol}），这里没有同步可见的失败。
+    return new Map();
+  }
+
+  /**
+   * 启动一个标的的同步任务。**不等待它跑完**。
+   *
+   * 任务自己负责三件事：跑、把失败写进日志、把全局性错误记进 {@link fatalError}。
+   * 跑完后从 {@link inflightTasks} 摘掉，于是它的并发名额立刻让给别的标的。
+   */
+  private startSymbol(entry: SymbolEntry): void {
+    const task = (async (): Promise<void> => {
+      let error: SyncError | null;
+      try {
+        error = await this.control.runOnce(entry.symbol, this.now());
+      } catch (unexpected) {
+        error =
+          unexpected instanceof SyncError
+            ? unexpected
+            : new SyncError(
+                'INTERNAL_ERROR',
+                unexpected instanceof Error ? unexpected.message : String(unexpected),
+              );
       }
-    };
-    await Promise.all(Array.from({ length: limit }, () => worker()));
-    return failures;
+      if (error === null) return;
+      log.warn(`${entry.symbol} 同步失败 [${error.code}]：${error.message}`);
+      // 错误隔离：只有**全局性**错误才让进程退出，单标的错误一律不扩散（R-21.1）。
+      if (GLOBAL_FATAL_CODES.has(error.code) && !this.isSymbolLocalFailure(error.code)) {
+        this.fatalError = error;
+      }
+    })();
+
+    const tracked = task
+      .catch(() => undefined)
+      .finally(() => {
+        this.inflightTasks.delete(entry.symbol);
+      });
+    this.inflightTasks.set(entry.symbol, tracked);
+  }
+
+  /**
+   * 正在占用并发名额的标的数。
+   *
+   * 两个来源取**并集**而不是相加：
+   *   * `control` 的槽位（`slot.inflight`）——控制面与守护进程共享的那一份；
+   *   * 本守护进程已经启动、还没摘掉的任务。
+   *
+   * 取并集是为了既不重复计数，又覆盖「任务已启动但 `runOnce` 还没设上 inflight」的窗口。
+   */
+  private busyCount(): number {
+    const busy = new Set<string>();
+    for (const [symbol, slot] of Object.entries(this.control.slotsSnapshot())) {
+      if (slot.inflight) busy.add(symbol);
+    }
+    for (const symbol of this.inflightTasks.keys()) busy.add(symbol);
+    return busy.size;
   }
 
   async start(): Promise<void> {
@@ -282,13 +365,12 @@ export class SyncDaemon {
   private async loop(): Promise<void> {
     while (this.running && !this.stopping) {
       try {
-        const failures = await this.tick();
-        // 这里判的是**错误码**，不是标的名：原先传了 symbol，
-        // 而 isSymbolLocalFailure 内部比的是错误码，等于豁免判断永远为真。
-        for (const code of failures.values()) {
-          if (GLOBAL_FATAL_CODES.has(code) && !this.isSymbolLocalFailure(code)) {
-            throw new Error(`全局性错误 [${code}]，守护进程退出`);
-          }
+        await this.tick();
+        // 任务不再由 tick() 等待，全局性错误也就没法从它的返回值里拿到。
+        // 任务把错误记在这里，循环**下一轮**检查到就退出——R-14.5「全局性错误必须
+        // 让进程退出」这条硬约束因此不丢。
+        if (this.fatalError !== null) {
+          throw this.fatalError;
         }
       } catch (error) {
         this.running = false;
@@ -297,6 +379,10 @@ export class SyncDaemon {
         // 页面显示守护进程在线，而数据一动不动，正是 R-17.6 禁止的那种骗人界面。
         // 这里**不删**心跳行：进程确实还活着，删掉会让页面报 stopped（「去启动进程」），
         // 而真实处置是查日志。留着让它自然变旧即可，读取方按阈值判成 stale。
+        //
+        // 在途任务**不等**：让它们跑完（它们写的是已落库的部分，下次从水位续传，不丢数据），
+        // 进程随后自然退出。旧写法是「等这一轮**全部**标的跑完才检查致命错误」，
+        // 那意味着一个首次全量能拖住退出几十分钟——现在最多晚一个轮询周期被发现。
         this.stopHeartbeat();
         this.exitIfGlobalFatal(error);
         throw error;
@@ -335,7 +421,12 @@ export class SyncDaemon {
     this.running = false;
     this.stopHeartbeat();
     // 有界等待在途轮次收尾（理由见 STOP_DRAIN_TIMEOUT_MS）。
+    //
+    // **还要等在途任务**：任务不再由 `tick()` 等待（见 {@link tick}），所以
+    // 「循环结束了」不等于「同步结束了」。等它们一下，退出时不会留下一个
+    // 半途而废的写库事务。
     await Promise.race([
+      Promise.all([...this.inflightTasks.values()]).catch(() => undefined),
       this.loopPromise?.catch(() => undefined) ?? Promise.resolve(),
       this.sleep(STOP_DRAIN_TIMEOUT_MS),
     ]);
