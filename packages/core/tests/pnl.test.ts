@@ -9,7 +9,13 @@
 
 import { describe, expect, it } from 'vitest';
 
-import { estimateBracketPnl, realizedPnl, QUOTE_ASSET } from '../src/pnl.js';
+import {
+  estimateBracketPnl,
+  feeInQuoteAsset,
+  feePriceSymbol,
+  realizedPnl,
+  QUOTE_ASSET,
+} from '../src/pnl.js';
 
 describe('estimateBracketPnl', () => {
   it('多头：止盈在上、止损在下，收益与亏损都是正的', () => {
@@ -135,5 +141,64 @@ describe('realizedPnl', () => {
 
   it('计价币是稳定币', () => {
     expect(QUOTE_ASSET).toBe('USDT');
+  });
+});
+
+describe('feeInQuoteAsset', () => {
+  it('BNB 计价的手续费按汇率折成计价币', () => {
+    // 2026-10-23 目标机上那笔真实的成交：0.00009805 BNB，按 590 折 ≈ 0.0578 USDT。
+    const amount = feeInQuoteAsset(0.00009805, 'BNB', 590);
+    expect(amount).toBeCloseTo(0.0578495, 10);
+  });
+
+  it('折算结果与「当成计价币直接记」差着几百倍——这正是要修的那个 bug', () => {
+    const raw = 0.00009805;
+    const converted = feeInQuoteAsset(raw, 'BNB', 590);
+    // 原代码记的是 raw（当成 USDT），实际值是 converted。
+    expect(converted / raw).toBeCloseTo(590, 6);
+  });
+
+  it('币种就是计价币时按原价折（汇率传 1）', () => {
+    expect(feeInQuoteAsset(0.04, 'USDT', 1)).toBeCloseTo(0.04, 10);
+  });
+
+  it('手续费是 0 时折出来还是 0', () => {
+    expect(feeInQuoteAsset(0, 'BNB', 590)).toBe(0);
+  });
+
+  it('没有币种就报错——宁可报错，也不要默默当成计价币', () => {
+    expect(() => feeInQuoteAsset(0.04, '', 590)).toThrow(/币种/);
+    expect(() => feeInQuoteAsset(0.04, '   ', 590)).toThrow(/币种/);
+  });
+
+  it('金额是负数或非有限数就报错', () => {
+    expect(() => feeInQuoteAsset(-1, 'BNB', 590)).toThrow(/非负/);
+    expect(() => feeInQuoteAsset(Number.NaN, 'BNB', 590)).toThrow(/非负/);
+  });
+
+  it('价格不是正数就报错（0 与负价会把手续费变成 0 或负数）', () => {
+    expect(() => feeInQuoteAsset(0.04, 'BNB', 0)).toThrow(/正有限数/);
+    expect(() => feeInQuoteAsset(0.04, 'BNB', -1)).toThrow(/正有限数/);
+    expect(() => feeInQuoteAsset(0.04, 'BNB', Number.POSITIVE_INFINITY)).toThrow(/正有限数/);
+  });
+});
+
+describe('feePriceSymbol', () => {
+  it('手续费币种拼成取价用的交易对', () => {
+    expect(feePriceSymbol('BNB')).toBe('BNBUSDT');
+    expect(feePriceSymbol('bnb')).toBe('BNBUSDT');
+    expect(feePriceSymbol(' BNB ')).toBe('BNBUSDT');
+  });
+
+  it('计价币可以换，但默认是 USDT', () => {
+    expect(feePriceSymbol('BNB', 'USDC')).toBe('BNBUSDC');
+  });
+
+  it('没有币种就报错', () => {
+    expect(() => feePriceSymbol('')).toThrow(/币种/);
+  });
+
+  it('币种就是计价币时报错——那种情况根本不需要折算', () => {
+    expect(() => feePriceSymbol('USDT')).toThrow(/不需要折算/);
   });
 });

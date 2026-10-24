@@ -877,6 +877,38 @@ export class BinancePrivateClient {
     };
   }
 
+  // ------------------------------------------------- 公开行情接口（标记价）
+  //
+  // 「标记价」= 交易所给的**清算参考价**（不是最新成交价）。用它给非计价币的手续费
+  // 折价，比用最新成交价稳：最新成交价可以被一根插针打到天差地别，标记价不会。
+  //
+  // 端点是 `GET /fapi/v1/premiumIndex`（带 symbol 权重 1）：**公开接口，不签名**。
+  // 放在这个文件里是因为它与私有接口共用同一个 baseUrl 与同一条 fetch 通道——
+  // 出网要走的代理只有一条，另开一条通道就多一个「为什么这条路不通」要查的地方。
+  //
+  // 唯一的用途：把 **BNB 计的手续费**折成 USDT 价值（见 `apps/executor` 的成交处理）。
+
+  /**
+   * 取某个交易对的标记价。
+   *
+   * @param symbol 交易对，如 `'BNBUSDT'`（**不是** `'BNB'`）。
+   */
+  async markPrice(symbol: string): Promise<number> {
+    const body = await this.request<unknown>('GET', '/fapi/v1/premiumIndex', {
+      signed: false,
+      params: { symbol },
+    });
+    if (typeof body !== 'object' || body === null) {
+      throw new SyncError('EXCHANGE_ERROR', 'premiumIndex 返回的不是对象', {
+        symbol,
+        body: JSON.stringify(body).slice(0, 200),
+      });
+    }
+    const row = body as Record<string, unknown>;
+    // 标记价在 payload 里是**字符串**（`'590.12345678'`），走 requireNumber 统一处理。
+    return requireNumber(row['markPrice'], 'markPrice', `premiumIndex ${symbol}`);
+  }
+
   // ------------------------------------------------- 只读查询（v0.6.0 交易对账）
   //
   // 下面两个端点**只读不写**，因此可以安全地挂在页面上由人手动触发。但它们是

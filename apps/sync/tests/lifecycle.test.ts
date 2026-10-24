@@ -789,3 +789,140 @@ describe('第二轮缺陷回归（R-1.3 / R-3.3 / R-14.4 / R-20.5 / R-21.5 / R-2
     }
   });
 });
+
+// ---------------------------------------------------------------------------
+// 慢标的不堵住别人（2026-10-23 目标机实测踩出来的）
+// ---------------------------------------------------------------------------
+
+/**
+ * 一个标的的**首次全量回补**会把「上次水位 → 现在」的数据一次拉完
+ * （`batch-size` 只是写库的批次大小，不是拉取上限），实测一轮 11~15 分钟。
+ *
+ * 旧的调度写法是「等这一轮**全部**标的跑完才进下一轮」，于是这个慢任务
+ * 把整个调度循环钉住：**别的标的十几分钟才被调度一次**，1m K 线因此落后
+ * 10~15 分钟（目标机上表现为「同步停在 7 分钟前」）。
+ *
+ * 下面这个用例守住修复后的行为：**慢的卡着，快的照旧每轮都跑。**
+ */
+describe('慢标的不堵住别人（调度不再等整轮）', () => {
+  let ctx: TestSchema;
+
+  beforeAll(async () => {
+    ctx = await createTestSchema('noblock');
+  });
+  afterAll(async () => {
+    await ctx.close();
+  });
+
+  function makeCtx(config: TradeToolConfig) {
+    return buildContext(ctx.pool, config, {
+      overrides: { password: TEST_PG.password, searchPath: ctx.schema },
+    });
+  }
+
+  it('SLOW 卡住不动时，FAST 仍然一轮一轮地跑', async () => {
+    const SLOW = 'TESTSLOWUSDC';
+    const FAST = 'TESTFASTUSDC';
+    const config = configWith({ concurrency: 2, pollIntervalMs: 20 });
+
+    let releaseSlow: () => void = () => undefined;
+    const slowGate = new Promise<void>((resolve) => {
+      releaseSlow = resolve;
+    });
+    let slowStarted = false;
+    let fastRuns = 0;
+
+    const control = new SyncControl(makeCtx(config), {
+      config,
+      syncFn: async (symbol) => {
+        if (symbol === SLOW) {
+          slowStarted = true;
+          // 卡住：模拟一次要跑十几分钟的首次全量
+          await slowGate;
+        } else {
+          fastRuns += 1;
+        }
+        return okSummary(symbol);
+      },
+    });
+    await seedSymbol(ctx.pool, SLOW);
+    await seedSymbol(ctx.pool, FAST);
+    await control.start(SLOW);
+    await control.start(FAST);
+
+    const daemon = new SyncDaemon(makeCtx(config), {
+      config,
+      control,
+      // **真实计时**：sleep 注成立即返回会让循环变成忙等，测不出「一轮一轮」。
+      sleep: (ms) => new Promise((r) => setTimeout(r, ms)),
+      heartbeatIntervalMs: 60_000,
+    });
+    await daemon.start();
+
+    // 等 SLOW 真的卡住，再给 FAST 几轮时间
+    await new Promise((r) => setTimeout(r, 60));
+    expect(slowStarted, 'SLOW 应该已经卡在那一轮里').toBe(true);
+    const runsWhileSlowStuck = fastRuns;
+    await new Promise((r) => setTimeout(r, 250));
+
+    // 关键断言：SLOW 卡着的时候，FAST 仍然被反复调度。
+    // 旧写法下这里是 1（FAST 在第一轮跑完就一直等 SLOW），现在应当 ≥ 3。
+    expect(fastRuns, 'SLOW 卡住时 FAST 必须照旧一轮一轮跑').toBeGreaterThanOrEqual(3);
+    expect(runsWhileSlowStuck).toBeGreaterThanOrEqual(1);
+
+    releaseSlow();
+    await daemon.stop();
+  });
+
+  it('慢标的只占自己的并发名额，不会把名额全占光', async () => {
+    // 符号名故意让 SLOW 排在前面：公平轮转在「都没跑过」时按 symbol 兜底排序，
+    // 于是第一轮一定先选 SLOW，它卡住之后**唯一的名额**才轮得到验证。
+    const SLOW = 'TESTAAASLOW2USDC';
+    const FAST = 'TESTZZZFAST2USDC';
+    const config = configWith({ concurrency: 1, pollIntervalMs: 20 });
+
+    let releaseSlow: () => void = () => undefined;
+    const slowGate = new Promise<void>((resolve) => {
+      releaseSlow = resolve;
+    });
+    let fastRuns = 0;
+
+    const control = new SyncControl(makeCtx(config), {
+      config,
+      syncFn: async (symbol) => {
+        if (symbol === SLOW) {
+          await slowGate;
+        } else {
+          fastRuns += 1;
+        }
+        return okSummary(symbol);
+      },
+    });
+    await seedSymbol(ctx.pool, SLOW);
+    await seedSymbol(ctx.pool, FAST);
+    await control.start(SLOW);
+    await control.start(FAST);
+
+    const daemon = new SyncDaemon(makeCtx(config), {
+      config,
+      control,
+      sleep: (ms) => new Promise((r) => setTimeout(r, ms)),
+      heartbeatIntervalMs: 60_000,
+    });
+    await daemon.start();
+    await new Promise((r) => setTimeout(r, 150));
+    const whileSlowStuck = fastRuns;
+    await new Promise((r) => setTimeout(r, 200));
+
+    // 并发上限是 1：SLOW 占着唯一的名额时，FAST 拿不到名额。
+    // 这条断言是为了把「慢的不堵别人」和「并发上限依然成立」两件事分开——
+    // 修复不能变成「并发上限形同虚设」。
+    expect(fastRuns, '并发上限=1 时，SLOW 占着名额，FAST 就不该被调度').toBe(whileSlowStuck);
+
+    releaseSlow();
+    await new Promise((r) => setTimeout(r, 200));
+    expect(fastRuns, 'SLOW 让出名额后 FAST 立刻能被调度').toBeGreaterThan(whileSlowStuck);
+
+    await daemon.stop();
+  });
+});

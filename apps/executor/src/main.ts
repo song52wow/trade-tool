@@ -298,6 +298,11 @@ async function main(): Promise<void> {
       // 此刻**没有任何在途事件**，是唯一适合兜底收敛的时刻：接住
       // 「断线期间成交事件整个丢了」——仓位已空而记录还停在 armed。
       // 事件流里不做这件事，因为那里会与止盈止损的 settle() 并发抢同一行。
+      //
+      // 这里给的只是**候选提示**。`positionRisk` 在一个完全没有仓位的账户上返回
+      // **空数组**（那是明确的「没有仓位」，不是「拿不到」）——所以候选集由
+      // `convergeFlatPositions` 自己从库里取「有未终结记录的标的」补全，
+      // 别在这里替它筛掉「没出现在返回里」的标的（2026-10-23 实测踩到）。
       await service.convergeFlatPositions(
         rows.filter((r) => r.positionAmt === 0).map((r) => ({ symbol: r.symbol })),
       );
@@ -313,6 +318,9 @@ async function main(): Promise<void> {
     config,
     placer: client,
     atr,
+    // v0.9.3：非计价币手续费（BNB 抵扣）折成计价币时用它取标记价。
+    // 走的是公开接口 `/fapi/v1/premiumIndex`，与私有接口同一条出网路径。
+    markPrice: (symbol) => client.markPrice(symbol),
     // 与周期对账共用**同一个**派发器：去重与冷却的记账因此是同一份，
     // 不会出现「同一件事，对账那边压住了、这边又推一遍」。
     alerts,

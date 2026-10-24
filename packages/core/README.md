@@ -9,7 +9,7 @@
 | `agent-context.ts`      | 行情上下文的跨语言契约（Python 载荷的 zod schema + 纯映射）                                                       |
 | `agent-trader.ts`       | 交易员契约与纯函数（v1.0.0）：提议 → 进场价 / 数量 / 止损止盈                                                     |
 | `agent-plan.ts`         | 方案「能不能自动执行」的判据（v1.0.0）：**四处共用一份**                                                          |
-| `agent-prompt.ts`       | 发给模型的提示词（v1.0.0）：系统提示、截断、镜像到飞书的消息构造                                                  |
+| `model-prompt.ts`       | 发给模型的提示词（v1.0.0）：系统提示、截断、镜像到飞书的消息构造                                                  |
 | `config.ts`             | zod 配置 schema 与 `defaultConfig()`                                                                              |
 | `config-io.ts`          | 配置文件读写（`TRADE_TOOL_HOME` → `trade-tool.config.json`）                                                      |
 | `env.ts`                | 加载仓库根的 `.env`（`loadProjectEnv()`，每个进程入口都要调）                                                     |
@@ -19,6 +19,7 @@
 | `market-sync.ts`        | 同步领域的类型、错误码 `SyncError` 与 `SyncErrorCode`                                                             |
 | `net-position.ts`       | 流内增量净额（`NetPositionTracker`）                                                                              |
 | `notify.ts`             | 通知层（v0.8.0）：飞书 webhook 通道 + 告警去重 / 冷却 / 恢复通知 ＋ 内容类型清单（`NOTIFY_KINDS`）                |
+| `pnl.ts`                | 盈亏口径（v0.9.3）：`estimateBracketPnl`、`realizedPnl`、`feeInQuoteAsset`（非计价币手续费折算）                  |
 | `reconcile.ts`          | 交易对账判据（纯函数，只报告不动手）+ 差异类型清单与中文名                                                        |
 | `risk-ids.ts`           | 条件单编号约定 + `orderType` 归类（对账与下单共用一份）＋ Agent 进场单号（`agentEntryClientOrderId`，带尝试次数） |
 | `risk-policy.ts`        | 止盈止损策略的纯函数（`deriveBracketPlan`、`deriveStagedPlan` 等）                                                |
@@ -73,3 +74,20 @@ v0.9.1 起只有这一个止盈倍数。原因是分批形态下**「整段止�
   所以它必须等于交易所上那张单的价格。
 - **分批时那一个倍数就是「先兑现那一段」的目标**（不是「整段目标」）。剩余仓位由
   `trailAtrMult` 管的移动止损了结。
+
+## 手续费折算（`feeInQuoteAsset`）
+
+币安的手续费**不一定**用计价币收——开了 BNB 抵扣就用 BNB 收。而盈亏公式只认计价币，
+所以**折算这一步不能省**：不折算就是把「0.00009805 BNB」当成「0.00009805 USDT」记，
+差着几百倍。
+
+这个模块只负责**乘**：`feeInQuoteAsset(amount, asset, price)` 把「以 `asset` 计的金额」
+按「1 个 `asset` 值多少计价币」折成计价币。**取价不是它的事**——那是调用方的事
+（IO 不进 core）。`feePriceSymbol(asset)` 把币种拼成取价用的交易对（`BNB` → `BNBUSDT`）。
+
+三条边界：
+
+- 币种**为空就报错**。宁可报错，也不要默默当成计价币——那正是这个 bug 的成因。
+- 金额必须是**非负有限数**，价格必须是**正有限数**。0 或负价会把手续费变成 0 或负数，
+  两样都是「看起来正常、其实错了」的数字。
+- 币种就是计价币时**不需要折算**（`feePriceSymbol` 会直接报错），那种情况按原价记。

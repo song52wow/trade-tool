@@ -523,3 +523,53 @@ describe('只读查询端点（v0.6.0 对账用）', () => {
     await expect(client.positionRisk()).rejects.toThrow(/positionAmt/);
   });
 });
+
+/**
+ * 标记价（v0.9.3：把 BNB 计价的手续费折成 USDT 时用它）。
+ *
+ * 契约断言对着官方文档写：`GET /fapi/v1/premiumIndex` 是**公开接口**，
+ * 带 symbol 时回**一个对象**（不是数组），`markPrice` 在 payload 里是**字符串**。
+ */
+describe('标记价 premiumIndex（v0.9.3 手续费折算用）', () => {
+  /** 官方 premiumIndex 示例（Binance 文档的字段值原样照抄）。 */
+  const PREMIUM_PAYLOAD = {
+    symbol: 'BNBUSDT',
+    markPrice: '590.12345678',
+    indexPrice: '590.10000000',
+    estimatedSettlePrice: '589.90000000',
+    lastFundingRate: '0.00010000',
+    nextFundingTime: 1720736417660,
+    interestRate: '0.00010000',
+    time: 1720736417659,
+  };
+
+  it('走 /fapi/v1/premiumIndex、带 symbol，且**不签名**', async () => {
+    const urls: string[] = [];
+    const client = clientWith((async (url: string) => {
+      urls.push(String(url));
+      return jsonResponse(PREMIUM_PAYLOAD);
+    }) as unknown as typeof fetch);
+
+    const price = await client.markPrice('BNBUSDT');
+
+    expect(urls[0]).toContain('/fapi/v1/premiumIndex');
+    expect(urls[0]).toContain('symbol=BNBUSDT');
+    // 公开接口：加了签名反而会被拒
+    expect(urls[0]).not.toContain('signature=');
+    expect(urls[0]).not.toContain('timestamp=');
+    // 字符串必须转成数字
+    expect(price).toBe(590.12345678);
+  });
+
+  it('payload 里没有 markPrice 就抛错，不返回 0 冒充', async () => {
+    const client = clientWith((async () =>
+      jsonResponse({ symbol: 'BNBUSDT' })) as unknown as typeof fetch);
+    await expect(client.markPrice('BNBUSDT')).rejects.toThrow(/markPrice/);
+  });
+
+  it('交易所报错要抛错，不能当成「价格是 0」', async () => {
+    const client = clientWith((async () =>
+      jsonResponse({ code: -1121, msg: 'Invalid symbol.' })) as unknown as typeof fetch);
+    await expect(client.markPrice('NOPEUSDT')).rejects.toThrow(SyncError);
+  });
+});
