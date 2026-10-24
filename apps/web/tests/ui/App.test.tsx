@@ -517,6 +517,8 @@ describe('详情页 K 线', () => {
           '1d': { withheldReason: 'disabled' },
         },
       },
+      // 同上：Agent 面板也读一条不同形状的路由，没有它就会拿到列表的 { items }。
+      '/api/symbols/BTCUSDC/agent': { symbol: 'BTCUSDC', report: null, plan: null },
     };
   }
 

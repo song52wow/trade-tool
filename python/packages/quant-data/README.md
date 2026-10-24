@@ -10,15 +10,16 @@ uv run python -m quant_data generate --symbol BTCUSDT --interval 1h --bars 500
 
 ## 子命令
 
-| 子命令                          | 作用                                                 | 需要 PG |
-| ------------------------------- | ---------------------------------------------------- | ------- |
-| `generate`                      | 确定性合成源（既有离线链路，行为未变）               | 否      |
-| `symbols`                       | 运行时发现可交易永续（R-7）                          | 配额桶  |
-| `resolve --symbol`              | 精确匹配 + 校验，失败给结构化错误码（R-7.2）         | 配额桶  |
-| `estimate --symbol`             | 首次全量规模预估，**不依赖 PG**（R-8.3）             | 否      |
-| `sync --symbol [--from] [--to]` | 首次全量 / 增量续传 / 缺口自动回补（R-8 … R-11）     | 是      |
-| `backfill --symbol --from --to` | 显式区间补数，恒为 `ON CONFLICT DO NOTHING`（R-15）  | 是      |
-| `verify --symbol`               | 全表缺口扫描并重建 `verified_upto` 基线（R-11.A3 ②） | 是      |
+| 子命令                          | 作用                                                         | 需要 PG |
+| ------------------------------- | ------------------------------------------------------------ | ------- |
+| `generate`                      | 确定性合成源（既有离线链路，行为未变）                       | 否      |
+| `symbols`                       | 运行时发现可交易永续（R-7）                                  | 配额桶  |
+| `resolve --symbol`              | 精确匹配 + 校验，失败给结构化错误码（R-7.2）                 | 配额桶  |
+| `estimate --symbol`             | 首次全量规模预估，**不依赖 PG**（R-8.3）                     | 否      |
+| `sync --symbol [--from] [--to]` | 首次全量 / 增量续传 / 缺口自动回补（R-8 … R-11）             | 是      |
+| `backfill --symbol --from --to` | 显式区间补数，恒为 `ON CONFLICT DO NOTHING`（R-15）          | 是      |
+| `verify --symbol`               | 全表缺口扫描并重建 `verified_upto` 基线（R-11.A3 ②）         | 是      |
+| `market-context --symbol`       | 分析师 Agent 的行情上下文（v1.0.0）：技术面现算 + 情绪面取数 | 是      |
 
 ## 模块
 
@@ -50,6 +51,17 @@ uv run python -m quant_data generate --symbol BTCUSDT --interval 1h --bars 500
   调用方只能当成「ATR 不可用」而拒绝下单；成交事件不会重放，于是**新开仓永远挂不上保护单**，
   仓位从此裸奔（2026-10-21 实测踩到并修掉）。
   `null` 与「缺字段」是两件事：缺字段是契约破损（TS 侧版本不对），那要报错。
+- `market_context.py` — 分析师 Agent 的行情上下文（v1.0.0）：
+  **技术面在 Python 侧现算**（读派生 K 线 → 取最后一段**连续** K 线 → `compute_series`
+  用 `DEFAULT_SPECS` 算指标 → `objective_bias()` 给一个客观倾向分），
+  **不物化 `indicator_*` 表**——那层默认关闭且占同步 72% 耗时，按需算单标的几百根是毫秒级。
+  指标公式仍然只有一份（`quant_core/indicators.py`），本模块不含任何指标公式。
+  **情绪面**走 7 个 Binance 公开合约端点（免密钥）：资金费率、标记价 / 指数价基差、
+  持仓量与变化、多空账户比、主动买卖比、24h 成交额。
+  ⚠️ **取不到的项记 `None` 并写进 `notes`，同时把 `degraded` 置 true**——
+  **禁止用 0 冒充缺失**（`0` 与「没取到」对模型的含义正好相反）。
+  与技术面不同：技术面取不到是**报错**（`AGENT_CONTEXT_UNAVAILABLE`），
+  情绪面缺项是**降级但可见**——两者严重度差量级。
 
 **表结构以 `packages/data/sql/*.sql` 为唯一来源**，本包不持有影子定义（R-2.5）。
 

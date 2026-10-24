@@ -19,6 +19,9 @@ import { toErrorBody } from './errors.js';
 
 import type {
   AddSymbolBody,
+  AgentViewDto,
+  AgentLlmStatusDto,
+  TradingPlanDto,
   BarDto,
   BracketsDto,
   CredentialStatusDto,
@@ -29,6 +32,7 @@ import type {
   LifecycleAction,
   NotifyStatusDto,
   NotifyWriteBody,
+  AgentLlmWriteBody,
   OverviewDto,
   RemoveSymbolBody,
   RiskPolicyEntryDto,
@@ -114,6 +118,32 @@ export interface WebDeps {
   writeRiskPolicy(body: RiskPolicyWriteBody): Promise<RiskPolicyEntryDto>;
   deleteRiskPolicy(input: { scope: RiskPolicyScopeDto; symbol: string }): Promise<{ ok: true }>;
   estimate(symbol: string): Promise<SymbolDetailDto['estimate']>;
+  /**
+   * 分析师报告与交易员执行方案（v1.0.0），**只读本地库**。
+   *
+   * 纯读：只打 PG，不调模型、不出网、不下单，因此可以挂在页面的刷新节奏上。
+   *
+   * 从没分析过时 `report` / `plan` 都是 `null`——「还没分析过」与「分析过但没出方案」
+   * 在界面上必须能分开说，因此不返回空报告冒充。
+   */
+  listAgentView(symbol: string): Promise<AgentViewDto>;
+  /**
+   * 批准 / 驳回一份执行方案（v1.0.0 自动下单）。
+   *
+   * **批准本身不下单**——下单由 `apps/executor` 消费 `approved` 方案完成，
+   * 而 executor 只在 `agent.execute.enabled` 开着时才消费。
+   */
+  setTradingPlanStatus(
+    symbol: string,
+    planId: string,
+    status: 'approved' | 'rejected',
+  ): Promise<TradingPlanDto>;
+  /** 模型接入的运行期设置（v1.0.0）。**没有明文密钥。** */
+  getAgentLlmStatus(): Promise<AgentLlmStatusDto>;
+  /** 写入模型接入设置。密钥**密文落库**，不回显。 */
+  writeAgentLlmSettings(body: AgentLlmWriteBody): Promise<AgentLlmStatusDto>;
+  /** 清空控制面录入的那一份（退回配置文件 + 环境变量）。 */
+  clearAgentLlmSettings(): Promise<AgentLlmStatusDto>;
   startJob(input: { kind: JobKind; symbol: string; target?: number | undefined }): Promise<JobDto>;
   listJobs(): Promise<JobDto[]>;
   getJob(id: string): Promise<JobDto | null>;
@@ -413,11 +443,88 @@ export function buildApp(deps: WebDeps): Hono {
     return c.json(await deps.testNotify());
   });
 
-  /** 策略总览：全局默认 + 全部标的覆盖 + 该标的最终生效的那一套。 */
-  app.get('/api/settings/risk-policy', async (c) => {
-    const symbol = c.req.query('symbol');
-    return c.json(await deps.getRiskPolicy(symbol === undefined ? null : symbol));
+  // ------------------------------------------------- 模型接入设置（v1.0.0）
+
+  /**
+   * 模型接入的运行期设置。**回包里没有明文密钥**——只有「配没配」与末 4 位。
+   */
+  app.get('/api/settings/agent-llm', async (c) => c.json(await deps.getAgentLlmStatus()));
+
+  /**
+   * 写入模型接入设置。
+   *
+   * 密钥**直接填在这里**：它会加密落库，不会出现在配置文件、argv 或日志里
+   * （与通知 webhook 的做法同一套）。
+   */
+  app.put('/api/settings/agent-llm', async (c) => {
+    assertSameOrigin(c);
+    const body = await bodyOf<AgentLlmWriteBody>(c);
+    if (typeof body?.enabled !== 'boolean') {
+      throw new SyncError('CONFIG_INVALID', '缺少 enabled（必须是布尔值）');
+    }
+    if (typeof body?.baseUrl !== 'string') {
+      throw new SyncError('CONFIG_INVALID', '缺少 baseUrl（留空表示「保持原样」）');
+    }
+    if (typeof body?.model !== 'string') {
+      throw new SyncError('CONFIG_INVALID', '缺少 model（留空表示「保持原样」）');
+    }
+    if (body.apiKey !== undefined && typeof body.apiKey !== 'string') {
+      throw new SyncError('CONFIG_INVALID', 'apiKey 必须是字符串');
+    }
+    if (!Number.isInteger(body.timeoutMs) || body.timeoutMs <= 0) {
+      throw new SyncError(
+        'CONFIG_INVALID',
+        `timeoutMs 必须是正整数毫秒，收到：${String(body.timeoutMs)}`,
+      );
+    }
+    return c.json(await deps.writeAgentLlmSettings(body));
   });
+
+  /** 清空控制面录入的那一份（退回配置文件 + 环境变量）。 */
+  app.delete('/api/settings/agent-llm', async (c) => {
+    assertSameOrigin(c);
+    return c.json(await deps.clearAgentLlmSettings());
+  });
+
+  /**
+   * 分析师报告与执行方案（v1.0.0）：**只读本地库**。
+   *
+   * 纯读，因此可以挂在页面的刷新节奏上——与 `/bars` 同性质。
+   * 没分析过时返回 `{ report: null, plan: null }`（200），不是 404：
+   * 「这个标的还没被分析过」是完全正常的状态，页面要如实显示空状态。
+   */
+  app.get('/api/symbols/:symbol/agent', async (c) => {
+    const symbol = normalizeSymbol(c.req.param('symbol'));
+    return c.json(await deps.listAgentView(symbol));
+  });
+
+  /**
+   * 批准 / 驳回一份执行方案（v1.0.0 自动下单）。
+   *
+   * ⚠️ **批准本身不下单**。下单由 `apps/executor` 消费 `approved` 的方案完成，
+   * 而 executor 只在 `agent.execute.enabled` 开着时才消费。
+   * 开关关着时，批准只是「预先批准」，**不会有单下出去**。
+   *
+   * 它是写操作，因此要过来源校验（与其它写路由一致）。
+   */
+  app.put('/api/symbols/:symbol/agent/plans/:planId', async (c) => {
+    assertSameOrigin(c);
+    const symbol = normalizeSymbol(c.req.param('symbol'));
+    const planId = c.req.param('planId');
+    const body = await bodyOf<{ status?: unknown }>(c);
+    if (body?.status !== 'approved' && body?.status !== 'rejected') {
+      throw new SyncError('CONFIG_INVALID', 'status 必须是 approved 或 rejected');
+    }
+    return c.json(await deps.setTradingPlanStatus(symbol, planId, body.status));
+  });
+
+  /** 策略总览：全局默认 + 全部标的覆盖 + 该标的最终生效的那一套。 */ app.get(
+    '/api/settings/risk-policy',
+    async (c) => {
+      const symbol = c.req.query('symbol');
+      return c.json(await deps.getRiskPolicy(symbol === undefined ? null : symbol));
+    },
+  );
 
   app.put('/api/settings/risk-policy', async (c) => {
     assertSameOrigin(c);

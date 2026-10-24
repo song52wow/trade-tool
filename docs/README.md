@@ -49,3 +49,8 @@ docs/v0.1.0-<主题>-appendix.md   ← 证据：实测数字 / curl 脚本 / 实
 
 ⚠️ v0.7.0 是**已定设计、未实现**：文档里带「待核实」的两条（Algo API 是否接受 `quantity`、
 两张 `closePosition` 单重叠时的行为）会改变实现形态，实现前必须先做掉。
+
+⚠️ **v0.8.0（通知层）、v0.9.0（LLM 决策）、v1.0.0（分析师 / 交易员 Agent）没有需求文档**——
+它们的规则直接写在 AGENTS.md 的 §6.9 / §6.10 / §6.11 与各包的 README 里
+（`packages/core/README.md`、`packages/data/README.md`、`apps/agent/README.md`）。
+这三个版本的需求来自对话而非文档，因此**规则以 AGENTS.md 为准**。

@@ -3,7 +3,7 @@
 #
 # 为什么必须在这里跑 `db migrate`（而不是让用户手动敲一次）：
 # apps/web 启动第一件事就是 `runtime.assertSchema()`，schema 版本对不上直接拒绝启动；
-# sync / executor 也一样。把迁移放在入口里，四个入口共用一条路径，
+# sync / executor 也一样。把迁移放在入口里，所有入口共用一条路径，
 # 就不存在「web 起来了但库还是旧的」这种半个可用状态。
 set -euo pipefail
 

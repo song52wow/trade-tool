@@ -1,11 +1,16 @@
 import { resolve } from 'node:path';
 
 import {
+  buildAnalystContext,
+  parseMarketContextPayload,
   resolveHome,
   SyncError,
   type AggregateSummary,
+  type AnalystContext,
+  type ContractFacts,
   type ContractSpec,
   type DataConfig,
+  type MarketContextPayload,
   type RateLimitStatus,
   type SyncPlanEstimate,
   type SyncRunSummary,
@@ -17,6 +22,7 @@ import {
 
 import { runPython, type PythonRuntime } from './bridge.js';
 import { pythonEnvFromEnv } from './exchange-endpoints.js';
+import { parseMinNotional, parseMinQty, parseStepSize, parseTickSize } from './binance-private.js';
 import * as repo from './db/repo.js';
 import { buildDsn, connectionOptions, type ConnectionOptions, type Pool } from './db/pool.js';
 
@@ -514,6 +520,90 @@ export async function aggregateSymbol(
   });
 }
 
+// ------------------------------------------------------ Agent 的行情上下文（v1.0.0）
+
+/** 取一份行情上下文的参数。 */
+export interface AgentContextOptions {
+  symbol: string;
+  /** 分析周期（派生周期之一）。 */
+  interval: string;
+  /** 参与计算的已收盘 K 线根数。 */
+  bars: number;
+}
+
+/** 取到的行情上下文。 */
+export interface AgentContextResult {
+  /** 组装好的上下文（喂给模型）。 */
+  context: AnalystContext;
+  /** Python 侧的载荷（落库留痕用）。 */
+  payload: MarketContextPayload;
+  /** 情绪面有接口没取到。 */
+  degraded: boolean;
+}
+
+/**
+ * 取一份完整的行情上下文：技术面（Python 现算）+ 情绪面（公开接口）+ 基本面（合约规格）。
+ *
+ * 三块数据来自三个不同的地方，缺一不可：
+ *
+ * - **技术面**：Python 侧按库内派生 K 线现算（指标公式的唯一所在地）。
+ * - **情绪面**：Python 侧出网取公开合约数据。
+ * - **基本面**：这里读**库里**的 `contract_spec` 快照——不重新拉 exchangeInfo。
+ *   理由与止盈止损对齐 tickSize 同源：规格必须与下单时用的是**同一份快照**，
+ *   否则「方案上的价格」与「实际挂单的规格」可能来自两次不同的抓取。
+ *
+ * @throws SyncError 'AGENT_CONTEXT_UNAVAILABLE' 形状不符 / 没有合约规格快照。
+ */
+export async function loadAgentContext(
+  ctx: MarketContext,
+  options: AgentContextOptions,
+): Promise<AgentContextResult> {
+  const raw = await invoke<unknown>(ctx, {
+    args: [
+      'market-context',
+      '--symbol',
+      options.symbol,
+      '--interval',
+      options.interval,
+      '--bars',
+      String(options.bars),
+      '--weight-budget',
+      String(ctx.config.sync.weightBudgetPerMinute),
+    ],
+    withDsn: true,
+  });
+  const payload = parseMarketContextPayload(raw);
+
+  const specRaw = await repo.readContractSpecRaw(ctx.pool, ctx.exchange, options.symbol);
+  if (specRaw === null) {
+    throw new SyncError(
+      'AGENT_CONTEXT_UNAVAILABLE',
+      `${options.symbol} 没有合约规格快照（contract_spec）：先同步这个标的，` +
+        '否则算不出最小价格变动，方案的价格无从对齐',
+      { symbol: options.symbol, exchange: ctx.exchange },
+    );
+  }
+  const spec = await repo.readContractSpec(ctx.pool, ctx.exchange, options.symbol);
+  const facts: ContractFacts = {
+    contractType: spec?.contractType ?? 'UNKNOWN',
+    onboardDateMs: spec?.onboardDate ?? null,
+    tickSize: parseTickSize(specRaw, options.symbol),
+    stepSize: parseStepSize(specRaw, options.symbol),
+    minQty: parseMinQty(specRaw, options.symbol),
+    minNotional: parseMinNotional(specRaw, options.symbol),
+  };
+
+  const baseline = {
+    stopAtrMult: ctx.config.executor.stopAtrMult,
+    takeProfitAtrMult: ctx.config.executor.takeProfitAtrMult,
+  };
+  return {
+    context: buildAnalystContext(payload, facts, baseline),
+    payload,
+    degraded: payload.sentiment.degraded,
+  };
+}
+
 // ------------------------------------------------------------------ 状态读
 
 export async function getState(
@@ -522,7 +612,6 @@ export async function getState(
 ): Promise<SymbolSyncState | null> {
   return repo.readState(ctx.pool, ctx.exchange, symbol);
 }
-
 export async function getAllStates(ctx: MarketContext): Promise<SymbolSyncState[]> {
   // 按 exchange 过滤：全局汇总是按 exchange 统计的，不过滤会让 `sync status`
   // 列出的标的数与汇总数出自两个不同的总体。

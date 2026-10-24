@@ -1136,6 +1136,14 @@ def test_migrations_are_idempotent(conn: DbConn, pg_dsn: str) -> None:
         "015_restore_llm_params_check",
         # v0.9.2：移动止损的档位序号 + 通知内容类型扩容
         "016_trail_step",
+        # v1.0.0：分析师报告 + 交易员执行方案
+        "017_agent_decisions",
+        # v1.0.0：方案变真实订单（执行态列 + agent-plan 决策来源）
+        "018_agent_plan_execution",
+        # v1.0.0：模型接入的运行期设置（密文落库）
+        "019_agent_llm_settings",
+        # v1.0.0：通知内容类型多两种提示词
+        "020_agent_prompt_notify",
         # v0.9.3：手续费的币种与折算汇率（编号跳号：017~020 已被另一条在研分支占用）
         "021_fee_asset",
     ]

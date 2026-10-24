@@ -1,8 +1,17 @@
 """Binance USDⓈ-M 永续的 REST 接入与 K 线解析。
 
-只做公开行情（N-5），只用两个端点（附录 A.2）：
+只做公开行情（N-5），只用这几个端点（附录 A.2）：
 - ``GET /fapi/v1/exchangeInfo``：合约元数据（R-7），约 1.14 MB，必须共享缓存（R-7.4）
 - ``GET /fapi/v1/klines``：1m K 线（R-9）
+
+以及**情绪面 / 基本面**用的公开端点（v1.0.0，Agent 用）：
+- ``GET /fapi/v1/premiumIndex``：标记价、指数价、当前资金费率
+- ``GET /fapi/v1/fundingRate``：历史资金费率
+- ``GET /fapi/v1/openInterest``：当前持仓量
+- ``GET /futures/data/openInterestHist``：持仓量历史
+- ``GET /futures/data/globalLongShortAccountRatio``：全市场多空账户比
+- ``GET /futures/data/takerlongshortRatio``：主动买 / 主动卖量比
+- ``GET /fapi/v1/ticker/24hr``：24 小时统计（成交额、涨跌幅、笔数）
 
 **不写死任何标的名或任何标的元数据数值**（R-5）：``onboardDate`` / ``status`` /
 ``contractType`` 一律运行时解析。
@@ -47,6 +56,19 @@ STATUS_TRADING = "TRADING"
 
 #: exchangeInfo 的请求权重：附录只实测了 klines 的分层，这里按最小档保守预留。
 EXCHANGE_INFO_WEIGHT = 1
+
+#: 情绪面 / 基本面公开端点的请求权重。
+#:
+#: 交易所的权重表会变，而这里的取值只影响「本地预算怎么扣」——
+#: **宁可多扣不可少扣**：多扣只是慢一点，少扣可能撞 429。
+#: 真撞了由 ``WeightBudget`` 走全局暂停兜底（R-21.4），不会变成「静默继续打满配额」。
+PREMIUM_INDEX_WEIGHT = 1
+FUNDING_RATE_WEIGHT = 1
+OPEN_INTEREST_WEIGHT = 1
+OPEN_INTEREST_HIST_WEIGHT = 1
+LONG_SHORT_RATIO_WEIGHT = 1
+TAKER_RATIO_WEIGHT = 1
+TICKER_24H_WEIGHT = 2
 
 #: 触发全局暂停的交易所状态码（R-21.4）。
 RATE_LIMIT_STATUSES = frozenset({418, 429})
@@ -167,6 +189,33 @@ def _optional_int(value: object, index: int, field: str) -> int | None:
     return _require_int(value, index, field)
 
 
+def _as_object(payload: object, context: str) -> dict[str, object]:
+    """响应必须是一个对象，否则报错。
+
+    不返回空 dict：形状不对说明接口变了或被网关拦了，
+    **静默当成空数据会让上层「什么都不知道」也照样往下走**（约定 9）。
+    """
+    if not isinstance(payload, Mapping):
+        raise SyncError("EXCHANGE_ERROR", f"{context} 响应不是对象", {"context": context})
+    return dict(payload)
+
+
+def _as_rows(payload: object, context: str) -> list[dict[str, object]]:
+    """响应必须是一个对象数组。理由同 {@link _as_object}。"""
+    if not isinstance(payload, list):
+        raise SyncError("EXCHANGE_ERROR", f"{context} 响应不是数组", {"context": context})
+    rows: list[dict[str, object]] = []
+    for item in payload:
+        if not isinstance(item, Mapping):
+            raise SyncError(
+                "EXCHANGE_ERROR",
+                f"{context} 响应里有非对象元素",
+                {"context": context},
+            )
+        rows.append(dict(item))
+    return rows
+
+
 def parse_klines(payload: object) -> list[Kline]:
     """按位置解析 12 字段 K 线数组（附录 A.2）。"""
     if not isinstance(payload, list):
@@ -265,6 +314,89 @@ class BinanceClient:
             params["endTime"] = str(end_ms)
         payload = self._get("/fapi/v1/klines", params, kline_weight(limit), "klines")
         return parse_klines(payload)
+
+    # --------------------------------------------------------------- 情绪面 / 基本面
+    #
+    # 以下方法只做「URL 拼装 + 权重预留 + 形状校验」，**不解释数值**：
+    # 数值怎么算（年化、变化率、基差）属于分析口径，放在 ``market_context`` 里，
+    # 那里能同时看到这些数的含义。本模块保持「极薄的 REST 客户端」。
+
+    def premium_index(self, symbol: str) -> dict[str, object]:
+        """标记价、指数价与**当前**资金费率。
+
+        返回的字段是交易所给的**字符串**（如 ``"60000.12"``），由调用方按数值解析。
+        """
+        payload = self._get(
+            "/fapi/v1/premiumIndex",
+            {"symbol": symbol},
+            PREMIUM_INDEX_WEIGHT,
+            "premiumIndex",
+        )
+        return _as_object(payload, "premiumIndex")
+
+    def funding_rate(self, symbol: str, limit: int = 3) -> list[dict[str, object]]:
+        """历史资金费率（按时间升序）。"""
+        payload = self._get(
+            "/fapi/v1/fundingRate",
+            {"symbol": symbol, "limit": str(limit)},
+            FUNDING_RATE_WEIGHT,
+            "fundingRate",
+        )
+        return _as_rows(payload, "fundingRate")
+
+    def open_interest(self, symbol: str) -> dict[str, object]:
+        """当前持仓量。"""
+        payload = self._get(
+            "/fapi/v1/openInterest",
+            {"symbol": symbol},
+            OPEN_INTEREST_WEIGHT,
+            "openInterest",
+        )
+        return _as_object(payload, "openInterest")
+
+    def open_interest_hist(self, symbol: str, period: str, limit: int) -> list[dict[str, object]]:
+        """持仓量历史（按时间升序）。"""
+        payload = self._get(
+            "/futures/data/openInterestHist",
+            {"symbol": symbol, "period": period, "limit": str(limit)},
+            OPEN_INTEREST_HIST_WEIGHT,
+            "openInterestHist",
+        )
+        return _as_rows(payload, "openInterestHist")
+
+    def global_long_short_ratio(
+        self, symbol: str, period: str, limit: int
+    ) -> list[dict[str, object]]:
+        """全市场多空**账户**比（按时间升序）。"""
+        payload = self._get(
+            "/futures/data/globalLongShortAccountRatio",
+            {"symbol": symbol, "period": period, "limit": str(limit)},
+            LONG_SHORT_RATIO_WEIGHT,
+            "globalLongShortAccountRatio",
+        )
+        return _as_rows(payload, "globalLongShortAccountRatio")
+
+    def taker_long_short_ratio(
+        self, symbol: str, period: str, limit: int
+    ) -> list[dict[str, object]]:
+        """主动买 / 主动卖成交量比（按时间升序）。"""
+        payload = self._get(
+            "/futures/data/takerlongshortRatio",
+            {"symbol": symbol, "period": period, "limit": str(limit)},
+            TAKER_RATIO_WEIGHT,
+            "takerlongshortRatio",
+        )
+        return _as_rows(payload, "takerlongshortRatio")
+
+    def ticker_24h(self, symbol: str) -> dict[str, object]:
+        """24 小时统计：成交额、涨跌幅、成交笔数。"""
+        payload = self._get(
+            "/fapi/v1/ticker/24hr",
+            {"symbol": symbol},
+            TICKER_24H_WEIGHT,
+            "ticker24hr",
+        )
+        return _as_object(payload, "ticker24hr")
 
     def _get(
         self,

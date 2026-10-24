@@ -16,6 +16,7 @@ import {
   BinancePrivateClient,
   buildContext,
   createPool,
+  listUnsettledBrackets,
   openUserDataStream,
   parseAccountUpdate,
   parseOrderTradeUpdate,
@@ -24,6 +25,7 @@ import {
   resolvePolicy,
   exchangeEndpointsFromEnv,
   createLlmClient,
+  createPromptMirror,
   readBars,
 } from '@trade-tool/data';
 
@@ -31,6 +33,12 @@ import type { Pool } from '@trade-tool/data';
 
 import { createAtrProvider } from './atr.js';
 import { createRiskDecider } from './decision.js';
+import {
+  createPlanExecutor,
+  resolveAgentPlanDecision,
+  startPlanExecutionTimer,
+  type PlanExecutionTimer,
+} from './plan-execution.js';
 import { startPeriodicReconcile, type PeriodicReconcile } from './reconcile.js';
 import { startTrailingTimer } from './trailing.js';
 import { createExecutorService } from './service.js';
@@ -46,6 +54,11 @@ let closeStream: (() => void) | undefined;
 let reconcileTimer: PeriodicReconcile | undefined;
 /** 移动止损定时器（v0.7.0）。同样必须停掉。 */
 let trailTimer: { stop(): void } | undefined;
+/**
+ * 方案执行定时器（v1.0.0 自动下单）。同样必须停掉——
+ * 它会下真实订单，退出时还在跑就意味着「进程要退了但单还在下」。
+ */
+let planTimer: PlanExecutionTimer | undefined;
 
 /**
  * 凭据解析：走 `resolveActiveCredentials()`（**库里优先、环境变量兜底**）。
@@ -153,6 +166,17 @@ async function main(): Promise<void> {
 
   const alerts = new AlertDispatcher({ channel: resolveChannel });
 
+  /**
+   * 提示词镜像（v1.0.0）：把问模型要档位时的那一组消息推到群里。
+   *
+   * **复用上面那个通道解析器**：「哪一份在生效」只有一份实现（§6.9.1 规则 1），
+   * 而镜像与告警本来就是同一个通道。
+   *
+   * ⚠️ 这一档在通知清单里**默认不勾**，而且它**每次成交**一条——
+   * 勾上就是「每笔成交往群里发一条」。用户自己决定要不要。
+   */
+  const mirror = createPromptMirror({ resolveChannel });
+
   const ctx = buildContext(pool, config);
   const client = new BinancePrivateClient({
     credentials,
@@ -189,6 +213,10 @@ async function main(): Promise<void> {
           timeoutMs: config.executor.llm.timeoutMs,
         }),
         config: config.executor.llm,
+        // 提示词镜像（v1.0.0）：与 Agent 共用同一份实现。
+        // ⚠️ 这一档在通知清单里**默认不勾**，而且它**每次成交**一条——
+        // 勾上就是「每笔成交往群里发一条」，用户自己决定要不要。
+        mirrorPrompt: (input) => mirror.mirror(input),
       })
     : undefined;
   if (decider !== undefined) {
@@ -302,6 +330,14 @@ async function main(): Promise<void> {
     // 行为与 v0.9.0 之前逐字一致。
     ...(decider === undefined ? {} : { decider }),
     readRecentReturns,
+    // Agent 方案（v1.0.0）。这笔单是**按批准的方案**下的时，
+    // 止损止盈用方案里的 ATR 倍数，而不是配置档位——
+    // 让人批准的数和实际挂单的数必须是同一个。
+    resolveAgentPlan: async (update) =>
+      resolveAgentPlanDecision(pool, ctx.exchange, {
+        symbol: update.symbol,
+        clientOrderId: update.clientOrderId,
+      }),
   });
 
   await seedNetPositions();
@@ -312,6 +348,44 @@ async function main(): Promise<void> {
   // 移动止损定时器与对账定时器**必须分开**（v0.7.0 / AGENTS.md §6.8）：对账是只读的，
   // 而移动止损要下单，合并会让「对账绝不动手」这条保证失守。
   trailTimer = startTrailingTimer(service, config.executor.trailIntervalMs);
+
+  /**
+   * 自动下单（v1.0.0）。**默认关闭**：`agent.execute.enabled` 缺省 false，
+   * 于是这一整段不建任何东西——executor 的行为与 v1.0.0 之前逐字一致，
+   * 一笔单都不会多下。
+   *
+   * 开关打开后，`apps/agent` 产出的方案直接进 `approved`，由这里消费：
+   * 认领 → 下市价进场单 → 成交事件回来时按方案档位挂止损止盈。
+   */
+  if (config.agent.execute.enabled) {
+    const planExecutor = createPlanExecutor({
+      pool,
+      placer: client,
+      exchange: ctx.exchange,
+      planTtlMs: config.agent.execute.planTtlMs,
+      maxOpenPlans: config.agent.execute.maxOpenPlans,
+      alerts,
+      // 已有仓位不叠加：Agent 的仓位按「一笔干净开仓」算的，
+      // 在已有仓位上再加一笔，敞口就不是方案里写的那个数了。
+      hasOpenPosition: (symbol) => {
+        const amount = tracker.get(symbol);
+        return amount !== undefined && amount !== 0;
+      },
+      // 已有未终结的保护就不开新仓：条件单保护的是整个净仓位。
+      hasUnsettledBracket: async (symbol) => {
+        const unsettled = await listUnsettledBrackets(pool, ctx.exchange, symbol);
+        return unsettled.length > 0;
+      },
+    });
+    planTimer = startPlanExecutionTimer(planExecutor, config.agent.execute.pollIntervalMs);
+    console.error(
+      `[executor] 自动下单已开启：每 ${String(config.agent.execute.pollIntervalMs / 1000)} 秒` +
+        `检查一次已批准的方案（同时最多 ${String(config.agent.execute.maxOpenPlans)} 笔，` +
+        `方案有效期 ${String(config.agent.execute.planTtlMs / 1000)} 秒）`,
+    );
+  } else {
+    console.error('[executor] 自动下单未开启：只挂止盈止损，不会按 Agent 方案开仓');
+  }
 
   let delay = config.executor.reconnectBaseMs;
   const serial = createSerialRunner();
@@ -402,6 +476,7 @@ async function main(): Promise<void> {
   closeStream?.();
   reconcileTimer?.stop();
   trailTimer?.stop();
+  planTimer?.stop();
   await pool.end().catch(() => undefined);
 }
 
@@ -413,6 +488,7 @@ for (const signal of ['SIGINT', 'SIGTERM'] as const) {
     // 定时器也要停：挂着的 setInterval 会让进程在「已收到停止信号」之后继续不退出。
     reconcileTimer?.stop();
     trailTimer?.stop();
+    planTimer?.stop();
   });
 }
 

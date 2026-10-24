@@ -3,6 +3,8 @@ import {
   NOTIFY_KIND_INFO,
   NOTIFY_KINDS,
   SyncError,
+  assertApprovable,
+  autoExecutableProblem,
   createNotifier,
   loadConfigOrDefault,
   parseSecretKey,
@@ -46,14 +48,24 @@ import {
   readDerivedIntervals,
   readLatestBars,
   readLatestReconciliation,
+  readLatestAnalystReport,
+  readLatestTradingPlan,
+  readTradingPlanById,
+  updateTradingPlanStatus,
+  readAgentLlmStatus,
+  readAgentLlmPanelTarget,
+  writeAgentLlmSettings as writeAgentLlmSettingsRow,
+  clearAgentLlmSettings as clearAgentLlmSettingsRow,
   resolveActiveCredentials,
   resolveContract,
   runReconciliation,
   schemaStatus,
   syncSymbol,
   verifySymbol,
+  type AnalystReportRow,
   type MarketContext,
   type Pool,
+  type TradingPlanRow,
   exchangeEndpointsFromEnv,
 } from '@trade-tool/data';
 import { createSyncService, HEARTBEAT_INTERVAL_MS, type SyncService } from '@trade-tool/sync';
@@ -96,12 +108,16 @@ function masterKeyOrNull(): Buffer | null {
   return requireMasterKey();
 }
 import type {
+  AgentReportDto,
+  AgentViewDto,
   BarDto,
   BracketsDto,
   CredentialStatusDto,
   NotifyStatusDto,
+  AgentLlmStatusDto,
   RiskPolicyEntryDto,
   RiskPolicyViewDto,
+  TradingPlanDto,
   DaemonStatusDto,
   ReconcileReport,
   ExchangeListDto,
@@ -298,6 +314,45 @@ export function createWebRuntime(config: TradeToolConfig): WebRuntime {
     estimate: (symbol) => estimateFirstPull(ctx, symbol),
 
     /**
+     * 分析师报告与执行方案（v1.0.0）：**只读**本地表。
+     *
+     * 纯读：只打 PG，不调模型、不出网、不下单，因此能挂在页面的 5s 刷新节奏上。
+     *
+     * 报告与方案**分别**取「最近一条」：方案可能来自上一份报告（这一轮分析师失败时，
+     * 只会写一条 `action = 'failed'` 的方案而没有新报告）。因此页面上要能同时看到
+     * 「最新报告」与「最新方案」，而不是把它们捆在一起——捆在一起会让人以为
+     * 那份方案就是基于那份报告做的。
+     */
+    async listAgentView(symbol): Promise<AgentViewDto> {
+      const [report, plan] = await Promise.all([
+        readLatestAnalystReport(pool, ctx.exchange, symbol),
+        readLatestTradingPlan(pool, ctx.exchange, symbol),
+      ]);
+      return {
+        symbol,
+        report: report === null ? null : toAgentReportDto(report),
+        plan: plan === null ? null : toTradingPlanDto(plan),
+      };
+    },
+
+    /**
+     * 批准 / 驳回一份执行方案（v1.0.0 自动下单）。
+     *
+     * ⚠️ **批准本身不下单**。真正的下单由 `apps/executor` 消费 `approved` 的方案完成，
+     * 而 executor 只在 `agent.execute.enabled` 开着时才消费。因此：
+     *
+     * - 开关**关着**时：批准只是把方案标成 `approved`（为将来打开开关做准备），
+     *   executor 压根不看它——**不会有单下出去**；
+     * - 开关**打开**时：Agent 产出的方案本来就直接进 `approved`，
+     *   executor 会消费它。这一条路由留给「上一轮开关是关着的」那种情况。
+     *
+     * 页面必须把这两件事说清楚，否则用户会以为「点了批准 = 立刻开仓」。
+     */
+    async setTradingPlanStatus(symbol, planId, status): Promise<TradingPlanDto> {
+      return applyTradingPlanStatus({ pool, exchange: ctx.exchange, symbol, planId, status });
+    },
+
+    /**
      * 交易对账（v0.6.0）：**只读**地比对交易所与本地，绝不下单/撤单/写库。
      *
      * 需要明文凭据来签名私有接口（AGENTS.md 约定 2 的同一原则：密钥只经环境变量与
@@ -420,6 +475,61 @@ export function createWebRuntime(config: TradeToolConfig): WebRuntime {
       // 写完重新读一遍状态：回包里的「生效来源」必须是从库里读出来的事实，
       // 而不是「我们刚写了什么」的自我复述。
       return this.getNotifyStatus();
+    },
+
+    /**
+     * 模型接入的运行期设置（v1.0.0）。
+     *
+     * **控制面录入优先**，配置文件 + 环境变量兜底——判据只有
+     * `resolveAgentLlmSettings` 一份实现（两处各判一次的话，
+     * 「哪一份在生效」就有两个答案）。
+     */
+    async getAgentLlmStatus(): Promise<AgentLlmStatusDto> {
+      const status = await readAgentLlmStatus({
+        pool,
+        masterKey: masterKeyOrNull(),
+        config: config.agent.llm,
+      });
+      return {
+        enabled: status.enabled,
+        baseUrl: status.baseUrl,
+        model: status.model,
+        timeoutMs: status.timeoutMs,
+        source: status.source,
+        apiKeyEnv: status.apiKeyEnv,
+        configKeyAvailable: status.configKeyAvailable,
+        panel: status.panel,
+        updatedAt: status.updatedAt,
+        masterKeyReady: masterKeyStatus().ok,
+      };
+    },
+
+    async writeAgentLlmSettings(body): Promise<AgentLlmStatusDto> {
+      const key = requireMasterKey();
+      // 面板那一档当前存着的值：「留空 = 保持原样」要靠它才成立。
+      const current = await readAgentLlmPanelTarget({ pool, masterKey: key });
+      await writeAgentLlmSettingsRow(
+        pool,
+        key,
+        {
+          enabled: body.enabled,
+          baseUrl: body.baseUrl,
+          model: body.model,
+          apiKey: body.apiKey,
+          clearApiKey: body.clearApiKey === true,
+          timeoutMs: body.timeoutMs,
+          now: Date.now(),
+        },
+        current,
+      );
+      // 写完重新读一遍状态：回包里的「生效来源」必须是从库里读出来的事实，
+      // 而不是「我们刚写了什么」的自我复述。
+      return this.getAgentLlmStatus();
+    },
+
+    async clearAgentLlmSettings(): Promise<AgentLlmStatusDto> {
+      await clearAgentLlmSettingsRow(pool);
+      return this.getAgentLlmStatus();
     },
 
     async clearNotifySettings(): Promise<NotifyStatusDto> {
@@ -564,4 +674,118 @@ function toPolicyDto(row: {
     symbol: row.symbol ?? '',
     updatedAt: row.updatedAt ?? 0,
   };
+}
+
+// ------------------------------------------- Agent 报告与方案的 DTO 转换（v1.0.0）
+
+/**
+ * 数据库行 → 页面用的报告。
+ *
+ * **只搬运，不加工**：分数、立场、信心都是 core 的纯函数算出来的，这里原样透出。
+ * 加工（例如把分数映射成颜色）属于展示层的事，那是页面的活。
+ */
+function toAgentReportDto(row: AnalystReportRow): AgentReportDto {
+  return {
+    id: row.id,
+    symbol: row.symbol,
+    interval: row.interval,
+    asOfMs: row.asOfMs,
+    createdAtMs: row.createdAtMs,
+    stance: row.stance,
+    confidence: row.confidence,
+    bias: row.bias,
+    agreement: row.agreement,
+    technical: { score: row.technical.score, notes: row.technical.notes },
+    sentiment: { score: row.sentiment.score, notes: row.sentiment.notes },
+    fundamental: { score: row.fundamental.score, notes: row.fundamental.notes },
+    atr: row.atr,
+    lastClose: row.lastClose,
+    rationale: row.rationale,
+    degraded: row.degraded,
+  };
+}
+
+/** 数据库行 → 页面用的方案。 */
+function toTradingPlanDto(row: TradingPlanRow): TradingPlanDto {
+  // 「能不能批准」用 core 那一份判据算，页面只负责显示（§5 第 5 条）。
+  const approvableReason = autoExecutableProblem(row.entryType, row.action);
+  return {
+    id: row.id,
+    symbol: row.symbol,
+    reportId: row.reportId,
+    createdAtMs: row.createdAtMs,
+    action: row.action,
+    status: row.status,
+    side: row.side,
+    entryType: row.entryType,
+    entryPrice: row.entryPrice,
+    stopPrice: row.stopPrice,
+    takeProfitPrice: row.takeProfitPrice,
+    quantity: row.quantity,
+    notional: row.notional,
+    riskAmount: row.riskAmount,
+    equity: row.equity,
+    equitySource: row.equitySource,
+    riskFraction: row.riskFraction,
+    riskReward: row.riskReward,
+    stance: row.stance,
+    confidence: row.confidence,
+    rationale: row.rationale,
+    adjustments: row.adjustments,
+    failureReason: row.failureReason,
+    entryOrderId: row.entryOrderId,
+    executionFailureReason: row.executionFailureReason,
+    approvable: approvableReason === null,
+    approvableReason,
+  };
+}
+
+/**
+ * 批准 / 驳回一份执行方案的**核心逻辑**（不碰 HTTP）。
+ *
+ * 单独抽出来是为了**能被测**：控制面的批准要走真库，
+ * 而「限价方案能不能批准」这条判据是纯的——摊成一个只依赖注入的函数，
+ * 测试直接调用它，不必起整个控制面。
+ *
+ * ⚠️ **判据用 core 那一份**（`packages/core/src/agent-plan.ts`），
+ * 不在这里自己写一遍：agent 的自动批准、CLI 的人工批准、executor 的兜底
+ * 检查**四处共用**（§5 第 5 条：同一概念只有一个名字）。
+ *
+ * @throws SyncError 'CONFIG_INVALID' 状态不合法 / 这份方案不能批准；
+ *   'DB_UNIQUE_VIOLATION' 方案不存在 / 标的对不上。
+ */
+export async function applyTradingPlanStatus(input: {
+  pool: Pool;
+  exchange: string;
+  symbol: string;
+  planId: string;
+  status: 'approved' | 'rejected';
+}): Promise<TradingPlanDto> {
+  const { pool, exchange, symbol, planId, status } = input;
+  if (status !== 'approved' && status !== 'rejected') {
+    throw new SyncError('CONFIG_INVALID', `不允许把方案状态改成 ${status}`, { status });
+  }
+  const plan = await readTradingPlanById(pool, exchange, planId);
+  if (plan === null) {
+    throw new SyncError('DB_UNIQUE_VIOLATION', `方案 ${planId} 不存在`, { planId });
+  }
+  // URL 里的标的必须与方案自己的对得上。方案号全局唯一，所以这一条拦的是
+  // 「拿 A 标的的 URL 去改 B 标的的方案」——不是安全边界（控制面无鉴权），
+  // 而是**防手滑**：改错标的的方案是不可逆的（它会变成真实订单）。
+  if (plan.symbol !== symbol) {
+    throw new SyncError(
+      'DB_UNIQUE_VIOLATION',
+      `方案 ${planId} 属于 ${plan.symbol}，不是 ${symbol}`,
+      { planId, symbol, planSymbol: plan.symbol },
+    );
+  }
+  if (status === 'approved') {
+    assertApprovable({ planId, entryType: plan.entryType, action: plan.action });
+  }
+  await updateTradingPlanStatus(pool, planId, status);
+  const updated = await readTradingPlanById(pool, exchange, planId);
+  if (updated === null) {
+    throw new SyncError('DB_UNIQUE_VIOLATION', `方案 ${planId} 读不到了`, { planId });
+  }
+  return toTradingPlanDto(updated);
 }

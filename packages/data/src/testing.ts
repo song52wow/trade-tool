@@ -64,12 +64,48 @@ export interface MockExchange {
   setSymbols(specs: readonly MockSymbolSpec[]): void;
   /** 交易所被整体限速时，kline 端点返回的 HTTP 状态 */
   setRateLimit(status: number | null, retryAfterSec: number): void;
-  requests: { exchangeInfo: number; klines: number };
+  /**
+   * 换掉情绪面数据（分析师 Agent 用）。传 `null` = 那 7 个端点重新变回 404，
+   * 于是 Agent 走「降级」路径。
+   */
+  setSentiment(spec: MockSentimentSpec | null): void;
+  requests: { exchangeInfo: number; klines: number; sentiment: number };
   close(): Promise<void>;
 }
 
 export type MockKlineFailure =
   { kind: 'http'; status: number; body: unknown } | { kind: 'network' };
+
+/**
+ * 情绪面（分析师 Agent 用）的假数据。
+ *
+ * 字段名与 Binance 的 7 个公开端点**逐字一致**——假交易所的价值在于
+ * 「形状与真交易所一样」，字段名对不上就等于验证了另一套契约。
+ */
+export interface MockSentimentSpec {
+  /** 标记价。 */
+  markPrice: number;
+  /** 指数价。 */
+  indexPrice: number;
+  /** 当前资金费率（比率，如 `0.0001` = 0.01%）。 */
+  lastFundingRate: number;
+  /** 下次结算时刻（epoch ms）。 */
+  nextFundingTime: number;
+  /** 当前持仓量。 */
+  openInterest: number;
+  /** 持仓量历史（按时间升序）。至少给 2 个点，才算得出变化率。 */
+  openInterestHistory: readonly number[];
+  /** 多空账户比（>1 = 多头账户多）。 */
+  longShortRatio: number;
+  /** 主动买 / 主动卖成交量比（>1 = 主动买多占优）。 */
+  buySellRatio: number;
+  /** 24h 成交额（计价币）。 */
+  quoteVolume: number;
+  /** 24h 成交笔数。 */
+  trades: number;
+  /** 24h 涨跌幅（百分比数）。 */
+  priceChangePercent: number;
+}
 
 interface MockServerOptions {
   symbols?: readonly MockSymbolSpec[];
@@ -77,6 +113,96 @@ interface MockServerOptions {
   historyBars?: number;
   /** 生成的最后一根「收盘时间」——固定值以便断言 */
   nowMs: number;
+  /**
+   * 情绪面数据。**不给**时那 7 个端点一律 404——分析师 Agent 因此走「降级」路径
+   * （缺项记 `notes` + `degraded=true`）。这正是最该被测的一条。
+   */
+  sentiment?: MockSentimentSpec | null;
+}
+
+/** 情绪面那 7 个公开端点的路径。 */
+const SENTIMENT_PATHS = new Set([
+  '/fapi/v1/premiumIndex',
+  '/fapi/v1/fundingRate',
+  '/fapi/v1/openInterest',
+  '/futures/data/openInterestHist',
+  '/futures/data/globalLongShortAccountRatio',
+  '/futures/data/takerlongshortRatio',
+  '/fapi/v1/ticker/24hr',
+]);
+
+/**
+ * 情绪面端点的回包。
+ *
+ * **字段名逐字照抄 Binance**：标记价 `markPrice`、资金费率 `lastFundingRate`、
+ * 持仓量 `openInterest` / `sumOpenInterest`、多空比 `longShortRatio`、
+ * 主动买卖比 `buySellRatio`、成交额 `quoteVolume`、笔数 `count`。
+ * 字段名对不上就等于验证了另一套契约——那比不测更糟。
+ */
+function sentimentPayload(
+  path: string,
+  symbol: string,
+  spec: MockSentimentSpec,
+  nowMs: number,
+): unknown {
+  switch (path) {
+    case '/fapi/v1/premiumIndex':
+      return {
+        symbol,
+        markPrice: String(spec.markPrice),
+        indexPrice: String(spec.indexPrice),
+        lastFundingRate: String(spec.lastFundingRate),
+        nextFundingTime: spec.nextFundingTime,
+        time: nowMs,
+      };
+    case '/fapi/v1/fundingRate':
+      return [
+        {
+          symbol,
+          fundingRate: String(spec.lastFundingRate),
+          fundingTime: spec.nextFundingTime - 8 * 60 * 60 * 1000,
+        },
+      ];
+    case '/fapi/v1/openInterest':
+      return { symbol, openInterest: String(spec.openInterest), time: nowMs };
+    case '/futures/data/openInterestHist':
+      return spec.openInterestHistory.map((value, index) => ({
+        symbol,
+        sumOpenInterest: String(value),
+        // 按时间升序，最后一个点对应「现在」
+        timestamp: nowMs - (spec.openInterestHistory.length - 1 - index) * 30 * 60 * 1000,
+      }));
+    case '/futures/data/globalLongShortAccountRatio':
+      return [
+        {
+          symbol,
+          longShortRatio: String(spec.longShortRatio),
+          longAccount: String(spec.longShortRatio / (1 + spec.longShortRatio)),
+          shortAccount: String(1 / (1 + spec.longShortRatio)),
+          timestamp: nowMs,
+        },
+      ];
+    case '/futures/data/takerlongshortRatio':
+      return [
+        {
+          symbol,
+          buySellRatio: String(spec.buySellRatio),
+          buyVol: String(spec.buySellRatio),
+          sellVol: '1',
+          timestamp: nowMs,
+        },
+      ];
+    case '/fapi/v1/ticker/24hr':
+      return {
+        symbol,
+        lastPrice: String(spec.markPrice),
+        priceChangePercent: String(spec.priceChangePercent),
+        quoteVolume: String(spec.quoteVolume),
+        count: spec.trades,
+      };
+    default:
+      return {};
+  }
 }
 
 /** 12 字段顺序与 Binance 一致（附录 A.2），必须按下标解析。 */
@@ -112,7 +238,8 @@ export async function startMockExchange(options: MockServerOptions): Promise<Moc
   let rateLimit: { status: number; retryAfterSec: number } | null = null;
 
   const klineRequests: MockExchange['klineRequests'] = [];
-  const requests = { exchangeInfo: 0, klines: 0 };
+  const requests = { exchangeInfo: 0, klines: 0, sentiment: 0 };
+  let sentiment: MockSentimentSpec | null = options.sentiment ?? null;
 
   const baseFor = (i: number): number => 100 + (i % 97) * 0.5;
 
@@ -232,6 +359,28 @@ export async function startMockExchange(options: MockServerOptions): Promise<Moc
       return;
     }
 
+    // ------------------------------------------------ 情绪面（分析师 Agent）
+    //
+    // 这 7 个端点**默认可用性由 sentiment 决定**：不给数据就 404，
+    // 于是 Agent 走「降级」路径（缺项记进 notes + degraded=true）。
+    // 给了就返回形状与真交易所逐字一致的回包。
+    if (SENTIMENT_PATHS.has(url.pathname)) {
+      requests.sentiment += 1;
+      const symbol = url.searchParams.get('symbol') ?? '';
+      if (!specs.has(symbol)) {
+        send(400, { code: -1121, msg: 'Invalid symbol.' });
+        return;
+      }
+      if (sentiment === null) {
+        // 404 而不是 500：真交易所上「这个端点没部署」长这样，
+        // 而 Python 侧正是按「取不到 → 记 None」来处置的。
+        send(404, { code: -1121, msg: 'Unknown endpoint.' });
+        return;
+      }
+      send(200, sentimentPayload(url.pathname, symbol, sentiment, nowMs));
+      return;
+    }
+
     send(404, { code: -1121, msg: 'Unknown endpoint.' });
   });
 
@@ -255,6 +404,7 @@ export async function startMockExchange(options: MockServerOptions): Promise<Moc
       klineRequests.length = 0;
       requests.exchangeInfo = 0;
       requests.klines = 0;
+      requests.sentiment = 0;
     },
     dropRange: (symbol, from, to) => {
       const list = dropRanges.get(symbol) ?? [];
@@ -281,6 +431,9 @@ export async function startMockExchange(options: MockServerOptions): Promise<Moc
     },
     setRateLimit: (status, retryAfterSec) => {
       rateLimit = status === null ? null : { status, retryAfterSec };
+    },
+    setSentiment: (spec) => {
+      sentiment = spec;
     },
     close: () =>
       new Promise<void>((resolve) => {

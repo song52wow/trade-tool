@@ -91,7 +91,7 @@ export type LlmDecision = z.infer<typeof llmDecisionSchema>;
  * 这个字段是整套机制里最重要的一列：它让「这次挂单用的是模型决定的还是人配的」
  * 成为一个**可查的事实**，而不是猜的。`risk_bracket` 会把它落库。
  */
-export type DecisionSource = 'llm' | 'config' | 'config-fallback';
+export type DecisionSource = 'llm' | 'config' | 'config-fallback' | 'agent-plan';
 
 /** 决策结果：档位 + 来源 + 可选的说明。 */
 export interface RiskDecisionResult {

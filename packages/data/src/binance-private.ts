@@ -149,6 +149,53 @@ export interface PlacedAlgoOrder {
 }
 
 /**
+ * **进场**市价单（v1.0.0 自动下单）。
+ *
+ * 为什么单独一个形态：上面两个都是**条件单**（`STOP_MARKET` / `TAKE_PROFIT_MARKET`），
+ * 它们走 Algo Order API，回执是 `algoId`。而市价进场是**普通订单**，走
+ * `POST /fapi/v1/order`，回执是 `orderId`——两套编号空间互不通用，
+ * 拿 `orderId` 去撤条件单会得到「订单不存在」。
+ *
+ * 为什么进场用市价而不是限价：Agent 的方案里 `entry_price` 是**估算值**
+ * （它在出方案时看到的是那一刻的盘口），限价单挂在那个价上很可能永远不成交，
+ * 于是仓位不建立、止损也不挂——一个「看起来在等、实际上什么都不会发生」的状态。
+ * 市价单成交价会与估算值有偏差（滑点），但**偏差是有限的、可见的**，
+ * 而「不成交」是不可见的。止损与止盈按**实际成交价**重新算（见 executor 的
+ * `deriveStagedPlan`），所以滑点不会让止损落在一个错误的位置。
+ */
+export interface MarketOrderRequest {
+  symbol: string;
+  side: OrderSide;
+  /** 数量，必须已按 `LOT_SIZE.stepSize` 对齐。 */
+  quantity: number;
+  /**
+   * 自定义单号（交易所侧叫 `newClientOrderId`）。
+   *
+   * **必须由调用方按「每次尝试一个新号」的规则生成**：Binance 不允许两张
+   * `clientOrderId` 相同的挂单同时存在，沿用同一个号重试必然撞「重复」，
+   * 于是重试永远失败（与 §6.8.4 止损单号复用是同一个坑）。
+   */
+  clientOrderId: string;
+  /** 只减不开。进场单用不到，留着是为了将来平仓复用同一条路径。 */
+  reduceOnly?: boolean;
+  recvWindowMs?: number;
+}
+
+/** 普通订单挂成之后的回执。**是 orderId**，与条件单的 `algoId` 不是一回事。 */
+export interface PlacedMarketOrder {
+  orderId: number;
+  clientOrderId: string;
+  symbol: string;
+  side: OrderSide;
+  /** 交易所回的状态（`NEW` / `FILLED` / `PARTIALLY_FILLED` …）。 */
+  status: string;
+  /** 成交均价。回执里可能没有（未成交时），此时为 `null`。 */
+  avgPrice: number | null;
+  /** 累计成交量。未成交时是 0。 */
+  executedQty: number;
+}
+
+/**
  * 交易所的错误体：`{ code, msg }`。
  *
  * 判定**只看 code 的值**，不看「有没有 code 这个键」。
@@ -461,6 +508,66 @@ function requireFilters(rawExchangeInfoEntry: unknown, symbol: string): unknown[
 }
 
 /**
+ * 从 exchangeInfo 的原始条目里取最小下单数量（`LOT_SIZE.minQty`）。
+ *
+ * 交易员 Agent 要按「风险金额 ÷ 止损距离」算数量，算出来的数量可能**低于**交易所的
+ * 最小下单量——那笔单根本不存在，因此必须先知道这个下限。
+ */
+export function parseMinQty(rawExchangeInfoEntry: unknown, symbol: string): number {
+  for (const filter of requireFilters(rawExchangeInfoEntry, symbol)) {
+    if (typeof filter !== 'object' || filter === null) continue;
+    const entry = filter as Record<string, unknown>;
+    if (entry['filterType'] !== 'LOT_SIZE') continue;
+    const minQty = entry['minQty'];
+    if (typeof minQty !== 'string' || minQty.trim() === '' || !Number.isFinite(Number(minQty))) {
+      throw new SyncError('CONFIG_INVALID', `${symbol} 的 minQty 不是合法数字：${String(minQty)}`, {
+        symbol,
+        minQty: String(minQty),
+      });
+    }
+    if (Number(minQty) < 0) {
+      throw new SyncError('CONFIG_INVALID', `${symbol} 的 minQty 不能为负：${minQty}`, {
+        symbol,
+        minQty,
+      });
+    }
+    return Number(minQty);
+  }
+  throw new SyncError('CONFIG_INVALID', `${symbol} 的 exchangeInfo 快照里没有 LOT_SIZE`, {
+    symbol,
+  });
+}
+
+/**
+ * 从 exchangeInfo 的原始条目里取最小名义金额（`MIN_NOTIONAL.notional`）。
+ *
+ * **取不到返回 0**（而不是报错）：不是所有标的都有这条限制，而「没有限制」与
+ * 「限制是 0」在这条语义下是同一件事。其它解析函数取不到都报错，是因为那里
+ * 「取不到」意味着「不知道」，而这里「没有这条 filter」就是「没有这条限制」。
+ */
+export function parseMinNotional(rawExchangeInfoEntry: unknown, symbol: string): number {
+  for (const filter of requireFilters(rawExchangeInfoEntry, symbol)) {
+    if (typeof filter !== 'object' || filter === null) continue;
+    const entry = filter as Record<string, unknown>;
+    if (entry['filterType'] !== 'MIN_NOTIONAL') continue;
+    const notional = entry['notional'];
+    if (
+      typeof notional !== 'string' ||
+      notional.trim() === '' ||
+      !Number.isFinite(Number(notional))
+    ) {
+      throw new SyncError(
+        'CONFIG_INVALID',
+        `${symbol} 的 MIN_NOTIONAL 不是合法数字：${String(notional)}`,
+        { symbol, notional: String(notional) },
+      );
+    }
+    return Number(notional);
+  }
+  return 0;
+}
+
+/**
  * 私有 REST 客户端。
  *
  * 签名 = HMAC-SHA256(queryString, apiSecret) 的 hex。查询串里的键按字典序拼接，
@@ -746,6 +853,54 @@ export class BinancePrivateClient {
     });
   }
 
+  /**
+   * 挂一张**市价进场单**（v1.0.0 自动下单）。
+   *
+   * 走**普通订单**接口 `POST /fapi/v1/order`，不是 Algo Order API——
+   * 市价单没有「条件」可言，回执也是普通 `orderId`。
+   *
+   * ⚠️ **数量必须已经按 `LOT_SIZE.stepSize` 对齐**：交易所不会替你截断，
+   * 数量不合规时整单被拒（`-1013`），而那种失败看起来像「网络问题」——
+   * 排查时容易走偏。对齐由调用方用 `alignToQty` 做（判据只有一份实现）。
+   */
+  async placeMarketOrder(request: MarketOrderRequest): Promise<PlacedMarketOrder> {
+    if (!Number.isFinite(request.quantity) || request.quantity <= 0) {
+      throw new SyncError('CONFIG_INVALID', `市价单数量必须为正：${String(request.quantity)}`, {
+        symbol: request.symbol,
+        quantity: request.quantity,
+      });
+    }
+    const body = await this.request<Record<string, unknown>>('POST', '/fapi/v1/order', {
+      signed: true,
+      params: {
+        symbol: request.symbol,
+        side: request.side,
+        type: 'MARKET',
+        quantity: String(request.quantity),
+        newClientOrderId: request.clientOrderId,
+        ...(request.reduceOnly === undefined ? {} : { reduceOnly: String(request.reduceOnly) }),
+        recvWindow: request.recvWindowMs ?? this.recvWindowMs,
+      },
+    });
+    const where = `placeMarketOrder ${request.symbol}`;
+    // `avgPrice` 在未成交的回执里是 "0"（字符串）。它是「成交均价」，
+    // 0 表示**还没成交**而不是「成交价是 0」——两者不能混，因此 null 与 0 要分开。
+    const rawAvg = body['avgPrice'];
+    const avgPrice =
+      rawAvg === undefined || rawAvg === null || rawAvg === ''
+        ? null
+        : requireNumber(rawAvg, 'avgPrice', where);
+    return {
+      orderId: requireNumber(body['orderId'], 'orderId', where),
+      clientOrderId: requireString(body['clientOrderId'], 'clientOrderId', where),
+      symbol: requireString(body['symbol'], 'symbol', where),
+      side: requireString(body['side'], 'side', where) as OrderSide,
+      status: requireString(body['status'], 'status', where),
+      avgPrice: avgPrice !== null && avgPrice > 0 ? avgPrice : null,
+      executedQty: requireNumber(body['executedQty'], 'executedQty', where),
+    };
+  }
+
   // ------------------------------------------------- 公开行情接口（标记价）
   //
   // 「标记价」= 交易所给的**清算参考价**（不是最新成交价）。用它给非计价币的手续费
@@ -791,6 +946,46 @@ export class BinancePrivateClient {
   //   因此「某标的没出现在结果里」= 无仓位也无挂单，这恰好是对账要用的语义。
   // * `GET /fapi/v1/openAlgoOrders`（带 symbol 权重 1，不带 **40**）。条件单查询走的是
   //   Algo Order API 这一套，与下单 / 撤单同一个家族（`/fapi/v1/algoOrder`）。
+
+  /**
+   * 账户余额（`GET /fapi/v2/balance`，权重 5）。
+   *
+   * 交易员 Agent 要按「账户权益的百分之几」算仓位，因此必须知道权益是多少。
+   * Binance 文档给 `balance` 的口径是 **钱包余额 + 未实现盈亏**，也就是该资产上的
+   * 账户权益——这正是「我能亏多少」的分母。
+   *
+   * 只取计价资产（USDT）那一档：多币种账户的保证金是共享的，把别的币种也加进来
+   * 会把「最多亏多少」算大。取不到就报错，**不返回 0**——0 会被当成「这个账户没钱」，
+   * 于是仓位算成 0，一个看起来正常、实际什么都不做的方案。
+   */
+  async accountBalance(asset = 'USDT'): Promise<number> {
+    const body = await this.request<unknown[]>('GET', '/fapi/v2/balance', { signed: true });
+    if (!Array.isArray(body)) {
+      throw new SyncError('EXCHANGE_ERROR', '/fapi/v2/balance 返回的不是数组', {
+        body: JSON.stringify(body).slice(0, 200),
+      });
+    }
+    for (const [index, raw] of body.entries()) {
+      if (typeof raw !== 'object' || raw === null) {
+        throw new SyncError('EXCHANGE_ERROR', `/fapi/v2/balance 第 ${String(index)} 条不是对象`);
+      }
+      const row = raw as Record<string, unknown>;
+      if (row['asset'] !== asset) continue;
+      const balance = requireNumber(row['balance'], 'balance', `balance[${String(index)}]`);
+      if (balance < 0) {
+        throw new SyncError('EXCHANGE_ERROR', `${asset} 的账户余额为负：${String(balance)}`, {
+          asset,
+          balance,
+        });
+      }
+      return balance;
+    }
+    throw new SyncError(
+      'EXCHANGE_ERROR',
+      `/fapi/v2/balance 的返回里没有 ${asset} 这一档：算不出账户权益`,
+      { asset },
+    );
+  }
 
   /**
    * 当前持仓。

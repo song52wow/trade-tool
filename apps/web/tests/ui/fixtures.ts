@@ -171,6 +171,9 @@ export function symbolHandlers(
         failed: 0,
       },
     },
+    // Agent 面板也读一条不同形状的路由：没有它，前缀匹配会让它拿到
+    // `/api/symbols/X` 的详情外壳（形状不对 → 面板报「形状不对」而不是崩）。
+    [`/api/symbols/${symbol}/agent`]: { symbol, report: null, plan: null },
     [`/api/symbols/${symbol}`]: {
       ...symbolRow(symbol),
       contract: null,

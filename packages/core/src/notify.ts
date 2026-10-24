@@ -43,9 +43,60 @@ export const NOTIFY_KINDS = [
   'llm-fallback',
   'tp1-filled',
   'trail-moved',
+  'agent-plan-executed',
+  'agent-plan-failed',
+  'agent-prompt',
+  'decision-prompt',
 ] as const;
 
 export type NotifyKind = (typeof NOTIFY_KINDS)[number];
+
+/**
+ * **提示词镜像**的那两种内容。
+ *
+ * 分成两种而不是一种，理由是**频率差得远**：
+ *   * `agent-prompt` —— Agent 每个标的每轮发两条（分析师 + 交易员），
+ *     缺省间隔 15 分钟；
+ *   * `decision-prompt` —— executor **每次成交**都要问一次模型要档位
+ *     （v0.9.0 的 LLM 决策），一次开仓就是一条。
+ *
+ * 合成一种的话，勾了它就等于「每笔成交往群里发一条」——那是刷屏，
+ * 而刷屏的告警等于没接（§6.9 第 2 条）。分开则由用户自己取舍。
+ */
+export const PROMPT_MIRROR_KINDS = ['agent-prompt', 'decision-prompt'] as const;
+
+export type PromptMirrorKind = (typeof PROMPT_MIRROR_KINDS)[number];
+
+/**
+ * 「Agent 提示词」这一种通知内容的 id。
+ *
+ * 单独给个常量：判断「用户勾了提示词没有」的地方要用**字面量**，
+ * 而那一处的 `kinds` 是宽泛的 `string[]`（运行期才校验），
+ * 手写字符串拼错一个字母不会报错——而拼错的后果是**永远不发**。
+ */
+export const AGENT_PROMPT_KIND: PromptMirrorKind = 'agent-prompt';
+
+/** 「止盈止损档位提示词」这一种通知内容的 id。理由同 {@link AGENT_PROMPT_KIND}。 */
+export const DECISION_PROMPT_KIND: PromptMirrorKind = 'decision-prompt';
+
+/**
+ * **默认要通知的内容**。
+ *
+ * 与 {@link NOTIFY_KINDS}（全部可选内容）的区别只有两个：
+ * `agent-prompt` 与 `decision-prompt` **不在**里面。
+ *
+ * 为什么要单独分一份：提示词镜像是**排障用的调试数据**，不是「发生了一件事」。
+ * `agent-prompt` 每个标的每轮两条；`decision-prompt` **每次成交**一条——
+ * 而且内容里带着行情与账户权益。默认就发的话，装了这个包就等于自动把仓位信息
+ * 发给了第三方群，还会被刷屏。
+ * 其余那些内容（对账差异、挂单失败、成交）是**事件**：漏推了就没人知道出事了，
+ * 而提示词漏推了只是「排障时少一条线索」。
+ *
+ * 所以它们是**唯二默认不勾**的，要发得显式勾上。
+ */
+export const DEFAULT_NOTIFY_KINDS: readonly NotifyKind[] = NOTIFY_KINDS.filter(
+  (kind) => !PROMPT_MIRROR_KINDS.includes(kind as PromptMirrorKind),
+);
 
 /** 每个内容类型的**中文名与一句话说明**（页面的勾选项文案）。 */
 export const NOTIFY_KIND_INFO: Record<NotifyKind, { label: string; hint: string }> = {
@@ -69,6 +120,22 @@ export const NOTIFY_KIND_INFO: Record<NotifyKind, { label: string; hint: string 
   'trail-moved': {
     label: '移动止损换档',
     hint: '止损位挪到新的一档了，附新旧两档的价。同一笔仓位在冷却期内只推一次',
+  },
+  'agent-plan-executed': {
+    label: 'Agent 方案已下单',
+    hint: '一份被批准的方案变成了真实订单，附方向、数量、止损与止盈价',
+  },
+  'agent-plan-failed': {
+    label: 'Agent 方案下单失败',
+    hint: '方案没能变成订单，附失败原因。仓位没有建立，止损也不会挂',
+  },
+  'agent-prompt': {
+    label: 'Agent 提示词',
+    hint: '分析师与交易员每次调模型前的那一组消息，逐字发到群里（排障用；默认不勾，内容含行情与账户权益）',
+  },
+  'decision-prompt': {
+    label: '止盈止损档位提示词',
+    hint: 'executor 每次按成交价问模型要止损止盈倍数时的那一组消息（**每次成交一条**，比上面频繁得多；默认不勾）',
   },
 };
 

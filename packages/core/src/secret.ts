@@ -39,6 +39,27 @@ export interface SealedPayload {
  * 用一个被截断的密钥「凑合着加密」是最坏的结果——它看起来在工作，
  * 但强度只剩截断后那几字节，而没有任何地方会提示你。
  */
+/**
+ * 读主密钥，**没有就返回 `null`**。
+ *
+ * 与 {@link parseSecretKey} 的区别：那个在缺密钥时抛错（executor 需要主密钥，
+ * 它本来就在持续下单，配错了必须立刻失败）；这里的缺密钥只意味着
+ * 「用不了控制面录入的那一份」，而配置文件 + 环境变量那一档仍然可用——
+ * 对 `apps/agent`（模型接入、通知地址）与 `apps/cli` 来说，主密钥是**可选**的。
+ *
+ * ⚠️ **配错了仍然抛错**：变量**有值但格式不对**（长度不对、不是 hex/base64）
+ * 是配置错误，必须立刻报出来，不能当成「没配」——后者会让一个配错的主密钥
+ * 看起来像是「主密钥没注入」，两者的处置完全不同。
+ */
+export function readOptionalSecretKey(
+  env: NodeJS.ProcessEnv = process.env,
+  envName = SECRET_KEY_ENV,
+): Buffer | null {
+  const raw = env[envName];
+  if (raw === undefined || raw.trim() === '') return null;
+  return parseSecretKey(raw, envName);
+}
+
 export function parseSecretKey(raw: string | undefined, envName = SECRET_KEY_ENV): Buffer {
   if (raw === undefined || raw.trim() === '') {
     throw new SyncError(
@@ -177,4 +198,33 @@ export function openNotifyTarget(payload: SealedPayload, key: Buffer): SecretNot
     throw new SyncError('CONFIG_INVALID', '通知密文解开后不是 {webhookUrl, secret} 结构');
   }
   return parsed as SecretNotifyTarget;
+}
+
+/**
+ * 模型接入的凭据（v1.0.0 控制面录入）：API 密钥。
+ *
+ * 形状比 `SecretCredentials` / `SecretNotifyTarget` 简单——只有一项。
+ * 之所以仍然走「打包成 JSON 再整体加密」而不是直接加密字符串：
+ * 形状校验（解开后必须是一段字符串）需要一段可校验的结构，
+ * 而 `open_` 只认 `SealedPayload`。多一层 JSON 换来的是
+ * 「解开了但内容不对」能**报错**而不是当成空串继续用。
+ */
+export interface SecretAgentLlmKey {
+  apiKey: string;
+}
+
+export function sealAgentLlmKey(target: SecretAgentLlmKey, key: Buffer): SealedPayload {
+  return seal(Buffer.from(JSON.stringify(target), 'utf8'), key);
+}
+
+export function openAgentLlmKey(payload: SealedPayload, key: Buffer): SecretAgentLlmKey {
+  const parsed = JSON.parse(open_(payload, key).toString('utf8')) as unknown;
+  if (
+    typeof parsed !== 'object' ||
+    parsed === null ||
+    typeof (parsed as SecretAgentLlmKey).apiKey !== 'string'
+  ) {
+    throw new SyncError('CONFIG_INVALID', '模型密钥密文解开后不是 {apiKey} 结构');
+  }
+  return parsed as SecretAgentLlmKey;
 }

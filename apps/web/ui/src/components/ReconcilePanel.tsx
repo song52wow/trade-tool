@@ -15,7 +15,7 @@ function reason(error: unknown): string {
  * 一律带上原值：读代码 / 查库时用的是 `kind` 的英文，界面上只给中文会让两边对不上，
  * 而「对不上」正是这个面板要解决的事情本身。
  *
- * ⚠️ 这份表是 core 的 `RECONCILE_KIND_INFO` 之外的**第二份清单**（AGENTS.md §7 第 8 条
+ * ⚠️ 这份表是 core 的 `RECONCILE_KIND_INFO` 之外的**第二份清单**（AGENTS.md §7 第 7 条
  * 已登记为已知漂移）：新增差异类型时两处都要改，否则 `tsc` 会在这里报错——
  * 编译器是这条漂移的兜底，不是许可。
  */

@@ -101,3 +101,47 @@ export function algoOrderTag(orderType: string): BracketTag {
   if (orderType.startsWith('STOP')) return 'sl';
   throw new SyncError('EXCHANGE_ERROR', `无法识别的条件单类型：${orderType}`, { orderType });
 }
+
+// ------------------------------------------------------------------ Agent 进场单
+
+/**
+ * Agent 进场单的自定义号前缀（v1.0.0 自动下单）。
+ *
+ * 与 `rsk-` 分开是因为**编号空间不同**：`rsk-` 是条件单（`clientAlgoId`），
+ * 这一类是**普通市价单**（`newClientOrderId`）。两者的前缀混用会让对账与
+ * 「这张单是不是我方挂的」判断同时失灵——所以宁可多一个前缀，也不要共用一个。
+ */
+export const AGENT_CLIENT_ID_PREFIX = 'agt';
+
+/**
+ * 由方案 id 与尝试次数派生进场单的自定义号：`agt-p<方案id>-a<第几次尝试>`。
+ *
+ * **为什么带尝试次数**：Binance 不允许两张 `clientOrderId` 相同的挂单同时存在，
+ * 沿用同一个号重试必然撞「重复」，于是重试永远失败（与止损单号复用同一个坑，
+ * 见本文件开头）。号里带次数，重试就自动换号。
+ *
+ * 截断到 36 字符（Binance 的长度上限）。方案 id 是 bigint，位数有限，
+ * 正常情况下根本不会触发截断——但**不能依赖「正常情况」**：超长会被交易所拒，
+ * 而那种失败长得很像网络问题。
+ */
+export function agentEntryClientOrderId(planId: string, attempt: number): string {
+  return `${AGENT_CLIENT_ID_PREFIX}-p${planId}-a${attempt}`.slice(0, CLIENT_ID_MAX);
+}
+
+/**
+ * 反解：这是不是 Agent 挂的进场单？是的话返回方案 id 与第几次尝试。
+ *
+ * 不是我们的一律返回 `null`（用户自己在网页上下的单走这里），
+ * 形状不对的 `agt-` 前缀单也返回 `null`——它只是「不是我方格式」，不是异常。
+ */
+export function parseAgentEntryClientOrderId(
+  clientOrderId: string,
+): { planId: string; attempt: number } | null {
+  if (!clientOrderId.startsWith(`${AGENT_CLIENT_ID_PREFIX}-`)) return null;
+  const rest = clientOrderId.slice(AGENT_CLIENT_ID_PREFIX.length + 1);
+  const matched = /^p(\d+)-a(\d+)$/.exec(rest);
+  if (matched === null) return null;
+  const attempt = Number(matched[2]);
+  if (!Number.isSafeInteger(attempt) || attempt <= 0) return null;
+  return { planId: matched[1] as string, attempt };
+}

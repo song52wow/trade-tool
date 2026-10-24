@@ -1041,7 +1041,7 @@ tr.clickable:focus-visible {
     grid-template-columns: minmax(0, 1fr) minmax(0, 1.25fr);
   }
 
-  /* 凭据与通知并排放在左列；策略整块放到右列。
+  /* 凭据与通知并排放在左列；策略与模型接入放在右列。
      用 grid-area 而不是自动排列：自动排列会把「通知」塞到右列、
      「策略」甩到下一行左列，留下一大块空白。 */
   .settings-grid > :nth-child(1) {
@@ -1056,7 +1056,15 @@ tr.clickable:focus-visible {
 
   .settings-grid > :nth-child(3) {
     grid-column: 2;
-    grid-row: 1 / span 2;
+    grid-row: 1;
+  }
+
+  /* 模型接入（v1.0.0）排在右列第二行。
+     它挨着策略那一块：两者都是「运行时去哪儿取参数」，
+     放一列里比塞到左列第三行更好找（那一行下面什么都没有，看着像布局坏了）。 */
+  .settings-grid > :nth-child(4) {
+    grid-column: 2;
+    grid-row: 2;
   }
 }
 

@@ -1,7 +1,8 @@
 import { z } from 'zod';
 
 import { EXCHANGE_ENVIRONMENTS } from './exchange-endpoints.js';
-import { NOTIFY_KINDS } from './notify.js';
+import { llmEndpointSchema, refineLlmEndpoint } from './llm-endpoint.js';
+import { DEFAULT_NOTIFY_KINDS, NOTIFY_KINDS } from './notify.js';
 import { normalizeTakeProfit1Ratio } from './risk-policy.js';
 import { INTERVALS } from './types.js';
 
@@ -251,28 +252,8 @@ export const syncSchema = z.object({
  * 与降级原因，对账与飞书告警都能查到。约定 9 忌讳的是「静默兜底」——
  * 兜底本身不犯规，**不留痕迹**才犯规。
  */
-export const llmSchema = z
-  .object({
-    /** 是否让模型参与决策。缺省 false。 */
-    enabled: z.boolean().default(false),
-    /**
-     * API 基址。OpenAI 兼容协议，如 `https://api.openai.com/v1`。
-     *
-     * **不给默认值**：各家地址不同，给了默认值就等于「忘了配也能跑」，
-     * 而它会真的去某个地方发请求。开启时缺它必须报错（见 `llmSchema` 的 refine）。
-     */
-    baseUrl: z.string().default(''),
-    /** 模型名。同样不给默认值。 */
-    model: z.string().default(''),
-    /** API 密钥所在的**环境变量名**。配置文件里不写密钥本身（约定 2）。 */
-    apiKeyEnv: z.string().min(1).default('TRADE_TOOL_LLM_API_KEY'),
-    /**
-     * 单次调用的硬超时（毫秒）。
-     *
-     * 缺省 8000。**这个值是裸仓窗口的上限**——从成交到挂出止损单之间，
-     * 模型最多占用这么久。上限之内模型没给出结果就降级。
-     */
-    timeoutMs: z.number().int().positive().max(60_000).default(8_000),
+export const llmSchema = llmEndpointSchema
+  .extend({
     /**
      * 模型失败时降级到 `risk_policy` 的档位（而不是拒绝下单）。
      *
@@ -288,11 +269,11 @@ export const llmSchema = z
      */
     contextBars: z.number().int().min(0).max(200).default(20),
   })
-  .refine((cfg) => !cfg.enabled || (cfg.baseUrl.trim() !== '' && cfg.model.trim() !== ''), {
-    message:
-      'executor.llm.enabled 为 true 时必须同时给出 executor.llm.baseUrl 与 executor.llm.model：' +
-      '它们决定请求发到哪里、用哪个模型。缺任一项都不许静默用默认值',
-    path: ['enabled'],
+  .superRefine((cfg, ctx) => {
+    const result = refineLlmEndpoint(cfg, ['executor', 'llm']);
+    if (!result.ok) {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, message: result.message, path: ['enabled'] });
+    }
   });
 
 /**
@@ -446,14 +427,15 @@ export const notifySchema = z.object({
    *
    * 取值是**通知内容类型**（`NOTIFY_KINDS`），也就是「哪种事发生时才叫我」——
    * 交易对账的差异类型（8 种）加上交易生命周期事件（止盈止损挂上、一轮走完）。
-   * 缺省 = 全部都要。
+   * 缺省 = {@link DEFAULT_NOTIFY_KINDS}（**不含**「Agent 提示词」——那一档默认不勾，
+   * 理由见 `notify.ts` 的 `DEFAULT_NOTIFY_KINDS`）。
    *
    * 为什么不用「最低严重度」一刀切：严重度对同一个类型是固定的，粗暴的阈值等于
    * 「全都要」或「只要三个紧急的」，用户真正想做的是「我只想知道哪几种事」——
    * 比如「止盈单没了」这种噪音就别烦我了，但「仓位没有止损保护」一定要说。
    * 逐项勾选能表达，而阈值表达不了。
    */
-  kinds: z.array(z.enum(NOTIFY_KINDS)).default([...NOTIFY_KINDS]),
+  kinds: z.array(z.enum(NOTIFY_KINDS)).default([...DEFAULT_NOTIFY_KINDS]),
   /**
    * 同一条告警的重复推送冷却时间（毫秒）。
    *
@@ -467,6 +449,193 @@ export const notifySchema = z.object({
     .default(30 * 60_000),
 });
 
+/**
+ * LLM 接入配置（Agent 段，v1.0.0）。
+ *
+ * 与 `executor.llm` 共用接入字段（见 [`llm-endpoint.ts`](./llm-endpoint.ts)），
+ * 差别在**失败时怎么办**：
+ *
+ * - `executor.llm.fallbackToPolicy = false` → 拒绝挂单 → **裸仓**（仓位已成交）；
+ * - `agent.llm.fallbackToTrade = true` → 这一轮**不出方案** → 不开新仓。
+ *
+ * 后者没有裸仓风险，所以缺省是 `true`（降级）。降级会**落库**并留下原因，
+ * 不会静默跳过（AGENTS.md 约定 9）。
+ */
+export const agentLlmSchema = llmEndpointSchema
+  .extend({
+    /**
+     * 模型失败 / 输出不合法时，这一轮**降级成「不出方案」**而不是让整轮失败。
+     *
+     * 缺省 true。关掉它意味着模型不可用时 Agent 直接报错退出——
+     * 只有在「宁可没有方案也不要一份来路不明的方案」时才需要。
+     */
+    fallbackToTrade: z.boolean().default(true),
+  })
+  .superRefine((cfg, ctx) => {
+    const result = refineLlmEndpoint(cfg, ['agent', 'llm']);
+    if (!result.ok) {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, message: result.message, path: ['enabled'] });
+    }
+  });
+
+/**
+ * 分析师 / 交易员 Agent 的配置（v1.0.0）。
+ *
+ * ## 整段默认关闭
+ *
+ * 开启它意味着**模型会参与决定真金白银下多少、止损放哪**。
+ * 这是「不确定的输入 → 不可逆的动作」的通道，默认打开等于默认接受这个风险
+ * （与 `executor.enabled` 同一类理由）。
+ *
+ * 关闭时（缺省）整个 Agent 进程不会发起任何模型调用，也不会出任何方案。
+ */
+export const agentSchema = z.object({
+  /** 是否让 Agent 跑起来。缺省 false。 */
+  enabled: z.boolean().default(false),
+  /**
+   * 参与分析的标的。
+   *
+   * `[]` = **库里的全部标的**（`symbols` 表里有的都算）。写死一批标的会让
+   * 「加了一个新标的却没人分析它」变成静默的事。
+   */
+  symbols: z.array(z.string().min(1)).default([]),
+  /**
+   * 分析用的**派生周期**。
+   *
+   * 只接受 `15m / 1h / 4h / 1d`：技术面靠派生 K 线算，
+   * 而 `1m` 上做指标物化是容量结论（单标的约 4.3 GB）。
+   */
+  interval: z.enum(['15m', '1h', '4h', '1d']).default('1h'),
+  /** 每轮之间的间隔（毫秒）。缺省 15 分钟。 */
+  intervalMs: z
+    .number()
+    .int()
+    .positive()
+    .min(60_000)
+    .default(15 * 60_000),
+  /**
+   * 技术面计算用多少根已收盘 K 线。
+   *
+   * 缺省 300：够算出 MA60 与 KDJ 的预热，又不至于让单次分析太慢。
+   */
+  bars: z.number().int().positive().max(1_500).default(300),
+  /**
+   * 三个面的权重。
+   *
+   * 缺省基本面 0.5：基本面（合约规格、流动性、持有成本）变化**慢**，
+   * 而技术面与情绪面变化快，因此权重低一档。不必和为 1——合成时会归一。
+   */
+  weights: z
+    .object({
+      technical: z.number().positive().default(1),
+      sentiment: z.number().positive().default(1),
+      fundamental: z.number().positive().default(0.5),
+    })
+    .default({}),
+  /**
+   * 「中性带」的宽度：综合分落在 `(-band, band)` 里就算中性。
+   *
+   * 缺省 0.2：综合分不到两成时三个面基本在互相抵消，
+   * 这时候硬给一个方向比给「观望」更危险。
+   */
+  neutralBand: z.number().min(0).max(1).default(0.2),
+  /**
+   * 风控上限。**这些上限来自配置，不来自模型**——
+   * 模型说什么只影响「用掉上限的多少」，影响不了「上限是多少」。
+   */
+  risk: z
+    .object({
+      /** 单笔最大风险占权益的比例。缺省 1%（0.01）。 */
+      maxRiskFraction: z.number().positive().max(0.05).default(0.01),
+      /** 单笔最大名义金额（计价币）。`0` = 不限。 */
+      maxNotional: z.number().min(0).default(0),
+      /** 最小盈亏比。低于它就抬高止盈倍数到达标。 */
+      minRiskReward: z.number().positive().default(1.5),
+      /**
+       * 分析师结论为**中性**时，风险敞口的打折系数。缺省 0.5（减半）。
+       *
+       * 没有方向性确认时仓位就该小。必须是 `(0, 1]`：`0` 等于「中性时一笔都不做」，
+       * 那是另一种设计（用 `executor.enabled` 之外的手段关掉整段）。
+       */
+      neutralRiskFactor: z.number().positive().max(1).default(0.5),
+    })
+    .default({}),
+  /** 模型接入。见 {@link agentLlmSchema}。 */
+  llm: agentLlmSchema.default({}),
+  /**
+   * 账户权益从哪来。
+   *
+   * 仓位大小是「愿意亏多少钱 ÷ 每股亏多少」算出来的，而分母是**账户权益**——
+   * 因此算仓位就必须知道权益是多少。两条路，**显式选一条**（不做「优先级解析」）：
+   *
+   * - `exchange`：从交易所读实时余额。准，但要凭据（`executor.apiKeyEnv` /
+   *   `apiSecretEnv` 或控制面里加密存的那份）。
+   * - `config`：用 `equity` 里写的数。适合「只做分析、不碰账户」的场景，
+   *   但它是**手动维护**的——账户变大变小都要人记得改。
+   *
+   * 缺省 `exchange`：权益写错会直接变成仓位算错，而仓位算错就是真钱。
+   */
+  equitySource: z.enum(['exchange', 'config']).default('exchange'),
+  /**
+   * 账户权益（计价币）。**只在 `equitySource = 'config'` 时用**。
+   *
+   * 缺省 0 = 没配。用 `equitySource = 'config'` 却没填这个数时，
+   * 交易员这一步会**明确失败**（而不是拿 0 去算仓位——那会算出 0 数量，
+   * 一个看起来正常、实际什么都不做的方案）。
+   */
+  equity: z.number().min(0).default(0),
+  /**
+   * 自动执行。**默认关闭**：方案只落库、只在页面与 CLI 里看，
+   * 不会变成真实订单。
+   *
+   * 打开它意味着「模型决定的这笔方案会真的开仓」——那是真钱，
+   * 因此要显式打开，且受 `risk` 段的全部上限约束。
+   *
+   * 打开后的完整链路（v1.0.0 已实现）：
+   *
+   *   1. Agent 跑完一轮 → 方案**自动进入 `approved`**（不再停在「建议」）；
+   *   2. `apps/executor` 捞起 `approved` 的方案 → **认领** → 下市价进场单；
+   *   3. 成交事件回来 → 按**方案给的 ATR 倍数**挂止损止盈
+   *      （`decision_source='agent-plan'`，落进账本可查）。
+   *
+   * ⚠️ **关着的时候，控制面上的「批准」不会导致下单**：批准只是把方案标成
+   * `approved`（为将来打开开关做准备），执行器在开关关着时**根本不消费**它。
+   * 反过来，打开开关后方案自动批准——否则用户开了开关还要再点一下，
+   * 等于两处开关。
+   */
+  execute: z
+    .object({
+      /**
+       * 是否把方案变成真实订单。缺省 false。
+       *
+       * 打开后由 `apps/executor` 执行（**不是** `apps/agent`）：
+       * 下单要用交易所凭据，而凭据在 executor 那边。
+       */
+      enabled: z.boolean().default(false),
+      /** 同时最多挂多少笔未终结的方案。缺省 1。 */
+      maxOpenPlans: z.number().int().positive().max(20).default(1),
+      /**
+       * executor 多久检查一次「有没有已批准的方案」（毫秒）。缺省 30 秒。
+       *
+       * 它只影响**下单的延迟**，不影响分析节奏：Agent 按 `agent.intervalMs`
+       * 出方案，executor 按这个节奏去捡。
+       */
+      pollIntervalMs: z.number().int().positive().min(1_000).default(30_000),
+      /**
+       * 方案的有效期（毫秒）。超时的方案不再执行。
+       *
+       * 缺省 30 分钟：一份方案的依据是「刚才那批行情」，
+       * 半小时后行情都换了，拿旧方案下单是拿旧信息冒险。
+       */
+      planTtlMs: z
+        .number()
+        .int()
+        .positive()
+        .default(30 * 60_000),
+    })
+    .default({}),
+});
+
 export const configSchema = z.object({
   version: z.literal(1).default(1),
   market: marketSchema,
@@ -477,6 +646,7 @@ export const configSchema = z.object({
   sync: syncSchema.default({}),
   executor: executorSchema.default({}),
   notify: notifySchema.default({}),
+  agent: agentSchema.default({}),
 });
 
 export type MarketConfig = z.infer<typeof marketSchema>;
@@ -487,6 +657,8 @@ export type SyncConfig = z.infer<typeof syncSchema>;
 export type ExecutorConfig = z.infer<typeof executorSchema>;
 export type LlmConfig = z.infer<typeof llmSchema>;
 export type NotifyConfig = z.infer<typeof notifySchema>;
+export type AgentConfig = z.infer<typeof agentSchema>;
+export type AgentLlmConfig = z.infer<typeof agentLlmSchema>;
 // 注意：`RemovePolicy` 这个类型名归 market-sync.ts 所有，config 只导出 zod schema，
 // 避免同一概念在两个模块各有一个类型名。
 export type RemovePolicySchema = z.infer<typeof removePolicySchema>;

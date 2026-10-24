@@ -40,8 +40,21 @@ export interface LlmClientOptions {
    * API 密钥所在的**环境变量名**。
    *
    * 配置文件里出现明文密钥会被直接拒绝（AGENTS.md 约定 2），因此这里只存名字。
+   *
+   * 给了 {@link LlmClientOptions.apiKey} 时它不必填——控制面录入的那一份
+   * 已经在调用方手里了。
    */
-  apiKeyEnv: string;
+  apiKeyEnv?: string;
+  /**
+   * 直接给的密钥（v1.0.0 控制面录入的那一份，密文解开后的明文）。
+   *
+   * 与 {@link LlmClientOptions.apiKeyEnv} **二选一**：给了就用它，
+   * 不给就从环境变量读。两者都不给时**报错**——不静默用空串去请求。
+   *
+   * 密钥**只在这两处出现**：环境变量，或控制面录入后解开的那一份。
+   * 它不进配置文件、不进 argv、不进日志（约定 2）。
+   */
+  apiKey?: string;
   /**
    * 单次调用的硬超时（毫秒）。
    *
@@ -111,11 +124,17 @@ export function createLlmClient(options: LlmClientOptions): LlmClient {
   if (options.model.trim() === '') {
     throw new SyncError('CONFIG_INVALID', 'LLM model 不能为空：它决定用哪个模型');
   }
-  if (options.apiKeyEnv.trim() === '') {
-    throw new SyncError(
-      'CONFIG_INVALID',
-      'LLM apiKeyEnv 不能为空：它必须是一个环境变量名（密钥本身不写进配置）',
-    );
+  // 密钥：**直接给的优先**，否则从环境变量读。两者都没有就报错——
+  // 拿着空串去请求会得到一个语焉不详的 401，而真正的原因（没配密钥）在这里更清楚。
+  const explicitKey = options.apiKey?.trim() ?? '';
+  if (explicitKey === '') {
+    if (options.apiKeyEnv === undefined || options.apiKeyEnv.trim() === '') {
+      throw new SyncError(
+        'CONFIG_INVALID',
+        'LLM 密钥没给：要么提供 apiKey（控制面录入的那一份），' +
+          '要么提供 apiKeyEnv（密钥所在的环境变量名）',
+      );
+    }
   }
   const timeoutMs = options.timeoutMs ?? 8_000;
   const temperature = options.temperature ?? 0;
@@ -123,7 +142,7 @@ export function createLlmClient(options: LlmClientOptions): LlmClient {
 
   return {
     async complete(messages: readonly LlmMessage[]): Promise<string> {
-      const apiKey = readLlmApiKey(options.apiKeyEnv);
+      const apiKey = explicitKey !== '' ? explicitKey : readLlmApiKey(options.apiKeyEnv as string);
       const controller = new AbortController();
       // 定时器**必须**在 finally 里清掉，否则每次调用都在 Node 的定时器列表里
       // 留一条，直到进程退出——一个每分钟跑几十次的定时器会让进程永远不退出。
