@@ -59,6 +59,7 @@ import {
 } from '@trade-tool/core';
 import {
   claimBracket,
+  isAlgoOrderGone,
   listTrailingBrackets,
   listUnsettledBrackets,
   markBracketArmed,
@@ -496,6 +497,22 @@ export function createExecutorService(deps: ExecutorServiceDeps): ExecutorServic
         ...feeFields(fee),
       });
       log.info(`${update.symbol} 止盈止损成交（${tag}），记录置为 ${state}`);
+      // 同一笔的**另一张**单必须撤掉：TP / SL 都是 `closePosition` 形态，
+      // 触发即平掉当时剩余的全部仓位——仓位没了，那张单就没有存在意义了。
+      //
+      // 分批形态下这张是「带数量的第一段止盈」：交易所**不会**自动撤它，
+      // 本地不撤就一定留一张孤儿单（2026-10-22 实测：对账连报 22 次
+      // `orphan-algo-order`）。全平形态下交易所会自己撤，撤单撞上 `-2011`
+      // 属于正常，撤单失败会被 `cancelAlgoOrders` 记成错误日志。
+      //
+      // 顺序：**先落库、后撤单**。反过来的话，崩在中间会让这一轮的盈亏事实
+      // 丢掉（记录还停在未终结态，重连兜底会把它算成「工具外平仓」——
+      // 出场价不知道，盈亏就算不出来了）。
+      await cancelAlgoOrders(
+        update.symbol,
+        outstandingOrders(record, tag === SL_TAG ? ['tp', 'tp1'] : ['sl']),
+        `${update.symbol} ${tag === TP_TAG ? '止盈' : '止损'}成交`,
+      );
       // 只有**真的**结算了那一行才通知：事件重放时行早已终结（settled = 0），
       // 再推一次就会把同一轮的战报发两遍。
       if (settled > 0) await notifySettled(update, record, state, fee.error);
@@ -1138,7 +1155,88 @@ export function createExecutorService(deps: ExecutorServiceDeps): ExecutorServic
   }
 
   /**
-   * 仓位被**工具外**平掉：把这个标的未终结的记录收敛成 `cancelled`。
+   * 一笔记录上**还挂着的**条件单（单号为 `null` = 那张单从没挂上，或已随记录结清）。
+   *
+   * `only` 用来只取其中几张：仓位归零时全撤；我方条件单成交时**只撤另一张**
+   * （正在保护剩余仓位的那张不能撤——分批形态下第一段止盈成交后，止损还要继续护着）。
+   */
+  function outstandingOrders(
+    record: Pick<BracketRecord, 'tpAlgoId' | 'tp1AlgoId' | 'slAlgoId'>,
+    only?: readonly ('tp' | 'tp1' | 'sl')[],
+  ): { algoId: number; what: string }[] {
+    const wanted = (tag: 'tp' | 'tp1' | 'sl'): boolean => only === undefined || only.includes(tag);
+    const orders: { algoId: number; what: string }[] = [];
+    if (wanted('tp') && record.tpAlgoId !== null) {
+      orders.push({ algoId: record.tpAlgoId, what: '止盈' });
+    }
+    if (wanted('tp1') && record.tp1AlgoId !== null) {
+      orders.push({ algoId: record.tp1AlgoId, what: '第一段止盈' });
+    }
+    if (wanted('sl') && record.slAlgoId !== null) {
+      orders.push({ algoId: record.slAlgoId, what: '止损' });
+    }
+    return orders;
+  }
+
+  /**
+   * 撤掉给定的几张条件单。**永不抛错**。
+   *
+   * ## 为什么本地必须撤
+   *
+   * 条件单有两种形态，两者的撤单语义**完全不同**：
+   *
+   * | 形态 | 参数 | 仓位平掉之后 |
+   * | --- | --- | --- |
+   * | 全平 | `closePosition=true` | **交易所自动撤销** |
+   * | 分批第一段 | `quantity` + `reduceOnly` | **交易所不撤**，一直挂着 |
+   *
+   * 2026-10-22 实测（执行器日志 + 对账快照双证）：全平形态的止损成交后**不留孤儿**；
+   * 分批形态的止损成交后，那张「带数量的第一段止盈」**一直挂在交易所上**——
+   * 对账连报 22 次 `orphan-algo-order`。手动平仓（工具外平仓）走的是同一条路，
+   * 症状一样：**止盈的买入单撤不掉**。
+   *
+   * ## 为什么「单已经不在了」算成功
+   *
+   * 全平形态的两张单里，交易所会自动撤掉其中一张，于是撤单撞上 `-2011`
+   * （「Unknown order sent.」）是**常态**，不是失败。见 {@link isAlgoOrderGone}。
+   *
+   * ## 为什么不抛错
+   *
+   * 撤单失败不能把「仓位已经平了」这个事实挡在门外——账面上必须收敛。
+   * 撤不掉的那张由对账的 `orphan-algo-order` 报出来（对账只报告、不动手）。
+   */
+  async function cancelAlgoOrders(
+    symbol: string,
+    orders: readonly { algoId: number; what: string }[],
+    reason: string,
+  ): Promise<number> {
+    let cancelled = 0;
+    for (const order of orders) {
+      try {
+        await placer.cancelAlgoOrder(order.algoId);
+        cancelled += 1;
+        log.info(`${symbol} 已撤掉${order.what}单 ${order.algoId}（${reason}）`);
+      } catch (error) {
+        if (isAlgoOrderGone(error)) {
+          // 它自己没了（交易所自动撤过 / 已经成交）——正是我们要的结果，不算失败。
+          // 记成 debug 而不是 error：每次平仓都会撞上一次，报成错就成了噪音。
+          log.debug(`${symbol} ${order.what}单 ${order.algoId} 已经不在交易所了，无需撤`);
+          continue;
+        }
+        // 撤不掉：大声报出来。这张单可能还挂在交易所上（对账会报孤儿），
+        // 而「仓位平了、单还在」正是最需要被看见的一种。
+        log.error(
+          `${symbol} 撤${order.what}单 ${order.algoId} 失败（${reason}）：${reasonOf(error)}。` +
+            '这张单可能仍挂在交易所上（对账会报 orphan-algo-order）。',
+        );
+      }
+    }
+    return cancelled;
+  }
+
+  /**
+   * 仓位被**工具外**平掉：把这个标的未终结的记录收敛成 `cancelled`，
+   * 并**撤掉它在交易所上还挂着的条件单**。
    *
    * 为什么必须有这条：`cancelled` 在 DDL、类型和界面上都存在，却没有任何写入方
    * （`markBracketSettled` 此前只接受 `take_profit` / `stop_loss`）。于是在交易所
@@ -1148,11 +1246,30 @@ export function createExecutorService(deps: ExecutorServiceDeps): ExecutorServic
    *
    * 行**不删**：`(exchange, symbol, entry_order_id)` 是幂等锚点，删了行，
    * 万一该入场订单的事件被重放，`claimBracket` 的 `ON CONFLICT DO NOTHING` 就挡不住重复挂单。
+   *
+   * ## 为什么还要撤单
+   *
+   * 收敛记录只解决「本地账面」；交易所上那张单还在。全平形态的两张单由交易所
+   * 自动撤销，**分批形态的第一段止盈不会**——它是带数量的单，交易所不碰它。
+   * 于是手动平仓之后那张止盈的买入单就一直挂着（用户报的现象）。
+   *
+   * ## 顺序：先撤、后落库
+   *
+   * 反过来的话，崩在中间就留下「记录已结清、单还挂着」——**没有任何东西会再撤它**
+   * （未终结集合里已经没有它了），只能靠人手工去交易所撤。
+   * 先撤后落库则崩在中间留下的是「记录还是 `armed`、单已经没了」：
+   * 重连后的 `convergeFlatPositions` 会再走一遍本方法（撤单得到「已经不在」→ 容忍），
+   * 然后把记录收敛成 `cancelled`——**自愈**。
    */
   async function closeOutside(symbol: string, source: string): Promise<HandleOutcome> {
     const records = await listUnsettledBrackets(pool, exchange, symbol);
     if (records.length === 0) return 'ignored';
     for (const record of records) {
+      await cancelAlgoOrders(
+        record.symbol,
+        outstandingOrders(record),
+        `${symbol} 仓位被工具外平掉（${source}）`,
+      );
       await markBracketSettled(
         pool,
         { exchange, symbol: record.symbol, entryOrderId: record.entryOrderId },

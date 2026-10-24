@@ -11,6 +11,7 @@ import { SyncError } from '@trade-tool/core';
 import {
   BinancePrivateClient,
   ORDER_TRADE_UPDATE,
+  isAlgoOrderGone,
   parseOrderTradeUpdate,
   parseTickSize,
 } from '@trade-tool/data';
@@ -133,6 +134,26 @@ describe('私有 REST', () => {
   it('撤单失败（负数码）仍然要报错，且错误信息带上交易所的 msg', async () => {
     const client = clientWith(async () => jsonResponse({ code: -2011, msg: 'Unknown order' }, 400));
     await expect(client.cancelAlgoOrder(123456)).rejects.toThrow(/Unknown order/);
+  });
+
+  // 「这张单已经不在交易所了」不是撤单失败——它是**目标状态**。
+  // 全平形态的两张单里，交易所会自动撤掉其中一张，于是本地撤单撞上 `-2011`
+  // 是常态（2026-10-24 实测）。把它当成失败，会让每次平仓都报一条错。
+  it('「单已经不在」（-2011）判定为已达成目标，其余负数码仍算真失败', async () => {
+    const client = clientWith(async () => jsonResponse({ code: -2011, msg: 'Unknown order' }, 400));
+    const error = await client.cancelAlgoOrder(123456).catch((caught: unknown) => caught);
+    expect(isAlgoOrderGone(error)).toBe(true);
+
+    // 别的负数码（限频、鉴权…）一律是真失败，必须报出来。
+    const other = new SyncError('EXCHANGE_ERROR', '限频', {
+      status: 429,
+      exchangeCode: -1003,
+      path: '/fapi/v1/algoOrder',
+    });
+    expect(isAlgoOrderGone(other)).toBe(false);
+    // 不是交易所错误、或压根不是 SyncError，都不算「单不在了」。
+    expect(isAlgoOrderGone(new Error('网络断了'))).toBe(false);
+    expect(isAlgoOrderGone(null)).toBe(false);
   });
 
   it('数量非正直接报错，不把 0 发到交易所', async () => {

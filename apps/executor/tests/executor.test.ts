@@ -1934,3 +1934,164 @@ describe('v0.9.3：手续费折算', () => {
     expect(settled?.severity).toBe('warning');
   });
 });
+
+// ---------------------------------------------------------------------------
+// 仓位没了 → 交易所上还挂着的那几张单必须撤掉（2026-10-24 修）
+//
+// 2026-10-22 实测（执行器日志 + 对账快照双证）：
+//   * 全平形态（`closePosition=true`）：仓位一平，**交易所自动撤销**那两张单；
+//   * 分批形态的第一段止盈（`quantity` + `reduceOnly`）：**交易所不撤**，
+//     它一直挂着 → 对账连报 22 次 `orphan-algo-order`。
+// 而本地**从来没有**去撤过它：手动平仓（工具外平仓）与止损成交都只落库、不撤单。
+// ---------------------------------------------------------------------------
+
+describe('仓位归零 → 撤掉交易所上还挂着的条件单', () => {
+  /** 分批形态（比例 0.5）：第一段止盈带数量、止损是 closePosition。 */
+  function stagedDeps(atr: AtrProvider = fakeAtr()) {
+    const fake = fakePool();
+    const placer = fakePlacer();
+    const service = createExecutorService({
+      pool: fake.pool,
+      config: makeConfig(),
+      placer,
+      atr,
+      resolvePolicy: stagedPolicy(),
+    });
+    return { fake, placer, service };
+  }
+
+  it('手动平仓（工具外平仓）→ 撤掉分批形态的第一段止盈单与止损单', async () => {
+    const { fake, placer, service } = stagedDeps();
+
+    // 开仓 → 两张单挂上：TP1（带数量）+ SL（closePosition），记录停在 `partial_armed`。
+    expect(await service.handleFill(fill())).toBe('armed');
+    const row = fake.state.claims.get('binance/BTCUSDT/42');
+    expect(row?.state).toBe('partial_armed');
+    const tp1Id = row?.tp1AlgoId;
+    const slId = row?.slOrderId;
+    expect(tp1Id).toBeTypeOf('number');
+    expect(slId).toBeTypeOf('number');
+
+    // 用户在交易所 App 上按了平仓：净仓归零 → 工具外平仓。
+    const outcome = await service.handleFill(
+      fill({ side: 'SELL', orderId: 999, clientOrderId: 'manual-close' }),
+    );
+    expect(outcome).toBe('external-close');
+
+    // 关键：那张**带数量的**第一段止盈单必须被撤掉——交易所不会自动撤它。
+    expect(placer.cancelled).toContain(tp1Id);
+    expect(placer.cancelled).toContain(slId);
+    expect(fake.state.claims.get('binance/BTCUSDT/42')?.state).toBe('cancelled');
+  });
+
+  it('撤单时交易所说「这张单已经不在」（-2011）→ 不算失败，记录照样收敛', async () => {
+    const fake = fakePool();
+    // 全平形态：两张单都是 closePosition，仓位一平交易所就自动撤了——
+    // 于是本地撤单撞上 `-2011` 是**常态**，不是失败。
+    const placer = fakePlacer({
+      async cancelAlgoOrder(algoId: number) {
+        throw new SyncError(
+          'EXCHANGE_ERROR',
+          `Binance DELETE /fapi/v1/algoOrder 失败：Unknown order sent.（单 ${String(algoId)}）`,
+          { status: 400, exchangeCode: -2011, path: '/fapi/v1/algoOrder' },
+        );
+      },
+    });
+    const service = createExecutorService({
+      pool: fake.pool,
+      config: makeConfig(),
+      placer,
+      atr: fakeAtr(),
+    });
+
+    expect(await service.handleFill(fill())).toBe('armed');
+    const outcome = await service.handleFill(
+      fill({ side: 'SELL', orderId: 999, clientOrderId: 'manual-close' }),
+    );
+    // 「单已经不在了」正是我们要的结果，不能因此报错，更不能因此不收敛记录。
+    expect(outcome).toBe('external-close');
+    expect(fake.state.claims.get('binance/BTCUSDT/42')?.state).toBe('cancelled');
+  });
+
+  it('撤单真失败 → 记录照样收敛成 cancelled（仓位平了不能被撤单失败挡住）', async () => {
+    const fake = fakePool();
+    const placer = fakePlacer({
+      async cancelAlgoOrder() {
+        throw new SyncError('EXCHANGE_ERROR', '模拟撤单时的网络故障', {
+          status: 500,
+          exchangeCode: -1003,
+          path: '/fapi/v1/algoOrder',
+        });
+      },
+    });
+    const service = createExecutorService({
+      pool: fake.pool,
+      config: makeConfig(),
+      placer,
+      atr: fakeAtr(),
+    });
+
+    expect(await service.handleFill(fill())).toBe('armed');
+    const outcome = await service.handleFill(
+      fill({ side: 'SELL', orderId: 999, clientOrderId: 'manual-close' }),
+    );
+    expect(outcome).toBe('external-close');
+    // 撤单失败只记日志（撤不掉的那张由对账的 `orphan-algo-order` 报出来），
+    // 但「仓位已经平了」这个事实必须落库。
+    expect(fake.state.claims.get('binance/BTCUSDT/42')?.state).toBe('cancelled');
+  });
+
+  it('我们的止损成交 → 撤掉还挂着的那张第一段止盈单（分批形态的孤儿单）', async () => {
+    const { fake, placer, service } = stagedDeps();
+
+    expect(await service.handleFill(fill())).toBe('armed');
+    const row = fake.state.claims.get('binance/BTCUSDT/42');
+    const tp1Id = row?.tp1AlgoId;
+    const slId = row?.slOrderId;
+
+    // 止损成交：它平掉当时剩余的全部仓位。
+    const outcome = await service.handleFill(
+      fill({
+        clientOrderId: bracketClientOrderId('sl', '42'),
+        side: 'SELL',
+        lastFilledPrice: 59_800,
+        lastFilledQty: 0.1,
+      }),
+    );
+    expect(outcome).toBe('settled');
+    // 关键：那张带数量的第一段止盈单还挂在交易所上 → 必须撤掉。
+    expect(placer.cancelled).toContain(tp1Id);
+    // 止损单自己已经成交，不必再撤（撤它只会得到「已经不在」）。
+    expect(placer.cancelled).not.toContain(slId);
+    expect(fake.state.claims.get('binance/BTCUSDT/42')?.state).toBe('stop_loss');
+  });
+
+  it('第一段止盈成交 → **不**撤止损单（它还要继续保护剩下的仓位）', async () => {
+    // 用「涨上去」的行情：移动止损真的会换档（撤旧止损、挂新止损），
+    // 这样断言才有分量——撤单列表里**只有**换档那一次。
+    const { fake, placer, service } = stagedDeps(fakeAtr(ATR_UP));
+
+    expect(await service.handleFill(fill())).toBe('armed');
+    const row = fake.state.claims.get('binance/BTCUSDT/42');
+    const entrySlId = row?.slOrderId;
+    const tp1Id = row?.tp1AlgoId;
+
+    // 第一段止盈成交 → 进入移动止损。
+    const outcome = await service.handleFill(
+      fill({
+        clientOrderId: bracketClientOrderId('tp', '42'),
+        side: 'SELL',
+        lastFilledPrice: 60_300,
+        lastFilledQty: 0.05,
+      }),
+    );
+    expect(outcome).toBe('trailing');
+
+    // 撤掉的**只有**移动止损换档那一次（撤旧止损、挂新止损）。
+    // 若是「仓位归零就全撤」那条路跑错了，这里会多出第一段止盈单号——
+    // 而它已经成交，撤它没有意义；更要紧的是不能把还在护仓的止损撤掉。
+    expect(placer.cancelled).toEqual([entrySlId]);
+    expect(placer.cancelled).not.toContain(tp1Id);
+    expect(fake.state.claims.get('binance/BTCUSDT/42')?.state).toBe('trailing');
+  });
+});

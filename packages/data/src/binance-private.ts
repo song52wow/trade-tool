@@ -353,6 +353,30 @@ export function parseAccountUpdate(payload: unknown): AccountPositionUpdate[] | 
 }
 
 /**
+ * 「这张单已经不在交易所了」的判定。
+ *
+ * 币安对**撤一张找不到的单**回 `-2011 "Unknown order sent."`——官方口径是
+ * 「在撮合引擎里找不到这张单，通常是因为它已经完成或撤销了」。
+ * 因此这个码**不是撤单失败**，而是「想要的状态已经达成」。
+ *
+ * 为什么要单独判：条件单有两种撤单语义，撤单时经常遇到「已经不在了」——
+ *   * `closePosition=true` 的单：仓位一平，**交易所自动撤销**它；
+ *   * 带 `quantity` 的单（分批形态的第一段止盈）：交易所**不撤**，要本地撤。
+ * 于是本地撤单时经常撞上「它自己没了」。把它当成失败会每次平仓都报一条错，
+ * 而错久了就没人看了——那正是「看起来有问题、其实没问题」的反面（AGENTS.md 约定 9）。
+ *
+ * ⚠️ **只认 `-2011`**。别的负数码一律是真失败（限频、鉴权、时钟…），必须报出来。
+ */
+export function isAlgoOrderGone(error: unknown): boolean {
+  if (!(error instanceof SyncError)) return false;
+  if (error.code !== 'EXCHANGE_ERROR') return false;
+  const code = error.details['exchangeCode'];
+  if (typeof code === 'number') return code === -2011;
+  if (typeof code === 'string') return Number(code) === -2011;
+  return false;
+}
+
+/**
  * 从 exchangeInfo 的原始条目里取最小价格变动（`PRICE_FILTER.tickSize`）。
  *
  * 取的是**库里的** `contract_spec.raw`（不是实时再拉一次）：止盈止损要按 tick 对齐，
