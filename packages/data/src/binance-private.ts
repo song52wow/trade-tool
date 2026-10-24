@@ -631,12 +631,17 @@ export class BinancePrivateClient {
     for (let i = 0; i < sampleCount; i++) {
       const sentAt = Date.now();
       const body = await this.request<{ serverTime?: unknown }>('GET', '/fapi/v1/time');
+      // **收到响应的时刻必须记下来**：只记 sentAt 的话，单程延迟会被当成
+      // 时钟偏差，补偿量因此偏小，签出去的时间戳落到服务器时间**前面**——
+      // 那是币安拒得最狠的一侧（-1021）。2026-10-25 在服务器 + 代理上实测：
+      // 本机只慢 0.8 秒，却量成「慢 1.7~2.7 秒」，私有请求全挂。
+      const receivedAt = Date.now();
       if (typeof body?.serverTime !== 'number') {
         throw new SyncError('EXCHANGE_ERROR', '/fapi/v1/time 没有返回数字 serverTime', {
           body: JSON.stringify(body).slice(0, 200),
         });
       }
-      samples.push({ sentAt, serverTime: body.serverTime });
+      samples.push({ sentAt, receivedAt, serverTime: body.serverTime });
     }
     const skew = computeClockSkew(samples);
     this.clockOffsetMs = skew.offsetMs;
