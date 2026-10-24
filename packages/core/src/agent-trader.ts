@@ -509,6 +509,30 @@ export interface TraderPromptContext {
 }
 
 /**
+ * 把**比例**说成**百分比**（`0.01` → `"1%"`）。
+ *
+ * ## 为什么不能直接把两个数拼在一起
+ *
+ * 提示词里同一个数有两种写法就会歧义，而这里出过一次**真错**：
+ * 原来的模板是 `${maxRiskFraction}` 后面接 `${maxRiskFraction * 100}%`——
+ * `0.01` 于是拼成了 **「0.011%」**。那句话本意是「1% 的上限」，
+ * 读出来却变成「0.011% 的上限」，**小了 100 倍**。
+ *
+ * 后果不是「模型看错一个字」：模型会照着 0.011% 去提 `riskFraction`，
+ * 而那个值在 schema 的合法区间里，程序**不会夹它**（夹的是 0.01 的上限，不是 0.00011），
+ * 于是仓位只有该有的百分之一，而日志上一切正常。
+ * 「超过会被夹住」那句还给了它虚假的安全感——**看起来有护栏，其实护栏在另一个刻度上**。
+ *
+ * 所以这里把比例与百分比**都写出来**，并且只用这一处换算。
+ */
+function percentText(fraction: number): string {
+  // 先保留 4 位小数再转成 number：0.011 * 100 = 1.0999999999999999 这种浮点尾巴
+  // 不去掉的话，提示词里就会出现「1.0999999999999999%」。
+  const percent = Number((fraction * 100).toFixed(4));
+  return `${String(percent)}%`;
+}
+
+/**
  * 构造给模型看的提示词。
  *
  * **纯函数**（AGENTS.md 约定 4）。提示词里**不出现**密钥。
@@ -537,8 +561,9 @@ export function buildTraderPrompt(context: TraderPromptContext): string {
           '数字。限价单挂在现价多远（ATR 倍数），取值 [0, 5]。' +
           'entryType=market 时填 0。回调进场比追价更容易拿到好价',
         riskFraction:
-          '数字。本笔愿意亏掉权益的多大比例，取值 (0, 上限]。' +
-          '0.01 = 拿 1% 的权益去冒险。**这个数会被换算成真实的下单数量**',
+          '数字。**比例**（不是百分数），本笔愿意亏掉权益的多大比例，取值 (0, 上限]。' +
+          '0.01 = 拿 1% 的权益去冒险——要 1% 就填 0.01，不要填 1。' +
+          '**这个数会被换算成真实的下单数量**',
         stopAtrMult: '数字。止损距离（ATR 倍数），取值 (0, 20]',
         takeProfitAtrMult: '数字。止盈距离（ATR 倍数），取值 (0, 50]',
         rationale: '字符串。3 到 6 句，说明这个方案的依据',
@@ -552,8 +577,9 @@ export function buildTraderPrompt(context: TraderPromptContext): string {
     '- **只输出 JSON**，不要加 markdown 代码块标记。',
     '- **不要输出数量、价格、金额**——这些由系统按风控上限算出来，算得比你准' +
       '（它知道最小价格变动与最小下单量）。',
-    `- 风险比例不得超过 ${context.limits.maxRiskFraction}` +
-      `${context.limits.maxRiskFraction * 100}%（超过会被夹住，但仍按你的意图说明理由）。`,
+    `- 风险比例不得超过 ${String(context.limits.maxRiskFraction)}` +
+      `（即 ${percentText(context.limits.maxRiskFraction)}）。` +
+      '超过会被夹住，但仍按你的意图说明理由。',
     '- **止损与止盈的 ATR 倍数会被直接用掉**：它们决定真实的止损价与止盈价。' +
       '止损倍数太小会被市场噪音扫掉，太大则单笔亏损失控。',
     '',

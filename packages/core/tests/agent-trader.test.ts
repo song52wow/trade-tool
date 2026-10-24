@@ -309,4 +309,69 @@ describe('buildTraderPrompt', () => {
     expect(stanceLabel('bearish')).toBe('看空');
     expect(stanceLabel('neutral')).toBe('中性');
   });
+
+  it('风险上限必须说清「比例是多少、相当于百分之几」', () => {
+    // 踩过的坑：模板把 `0.01` 与 `1%` 直接拼在一起，提示词里就成了
+    // 「不得超过 0.011%」——把 1% 的上限说成了 0.011%，**小了 100 倍**。
+    // 模型照着提的 riskFraction 在 schema 合法区间里，程序不会夹它，
+    // 于是仓位只有该有的百分之一，而日志上一切正常。
+    const context = {
+      symbol: 'TESTUSDT',
+      verdict: verdict(),
+      equity: 10_000,
+      lastPrice: 100,
+      atr: 2,
+      atrPeriod: 14,
+      tickSize: 0.01,
+      stepSize: 0.001,
+      minQty: 0.001,
+      limits: LIMITS,
+      baseline: { stopAtrMult: 2, takeProfitAtrMult: 3 },
+    };
+    const prompt = buildTraderPrompt(context);
+    // 比例与百分比都在，且**没有**被拼成「0.011%」这种混账。
+    expect(prompt).toContain(String(LIMITS.maxRiskFraction));
+    expect(prompt).toContain('1%');
+    expect(prompt).not.toContain('0.011%');
+    expect(prompt).not.toContain(
+      `${String(LIMITS.maxRiskFraction)}${String(LIMITS.maxRiskFraction * 100)}%`,
+    );
+  });
+
+  it('风险上限：换成别的上限也不能拼出混账', () => {
+    const context = {
+      symbol: 'TESTUSDT',
+      verdict: verdict(),
+      equity: 10_000,
+      lastPrice: 100,
+      atr: 2,
+      atrPeriod: 14,
+      tickSize: 0.01,
+      stepSize: 0.001,
+      minQty: 0.001,
+      limits: { ...LIMITS, maxRiskFraction: 0.02 },
+      baseline: { stopAtrMult: 2, takeProfitAtrMult: 3 },
+    };
+    const prompt = buildTraderPrompt(context);
+    expect(prompt).toContain('0.02');
+    expect(prompt).toContain('2%');
+    expect(prompt).not.toContain('0.022%');
+  });
+
+  it('字段说明说清 riskFraction 是比例不是百分数', () => {
+    const context = {
+      symbol: 'TESTUSDT',
+      verdict: verdict(),
+      equity: 10_000,
+      lastPrice: 100,
+      atr: 2,
+      atrPeriod: 14,
+      tickSize: 0.01,
+      stepSize: 0.001,
+      minQty: 0.001,
+      limits: LIMITS,
+      baseline: { stopAtrMult: 2, takeProfitAtrMult: 3 },
+    };
+    expect(buildTraderPrompt(context)).toContain('要 1% 就填 0.01，不要填 1');
+  });
 });
