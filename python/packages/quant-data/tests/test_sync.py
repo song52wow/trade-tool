@@ -1146,6 +1146,8 @@ def test_migrations_are_idempotent(conn: DbConn, pg_dsn: str) -> None:
         "020_agent_prompt_notify",
         # v0.9.3：手续费的币种与折算汇率（编号跳号：017~020 已被另一条在研分支占用）
         "021_fee_asset",
+        # 2026-10-25：通知内容类型多两种同步器故障（notify_settings.kinds 扩枚举）
+        "022_sync_notify",
     ]
     pg.ensure_schema(conn)
 

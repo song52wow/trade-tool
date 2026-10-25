@@ -13,6 +13,16 @@ export {
 } from './primitives.js';
 export { SyncDaemon, createDaemon, HEARTBEAT_INTERVAL_MS, type DaemonOptions } from './daemon.js';
 export {
+  SyncAlerter,
+  SYNC_ALERT_SCOPE,
+  buildDaemonExitAlert,
+  buildStoppedAlert,
+  buildSymbolPinnedAlert,
+  type PinnedSymbol,
+  type StoppedReason,
+  type SyncAlerterOptions,
+} from './alert.js';
+export {
   createSyncService,
   createSyncServiceFromConfig,
   type SyncService,

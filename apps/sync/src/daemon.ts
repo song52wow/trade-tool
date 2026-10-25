@@ -14,6 +14,7 @@ import {
 } from '@trade-tool/data';
 
 import { SyncControl } from './primitives.js';
+import { SyncAlerter, type PinnedSymbol, type StoppedReason } from './alert.js';
 
 /**
  * 常驻调度循环（R-17 … R-21）。
@@ -81,6 +82,19 @@ export const HEARTBEAT_INTERVAL_MS = 10_000;
  */
 const STOP_DRAIN_TIMEOUT_MS = 10_000;
 
+/**
+ * **多久没有任何进展就算「停摆」**。
+ *
+ * 为什么需要它：网络类错误**不再**把标的钉死（见 `primitives.ts` 的
+ * `TRANSIENT_CODES`），于是「所有标的都被钉死」那条判据在代理彻底断掉时
+ * **不会**触发——一个都没被钉死，但一个也没在动。
+ * 没有这条判据的话，代理断掉就变成「没人知道」，那正是本轮要治的病。
+ *
+ * 取 10 分钟：出口代理的抖动是秒级的（实测 1.9 秒就成功），10 分钟还没有
+ * 任何进展，多半是代理或交易所真的出问题了。
+ */
+const STALLED_THRESHOLD_MS = 10 * 60_000;
+
 export interface DaemonOptions {
   config: TradeToolConfig;
   /** 测试可注入固定时钟 */
@@ -103,6 +117,15 @@ export interface DaemonOptions {
    * 最长 `backoffMaxMs`（默认 5 分钟）才生效（R-21.3 / R-22）。
    */
   control?: SyncControl;
+  /**
+   * 告警出口（飞书）。缺省 = 不推送。
+   *
+   * 为什么它必须是**可选**的：守护进程的核心职责是同步，
+   * 通知是给人看的旁路（AGENTS.md 约定 9「不静默兜底」讲的是**失败要报错**，
+   * 不是「推送失败要把进程带出去」）。测试不装通知通道，
+   * 于是断言「推送失败不影响同步」这条就无从谈起。
+   */
+  alerter?: SyncAlerter;
 }
 
 export class SyncDaemon {
@@ -136,6 +159,28 @@ export class SyncDaemon {
    * 心跳照刷，页面看到的是「还在跑」，而不是「静默死掉」。
    */
   private fatalError: SyncError | null = null;
+  /** 告警出口（飞书）。缺省 = 不推送。 */
+  private readonly alerter: SyncAlerter | undefined;
+  /**
+   * 上一轮的健康度摘要。
+   *
+   * 记它是为了**日志不刷屏**：健康度每 15 秒算一次，而「一切正常」这件事
+   * 没必要每 15 秒写一行。只在**变化**时打一行。
+   */
+  private lastHealthSummary: string | null = null;
+  /** 全局性错误**是否已经报过**。同一个错误可能从两条路径进来，只推一次。 */
+  private fatalReported = false;
+  /** 心跳定时器**正在起**（await 之中）。用来防止并发建出两个定时器。 */
+  private heartbeatStarting = false;
+  /** 上一轮是不是「没有可调度的标的」。用来让那行日志只在变化时出现。 */
+  private lastIdle: boolean | null = null;
+  /**
+   * 最近一次「有标的同步成功」的时刻。
+   *
+   * 它回答的是「数据还在不在往前走」——比「进程还在不在」更贴近
+   * 「有人在干活吗」这个问题。心跳的职责也是这个（见 {@link reportHealth}）。
+   */
+  private lastProgressAt: number | null = null;
 
   constructor(ctx: MarketContext, options: DaemonOptions) {
     this.ctx = ctx;
@@ -145,6 +190,7 @@ export class SyncDaemon {
     this.now = options.now ?? (() => Date.now());
     this.sleep = options.sleep ?? ((ms: number) => new Promise((r) => setTimeout(r, ms)));
     this.heartbeatIntervalMs = options.heartbeatIntervalMs ?? HEARTBEAT_INTERVAL_MS;
+    this.alerter = options.alerter;
   }
 
   get primitives(): SyncControl {
@@ -185,10 +231,18 @@ export class SyncDaemon {
   }
 
   /**
-   * 本轮可调度的标的：集合内、期望 running、非 error、不在退避中。
-   * **顺序稳定**且经过统一限速器排队，批量回补不会一次性放开全部并发（R-20.6 / AC-24）。
+   * 一次调度要用到的全部事实：标的集合、它们的状态、以及「本轮可调度」的子集。
+   *
+   * 为什么要合成一个方法：`selectBatch` 与「同步健康度」的判定
+   * （哪些标的被钉死了、是不是一个都没在跑）需要**同一份**状态快照。
+   * 各查一次的话，两次读到的状态可能不一样，于是「调度选了它」与
+   * 「告警说它卡住了」能同框出现——那正是这个仓库反复在治的「两个出口结论不一致」。
    */
-  async selectBatch(nowMs: number): Promise<SymbolEntry[]> {
+  private async collect(nowMs: number): Promise<{
+    entries: SymbolEntry[];
+    states: Map<string, SymbolSyncState>;
+    eligible: SymbolEntry[];
+  }> {
     const entries = await this.control.listSymbols();
     const states = new Map((await getAllStates(this.ctx)).map((s) => [s.symbol, s]));
 
@@ -214,6 +268,15 @@ export class SyncDaemon {
         return a.symbol < b.symbol ? -1 : a.symbol > b.symbol ? 1 : 0;
       });
 
+    return { entries, states, eligible };
+  }
+
+  /**
+   * 本轮可调度的标的：集合内、期望 running、非 error、不在退避中。
+   * **顺序稳定**且经过统一限速器排队，批量回补不会一次性放开全部并发（R-20.6 / AC-24）。
+   */
+  async selectBatch(nowMs: number): Promise<SymbolEntry[]> {
+    const { eligible } = await this.collect(nowMs);
     const slotsFree = Math.max(0, this.config.sync.concurrency - this.busyCount());
     return eligible.slice(0, slotsFree);
   }
@@ -246,8 +309,30 @@ export class SyncDaemon {
    */
   async tick(): Promise<Map<string, string>> {
     const nowMs = this.now();
-    const batch = await this.selectBatch(nowMs);
-    if (batch.length === 0) return new Map();
+    const { entries, states, eligible } = await this.collect(nowMs);
+    const slotsFree = Math.max(0, this.config.sync.concurrency - this.busyCount());
+    const batch = eligible.slice(0, slotsFree);
+
+    // 健康度**先于**调度算：它决定心跳还刷不刷，也决定要不要推告警。
+    await this.reportHealth(entries, states);
+
+    if (batch.length === 0) {
+      // 空批次**也要说话**。
+      //
+      // 2026-10-25 在目标机上实测踩到：三个标的连续失败到上限被钉成 error 之后，
+      // 调度器每 15 秒扫一次、每次都选不出标的，而这里直接 return——
+      // 于是**日志彻底安静了 5 小时 55 分**，而心跳照刷、控制面显示「在线」。
+      // 「没人知道」是这一层最贵的故障（notify.ts 文件头），日志这一行就是它的兜底。
+      //
+      // 但**只在变化时打**：每轮一行就成了新的噪音（每 15 秒一行，一天一千多行），
+      // 而「没人看」等于没接（notify.ts 文件头第 3 条）。
+      if (this.lastIdle !== true) {
+        this.lastIdle = true;
+        log.info('本轮没有可调度的标的（其余状态见上一条健康度日志）');
+      }
+      return new Map();
+    }
+    this.lastIdle = false;
 
     const started: string[] = [];
     for (const entry of batch) {
@@ -265,6 +350,91 @@ export class SyncDaemon {
     }
     // 失败由任务自己处理（见 {@link startSymbol}），这里没有同步可见的失败。
     return new Map();
+  }
+
+  /**
+   * 汇报「同步健康度」，并据此决定**心跳还刷不刷**。
+   *
+   * ## 「停摆」的判定
+   *
+   * 期望 running 的标的**全部**被钉成 `error` 才算停摆。
+   * 只被钉死一部分不算——其余的还在推进，数据仍在进。
+   * 退避中、在途的也不算：那是在跑，只是这一轮还没轮到。
+   *
+   * ## 为什么停摆时要停心跳
+   *
+   * 心跳的职责是回答「**有人在干活吗**」（apps/web/src/service.ts 的 `daemonStatus`）。
+   * 停摆时没有任何数据会再进，继续刷心跳就是让控制面显示「在线」——
+   * 而它读到的其实是「进程还在」。「进程还在但没人干活」和「有人干活」
+   * 在页面上长得一模一样，那正是这个仓库最忌讳的「界面在骗人」。
+   *
+   * 停掉之后页面按心跳年龄判成 stale（「进程还在但不对劲，查日志」），
+   * 而真正的处置（人工恢复被钉死的标的）由飞书那条「同步停摆」告警说清楚。
+   */
+  private async reportHealth(
+    entries: readonly SymbolEntry[],
+    states: Map<string, SymbolSyncState>,
+  ): Promise<void> {
+    const nowMs = this.now();
+    const runningSymbols = entries
+      .filter((entry) => entry.desiredState === 'running')
+      .map((entry) => entry.symbol);
+    const pinned: PinnedSymbol[] = [];
+    for (const symbol of runningSymbols) {
+      const state = states.get(symbol);
+      // 没有 sync_state 行的标的还没跑过，**不算被钉死**（它会被调度）。
+      if (state === undefined || state.status !== 'error') continue;
+      pinned.push({
+        symbol,
+        message: state.lastError ?? '（没有留下失败原因）',
+        consecutiveErrors: state.errorCount,
+      });
+    }
+    const allPinned = runningSymbols.length > 0 && pinned.length === runningSymbols.length;
+
+    // 「长时间没有进展」：**没有任何标的**在往前推进。
+    //
+    // 「有在途任务」不算停摆——那说明有任务正在跑（首次全量回补实测要十几分钟，
+    // 那段时间里它当然还没有「成功」过，但那是在干活）。
+    const idleMs = nowMs - (this.lastProgressAt ?? nowMs);
+    const stalled =
+      runningSymbols.length > 0 && this.inflightTasks.size === 0 && idleMs > STALLED_THRESHOLD_MS;
+
+    const reason: StoppedReason = allPinned ? 'all-pinned' : stalled ? 'no-progress' : null;
+    const stopped = reason !== null;
+
+    if (stopped) {
+      this.stopHeartbeat();
+    } else {
+      await this.startHeartbeat();
+    }
+
+    const summary =
+      reason === 'all-pinned'
+        ? `同步停摆：${String(runningSymbols.length)} 个在跑的标的全部被钉死（${pinned
+            .map((item) => item.symbol)
+            .join('、')}）`
+        : reason === 'no-progress'
+          ? `同步停摆：${Math.round(idleMs / 60_000)} 分钟没有任何标的同步成功` +
+            '（多半是出口代理或交易所不可达）'
+          : pinned.length === 0
+            ? `${String(runningSymbols.length)} 个在跑的标的都在推进`
+            : `${String(pinned.length)} 个标的被钉死（${pinned
+                .map((item) => item.symbol)
+                .join('、')}），其余 ${String(runningSymbols.length - pinned.length)} 个仍在推进`;
+    if (summary !== this.lastHealthSummary) {
+      this.lastHealthSummary = summary;
+      if (pinned.length === 0 && reason === null) log.info(summary);
+      else log.warn(summary);
+    }
+
+    if (this.alerter !== undefined) {
+      await this.alerter.reportHealth({
+        pinned,
+        stopped: reason,
+        ...(reason === 'no-progress' ? { idleMs } : {}),
+      });
+    }
   }
 
   /**
@@ -287,7 +457,11 @@ export class SyncDaemon {
                 unexpected instanceof Error ? unexpected.message : String(unexpected),
               );
       }
-      if (error === null) return;
+      if (error === null) {
+        // 有标的同步成功了 → 数据在往前走。
+        this.lastProgressAt = this.now();
+        return;
+      }
       log.warn(`${entry.symbol} 同步失败 [${error.code}]：${error.message}`);
       // 错误隔离：只有**全局性**错误才让进程退出，单标的错误一律不扩散（R-21.1）。
       if (GLOBAL_FATAL_CODES.has(error.code) && !this.isSymbolLocalFailure(error.code)) {
@@ -325,6 +499,9 @@ export class SyncDaemon {
     if (this.running) return;
     this.running = true;
     this.stopping = false;
+    // 「最近一次有进展」从**启动时刻**起算：刚起来的守护进程还没同步成功过，
+    // 那不算「很久没进展」——但 10 分钟之后仍然没有任何进展，就算数了。
+    this.lastProgressAt = this.now();
 
     // 全局性错误 → 进程退出；这是「不静默兜底」在常驻形态下的体现。
     try {
@@ -335,28 +512,22 @@ export class SyncDaemon {
       await this.reconcile();
     } catch (error) {
       this.running = false;
-      this.exitIfGlobalFatal(error);
+      await this.reportFatalAndExit(error);
       throw error;
     }
 
     // 心跳先落一行再开定时器：控制面据此回答「有人在干活吗」。
     // 启动失败时不能留下心跳行，否则页面会显示在线而其实没在跑。
-    await upsertDaemonHeartbeat(this.ctx.pool, this.ctx.exchange);
-    this.heartbeatTimer = setInterval(() => {
-      // 心跳写失败不能影响同步：吞掉并继续，让读取方按超时判离线即可。
-      // 反过来让它冒泡会变成一个未处理的 Promise 拒绝，直接终止进程（R-14.4）。
-      void upsertDaemonHeartbeat(this.ctx.pool, this.ctx.exchange).catch((error: unknown) => {
-        log.warn(`刷新守护进程心跳失败：${(error as Error)?.message ?? String(error)}`);
-      });
-    }, this.heartbeatIntervalMs);
-    // 心跳不该拖住进程退出
-    this.heartbeatTimer.unref?.();
+    await this.startHeartbeat();
 
     this.loopPromise = this.loop();
     // 不能把 loop 的拒绝留成 unhandled rejection：Node 默认会直接终止进程，
     // 日志里只剩下一个没有任何上下文的堆栈（R-14.4 要求错误可读、且单标的失败不终止进程）。
     // 这里显式接住并交给 exitIfGlobalFatal 输出原因；`stop()` 另有自己的 catch。
-    this.loopPromise.catch((error: unknown) => this.exitIfGlobalFatal(error));
+    this.loopPromise.catch(async (error: unknown) => {
+      // 兜底：循环内部的 catch 已经报过一次的话，`reportFatalAndExit` 会自己挡住。
+      await this.reportFatalAndExit(error);
+    });
     log.info(
       `同步守护进程已启动（并发上限 ${this.config.sync.concurrency}，轮询 ${this.config.sync.pollIntervalMs}ms）`,
     );
@@ -384,7 +555,7 @@ export class SyncDaemon {
         // 进程随后自然退出。旧写法是「等这一轮**全部**标的跑完才检查致命错误」，
         // 那意味着一个首次全量能拖住退出几十分钟——现在最多晚一个轮询周期被发现。
         this.stopHeartbeat();
-        this.exitIfGlobalFatal(error);
+        await this.reportFatalAndExit(error);
         throw error;
       }
       if (!this.running || this.stopping) break;
@@ -408,11 +579,72 @@ export class SyncDaemon {
     process.exitCode = 1;
   }
 
+  /**
+   * 全局性错误 → **先推一条告警** → 再让进程退出。
+   *
+   * 为什么要先推：`process.exitCode = 1` 只是设退出码，进程随后自然退出；
+   * 而推送是一次 HTTP 请求，它会把事件循环占住，进程会等它做完。
+   * 不这么做的话，「同步器死了」这件事只有日志知道——而这正是本轮要治的病。
+   *
+   * 推送失败**不阻止退出**：进程该退还得退，失败已经记进日志。
+   *
+   * 只推一次：同一个错误可能走两条路径进来（循环里的 catch 与 loopPromise 的兜底），
+   * 重复推送靠 `AlertDispatcher` 的冷却压住，但这里先自己挡一道，省一次无用推送。
+   */
+  private async reportFatalAndExit(error: unknown): Promise<void> {
+    if (this.fatalReported) {
+      this.exitIfGlobalFatal(error);
+      return;
+    }
+    this.fatalReported = true;
+    const code = (error as { code?: string })?.code;
+    if (this.alerter !== undefined) {
+      await this.alerter.reportDaemonExit({
+        ...(code === undefined ? {} : { code }),
+        message: (error as Error)?.message ?? String(error),
+      });
+    }
+    this.exitIfGlobalFatal(error);
+  }
+
   /** 停掉心跳刷新。循环退出与优雅退出都要走这里，语义相同：不再声称有人在同步。 */
   private stopHeartbeat(): void {
     if (this.heartbeatTimer !== null) {
       clearInterval(this.heartbeatTimer);
       this.heartbeatTimer = null;
+    }
+  }
+
+  /**
+   * 开始刷心跳。**幂等**：已经在刷就什么都不做。
+   *
+   * 之所以要能反复调用：停摆时心跳会被停掉（见 {@link reportHealth}），
+   * 恢复之后必须能重新刷上——否则一次停摆之后，心跳就再也不会回来了，
+   * 控制面会一直显示「离线」，而同步其实已经恢复。
+   */
+  private async startHeartbeat(): Promise<void> {
+    // 正在起：两次调用会各建一个定时器，而 `stopHeartbeat()` 只能清掉**最后一个**
+    // ——另一个会一直刷下去，让「循环已退出」的心跳测试变成随机的红。
+    if (this.heartbeatTimer !== null || this.heartbeatStarting) return;
+    // 守护进程已经在停了：不许再把心跳拉起来（否则会有一颗「僵尸心跳」
+    // 一直刷下去，而页面据此显示「在线」）。
+    if (this.stopping || !this.running) return;
+    this.heartbeatStarting = true;
+    try {
+      await upsertDaemonHeartbeat(this.ctx.pool, this.ctx.exchange);
+      // **await 期间守护进程可能已经停了**：这时绝不能再开定时器。
+      if (this.stopping || !this.running) return;
+      this.heartbeatTimer = setInterval(() => {
+        // 心跳写失败不能影响同步：吞掉并继续，让读取方按超时判离线即可。
+        // 反过来让它冒泡会变成一个未处理的 Promise 拒绝，直接终止进程（R-14.4）。
+        void upsertDaemonHeartbeat(this.ctx.pool, this.ctx.exchange).catch((error: unknown) => {
+          log.warn(`刷新守护进程心跳失败：${(error as Error)?.message ?? String(error)}`);
+        });
+      }, this.heartbeatIntervalMs);
+      // 心跳不该拖住进程退出
+      this.heartbeatTimer.unref?.();
+    } finally {
+      this.heartbeatStarting = false;
     }
   }
 

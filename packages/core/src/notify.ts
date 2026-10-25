@@ -32,6 +32,12 @@ import { RECONCILE_KIND_INFO, RECONCILE_KINDS } from './reconcile.js';
  *   * 交易对账的差异类型（`RECONCILE_KINDS`）——「哪种异常要我知道了」；
  *   * 交易生命周期事件（4 种）——「第一段止盈成交」「止损挪了」「止盈止损挂上了」
  *     「这一轮走完了」。
+ *   * **同步器自己的故障**（`sync-symbol-error` / `sync-stopped`）——「这个标的不动了」
+ *     「整个同步停摆了」。
+ *
+ * 最后那两种是 2026-10-25 补上的：同步器此前**一个通知出口都没有**，
+ * 标的连续失败被钉死、整个同步停摆，统统只写一行日志——而日志没人盯着。
+ * 那种「最贵的故障不是报错，是没人知道」正是这一层存在的理由（见文件头）。
  *
  * 合成一份而不是两套机制：用户在一个列表里勾，页面也只有一份清单可显示。
  * 清单与文案都由服务端下发（`NOTIFY_KIND_INFO`），页面不自己抄一份——抄了就会漂。
@@ -47,6 +53,8 @@ export const NOTIFY_KINDS = [
   'agent-plan-failed',
   'agent-prompt',
   'decision-prompt',
+  'sync-symbol-error',
+  'sync-stopped',
 ] as const;
 
 export type NotifyKind = (typeof NOTIFY_KINDS)[number];
@@ -136,6 +144,14 @@ export const NOTIFY_KIND_INFO: Record<NotifyKind, { label: string; hint: string 
   'decision-prompt': {
     label: '止盈止损档位提示词',
     hint: 'executor 每次按成交价问模型要止损止盈倍数时的那一组消息（**每次成交一条**，比上面频繁得多；默认不勾）',
+  },
+  'sync-symbol-error': {
+    label: '标的同步失败',
+    hint: '某个标的连续失败到上限，已停止自动重试，要人工恢复才会再跑（附失败原因与连续失败次数）',
+  },
+  'sync-stopped': {
+    label: '同步停摆',
+    hint: '所有在跑的标的都卡住了，同步不再前进——进程可能还活着，但一条数据都没进（附卡住的标的）',
   },
 };
 

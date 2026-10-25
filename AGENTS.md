@@ -188,6 +188,7 @@ apps/executor/src/main.ts   apps/agent/src/main.ts
 | 止盈止损编排、幂等、执行记录                           | `apps/executor/src` + `packages/data/src/db/risk.ts`                        |
 | **凭据静态加密**                                       | **`packages/core/src/secret.ts`** + `packages/data/src/db/credentials.ts`   |
 | **告警通道（飞书推送、去重与冷却）**                   | **`packages/core/src/notify.ts`**（转换在 `apps/executor/src/alert.ts`）    |
+| **同步器故障的告警（标的被钉死 / 同步停摆）**          | **`apps/sync/src/alert.ts`**（转换；通道仍是 core 那一份）                  |
 | **通知设置的读写与「哪一份在生效」**                   | **`packages/data/src/db/notify.ts`**（密文落库 + 优先级解析）               |
 | **新策略 / 回测引擎**                                  | **`python/packages/quant-backtest/src/`**                                   |
 | **分析师 Agent 的契约与纯函数（合成立场）**            | **`packages/core/src/agent-analyst.ts`**                                    |
@@ -332,29 +333,30 @@ web / sync / executor 三个容器同时启动，三个容器各自在入口里�
 按 schema 划分），把并发迁移串行化。**别删这把锁，也别改成 try 版本**：
 try 版本会让第二个进程「拿不到锁就跳过」，那正是「库还是旧的就启动了」的静默失败。
 
-| 迁移                           | 内容                                                                                                                                                                                                                                                        |
-| ------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `001_init`                     | `klines_1m`、`gaps`、`symbols`、`sync_state`、`contract_spec`、`weight_budget`、`schema_migrations`                                                                                                                                                         |
-| `002_sync_plan`                | `sync_state.plan_*`（首次全量的规模预估，开启之前就写进去）                                                                                                                                                                                                 |
-| `003_daemon_heartbeat`         | `daemon_heartbeat`                                                                                                                                                                                                                                          |
-| `004_klines_agg`               | `klines_{15m,1h,4h,1d}`（列与 `klines_1m` 逐列一致）                                                                                                                                                                                                        |
-| `005_indicators`               | `indicator_{ma,macd,rsi,boll,kdj,atr,obv}`                                                                                                                                                                                                                  |
-| `006_risk_bracket`             | `risk_bracket`（幂等锚点 + ATR 快照 + `last_error`）                                                                                                                                                                                                        |
-| `007_executor_settings`        | `executor_credentials`（密文 + 末 4 位提示）、`risk_policy`（global / symbol 两作用域）                                                                                                                                                                     |
-| `008_algo_order_ids`           | `risk_bracket` 的条件单编号列改名（Algo 编号空间，与普通 orderId 不通）                                                                                                                                                                                     |
-| `009_reconcile_run`            | `reconcile_run`（观测快照）                                                                                                                                                                                                                                 |
-| `010_risk_trailing`            | 两段止盈的阶段（`partial_armed` / `trailing`）与移动止损档位。**v0.7.0 设计，未落地**                                                                                                                                                                       |
-| `011_notify_settings`          | 飞书通知通道的运行期设置（v0.8.0）：地址与签名密钥**密文**落库 + 开关与参数。**新增迁移，两侧都要登记**                                                                                                                                                     |
-| `012_trade_pnl`                | 盈亏的**事实**（v0.8.0）：`risk_bracket` 增累计平仓量 / 成交额 / 手续费；通知内容类型扩到 11 种                                                                                                                                                             |
-| `013_llm_decision`             | LLM 决策的留痕（v0.9.0）：`risk_bracket` 增决策来源 / 生效档位 / 理由 / 降级原因                                                                                                                                                                            |
-| `014_take_profit_single_mult`  | 止盈倍数**合并成一个**（v0.9.0）：退役 `risk_policy.take_profit1_atr_mult` 与 `risk_bracket.decision_take_profit1_atr_mult`；`take_profit1_ratio` 的 CHECK 收紧为 `< 1`。**新增迁移，两侧都要登记**                                                         |
-| `015_restore_llm_params_check` | 补回「LLM 决策的数必须齐全」那条**联合约束**（v0.9.0）：014 用 `DROP COLUMN` 退役 `decision_take_profit1_atr_mult` 时，PostgreSQL **自动删掉了引用它的 CHECK**，于是这条守门人无声消失。**删列前先看有没有约束提到它**。**新增迁移，两侧都要登记**          |
-| `016_trail_step`               | 移动止损的**档位序号**（`risk_bracket` 增 `trail_step` / `trail_moves`）+ 通知内容类型扩容到 14 种（v0.9.2）。**新增迁移，两侧都要登记**                                                                                                                    |
-| `017_agent_decisions`          | 分析师报告与执行方案（v1.0.0）：`analyst_report`（三面分数 + 合成立场 + 理由 + 上下文留痕）、`trading_plan`（进场 / 仓位 / 止损 / 风险金额 / 调整记录 / 失败原因）。**新增迁移，两侧都要登记**（Python 侧不读写这两张表，但版本闸门两个方向都要校）         |
-| `018_agent_plan_execution`     | 让「批准的方案」变成真实订单（v1.0.0）：`trading_plan` 增执行态列（单号 / 尝试次数 / 认领时刻 / 下单失败原因）、`status` 扩出 `executing` 与 `failed`、`risk_bracket.decision_source` 允许 `agent-plan`、通知内容类型扩到 16 种。**新增迁移，两侧都要登记** |
-| `019_agent_llm_settings`       | 模型接入的运行期设置（v1.0.0）：`agent_llm_settings` 单行表（地址 / 模型 / 超时 / API 密钥**密文**）。**新增迁移，两侧都要登记**                                                                                                                            |
-| `020_agent_prompt_notify`      | 通知内容类型扩到 18 种（v1.0.0）：多两种「Agent 提示词」与「止盈止损档位提示词」（`notify_settings.kinds` 扩枚举，**两种都默认不勾**）。**扩枚举要保留旧约束名、旧值一个不少**（§5 第 12 条）；列默认值与存量行都不动。**新增迁移，两侧都要登记**           |
-| `021_fee_asset`                | 手续费的**币种与折算汇率**（`risk_bracket` 增 `fee_asset` / `fee_fx_rate`）：BNB 计价的手续费折成 USDT 时把「用的哪个价」留下来（v0.9.3）。**新增迁移，两侧都要登记**                                                                                       |
+| 迁移                           | 内容                                                                                                                                                                                                                                                                                                                                                                          |
+| ------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `001_init`                     | `klines_1m`、`gaps`、`symbols`、`sync_state`、`contract_spec`、`weight_budget`、`schema_migrations`                                                                                                                                                                                                                                                                           |
+| `002_sync_plan`                | `sync_state.plan_*`（首次全量的规模预估，开启之前就写进去）                                                                                                                                                                                                                                                                                                                   |
+| `003_daemon_heartbeat`         | `daemon_heartbeat`                                                                                                                                                                                                                                                                                                                                                            |
+| `004_klines_agg`               | `klines_{15m,1h,4h,1d}`（列与 `klines_1m` 逐列一致）                                                                                                                                                                                                                                                                                                                          |
+| `005_indicators`               | `indicator_{ma,macd,rsi,boll,kdj,atr,obv}`                                                                                                                                                                                                                                                                                                                                    |
+| `006_risk_bracket`             | `risk_bracket`（幂等锚点 + ATR 快照 + `last_error`）                                                                                                                                                                                                                                                                                                                          |
+| `007_executor_settings`        | `executor_credentials`（密文 + 末 4 位提示）、`risk_policy`（global / symbol 两作用域）                                                                                                                                                                                                                                                                                       |
+| `008_algo_order_ids`           | `risk_bracket` 的条件单编号列改名（Algo 编号空间，与普通 orderId 不通）                                                                                                                                                                                                                                                                                                       |
+| `009_reconcile_run`            | `reconcile_run`（观测快照）                                                                                                                                                                                                                                                                                                                                                   |
+| `010_risk_trailing`            | 两段止盈的阶段（`partial_armed` / `trailing`）与移动止损档位。**v0.7.0 设计，未落地**                                                                                                                                                                                                                                                                                         |
+| `011_notify_settings`          | 飞书通知通道的运行期设置（v0.8.0）：地址与签名密钥**密文**落库 + 开关与参数。**新增迁移，两侧都要登记**                                                                                                                                                                                                                                                                       |
+| `012_trade_pnl`                | 盈亏的**事实**（v0.8.0）：`risk_bracket` 增累计平仓量 / 成交额 / 手续费；通知内容类型扩到 11 种                                                                                                                                                                                                                                                                               |
+| `013_llm_decision`             | LLM 决策的留痕（v0.9.0）：`risk_bracket` 增决策来源 / 生效档位 / 理由 / 降级原因                                                                                                                                                                                                                                                                                              |
+| `014_take_profit_single_mult`  | 止盈倍数**合并成一个**（v0.9.0）：退役 `risk_policy.take_profit1_atr_mult` 与 `risk_bracket.decision_take_profit1_atr_mult`；`take_profit1_ratio` 的 CHECK 收紧为 `< 1`。**新增迁移，两侧都要登记**                                                                                                                                                                           |
+| `015_restore_llm_params_check` | 补回「LLM 决策的数必须齐全」那条**联合约束**（v0.9.0）：014 用 `DROP COLUMN` 退役 `decision_take_profit1_atr_mult` 时，PostgreSQL **自动删掉了引用它的 CHECK**，于是这条守门人无声消失。**删列前先看有没有约束提到它**。**新增迁移，两侧都要登记**                                                                                                                            |
+| `016_trail_step`               | 移动止损的**档位序号**（`risk_bracket` 增 `trail_step` / `trail_moves`）+ 通知内容类型扩容到 14 种（v0.9.2）。**新增迁移，两侧都要登记**                                                                                                                                                                                                                                      |
+| `017_agent_decisions`          | 分析师报告与执行方案（v1.0.0）：`analyst_report`（三面分数 + 合成立场 + 理由 + 上下文留痕）、`trading_plan`（进场 / 仓位 / 止损 / 风险金额 / 调整记录 / 失败原因）。**新增迁移，两侧都要登记**（Python 侧不读写这两张表，但版本闸门两个方向都要校）                                                                                                                           |
+| `018_agent_plan_execution`     | 让「批准的方案」变成真实订单（v1.0.0）：`trading_plan` 增执行态列（单号 / 尝试次数 / 认领时刻 / 下单失败原因）、`status` 扩出 `executing` 与 `failed`、`risk_bracket.decision_source` 允许 `agent-plan`、通知内容类型扩到 16 种。**新增迁移，两侧都要登记**                                                                                                                   |
+| `019_agent_llm_settings`       | 模型接入的运行期设置（v1.0.0）：`agent_llm_settings` 单行表（地址 / 模型 / 超时 / API 密钥**密文**）。**新增迁移，两侧都要登记**                                                                                                                                                                                                                                              |
+| `020_agent_prompt_notify`      | 通知内容类型扩到 18 种（v1.0.0）：多两种「Agent 提示词」与「止盈止损档位提示词」（`notify_settings.kinds` 扩枚举，**两种都默认不勾**）。**扩枚举要保留旧约束名、旧值一个不少**（§5 第 12 条）；列默认值与存量行都不动。**新增迁移，两侧都要登记**                                                                                                                             |
+| `021_fee_asset`                | 手续费的**币种与折算汇率**（`risk_bracket` 增 `fee_asset` / `fee_fx_rate`）：BNB 计价的手续费折成 USDT 时把「用的哪个价」留下来（v0.9.3）。**新增迁移，两侧都要登记**                                                                                                                                                                                                         |
+| `022_sync_notify`              | 通知内容类型扩到 20 种（2026-10-25）：多两种「标的同步失败」与「同步停摆」（`notify_settings.kinds` 扩枚举，**两种都默认勾上**——同步器此前一个通知出口都没有，静默过一次 5 小时 55 分）。**扩枚举要保留旧约束名、旧值一个不少**（§5 第 12 条）；列默认值与**存量行都要补勾**（照 016 / 018 的做法：不补勾的话升级后这两条推送会一声不吭地不发生）。**新增迁移，两侧都要登记** |
 
 ### 6.1 派生周期层（v0.2.0）
 
@@ -1050,15 +1052,39 @@ warn，而日志没人盯着。
    兜底不是静默的。**网络错误不兜底**：那意味着「不知道送没送到」，再发一次可能变成
    群里两条一样的消息。
 
-告警有两个来源：
+告警有三个来源：
 
 1. **交易对账的差异**（§6.5）：`apps/executor/src/alert.ts` 把一份报告变成一条告警，
    一轮对账的多个差异**合成一条**（一个裸仓常同时命中好几条判据，拆开推就成了「一个问
    题推了三遍」）。差异类型与严重度的判据仍然只有 `packages/core/src/reconcile.ts` 一份。
 2. **交易生命周期事件**：「止盈止损挂单成功」「一轮买卖完成」（v0.8.0）、
    「第一段止盈成交」「移动止损换档」（v0.9.2）。
+3. **同步器自己的故障**（2026-10-25 补）：`apps/sync/src/alert.ts`。此前同步器
+   **一个通知出口都没有**，于是「标的被钉死」「整个同步停摆」「守护进程退出」
+   这三件事只写进日志——而日志没人盯着。目标机上实测到一次**静默 5 小时 55 分**：
+   三个标的连续失败到上限被钉成 `error` 之后，调度器每 15 秒扫一次、每次都选不出
+   标的，`tick()` 对空批次直接 return（不打日志），而心跳照刷、控制面显示「在线」。
 
-两类告警的区别是**状态型 vs 事件型**：状态型（对账差异）在下一轮不见了 = 问题恢复了，
+   ⚠️ **同步停摆时必须停掉心跳**（`apps/sync/src/daemon.ts` 的 `reportHealth`）：
+   心跳的职责是回答「**有人在干活吗**」，停摆时没有任何数据会再进，继续刷心跳就是
+   让控制面显示「在线」——「进程还在但没人干活」与「有人干活」在页面上长得一模一样。
+   停掉之后页面按心跳年龄判成 stale，而真正的处置（人工恢复被钉死的标的）
+   由飞书那条「同步停摆」告警说清楚。
+
+   ⚠️ **网络类错误不计入「连续失败」**（2026-10-25 用户决定，
+   `apps/sync/src/primitives.ts` 的 `TRANSIENT_CODES`）：`NETWORK_ERROR` /
+   `RATE_LIMITED` / `EXCHANGE_RATE_LIMITED` 只拉长退避，**绝不**把标的钉成 `error`。
+   理由：出口代理与交易所会间歇性抽风（目标机实测：同一个代理节点上 `limit=500`
+   只要 1.9 秒、`limit=100` 却超时 25 秒，是随机的、与请求大小无关）。
+   旧口径下代理抖 5 次就把标的**永久**钉死、要人工点恢复——而代理一恢复，
+   数据本来就能自己续上。实测就是这么把 BNBUSDT 钉了 15 次、停了 40 分钟没人管。
+   `sync_state.error_count` 记的是**真错误**的连续次数（与环境类分开），
+   它要与「钉死」判据一致，也要能在重启后原样恢复。
+   ⚠️ **代价**：代理彻底断掉时标的不会被钉死，于是「全被钉死」那条判据不触发——
+   它由「**长时间没有任何进展**」（默认 10 分钟，且当前没有在途任务）那条接手，
+   否则又变成「没人知道」。
+
+三类告警的区别是**状态型 vs 事件型**：状态型（对账差异、同步停摆）在下一轮不见了 = 问题恢复了，
 因此要推「已恢复」；事件型（挂单成功、一轮完成、成交、换档）推过即忘，下一轮它不在了
 **不代表**问题恢复了，因此不参与恢复判定（`AlertItem.oneShot`）。
 

@@ -3,6 +3,7 @@ import { buildContext, createPool, type MarketContext } from '@trade-tool/data';
 
 import { SyncDaemon } from './daemon.js';
 import { SyncControl, type ControlPrimitives } from './primitives.js';
+import type { SyncAlerter } from './alert.js';
 
 /**
  * 把「原语 + 守护进程 + 连接池」组装成一个控制面可直接持有的对象。
@@ -23,6 +24,15 @@ export interface SyncServiceOptions {
    * 生产用 `HEARTBEAT_INTERVAL_MS`（10s），不传即缺省。
    */
   heartbeatIntervalMs?: number;
+  /**
+   * 告警出口（飞书）。缺省 = 不推送。
+   *
+   * 与 executor 同一套：通道在 `packages/core/src/notify.ts`，
+   * 「同步器的状态 → 告警条目」的转换在 `apps/sync/src/alert.ts`。
+   * 缺省不装，是因为控制面（apps/web）持有守护进程但**不该**替它发告警——
+   * 告警只有一个出口（AGENTS.md 约定 5：同一概念只有一个名字）。
+   */
+  alerter?: SyncAlerter;
 }
 
 export interface SyncService {
@@ -46,6 +56,7 @@ export function createSyncService(ctx: MarketContext, options: SyncServiceOption
     ...(options.heartbeatIntervalMs !== undefined
       ? { heartbeatIntervalMs: options.heartbeatIntervalMs }
       : {}),
+    ...(options.alerter !== undefined ? { alerter: options.alerter } : {}),
   });
   return {
     primitives,

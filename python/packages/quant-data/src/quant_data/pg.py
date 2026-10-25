@@ -100,6 +100,10 @@ KNOWN_MIGRATION_VERSIONS: frozenset[str] = frozenset(
         # Python 侧不读写 risk_bracket，但版本闸门两个方向都要校，
         # 漏登记会让**所有**碰 PG 的用例报「库比代码新」。
         "021_fee_asset",
+        # 2026-10-25：通知内容类型多两种同步器故障（notify_settings.kinds 扩枚举）。
+        # Python 侧不读写这张表，但版本闸门两个方向都要校，
+        # 漏登记会让**所有**碰 PG 的用例报「库比代码新」。
+        "022_sync_notify",
     }
 )
 

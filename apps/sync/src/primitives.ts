@@ -46,8 +46,18 @@ export interface RuntimeSlot {
   inflight: boolean;
   /** 退避截止时间；退避期间该标的不参与调度（R-21.2） */
   backoffUntil: number | null;
-  /** 本进程内观察到的连续失败次数 */
+  /**
+   * 连续失败次数（**只算非环境类错误**）：达到上限就进 `error` 并停止自动重试。
+   *
+   * 「非环境类」= 交易所明确说不行（4xx、限流之外的错误、数据对不上……），
+   * 那说明**这个标的有问题**，重试也不会变好（R-21.3）。
+   */
   consecutiveErrors: number;
+  /**
+   * 连续的环境类失败次数（网络不通、限流）：**只用来把退避拉长**，
+   * 不参与「钉死」的判定。理由见 {@link TRANSIENT_CODES}。
+   */
+  transientErrors: number;
 }
 
 export interface PrimitivesOptions {
@@ -103,6 +113,25 @@ const RECOVERABLE_PG_CODES = new Set([
   'DB_TRANSACTION_ROLLBACK',
 ]);
 
+/**
+ * **环境类**错误码：它们说明「现在连不上 / 暂时用不了」，不说明「这个标的数据有问题」。
+ *
+ * 这些错误**不计入**「连续失败」——也就是说，它们**不会**把标的钉成 `error`。
+ *
+ * 理由（2026-10-25 用户决定）：出口代理与交易所会间歇性抽风。目标机 192.168.1.90
+ * 实测：同一个代理节点上 `limit=500` 只要 1.9 秒、`limit=100` 却超时 25 秒——
+ * 是**随机**的，与请求大小无关。旧口径下，代理抖 5 次就把标的**永久**钉死、
+ * 要人工点「恢复」才会再跑；而代理一恢复，数据本来就能自己续上。
+ * 实测就是这么把 BNBUSDT 钉了 15 次、停了 40 分钟没人管。
+ *
+ * 退避**照样**要涨（别去锤交易所），只是它不再有「钉死」的副作用。
+ *
+ * ⚠️ **代价**：代理彻底断掉时，标的不会被钉死，于是「一个都没在跑」这件事
+ * 也不会由「全被钉死」那条判据发现。它由守护进程那条「长时间没有进展」
+ * 的判据接手（见 `apps/sync/src/daemon.ts`），否则就成了「没人知道」。
+ */
+const TRANSIENT_CODES = new Set(['NETWORK_ERROR', 'RATE_LIMITED', 'EXCHANGE_RATE_LIMITED']);
+
 export class SyncControl implements ControlPrimitives {
   private readonly ctx: MarketContext;
   private readonly exchange: string;
@@ -120,7 +149,12 @@ export class SyncControl implements ControlPrimitives {
   private slot(symbol: string): RuntimeSlot {
     const existing = this.slots.get(symbol);
     if (existing) return existing;
-    const created: RuntimeSlot = { inflight: false, backoffUntil: null, consecutiveErrors: 0 };
+    const created: RuntimeSlot = {
+      inflight: false,
+      backoffUntil: null,
+      consecutiveErrors: 0,
+      transientErrors: 0,
+    };
     this.slots.set(symbol, created);
     return created;
   }
@@ -218,6 +252,7 @@ export class SyncControl implements ControlPrimitives {
     const slot = this.slot(symbol);
     slot.backoffUntil = null;
     slot.consecutiveErrors = 0;
+    slot.transientErrors = 0;
     return this.markRunning(symbol);
   }
 
@@ -291,6 +326,11 @@ export class SyncControl implements ControlPrimitives {
    * 从持久化状态恢复运行时槽位（R-19.4 / R-21.2）。
    * 调度判断只看内存槽位，因此重启后必须把 `backoff_until` 与 `error_count` 灌回来，
    * 否则退避中的标的会被立刻重新调度、连续失败阈值也被清零。
+   *
+   * `consecutiveErrors` 灌的是**真错误**的连续次数（与环境类分开，见
+   * {@link TRANSIENT_CODES}）——库里 `error_count` 记的就是它。
+   * `transientErrors` **不恢复**：环境类失败没有持久化的计数，
+   * 重启后退避从头开始（最多 `backoffBaseMs` 就再试一次），这是可以接受的。
    */
   restoreRuntimeSlot(
     symbol: string,
@@ -324,6 +364,7 @@ export class SyncControl implements ControlPrimitives {
       });
       await this.syncFn(symbol);
       slot.consecutiveErrors = 0;
+      slot.transientErrors = 0;
       slot.backoffUntil = null;
       // 收尾时若意图在本轮内被改掉（pause 或移出集合），就写 paused。
       // 无条件写 running 会把暂停状态盖掉，造成「desired_state=paused 但 status=running」。
@@ -367,7 +408,11 @@ export class SyncControl implements ControlPrimitives {
         : new SyncError('INTERNAL_ERROR', error instanceof Error ? error.message : String(error));
 
     const slot = this.slot(symbol);
-    slot.consecutiveErrors += 1;
+    // **环境类**（网络 / 限流）与**真错误**分开计数（理由见 {@link TRANSIENT_CODES}）：
+    // 环境类只拉长退避，绝不参与「钉死」的判定。
+    const transient = TRANSIENT_CODES.has(syncError.code);
+    if (transient) slot.transientErrors += 1;
+    else slot.consecutiveErrors += 1;
 
     // PG 连接失败不消耗交易所配额，但需要退避重试（R-21.6）。
     // 「有限重试」同样适用于这一支：持续死锁的标的不能以最长 5 分钟的退避永远重试，
@@ -387,6 +432,21 @@ export class SyncControl implements ControlPrimitives {
       slot.backoffUntil = nowMs + delay;
       await this.writeStatusSafely(symbol, {
         lastError: syncError.message,
+        errorCount: slot.consecutiveErrors,
+        backoffUntil: slot.backoffUntil,
+      });
+      return syncError;
+    }
+
+    // 环境类失败：**永不钉死**。退避照涨（用 transientErrors），到点自动再试，
+    // 代理一恢复数据就自己续上——不需要人工点「恢复」。
+    if (transient) {
+      const delay = this.backoffDelay(slot.transientErrors);
+      slot.backoffUntil = nowMs + delay;
+      await this.writeStatusSafely(symbol, {
+        lastError: syncError.message,
+        // `errorCount` 只记**真错误**的连续次数：它要与「钉死」的判据一致，
+        // 也要能在重启后从库里原样恢复（见 {@link restoreRuntimeSlot}）。
         errorCount: slot.consecutiveErrors,
         backoffUntil: slot.backoffUntil,
       });

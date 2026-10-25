@@ -269,6 +269,52 @@ describe('错误隔离与退避（R-21 / AC-18）', () => {
     );
   });
 
+  it('网络错误不算「连续失败」：连续挂很多次也不会把标的确死（2026-10-25）', async () => {
+    // 目标机实测：出口代理会间歇性掐连接（同一个节点上 limit=500 只要 1.9 秒、
+    // limit=100 却超时 25 秒）。旧口径下代理抖 5 次就把标的**永久**钉死、
+    // 要人工点恢复——而代理一恢复，数据本来就能自己续上。
+    const config = configWith({ maxConsecutiveErrors: 3 });
+    const control = new SyncControl(
+      buildContext(ctx.pool, config, {
+        overrides: { password: TEST_PG.password, searchPath: ctx.schema },
+      }),
+      {
+        config,
+        syncFn: async () => {
+          throw new SyncError('NETWORK_ERROR', '请求交易所失败');
+        },
+      },
+    );
+    const daemon = new SyncDaemon(
+      buildContext(ctx.pool, config, {
+        overrides: { password: TEST_PG.password, searchPath: ctx.schema },
+      }),
+      { config, now: () => NOW, sleep: async () => undefined },
+    );
+    await seedSymbol(ctx.pool, 'TESTNETUSDC');
+    await setDesiredState(ctx.pool, 'binance', 'TESTNETUSDC', 'running');
+    await control.start('TESTNETUSDC');
+
+    // 连挂 8 次（远超阈值 3）
+    for (let i = 0; i < 8; i += 1) {
+      await control.runOnce('TESTNETUSDC', NOW + i * 400_000);
+    }
+
+    const row = await ctx.pool.query<{ status: string; error_count: number }>(
+      `SELECT status, error_count FROM sync_state WHERE symbol = 'TESTNETUSDC'`,
+    );
+    expect(row.rows[0]?.status, '网络错误不得把标的钉死').not.toBe('error');
+    expect(row.rows[0]?.error_count, '真错误的计数不该被网络错误撑起来').toBe(0);
+    // 退避**照样**要涨（别去锤交易所）
+    const slot = control.slotsSnapshot()['TESTNETUSDC'];
+    expect(slot?.transientErrors).toBe(8);
+    expect(slot?.backoffUntil).not.toBeNull();
+    // 而且它仍然会被调度（退避到期后）
+    expect((await daemon.selectBatch(NOW + 10_000_000)).map((e) => e.symbol)).toContain(
+      'TESTNETUSDC',
+    );
+  });
+
   it('R-21.5 需人工介入的错误立即进 error，不做退避重试', async () => {
     const control = makeControl(async () => {
       throw new SyncError('UNCLOSED_BAR_IN_STORE', 'last bar is not closed at 1760000000000');

@@ -15,6 +15,7 @@ import { describe, expect, it } from 'vitest';
 
 import {
   AlertDispatcher,
+  DEFAULT_NOTIFY_KINDS,
   DISABLED_NOTIFIER,
   NOTIFY_KINDS,
   NOTIFY_KIND_INFO,
@@ -569,5 +570,15 @@ describe('通知内容类型的清单', () => {
       expect(NOTIFY_KIND_INFO[kind].label.length).toBeGreaterThan(0);
       expect(NOTIFY_KIND_INFO[kind].hint.length).toBeGreaterThan(0);
     }
+  });
+
+  it('含同步器自己的两种故障，且默认就勾上（2026-10-25 补）', () => {
+    // 同步器此前一个通知出口都没有：标的被钉死、同步停摆都只写日志。
+    // 「最贵的故障不是报错，是没人知道」——这两种必须默认勾上：
+    // 不勾的话，升级之后这两条推送会一声不吭地不发生。
+    expect(NOTIFY_KINDS).toContain('sync-symbol-error');
+    expect(NOTIFY_KINDS).toContain('sync-stopped');
+    expect(DEFAULT_NOTIFY_KINDS).toContain('sync-symbol-error');
+    expect(DEFAULT_NOTIFY_KINDS).toContain('sync-stopped');
   });
 });
