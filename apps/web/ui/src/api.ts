@@ -6,6 +6,8 @@ import type {
   AgentViewDto,
   BarsDto,
   BracketsDto,
+  ChainPositionDto,
+  ChainSnapshotDto,
   CredentialStatusDto,
   CredentialWriteBody,
   ExchangeListDto,
@@ -13,7 +15,8 @@ import type {
   NotifyStatusDto,
   NotifyWriteBody,
   OverviewDto,
-  ReconcileReport,
+  ReconcileReportDto,
+  ReattachDto,
   RiskPolicyEntryDto,
   RiskPolicyScopeDto,
   RiskPolicyViewDto,
@@ -89,7 +92,12 @@ const post = <T>(path: string, body?: unknown) =>
 export const api = {
   overview: () => request<OverviewDto>('/api/overview'),
   symbols: () => request<{ items: SymbolRowDto[] }>('/api/symbols').then((r) => r.items),
-  symbol: (s: string) => request<SymbolDetailDto>(`/api/symbols/${encodeURIComponent(s)}`),
+  /**
+   * 单标的详情。可传 `init`（主要是 `signal`）：详情页每 5s 重读一次，
+   * 后端慢于这个节奏时必须能**取消上一轮**，否则请求会层层叠加、各占一个连接。
+   */
+  symbol: (s: string, init?: RequestInit) =>
+    request<SymbolDetailDto>(`/api/symbols/${encodeURIComponent(s)}`, init ?? {}),
   /**
    * 最近 limit 根 1m K 线（升序）。只读本地库，limit 超上限由服务端截断。
    *
@@ -170,15 +178,17 @@ export const api = {
    * 404 单列成「控制面还是旧进程」：路由在启动时注册，不重启就看不到它。
    */
   latestReconcile: () =>
-    request<{ report: ReconcileReport | null }>('/api/reconcile/latest').catch((error: unknown) => {
-      if (error instanceof ApiError && error.status === 404) {
-        throw new ApiError(
-          'CONTROL_PLANE_STALE',
-          '控制面没有 /reconcile/latest 路由：它还是改动前启动的旧进程。重启 trade-tool 控制面后刷新页面即可。',
-        );
-      }
-      throw error;
-    }),
+    request<{ report: ReconcileReportDto | null }>('/api/reconcile/latest').catch(
+      (error: unknown) => {
+        if (error instanceof ApiError && error.status === 404) {
+          throw new ApiError(
+            'CONTROL_PLANE_STALE',
+            '控制面没有 /reconcile/latest 路由：它还是改动前启动的旧进程。重启 trade-tool 控制面后刷新页面即可。',
+          );
+        }
+        throw error;
+      },
+    ),
   /**
    * 立刻手动对账一次（出网、签名、消耗权重），并覆盖最近一次自动快照。
    *
@@ -186,7 +196,7 @@ export const api = {
    * 404 同样单列成旧进程提示。
    */
   reconcile: (s: string) =>
-    request<ReconcileReport>(`/api/symbols/${encodeURIComponent(s)}/reconcile`).catch(
+    request<ReconcileReportDto>(`/api/symbols/${encodeURIComponent(s)}/reconcile`).catch(
       (error: unknown) => {
         if (error instanceof ApiError && error.status === 404) {
           throw new ApiError(
@@ -197,8 +207,57 @@ export const api = {
         throw error;
       },
     ),
+  /**
+   * **手动补挂**止盈止损（v1.3.0）：**会真下单**。
+   *
+   * `dryRun: true` 只算不挂——页面默认先跑一次，把「要挂哪几张、各多少钱」显示出来，
+   * 用户确认之后才发真的那一次。反过来（缺省不挂）会让「忘了传参数」变成一次静默的
+   * 空操作，而用户以为已经补上了。
+   *
+   * 404 单列成「控制面还是旧进程」：路由在启动时注册，不重启就看不到它。
+   */
+  reattach: (s: string, dryRun: boolean) =>
+    post<ReattachDto>(`/api/symbols/${encodeURIComponent(s)}/reattach`, { dryRun }).catch(
+      (error: unknown) => {
+        if (error instanceof ApiError && error.status === 404) {
+          throw new ApiError(
+            'CONTROL_PLANE_STALE',
+            '控制面没有 /reattach 路由：它还是改动前启动的旧进程。重启 trade-tool 控制面后刷新页面即可。',
+          );
+        }
+        throw error;
+      },
+    ),
   exchange: (refresh = false) =>
     request<ExchangeListDto>(`/api/exchange${refresh ? '?refresh=true' : ''}`),
+  /**
+   * 链上仓位列表（v1.2.0）。纯读本地表（链上事实由 `apps/chain-monitor` 落库），
+   * 因此可以跟着刷新节奏走。
+   *
+   * 404 单列成「控制面还是旧进程」：路由在进程启动时注册，不重启就看不到它。
+   */
+  chainPositions: () =>
+    request<{ items: ChainPositionDto[] }>('/api/chain/positions')
+      .then((r) => r.items)
+      .catch((error: unknown) => {
+        if (error instanceof ApiError && error.status === 404) {
+          throw new ApiError(
+            'CONTROL_PLANE_STALE',
+            '控制面没有 /api/chain/positions 路由：它还是改动前启动的旧进程。重启 trade-tool 控制面后刷新页面即可。',
+          );
+        }
+        throw error;
+      }),
+  /**
+   * 某一笔仓位的采样历史（v1.2.0），**升序**（服务端排好的）。
+   *
+   * `positionKey` 是链上身份（十六进制串），要 URL 编码——虽然它通常不含
+   * 需要转义的字符，但转义一下总比某天多一个字符时整个请求 404 强。
+   */
+  chainSnapshots: (positionKey: string, limit = 200) =>
+    request<{ positionKey: string; limit: number; items: ChainSnapshotDto[] }>(
+      `/api/chain/positions/${encodeURIComponent(positionKey)}/snapshots?limit=${String(limit)}`,
+    ).then((r) => r.items),
   addSymbol: (symbol: string) => post<SymbolRowDto>('/api/symbols', { symbol }),
   removeSymbol: (symbol: string, policy: RemovePolicy) =>
     request<{ ok: boolean }>(`/api/symbols/${encodeURIComponent(symbol)}`, {

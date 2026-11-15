@@ -1,0 +1,105 @@
+name: CI
+
+# 仓库的「提交前必跑」清单（AGENTS.md §3）在机器上跑一遍。
+#
+# 为什么要有它：在此之前「全绿」只存在于某台机器上——没有 CI，`pnpm check` 跑没跑过
+# 全靠自觉，而 `pnpm lint` 那种空转的绿灯更骗人。这里把四个门都显式列成 step，
+# 失败时能一眼看出是类型、lint、单测还是格式。
+#
+# 数据库：`packages/data`、`apps/sync` 与 Python 侧的真库用例都用随机 schema
+# （`tt_*` / session 级），因此一个空的 `trade_tool` 库就够，不需要任何种子数据。
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    # 本地实测 `pnpm check` 约 17 分钟（TS 单测 12 分钟 + Python 5 分钟），
+    # CI 机器更慢，给足余量；超时说明有东西卡住了，不该无限等。
+    timeout-minutes: 45
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: trade
+          POSTGRES_PASSWORD: trade
+          POSTGRES_DB: trade_tool
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U trade -d trade_tool"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+
+    env:
+      # 工作根必须是绝对路径（AGENTS.md §2.3）；测试会往里写 cache / meta。
+      TRADE_TOOL_HOME: ${{ github.workspace }}/.ci-home
+      # 与 compose.yaml 的默认值同源，测试库与开发库因此走同一套参数。
+      TRADE_TOOL_PG_HOST: 127.0.0.1
+      TRADE_TOOL_PG_PORT: '5432'
+      TRADE_TOOL_PG_USER: trade
+      TRADE_TOOL_PG_PASSWORD: trade
+      TRADE_TOOL_PG_DATABASE: trade_tool
+      TRADE_TOOL_TEST_PG_HOST: 127.0.0.1
+      TRADE_TOOL_TEST_PG_PORT: '5432'
+      TRADE_TOOL_TEST_PG_USER: trade
+      TRADE_TOOL_TEST_PG_PASSWORD: trade
+      TRADE_TOOL_TEST_PG_DATABASE: trade_tool
+      # 测试**不得**访问真实网络（AGENTS.md §8.2）：这里显式指向一个不存在的地址，
+      # 让「忘了打桩、真的去连币安」变成一条立刻失败的用例，而不是偶发的慢。
+      TRADE_TOOL_BINANCE_BASE_URL: http://127.0.0.1:9
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 pnpm（版本取自 package.json 的 packageManager）
+        uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: 安装 TS 依赖
+        run: pnpm install --frozen-lockfile
+
+      - name: 安装 Python 依赖
+        run: pnpm py:sync
+
+      - name: 准备工作根
+        run: mkdir -p "$TRADE_TOOL_HOME"
+
+      # 顺序按 AGENTS.md §3：先 build（下游测试依赖 dist），再类型与静态检查，最后用例。
+      - name: 构建
+        run: pnpm build
+
+      - name: 类型检查（TS）
+        run: pnpm typecheck
+
+      - name: 静态检查（Python / ruff）
+        run: pnpm py:lint
+
+      - name: 类型检查（Python / mypy --strict）
+        run: pnpm py:typecheck
+
+      - name: 单元测试（TS）
+        run: pnpm test
+
+      - name: 单元测试（Python）
+        run: pnpm py:test
+
+      - name: 格式检查
+        run: pnpm format:check

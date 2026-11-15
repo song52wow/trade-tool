@@ -24,6 +24,8 @@ import type {
   TradingPlanDto,
   BarDto,
   BracketsDto,
+  ChainPositionDto,
+  ChainSnapshotDto,
   CredentialStatusDto,
   CredentialWriteBody,
   ExchangeListDto,
@@ -39,7 +41,8 @@ import type {
   RiskPolicyScopeDto,
   RiskPolicyViewDto,
   RiskPolicyWriteBody,
-  ReconcileReport,
+  ReconcileReportDto,
+  ReattachDto,
   StartJobBody,
   SymbolDetailDto,
   SymbolRowDto,
@@ -81,14 +84,24 @@ export interface WebDeps {
    *   * `symbol` **必填**——不带标的的 `openAlgoOrders` 权重是 40（带标的只要 1），
    *     一个能被随手连点的接口不该默认按那个价走。全账户对账走 CLI。
    */
-  reconcile(symbol: string): Promise<ReconcileReport>;
+  reconcile(symbol: string): Promise<ReconcileReportDto>;
+  /**
+   * **手动补挂**止盈止损（v1.3.0）：**会真下单**。
+   *
+   * 与 `reconcile` 是一对：对账**只报告、绝不动手**（§6.5 第 1 条），
+   * 修复是人工决定之后的动作。因此它：
+   *   * 要签名访问交易所私有接口（读持仓与挂单 + 下单），只在用户点按钮时跑；
+   *   * `symbol` **必填**；
+   *   * `dryRun` 为真时**只算不挂**——页面默认先让用户看清要挂什么。
+   */
+  reattach(symbol: string, options?: { dryRun?: boolean }): Promise<ReattachDto>;
   /**
    * 最近一次**自动**对账的快照；从没跑过时 `null`。
    *
    * 纯读本地表，因此可以挂在刷新节奏上——与 `/bars` 同性质：出网发生在
    * executor 里，这里只是把已经算好的结果读出来。
    */
-  latestReconciliation(): Promise<ReconcileReport | null>;
+  latestReconciliation(): Promise<ReconcileReportDto | null>;
   /**
    * 凭据状态（v0.5.0）。**只回「配没配」与末 4 位**。
    *
@@ -128,6 +141,23 @@ export interface WebDeps {
    */
   listAgentView(symbol: string): Promise<AgentViewDto>;
   /**
+   * 链上仓位列表（v1.2.0）：**只读本地库**。
+   *
+   * 链上事实由 `apps/chain-monitor` 读链后落库，这里只读已经算好的账，
+   * 因此不出网、可以挂在页面的刷新节奏上。
+   *
+   * 库里一笔仓位都没有时返回 `[]`（200），不是 404：「还没配置链上仓位」
+   * 是完全正常的状态，页面要如实显示空状态。
+   */
+  listChainPositions(): Promise<ChainPositionDto[]>;
+  /**
+   * 某一笔仓位的采样历史（v1.2.0），**升序**。
+   *
+   * 从没采过样时返回 `[]`（200），不是 404——「还没采过样」与「路由不存在」
+   * 必须分开说。
+   */
+  listChainSnapshots(positionKey: string, options: { limit: number }): Promise<ChainSnapshotDto[]>;
+  /**
    * 批准 / 驳回一份执行方案（v1.0.0 自动下单）。
    *
    * **批准本身不下单**——下单由 `apps/executor` 消费 `approved` 方案完成，
@@ -150,6 +180,14 @@ export interface WebDeps {
 }
 
 const LIFECYCLE: readonly LifecycleAction[] = ['start', 'pause', 'resume'];
+
+/**
+ * 链上仓位的采样历史缺省条数（v1.2.0）。
+ *
+ * 200 条：监控是分钟级的，200 条足够看出几天的趋势，
+ * 又不至于让首屏响应过大。上限沿用 `parseBarLimit` 的那一个（2000）。
+ */
+const DEFAULT_CHAIN_SNAPSHOT_LIMIT = 200;
 
 /**
  * 写操作的来源校验（v0.5.0）。控制面无鉴权且局域网可达，
@@ -186,6 +224,22 @@ function normalizeSymbol(raw: string): string {
   return symbol;
 }
 
+/**
+ * 链上仓位的键（position_key）。
+ *
+ * 它是链上身份（keccak 拼出来的十六进制串），**不是**用户输入的自由文本。
+ * 这里只做「非空 + 不含路径分隔符」的检查：真正的身份校验在查库那一步
+ * （查不到就是查不到，不会因为长得像就当成另一笔仓位）。
+ *
+ * ⚠️ 允许出现的字符集很宽，是因为这个值会原样进 SQL 参数——**它永远是占位符**，
+ * 绝不拼进 SQL 字符串（AGENTS.md 约定 11）。
+ */
+function normalizePositionKey(raw: string): string {
+  const key = raw.trim();
+  if (key === '') throw new SyncError('CONFIG_INVALID', 'positionKey 不能为空');
+  return key;
+}
+
 export function buildApp(deps: WebDeps): Hono {
   const app = new Hono();
 
@@ -195,7 +249,24 @@ export function buildApp(deps: WebDeps): Hono {
     return c.json(body, status as 400);
   });
 
-  app.get('/api/health', (c) => c.json({ ok: true }));
+  /**
+   * **存活探针（liveness），不是就绪探针。**
+   *
+   * 它只回答「进程还在不在响应」。**刻意不查 PG、不查 schema**：那两件事的判据在
+   * `trade-tool doctor` 与各入口启动时的 `assertSchemaVersion`。若把数据库检查塞进
+   * 这里，PG 抖动会让编排器不停重启容器——重启治不了数据库，只会把「控制面暂时读不到
+   * 数据」升级成「控制面一直在重启」。
+   *
+   * 回包里写明 `probe: 'liveness'`：部署脚本与排障的人都该一眼看出它**不证明可用**。
+   * 2026-11-12 审计发现 `deploy/compose.yaml` 把它当 readiness 用，故在此标注。
+   */
+  app.get('/api/health', (c) =>
+    c.json({
+      ok: true,
+      probe: 'liveness',
+      note: '只证明控制面进程在响应；数据库与 schema 的判据见 `trade-tool doctor`',
+    }),
+  );
 
   app.get('/api/overview', async (c) => c.json(await deps.getOverview()));
 
@@ -331,9 +402,59 @@ export function buildApp(deps: WebDeps): Hono {
     return c.json({ report: await deps.latestReconciliation() });
   });
 
+  /**
+   * 链上仓位（v1.2.0）：**只读本地库**。
+   *
+   * 链上事实由 `apps/chain-monitor` 读链后落库，这里只把已经算好的账读出来——
+   * 不读链、不出网，因此能挂在页面的刷新节奏上。
+   */
+  app.get('/api/chain/positions', async (c) => {
+    return c.json({ items: await deps.listChainPositions() });
+  });
+
+  /**
+   * 某一笔仓位的采样历史（v1.2.0），**升序**（服务端排好的，页面不用再排）。
+   *
+   * `?limit=` 缺省 200 条；非法值（0 / 负数 / 小数 / 非数字）报 400，
+   * **一次查询都不发**——与 `/bars` 用同一套校验（`parseBarLimit`）。
+   * 超上限截断到上限而不是报错，并回传**实际生效**的 limit。
+   *
+   * 从没采过样时返回 `{ items: [] }`（200），不是 404：
+   * 「还没采过样」与「这个路由不存在」必须分开说。
+   */
+  app.get('/api/chain/positions/:positionKey/snapshots', async (c) => {
+    const positionKey = normalizePositionKey(c.req.param('positionKey'));
+    // 与 `/bars` 用**同一套** limit 校验（非法值 400、一次查询都不发、超上限截断），
+    // 只是缺省条数不同：曲线图看的是分钟级的采样，200 条足够看出趋势。
+    const limit = parseBarLimit(c.req.query('limit'), DEFAULT_CHAIN_SNAPSHOT_LIMIT);
+    return c.json({
+      positionKey,
+      limit,
+      items: await deps.listChainSnapshots(positionKey, { limit }),
+    });
+  });
+
   app.get('/api/symbols/:symbol/reconcile', async (c) => {
     const symbol = normalizeSymbol(c.req.param('symbol'));
     return c.json(await deps.reconcile(symbol));
+  });
+
+  /**
+   * **手动补挂**止盈止损（v1.3.0）：**会真下单**。
+   *
+   * 为什么是 POST 而不是 GET：它会改变交易所上的状态（挂出真实的条件单），
+   * GET 必须是幂等且无副作用的。
+   *
+   * `dryRun` 缺省为**假**——调用方必须显式说「只算不挂」才不挂。
+   * 反过来（缺省不挂、显式才挂）会让「忘了传参数」变成一次静默的空操作，
+   * 而用户以为已经补上了（约定 9：看起来成功其实什么都没做）。
+   *
+   * 页面默认先跑一次 `dryRun` 把要挂什么显示出来，用户确认后才发真的那次。
+   */
+  app.post('/api/symbols/:symbol/reattach', async (c) => {
+    const symbol = normalizeSymbol(c.req.param('symbol'));
+    const body = await bodyOf<{ dryRun?: boolean }>(c).catch(() => ({}) as { dryRun?: boolean });
+    return c.json(await deps.reattach(symbol, { dryRun: body?.dryRun === true }));
   });
 
   /** 规模预估（R-8.3）：首次全量前必须先算给人看，确认弹窗的数据就来自这里。 */

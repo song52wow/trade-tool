@@ -13,8 +13,8 @@ import {
   timeTicks,
   xOf,
   yOf,
-  fmtPrice,
 } from '../../ui/src/components/CandleChart';
+import { fmtPrice } from '../../ui/src/format.js';
 import type { BarDto } from '../../src/types';
 
 afterEach(cleanup);

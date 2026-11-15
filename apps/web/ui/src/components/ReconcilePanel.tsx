@@ -2,41 +2,19 @@ import { useLayoutEffect, useState } from 'react';
 
 import { ApiError, api } from '../api.js';
 import { fmtDate, fmtNumber, fmtTime } from '../format.js';
-import type { ReconcileDifference, ReconcileKind, ReconcileReport } from '../../../src/types';
+import type { ReconcileDifferenceDto, ReconcileReportDto } from '../../../src/types';
 
 function reason(error: unknown): string {
   if (error instanceof ApiError) return `[${error.code}] ${error.message}`;
   return error instanceof Error ? error.message : String(error);
 }
 
-/**
- * 差异类型的中文标签。
- *
- * 一律带上原值：读代码 / 查库时用的是 `kind` 的英文，界面上只给中文会让两边对不上，
- * 而「对不上」正是这个面板要解决的事情本身。
- *
- * ⚠️ 这份表是 core 的 `RECONCILE_KIND_INFO` 之外的**第二份清单**（AGENTS.md §7 第 7 条
- * 已登记为已知漂移）：新增差异类型时两处都要改，否则 `tsc` 会在这里报错——
- * 编译器是这条漂移的兜底，不是许可。
- */
-const KIND_LABEL: Record<ReconcileKind, string> = {
-  'missing-stop-order': '本地记为已挂单，但交易所没有止损单',
-  'unprotected-position': '有一笔入场成交没挂上任何保护单',
-  'position-without-record': '交易所有仓位，本地没有对应记录',
-  'missing-take-profit-order': '止盈单已不在交易所',
-  'unexpected-take-profit-order': '已进移动止损阶段，交易所却还挂着止盈单',
-  'price-mismatch': '触发价与本地记录不一致',
-  'record-without-position': '本地记为已挂单，但交易所已无仓位',
-  'orphan-algo-order': '交易所挂着我方单，但本地没有记录引用它',
-  'trail-move-failed': '移动止损有换档尝试没成功，止损位可能停在旧档',
-};
-
 const SEVERITY_LABEL: Record<'critical' | 'warning', string> = {
   critical: '紧急',
   warning: '注意',
 };
 
-function evidenceOf(item: ReconcileDifference): string {
+function evidenceOf(item: ReconcileDifferenceDto): string {
   return Object.entries(item.evidence)
     .filter(([, value]) => value !== null && value !== '')
     .map(([key, value]) => `${key}=${String(value)}`)
@@ -63,7 +41,7 @@ const STALE_AFTER_MS = 15 * 60_000;
  */
 export function ReconcilePanel(props: { symbol: string; tick: number }) {
   const { symbol, tick } = props;
-  const [report, setReport] = useState<ReconcileReport | null>(null);
+  const [report, setReport] = useState<ReconcileReportDto | null>(null);
   const [loaded, setLoaded] = useState(false);
   const [running, setRunning] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -117,7 +95,7 @@ export function ReconcilePanel(props: { symbol: string; tick: number }) {
 
       <p className="muted" style={{ fontSize: 12, margin: '6px 0' }}>
         由 <code>apps/executor</code> 每 5 分钟自动对账一次（全账户），下面是最近一次快照。
-        「立即对账」会**当场出网重查并覆盖它**——对账**只报告**，不会下单、撤单或修改本地状态。
+        「立即对账」会<b>当场出网重查并覆盖它</b>——对账<b>只报告</b>，不会下单、撤单或修改本地状态。
       </p>
 
       <div style={{ margin: '8px 0' }}>
@@ -171,7 +149,7 @@ export function ReconcilePanel(props: { symbol: string; tick: number }) {
                     <span className="tag error" style={{ marginRight: 6 }}>
                       {SEVERITY_LABEL[item.severity]}
                     </span>
-                    <strong>{KIND_LABEL[item.kind]}</strong>
+                    <strong>{item.label}</strong>
                     <div style={{ fontSize: 12 }}>{item.message}</div>
                     <div className="mono muted" style={{ fontSize: 11 }}>
                       {item.entryOrderId ?? '（无入场单号）'} · {evidenceOf(item)}

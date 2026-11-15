@@ -90,8 +90,18 @@ export type LlmDecision = z.infer<typeof llmDecisionSchema>;
  *
  * 这个字段是整套机制里最重要的一列：它让「这次挂单用的是模型决定的还是人配的」
  * 成为一个**可查的事实**，而不是猜的。`risk_bracket` 会把它落库。
+ *
+ * - `llm`：v0.9.0 的档位决策。模型只看到 ATR 与近期收益率数列。
+ * - `llm-trend`：v1.1.0 的趋势档位决策。模型看到的是**完整的趋势上下文**
+ *   （程序算好的客观倾向 + 均线 / 指标 / 情绪面），见
+ *   [`trend-decision.ts`](./trend-decision.ts)。
+ *   单独列一个来源值而不是并进 `llm`：两者给模型看的输入**不是同一批**，
+ *   而「模型当时看到了什么」正是事后复盘要回答的第一个问题。
+ * - `config`：人配的档位。
+ * - `config-fallback`：模型参与了但失败 / 超时 / 越界，降级用了人配的档位。
+ * - `agent-plan`：档位来自 v1.0.0 的 Agent 执行方案（成交之前就定好的）。
  */
-export type DecisionSource = 'llm' | 'config' | 'config-fallback' | 'agent-plan';
+export type DecisionSource = 'llm' | 'llm-trend' | 'config' | 'config-fallback' | 'agent-plan';
 
 /** 决策结果：档位 + 来源 + 可选的说明。 */
 export interface RiskDecisionResult {

@@ -92,6 +92,8 @@ export function RiskPolicyPanel(props: {
   const symbol = props.fixedSymbol ?? pickedSymbol;
   const [view, setView] = useState<RiskPolicyViewDto | null>(null);
   const [error, setError] = useState<string | null>(null);
+  /** 手动重试计数：读失败时页面不能只挂一句「读取中…」等用户自己去刷新。 */
+  const [reload, setReload] = useState(0);
   const [busy, setBusy] = useState(false);
   const [globalForm, setGlobalForm] = useState<PolicyForm>(EMPTY_FORM);
   const [symbolForm, setSymbolForm] = useState<PolicyForm>(EMPTY_FORM);
@@ -113,7 +115,7 @@ export function RiskPolicyPanel(props: {
     return () => {
       cancelled = true;
     };
-  }, [symbol]);
+  }, [symbol, reload]);
 
   const submit = (scope: 'global' | 'symbol') => {
     const form = scope === 'global' ? globalForm : symbolForm;
@@ -197,7 +199,7 @@ export function RiskPolicyPanel(props: {
 
       {error !== null ? (
         <div className="banner">
-          策略操作失败：{error}
+          策略读取 / 操作失败：{error}
           <div className="muted" style={{ fontSize: 12, marginTop: 4 }}>
             校验规则由服务端执行；这条错误会留在页面上，改对再提交才会消失。
           </div>
@@ -283,6 +285,20 @@ export function RiskPolicyPanel(props: {
             {symbol === '' ? '（当前没有指定标的，显示的就是全局这一层。）' : ''}
           </p>
         </div>
+      ) : error !== null ? (
+        // 读失败与「还在读」必须分开：一直显示「读取中…」等于让用户等一个不会来的结果。
+        <p className="muted">
+          没能读到策略。
+          <button
+            style={{ marginLeft: 8 }}
+            onClick={() => {
+              setError(null);
+              setReload((n) => n + 1);
+            }}
+          >
+            重试
+          </button>
+        </p>
       ) : (
         <p className="muted">读取中…</p>
       )}

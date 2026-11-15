@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 // UI 用例需要 DOM；服务端用例跑在默认的 node 环境。
 import './setup.js';
-import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { App } from '../../ui/src/App';
@@ -42,6 +42,19 @@ const overview: OverviewDto = {
     lastBeatAt: NOW - 2_000,
     ageMs: 2_000,
     staleAfterMs: 60_000,
+  },
+  // 默认在线且私有接口可用：否则会多出一条横幅，掩盖掉用例真正想验的东西
+  executor: {
+    state: 'running',
+    pid: 4243,
+    startedAt: NOW - 60_000,
+    lastBeatAt: NOW - 2_000,
+    ageMs: 2_000,
+    staleAfterMs: 60_000,
+    privateApiOk: true,
+    lastPrivateOkAt: NOW - 1_000,
+    lastErrorCode: null,
+    lastErrorMessage: null,
   },
   jobs: { active: 0, recent: [] },
   now: NOW,
@@ -416,6 +429,71 @@ describe('行内同步按钮', () => {
   });
 });
 
+describe('止盈止损服务的可见性（2026-11-06）', () => {
+  /** 造一份 overview：把止盈止损服务的状态换成给定的样子。 */
+  function overviewWithExecutor(executor: Partial<typeof overview.executor>): typeof overview {
+    return { ...overview, executor: { ...overview.executor, ...executor } };
+  }
+
+  function stubOverview(value: typeof overview): void {
+    stubFetch({
+      '/api/overview': value,
+      '/api/symbols': { items: [] },
+      '/api/jobs': { items: [] },
+      '/api/exchange': {
+        exchange: 'binance',
+        count: 0,
+        cachedAt: NOW,
+        ageMs: 0,
+        stale: false,
+        symbols: [],
+      },
+    });
+  }
+
+  it('私有接口不可用：常驻一条横幅，明说「仓位是裸的」', async () => {
+    stubOverview(
+      overviewWithExecutor({
+        privateApiOk: false,
+        lastErrorCode: '-2015',
+        lastErrorMessage: 'Invalid API-key, IP, or permissions for action',
+      }),
+    );
+    render(<App />);
+
+    await waitFor(() => expect(screen.getByText(/止盈止损服务连不上交易所私有接口/)).toBeTruthy());
+    // 必须说清后果：它挂不出单、也查不出仓位有没有保护。
+    expect(screen.getByText(/挂不出止盈止损单/)).toBeTruthy();
+    // 把交易所的原话带出来（排查第一手线索）。
+    expect(screen.getByText(/Invalid API-key/)).toBeTruthy();
+  });
+
+  it('服务没在跑：横幅说明「交易所有仓位的话，它们是裸的」', async () => {
+    stubOverview(
+      overviewWithExecutor({
+        state: 'stopped',
+        pid: null,
+        lastBeatAt: null,
+        ageMs: null,
+        privateApiOk: null,
+      }),
+    );
+    render(<App />);
+
+    await waitFor(() => expect(screen.getByText(/止盈止损服务未运行/)).toBeTruthy());
+    expect(screen.getByText(/交易所有仓位的话，它们是裸的/)).toBeTruthy();
+  });
+
+  it('一切正常时不出现这两条横幅（别制造噪音）', async () => {
+    stubOverview(overviewWithExecutor({ privateApiOk: true }));
+    render(<App />);
+
+    await waitFor(() => expect(screen.getByText('止盈止损服务')).toBeTruthy());
+    expect(screen.queryByText(/止盈止损服务连不上交易所私有接口/)).toBeNull();
+    expect(screen.queryByText(/止盈止损服务未运行/)).toBeNull();
+  });
+});
+
 describe('守护进程卡片', () => {
   it('在线时显示心跳的相对时间，且不是把时长当时间戳（曾误显示「20731 天前」）', async () => {
     stubFetch({
@@ -438,7 +516,13 @@ describe('守护进程卡片', () => {
 
     // lastBeatAt = NOW - 30s。fmtAgo 收绝对时间戳，
     // 若误传 now - lastBeatAt 会被当成 1970 年的时间而显示成「几万天前」。
-    await waitFor(() => expect(screen.getByText('运行中')).toBeTruthy());
+    // ⚠️ 「运行中」现在有两张卡（同步进程 / 止盈止损服务），按文本找会撞车——
+    // 改成按**卡片标题**定位那张卡的内容。
+    await waitFor(() =>
+      expect(
+        screen.getByText('同步进程').closest('.card')?.querySelector('.value')?.textContent,
+      ).toBe('运行中'),
+    );
     expect(screen.getByText(/心跳 30 秒前 · pid 4242/)).toBeTruthy();
     expect(screen.queryByText(/天前/)).toBeNull();
   });
@@ -572,6 +656,33 @@ describe('详情页 K 线', () => {
     expect(screen.getAllByText(/读取中/).length).toBeGreaterThan(0);
   });
 
+  it('缺口清单被截断时说清「还有多少条」，不把截断当全量', async () => {
+    const stub = detailStub(bars);
+    const detail = { ...(stub['/api/symbols/BTCUSDC'] as Record<string, unknown>) };
+    detail['gaps'] = [
+      {
+        symbol: 'BTCUSDC',
+        gapStart: NOW - 600_000,
+        gapEnd: NOW - 540_000,
+        missingRows: 1,
+        attempts: 0,
+        lastAttemptAt: null,
+        lastError: null,
+      },
+    ];
+    detail['gapsTotal'] = 250;
+    stub['/api/symbols/BTCUSDC'] = detail;
+
+    stubFetch(stub);
+    render(<App />);
+    await waitFor(() => expect(screen.getByText('BTCUSDC')).toBeTruthy());
+    fireEvent.click(screen.getAllByText('BTCUSDC')[0]!);
+
+    // 标题带上总数，正文再补一句「只列出 N 条」——缺口不得静默存在。
+    await waitFor(() => expect(screen.getAllByText(/共 250/).length).toBeGreaterThan(0));
+    expect(screen.getByText(/只列出最近的 1 条，共 250 条/)).toBeTruthy();
+  });
+
   it('库里没有历史的标的：K 线区给可执行的下一步，而不是空图', async () => {
     const bare = row('BTCUSDC', { hasHistory: false, state: null });
     stubFetch(detailStub([], bare));
@@ -583,5 +694,29 @@ describe('详情页 K 线', () => {
     // v0.2.0：空状态必须说明原因并给出下一步，文案里带上标的与动作
     await waitFor(() => expect(screen.getByText(/库里还没有 BTCUSDC 的任何 1m 数据/)).toBeTruthy());
     expect(screen.getByText(/开始同步后/)).toBeTruthy();
+  });
+
+  /**
+   * 回归用例：详情页的取数必须挂在**全局刷新节奏**上。
+   *
+   * 之前它的 effect 只依赖 `[props.symbol]`，而错误横幅写着「每 5s 自动重试」——
+   * 那句承诺是假的：后端抖一下之后详情永久停在错误态；同步进行中的行数 / 缺口也不动，
+   * 同一屏的 K 线却在每 5s 刷新（一屏两个时间基准）。
+   */
+  it('详情页跟着全局刷新节奏重读，而不是只读一次', async () => {
+    const calls = stubFetch(detailStub(bars));
+    render(<App />);
+    await waitFor(() => expect(screen.getByText('BTCUSDC')).toBeTruthy());
+    fireEvent.click(screen.getAllByText('BTCUSDC')[0]!);
+
+    const detailCalls = () => calls.filter((c) => c === '/api/symbols/BTCUSDC').length;
+    await waitFor(() => expect(detailCalls()).toBeGreaterThanOrEqual(1));
+    const before = detailCalls();
+
+    // 推进一轮全局刷新（REFRESH_MS = 5s）
+    await act(async () => {
+      vi.advanceTimersByTime(5_000);
+    });
+    await waitFor(() => expect(detailCalls()).toBeGreaterThan(before));
   });
 });

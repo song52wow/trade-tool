@@ -1,29 +1,13 @@
 import type { SyncStatus, SyncSummary } from '@trade-tool/core';
 
 import { fmtBytes, fmtNumber, fmtPercent, fmtAgo } from '../format.js';
-import type { DaemonStatusDto } from '../../../src/types';
+import { DAEMON_LABEL, EXECUTOR_LABEL, SYNC_STATUS_LABEL } from '../labels.js';
+import type { DaemonStatusDto, ExecutorStatusDto } from '../../../src/types';
 
 const COLORS: Record<SyncStatus, string> = {
   running: 'var(--ok)',
   paused: 'var(--muted)',
   error: 'var(--err)',
-};
-
-const STATUS_LABEL: Record<SyncStatus, string> = {
-  running: '同步中',
-  paused: '已暂停',
-  error: '出错',
-};
-
-/**
- * 三态而不是布尔：处置方式不同。
- * `stale`（心跳超时）该去查日志，`stopped`（没有心跳）该去启动进程——
- * 合成一个「离线」会把两种不同的下一步混成同一句话。
- */
-const DAEMON_LABEL: Record<DaemonStatusDto['state'], string> = {
-  running: '运行中',
-  stale: '心跳超时',
-  stopped: '未运行',
 };
 
 function Card(props: { label: string; value: string; hint?: string }) {
@@ -42,6 +26,7 @@ export function OverviewCards(props: {
   exchangeStale: boolean;
   exchangeAgeMs: number;
   daemon: DaemonStatusDto;
+  executor: ExecutorStatusDto;
   now: number;
   activeJobs: number;
 }) {
@@ -69,7 +54,7 @@ export function OverviewCards(props: {
                 className="dist-bar"
                 role="img"
                 aria-label={statuses
-                  .map((s) => `${STATUS_LABEL[s]} ${summary.countsByStatus[s]}`)
+                  .map((s) => `${SYNC_STATUS_LABEL[s]} ${summary.countsByStatus[s]}`)
                   .join('，')}
               >
                 {statuses.map((s) =>
@@ -88,7 +73,7 @@ export function OverviewCards(props: {
                 {statuses.map((s) => (
                   <span className="dist-legend-item" key={s}>
                     <span className="dist-swatch" style={{ background: COLORS[s] }} />
-                    {STATUS_LABEL[s]} <b>{fmtNumber(summary.countsByStatus[s])}</b>
+                    {SYNC_STATUS_LABEL[s]} <b>{fmtNumber(summary.countsByStatus[s])}</b>
                   </span>
                 ))}
               </div>
@@ -131,6 +116,29 @@ export function OverviewCards(props: {
                   : props.daemon.state === 'stale'
                     ? '心跳超时，去查 apps/sync 日志'
                     : '未运行，开始同步不会拉数据'
+              }
+            />
+            <Card
+              label="止盈止损服务"
+              value={
+                props.executor.state === 'running' && props.executor.privateApiOk === false
+                  ? '私有接口不可用'
+                  : props.executor.state === 'running' && props.executor.privateApiOk === null
+                    ? '运行中（接口未知）'
+                    : EXECUTOR_LABEL[props.executor.state]
+              }
+              hint={
+                props.executor.state === 'running' && props.executor.privateApiOk === false
+                  ? `挂不出单，也查不出仓位有没有保护${
+                      props.executor.lastErrorCode !== null
+                        ? ` · ${props.executor.lastErrorCode}`
+                        : ''
+                    }`
+                  : props.executor.state === 'running' && props.executor.lastPrivateOkAt !== null
+                    ? `私有接口上次可用 ${fmtAgo(props.executor.lastPrivateOkAt, props.now)}`
+                    : props.executor.state === 'stale'
+                      ? '心跳超时，去查 apps/executor 日志'
+                      : '未运行，仓位没有止盈止损保护'
               }
             />
             <Card

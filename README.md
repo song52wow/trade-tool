@@ -9,7 +9,8 @@ trade-tool/
 │   ├── sync/                    @trade-tool/sync       常驻同步守护进程 + 控制原语
 │   ├── web/                     @trade-tool/web        控制面：HTTP API + 看板（直接 import 原语）
 │   ├── executor/                @trade-tool/executor   止盈止损：成交 → 净仓位 → ATR → 条件单（会真实下单）＋ 执行 Agent 方案
-│   └── agent/                   @trade-tool/agent      分析师 + 交易员 Agent：分析 → 执行方案（默认不下单）
+│   ├── agent/                   @trade-tool/agent      分析师 + 交易员 Agent：分析 → 执行方案（默认不下单）
+│   └── chain-monitor/           @trade-tool/chain-monitor  链上（BSC / PancakeSwap V3）仓位监控：读链 → 算账 → 落库 → 推送
 ├── packages/
 │   ├── tsconfig/                @trade-tool/tsconfig   共享 tsconfig 预设
 │   ├── core/                    @trade-tool/core       领域模型 / 配置 / 错误码（**无指标实现**）
@@ -30,20 +31,27 @@ trade-tool/
 ```
 apps/cli ─────> packages/data ───────> packages/core
 apps/sync ────> packages/data ───────> packages/core
-apps/web ─────> packages/sync ───────> packages/data ──> packages/core
+apps/web ─────> apps/sync ───────────> packages/data ──> packages/core
 apps/executor ─> packages/data ───────> packages/core
 apps/agent ───> packages/data ───────> packages/core
+apps/chain-monitor ─> packages/data ──> packages/core
                       │
                       └─(唯一跨语言接缝: python -m quant_data)─> python/quant-*
 ```
 
+**`apps/` 之间只有两条复用边**，而且都是「装配」不是「第二个实现」：
+`apps/web → apps/sync`（控制面直接复用控制原语与守护进程装配）、
+`apps/cli → apps/agent`（`agent run` 一次性跑一轮，复用 Agent 的编排）。
+
 规则：`core` 不依赖任何 workspace 包；包之间只依赖 `core`；跨语言只允许从 `packages/data` 出去；
 `apps/sync` 与 `apps/web` **不得**绕过 `packages/data` 直接连 PG 读写。
-`apps/cli`、`apps/sync`、`apps/web`、`apps/executor`、`apps/agent` 是**五个独立入口**：CLI 只读 `sync status`、
+`apps/cli`、`apps/sync`、`apps/web`、`apps/executor`、`apps/agent`、`apps/chain-monitor`
+是**六个独立入口**：CLI 只读 `sync status`、
 不改生命周期；控制面只写 `desired_state`（先落库再生效），真正拉数据的始终是 `apps/sync`
 守护进程；`apps/executor` 只做止盈止损，不碰行情同步的生命周期；
 `apps/agent` 只出方案，既不碰行情同步的生命周期，**下单也不由它做**——
-下单在 `apps/executor`（凭据与私有接口都在那边）。
+下单在 `apps/executor`（凭据与私有接口都在那边）；
+`apps/chain-monitor` 只读链上、不下单、不碰行情同步。
 
 ## 环境要求
 
@@ -55,8 +63,8 @@ Node >= 22、pnpm >= 11、uv >= 0.11、PostgreSQL >= 16。运行 `pnpm --filter 
 cp .env.example .env      # 按本机情况改，主要是 TRADE_TOOL_HOME 与 TRADE_TOOL_PG_PASSWORD
 ```
 
-`.env` 已被 `.gitignore` 忽略，`.env.example` 是入库的模板。五个入口（`apps/cli`、`apps/sync`、
-`apps/web`、`apps/executor`、`apps/agent`）启动时会自动加载仓库根的 `.env`
+`.env` 已被 `.gitignore` 忽略，`.env.example` 是入库的模板。六个入口（`apps/cli`、`apps/sync`、
+`apps/web`、`apps/executor`、`apps/agent`、`apps/chain-monitor`）启动时会自动加载仓库根的 `.env`
 （`packages/core` 的 `loadProjectEnv()`，底层是 Node 内置的
 `process.loadEnvFile`），因此连同 Python 子进程（`bridge.ts` 透传 `process.env`）都能拿到密码。
 **已存在的环境变量不会被 `.env` 覆盖**，CI 与生产注入的值始终优先。
@@ -169,6 +177,26 @@ ATR 算（`deriveStagedPlan`）。这样价格计算保持是可复现的纯函�
 `executor.llm.timeoutMs`（缺省 8 秒）是这个窗口的上限。
 细则见 `AGENTS.md` §6.10。
 
+### 按趋势决定档位（v1.1.0，默认关闭）
+
+配置里写 `executor.trend.enabled = true`（另需 `executor.llm.enabled = true`）之后，
+模型定止盈止损档位时看到的不再只是一串收益率，而是**完整趋势上下文**：程序算好的
+客观倾向分（固定七条规则的投票）、均线 / 指标 / 情绪面。
+
+**这条链路是给「手动挂单」用的**：你在交易所自己下单，成交之后 executor 一样会接管
+并挂止盈止损——现在这两张单挂多远，由模型按趋势来定。
+
+⚠️ 最容易出的错是 **ATR 口径**：算价用的 ATR（`executor.atrInterval`，缺省 `1m`）与
+趋势分析用的 ATR（派生周期，缺省 `1h`）差着一到两个数量级。混用会让止损距离差十倍
+——挂出去的止损近到一根针就能被扫掉，而日志与库里的一切都「看起来正常」。
+因此提示词里只给**一个**带单位的 ATR（算价基准），均线与布林带换成相对成交价的
+百分比，符号由程序算好。
+
+取不到行情上下文时**不拒绝挂单**（仓位已经成交，不挂止损就是裸仓），而是降级到
+「只有收益率数列」的提示词，决策来源随之记成 `llm` 而**不是** `llm-trend`——
+事后一眼能看出这一笔没吃到趋势上下文。
+细则见 `AGENTS.md` §6.10.1。
+
 ## 分析师 / 交易员 Agent（`apps/agent`，v1.0.0）
 
 两个 Agent 回答两个问题：
@@ -242,6 +270,55 @@ pnpm --filter @trade-tool/cli start -- agent plan 42 --approve  # 预先批准�
 
 细则见 [`apps/agent/README.md`](apps/agent/README.md) 与 `AGENTS.md` §6.11–§6.13、§6.9.3。
 
+## 链上仓位监控（`apps/chain-monitor`，v1.2.0）
+
+这个仓库原本只看**币安合约**的行情与仓位。「某人在链上（BSC）的一笔 PancakeSwap V3
+流动性仓位现在值多少、赚没赚」只有链上说得清，于是多了一个入口
+`apps/chain-monitor`：定时读链 → 算账 → 落库 → 需要时推飞书，页面在控制面看。
+
+```
+配置文件里的 chain.positions[]
+      │  每 chain.pollIntervalMs（默认 15 分钟）一轮
+      ▼
+读链上事实：仓位管理器 positions(uint256) → tick 区间、流动性
+            池子       positions(bytes32) → 权威的流动性、手续费基准
+      ▼
+算账：持仓构成 → 当前价值 → 成本（按存入时的价格折算）→ 浮动盈亏（含手续费）
+      ▼
+落库：chain_position（滚动状态）+ chain_position_snapshot（每次采样）
+      ▼
+判定要不要推 → 飞书（通知种类 chain-position-alert）
+```
+
+**四条口径**：
+
+1. **只盯这一笔仓位**：盯哪一笔由配置文件说了算，代码里不写死任何合约名。
+2. **不刷屏**：价格动 0.1% 不推；只有「仓位被清空 / 有人加减仓 / 价格出了设定区间 /
+   价格或盈亏较上次推送超过阈值（默认 1.5%）」才推，且两次推送之间有冷却（默认 30 分钟）。
+3. **推不出去不算说过**：只有**真的发出去**了才更新「上次推送」的基准；推送失败会留下记录，
+   基准不动，下一轮还会试。
+4. **读失败常驻可见**：原因写进 `chain_position.last_error`，页面直接显示，不是弹一下就没了。
+
+**「存入时的价格」是反推出来的**：BSC 的公共节点不给查历史状态（`eth_call` 带区块号一律 403），
+于是用「投入的币数 + 流动性 + 边界 tick」反推，每次算账都验算一遍，**对不上直接抛错**。
+
+**通知走仓库既有那套**：复用 `packages/core/src/notify.ts`，通道每轮重新解析一次
+（控制面录的密文优先，配置文件 + 环境变量兜底），改完设置**不必重启本进程**。
+webhook 地址是凭据，只写环境变量名 `TRADE_TOOL_FEISHU_WEBHOOK_URL` 或在控制面录入。
+
+默认 `chain.enabled = false`（不开就不启动，不出网、不建连接）。细节见
+[`apps/chain-monitor/README.md`](apps/chain-monitor/README.md) 与 `AGENTS.md` §6.14。
+
+**控制面那一页是「卡片列表 → 详情」两条路由**（`#/chain` 与 `#/chain/<仓位键>`）：
+列表每张卡给「一眼看完」的重点（币对、区间内外、当前价值、浮动盈亏、区间尺、现价、
+已赚手续费、**当前 APY**、上次采样），点卡片进详情看全（结论 + 指标卡 → **定价区间**
+→ **采样明细（表格，一行一次采样）** → **链上查看** → 可收起的技术细节）。
+**不画走势图**——那把一页变成了流水账；采样明细用表格（采样是离散事实，曲线会连出
+没发生过的中间过程）。采样照旧落库（`chain_position_snapshot`）。
+链接由 `packages/core/src/chain-links.ts` 拼，页面与飞书告警**共用同一份**；
+当前 APY 由 `packages/core/src/chain-v3.ts` 的 `computeChainApy` 算
+（**最近 7 天实收手续费 ÷ 投入成本再年化**，算不出来时给原因而不是编一个数）。
+
 ## 交易对账（v0.6.0）
 
 止盈止损只有写入侧：占坑在 PG、下单在交易所，两者无法原子提交。进程死在中间是必然的
@@ -297,6 +374,54 @@ pnpm --filter @trade-tool/cli start -- reconcile -s BTCUSDT      # 单标的
 所以周期对账放在本来就常驻的 `apps/executor` 里；控制面只读已经算好的快照，
 因此可以安全地挂刷新节奏。
 
+## 手动补挂止盈止损（v1.3.0）
+
+对账只报告、不动手（补挂一张止损会平掉真实仓位，且不可逆）。因此「修复」一直是**人工决定**
+——而人决定之后，得有一条**能真的把单挂上去**的路。这条路就是 `risk reattach`。
+
+```bash
+# 先看清楚会挂什么（不挂单、不改任何状态）
+pnpm --filter @trade-tool/cli start -- risk reattach -s BTCUSDT --dry-run
+
+# 确认之后再挂（会真下单）
+pnpm --filter @trade-tool/cli start -- risk reattach -s BTCUSDT
+```
+
+控制面里是标的详情页「止盈止损」区块上的**「补挂止盈止损」**按钮：点一下先试算，
+把「要挂哪几张、各多少钱」显示出来，确认后才真的挂。
+
+它处理四种情形：
+
+| 情形                        | 含义                                             | 补什么      |
+| --------------------------- | ------------------------------------------------ | ----------- |
+| `naked-position`            | 交易所有仓位，本地没有任何未终结记录             | 止盈 + 止损 |
+| `unprotected-position`      | 记录占坑成功但下单失败，一张单都没挂上           | 止盈 + 止损 |
+| `missing-stop-order`        | 本地记为已挂上，交易所没有止损单——**仓位是裸的** | 只补止损    |
+| `missing-take-profit-order` | 止损还在，止盈没了                               | 只补止盈    |
+
+三条规矩：
+
+1. **复现优先于重算**。已有记录时**原样复现**它当初算好的价——补挂要的是「当初打算挂的
+   那一张」。只有「当初压根没算出档位」与「本地根本没有记录」才现算（按当前生效的策略档位）。
+2. **挂上去会立刻平仓就拒绝**。条件单是市价平仓单：止损/止盈挂错一侧，交易所立刻用市价
+   把仓位平掉。程序会拿现价核一遍，**取不到现价就不补**——宁可让人看见「补不上」。
+3. **挂在交易所上的单不重复挂**。已经有的那一张不会被挂第二张（同一标的两套保护会互相触发）。
+
+另外两件与「第一段止盈」有关的事（分批形态）：
+
+- **认得出「第一段已经成交了」**。第一段是带数量的单，成交后交易所自动撤掉——
+  于是「交易所上找不到那张单」在成交之后是**正常**的。但如果那一刻 executor 不在、
+  没人把这个事实记进库，补挂就会以为「第一段止盈单不见了」而**再挂一张**——
+  等于重复减仓。所以补挂会拿**交易所的实际仓位**核对一次（第一段成交后仓位正好少了
+  那一段），认出来了就不再挂第一段，并把「已成交」这个事实**补记进库**。
+  补记之后这一笔就进了移动止损的管辖区——**常驻的 executor 下一轮**会接手推进。
+- **仓位对不上就拒绝**。仓位数量与记录对不上（被手工动过、第一段只成交了一部分、
+  或者又加了仓）时一律**拒绝补挂**并说清是哪几个数对不上，**不猜**。
+
+判据只有一份实现（`packages/core/src/risk-reattach.ts`，纯函数），与对账共用
+「这一态该有哪些单」那一条；挂单走 `apps/executor/src/bracket-orders.ts`——**与自动路径
+同一份实现**，因此手动补的与自动挂的自定义号、方向、数量、失败回滚逐字一致。
+
 ## 飞书通知（v0.8.0）
 
 这个仓库里最贵的故障不是报错，而是**没人知道**：止盈止损挂单失败、仓位在交易所裸奔、
@@ -324,6 +449,18 @@ pnpm --filter @trade-tool/cli start -- reconcile -s BTCUSDT      # 单标的
 
 推什么：对账的差异。一轮对账的多个差异**合成一条**消息（一个裸仓常同时命中好几条判据，
 拆开推就成了「一个问题推了三遍」）。差异消失时会再推一条「交易对账已恢复正常」。
+
+**还有一类是「止盈止损服务自己不可用」**（2026-11-06 补）。此前这条链一个出口都没有：
+私有接口被币安拒了（`-2015`，通常是 key 失效、出口 IP 不在白名单、或
+`executor.environment` 写成了 demo），于是它拿不到 listenKey、**挂不出止盈止损**，
+对账也一并跑不通、**连「仓位没有保护」这条告警的原料都没有**。目标机上实测：从 10-31
+03:49 起彻底停摆，交易所上那个仓位一直是裸的，而**一条消息都没发出来**。
+
+现在这类故障会自己报出来（默认勾上，持续不可用超过 2 分钟才推，抖动不推）：
+告警里带着交易所的**原话**与排查那三样——API key 是否有效、出口 IP 是否在白名单、
+`executor.environment` 是不是 live。控制面的概览页也会显示「止盈止损服务」的**两个**
+状态：进程在不在（运行中 / 心跳超时 / 未运行）与私有接口通不通——「进程活着」不等于
+「服务能用」，私有接口全挂时心跳照跳。
 
 **推哪些内容由你逐项勾选**（每种一句话说明）：9 种对账差异，外加交易生命周期事件。比如
 「止盈单没了」这种你觉得是噪音的就别勾，「仓位没有止损保护」这种一定要勾。勾选项的清单

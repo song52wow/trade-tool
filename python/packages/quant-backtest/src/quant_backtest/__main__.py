@@ -5,7 +5,12 @@
 - 失败：退出码非 0，stderr **最后一行**为 ``QUANT_DATA_ERROR {"code":…,"message":…,"details":…}``。
 
 **K 线不经 stdout 传输**（R-7.2）：合成数据路径在 Python 进程内直接生成并消费，
-真实数据路径从 PG 读；两条路径都只把**摘要**（绩效指标、成交列表）写 stdout。
+只把**摘要**（绩效指标、成交列表）写 stdout。
+
+⚠️ **目前只有合成数据源**：`--source` 的取值只有 `synthetic`。从 PG 读真实 K 线的路径
+**尚未实现**（TS 侧的 `runBacktest` 也不注入 DSN）——本文件 2026-11-12 之前那句
+「真实数据路径从 PG 读」与实现不符，已删掉。要做这条路径，先补 `--source pg`
+与 DSN 注入，并同步改 `packages/data/src/market.ts` 的桥接参数。
 """
 
 from __future__ import annotations

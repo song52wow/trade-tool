@@ -56,6 +56,8 @@ import {
 
 import type { Pool } from '@trade-tool/data';
 
+import { startPeriodicTask } from './periodic.js';
+
 const log = createLogger('executor:plan');
 
 /**
@@ -564,47 +566,20 @@ export function startPlanExecutionTimer(
   intervalMs: number,
   options: StartPlanExecutionOptions = {},
 ): PlanExecutionTimer {
-  if (intervalMs === 0) {
-    log.info('agent.execute.enabled = false：自动下单已关闭，方案只落库');
-    return { stop: () => undefined };
-  }
-
-  const setIntervalImpl =
-    options.setIntervalImpl ?? ((fn, ms) => setInterval(fn, ms) as unknown as NodeJS.Timeout);
-  const clearIntervalImpl =
-    options.clearIntervalImpl ?? ((handle) => clearInterval(handle as unknown as number));
-
-  let running = false;
-  const tick = (): void => {
-    if (running) return;
-    running = true;
-    void executor
-      .runOnce()
-      .then((report: PlanExecutionReport) => {
-        if (report.executed > 0 || report.failed > 0 || report.stuck > 0) {
-          log.info(
-            `方案执行一轮：已下单 ${report.executed} / 跳过 ${report.skipped} / ` +
-              `失败 ${report.failed} / 状态未知 ${report.stuck}`,
-          );
-        }
-      })
-      .catch((error: unknown) => {
-        log.error(
-          `方案执行本轮失败（不影响挂单）：${error instanceof Error ? error.message : String(error)}`,
+  return startPeriodicTask({
+    intervalMs,
+    label: '方案执行',
+    disabledMessage: 'agent.execute.enabled = false：自动下单已关闭，方案只落库',
+    enabledMessage: (ms) => `自动下单已启用：每 ${String(ms / 1000)} 秒检查一次已批准的方案`,
+    tick: async () => {
+      const report: PlanExecutionReport = await executor.runOnce();
+      if (report.executed > 0 || report.failed > 0 || report.stuck > 0) {
+        log.info(
+          `方案执行一轮：已下单 ${report.executed} / 跳过 ${report.skipped} / ` +
+            `失败 ${report.failed} / 状态未知 ${report.stuck}`,
         );
-      })
-      .finally(() => {
-        running = false;
-      });
-  };
-
-  tick();
-  const handle = setIntervalImpl(tick, intervalMs);
-  log.info(`自动下单已启用：每 ${String(intervalMs / 1000)} 秒检查一次已批准的方案`);
-
-  return {
-    stop(): void {
-      clearIntervalImpl(handle);
+      }
     },
-  };
+    ...options,
+  });
 }

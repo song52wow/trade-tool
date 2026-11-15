@@ -33,7 +33,8 @@
   --text: #1d1d1f;
   --text-strong: #000000;
   --muted: #6e6e73;
-  --muted-2: #8a8a8f;
+  /* 4.64:1 on white（原来 #8a8a8f 只有 3.44:1，11px 的 hint 承载语义，达不到 AA） */
+  --muted-2: #74747a;
 
   /* —— 强调 —— */
   --accent: #0071e3;
@@ -100,7 +101,8 @@
   --text: #f2f4f7;
   --text-strong: #ffffff;
   --muted: #98a2b3;
-  --muted-2: #6b7480;
+  /* 6.11:1 on 深色底（原来 #6b7480 只有 4.11:1） */
+  --muted-2: #8791a1;
 
   /* 暗色下的强调色取霓虹青：亮色主题的深蓝在纯黑底上会糊成一片 */
   --accent: #38e1ff;
@@ -639,6 +641,250 @@ h3.sub {
   display: block;
 }
 
+/* ————————————————— 链上仓位 —————————————————
+ *
+ * 这一页原来的问题是「一屏里全是数」：地址、仓位键、交易哈希、L 值、四张卡、
+ * 两张曲线、整张采样表堆在一起，找一个「现在赚没赚」要翻半天。
+ * 现在分四层：结论（仓位 + 一句人话 + 指标卡）→ 定价区间 → 链上查看 →
+ * 可收起的技术细节。
+ */
+.chain-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.chain-head h2 {
+  margin: 0;
+}
+
+.chain-stamp {
+  font-size: 12px;
+}
+
+.chain-verdict {
+  margin: 8px 0 12px;
+  font-size: 14px;
+  line-height: 1.6;
+}
+
+.chain-summary {
+  cursor: pointer;
+  font-weight: 600;
+  font-size: 14px;
+  /* 收起时也要一眼看出可以点开 */
+  padding: 2px 0;
+}
+
+.chain-summary::marker {
+  color: var(--muted);
+}
+
+/* 定价区间尺：一条从下界到上界的轨道 + 一个「现价」标记。
+ * 比让用户去曲线里对两条虚线直观得多，也是「现在在不在区间」的第一眼答案。 */
+.range-gauge {
+  margin: 4px 0 10px;
+}
+
+.range-track {
+  position: relative;
+  height: 8px;
+  border-radius: 999px;
+  background: var(--line);
+}
+
+.range-fill {
+  position: absolute;
+  left: 0;
+  top: 0;
+  bottom: 0;
+  border-radius: 999px;
+  background: var(--accent-soft);
+}
+
+.range-marker {
+  position: absolute;
+  top: 50%;
+  width: 12px;
+  height: 12px;
+  margin-left: -6px;
+  margin-top: -6px;
+  border-radius: 50%;
+  background: var(--accent);
+  border: 2px solid var(--panel);
+  box-shadow: 0 0 0 1px var(--line-strong);
+}
+
+.range-gauge.out .range-marker {
+  background: var(--warn);
+}
+
+.range-labels {
+  display: flex;
+  justify-content: space-between;
+  margin-top: 4px;
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.range-caption {
+  margin: 2px 0 0;
+  font-size: 12px;
+}
+
+/* 链上仓位卡片列表：一格一笔仓位，点进去看详情。
+ * 卡片自己就要能一眼看出重点（值多少、赚没赚、价格在不在区间、年化多少），
+ * 所以区间尺直接放在卡里，不用来回切页面。 */
+.chain-card-grid {
+  display: grid;
+  /* 卡片**不铺满整行**：只有一笔仓位时，宽得离谱的卡片反而难读。
+   * 上限 360px，多的仓位往右排。 */
+  grid-template-columns: repeat(auto-fill, minmax(280px, 360px));
+  justify-content: start;
+  gap: 12px;
+  margin-top: 12px;
+}
+
+.chain-card {
+  display: block;
+  padding: 14px 16px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--panel-2);
+  color: var(--text);
+  text-decoration: none;
+  transition:
+    border-color 0.15s ease,
+    transform 0.15s ease;
+}
+
+.chain-card:hover {
+  border-color: var(--accent);
+  transform: translateY(-1px);
+}
+
+.chain-card-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.chain-card-title {
+  font-size: 15px;
+  font-weight: 600;
+}
+
+.chain-card-sub {
+  font-size: 11px;
+  color: var(--muted);
+  margin-top: 2px;
+}
+
+.chain-card-nums {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+  margin: 12px 0 8px;
+}
+
+.chain-card-nums .value {
+  font-size: 16px;
+}
+
+.chain-card-rows {
+  margin-top: 8px;
+  border-top: 1px solid var(--line);
+  padding-top: 8px;
+}
+
+.chain-card-row {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 12px;
+  padding: 2px 0;
+}
+
+.chain-card-hint {
+  margin: 8px 0 0;
+  font-size: 11px;
+}
+
+/* 详情页的「回列表」按钮：给钻进来的那一层一条回去的路。 */
+.chain-back {
+  margin: 8px 0 4px;
+  padding: 4px 10px;
+  font-size: 12px;
+}
+
+/* 链上查看：一排跳到链上核对的链接。
+ * 分两组（区块浏览器 / 流动性平台），组名是正文色，链接本身用强调色——
+ * 一眼能看出「哪些能点」。 */
+.chain-links {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px 24px;
+  margin-top: 8px;
+}
+
+.chain-link-group {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 10px;
+}
+
+.chain-link-title {
+  font-size: 11px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.chain-link {
+  display: inline-block;
+  padding: 4px 10px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  background: var(--panel-2);
+  color: var(--accent);
+  font-size: 12px;
+  text-decoration: none;
+  white-space: nowrap;
+}
+
+.chain-link:hover {
+  border-color: var(--accent);
+  text-decoration: underline;
+}
+
+/* 采样明细：田字格。
+ * 每一格都有**四边框线**（默认表格样式只有横线），这样「一行一次采样、
+ * 一列一个字段」的对应关系一眼就看得出来——采样的本质就是一张格子表。 */
+.chain-snap-table table {
+  border: 1px solid var(--line);
+  font-size: var(--fs-sm);
+}
+
+.chain-snap-table th,
+.chain-snap-table td {
+  border: 1px solid var(--line-soft);
+  padding: 6px 10px;
+}
+
+.chain-snap-table th {
+  border-color: var(--line);
+  top: 0;
+}
+
+.chain-snap-table td.muted {
+  color: var(--muted);
+}
+
 /* ==========================================================================
    控件
    ========================================================================== */
@@ -741,8 +987,20 @@ select {
 input:focus,
 select:focus {
   border-color: var(--accent);
-  outline: none;
   box-shadow: 0 0 0 3px var(--accent-soft);
+}
+
+/*
+ * 键盘焦点必须看得见。
+ *
+ * 上面那条 `input:focus` 的特异性高于全局 `:focus-visible`，原来它顺手写了
+ * `outline: none`——于是十几个输入框在键盘 Tab 过来时只剩一圈 12% 透明的光晕。
+ * 这里把轮廓补回来（鼠标点击不触发 `:focus-visible`，不会影响观感）。
+ */
+input:focus-visible,
+select:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
 }
 
 input:disabled,

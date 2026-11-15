@@ -62,10 +62,73 @@
   标的被钉死、整个同步停摆都只写日志，目标机上实测静默过一次 5 小时 55 分。
   因此列默认值与**存量行都补勾**（照 `016` / `018` 的做法）：
   不补勾的话，升级之后这两条推送会**一声不吭地不发生**。
+- `sql/023_trend_decision_source.sql` — 决策来源多一个 `llm-trend`
+  （`risk_bracket.decision_source` 扩枚举）：v1.1.0 的趋势档位决策里，模型看到的是
+  **完整趋势上下文**而不是只有收益率数列，两种来源**必须能分开查**——
+  「模型当时看到了什么」正是事后复盘要回答的第一个问题。
+  ⚠️ **扩枚举**：旧值一个不少、约束名也不改（AGENTS.md §5 第 12 条）。
+  同一次迁移把「LLM 决策的数必须齐全」那条联合约束**同时管住两种模型来源**。
+- `db/executor-status.ts` — 止盈止损服务（executor）自己的状态行（2026-11-06，迁移
+  `024_executor_status`）。**「进程活着」与「服务能用」分成两组列**：
+  `last_beat` 由独立于业务动作的定时器刷新（私有接口全挂时心跳照跳），
+  `private_api_ok` / `last_private_ok_at` / `last_error_code` / `last_error_message`
+  记的是**最近一次私有接口调用的结果**。合成一个「在线」就是骗人——2026-10-31 到
+  11-06 那 6 天静默，页面显示的就是一个会骗人的界面。
+  读侧 `readExecutorStatus()` 判三态（`running` / `stale` / `stopped`），
+  与 `daemon_heartbeat` 同一套语义：**行不存在 = 确切地「没在跑」**。
+- `sql/024_executor_status.sql` — `executor_status`（单行表，按 exchange 一行）。
+- `sql/025_executor_notify.sql` — 「要通知哪些内容」多**一种**：「止盈止损服务不可用」
+  （`notify_settings.kinds` 扩枚举）。
+  ⚠️ **扩枚举**：旧值一个不少、约束名也不改（AGENTS.md §5 第 12 条）。
+  与 `020` 相反，这一种是**默认勾上**的：私有接口一挂，executor 既挂不出单、
+  也跑不出对账——**连告警的原料都没有**，不补勾就等于默认不发。
+  因此列默认值与**存量行都补勾**（照 `016` / `018` / `022` 的做法）。
+- `bsc-v3.ts` — 链上（BSC）**只读**访问（v1.2.0）：纯 TS 的 keccak256、JSON-RPC 客户端
+  与 PancakeSwap V3 仓位的链上事实。
+  ⚠️ **keccak 自己实现的理由**：Node 的 `crypto` 只有 **NIST 的 sha3-256**，
+  填充规则与 Ethereum 用的原始 Keccak 不同，算出来的函数选择器全错，
+  而且**错得很安静**（调用返回空数据，不报错）。
+  ⚠️ **判据只能是公开常量**：2026-11-11 实测踩到 ρ/π 步骤的两个下标写反，
+  哈希照样能算出一串 32 字节、不报任何错，但选择器全错
+  （`positions(uint256)` 算成 `0xeb778fda`，正确的是 `0x99fbab88`）。
+  判据见 `tests/bsc-v3.test.ts`（keccak256("") / keccak256("abc") 的标准值）。
+  链上事实**互相校验**：仓位管理器的 `positions(uint256)` 与池子的 `positions(bytes32)`
+  两处流动性对不上就抛错；池子查不到（key 算错）也抛错——**不能当成「仓位没了」**。
+- `db/chain-position.ts` — 链上仓位的登记 / 采样 / 告警记录（v1.2.0，迁移
+  `026_chain_position`）。金额列用 `numeric`（18 位小数的代币数量是 1e18 量级，
+  `double precision` 装不下），价格与盈亏用 `double precision`。
+  ⚠️ **「上一轮的流动性」与「这一轮的」是两件事**：前者是滚动状态列 `last_liquidity`，
+  后者在采样表里。2026-11-11 实测踩过：列表查询写成 `s.liquidity AS last_liquidity`
+  **撞上了表里同名的列**，后出现的把前一个盖掉 → 「上一轮的值」永远是「这一轮的值」，
+  **加减仓与清空都检测不出来**，而且一声不响。两个数必须能同时读出来。
+- `sql/026_chain_position.sql` — 链上仓位的三张表：`chain_position`（配置 + 滚动状态）、
+  `chain_position_snapshot`（每次采样）、`chain_position_alert`（推过什么、推没推出去）。
+- `sql/027_chain_notify.sql` — 「要通知哪些内容」多**一种**：「链上仓位异动」
+  （`notify_settings.kinds` 扩枚举）。
+  ⚠️ **扩枚举**：旧值一个不少、约束名也不改（AGENTS.md §5 第 12 条）。
+  列默认值与**存量行都补勾**（照 `016` / `018` / `022` / `025` 的做法）：
+  控制面存的是**一份勾选清单**，新增种类时清单不会自动多出这一项，
+  不补勾的话监控会「判定该推、通道按没勾静默跳过」——一条也发不出去。
+  ⚠️ 两种提示词镜像**不补**：它们默认不勾（带着行情与账户权益）。
 - `market.ts` — 控制面唯一需要认识的东西：调 Python 干活 + 查 PG 看状态，收敛成结构化输入输出。
   `loadAgentContext()` 是 v1.0.0 的入口：调 Python 的 `market-context` 子命令，
   再读库内 `contract_spec` 快照，拼成 `ContractFacts` 交给 core 的
   `buildAnalystContext` 做纯映射。
+- `binance-private.ts` — 私有 REST（签名、查仓、挂撤条件单）与**用户数据流**。
+  `isPrivateApiUnusableError()` 判定「这个错误是不是意味着**整条私有接口**不可用」
+  （鉴权被拒 `-2015`、key 坏了 `-2014`、时钟越界 `-1021`、签名不对 `-1022`、
+  以及连都连不上的网络错误），与**业务失败**（余额不足 `-2019`、参数非法 `-1100`）
+  严格分开：后者是这一笔的问题，接口本身好得很。判据只有这一份实现，
+  用它的是 `apps/executor/src/health.ts`（「止盈止损服务不可用」那条告警）。
+  ⚠️ **用户数据流的重连纪律在这里**（AGENTS.md §6.3.1 规则 7）：Node 的 `WebSocket`
+  在代理掐断隧道时可能**只派发 `error`、不派发 `close`**，重连若只挂在 `onClose` 上，
+  那个 `await` 就永远不返回——进程活着、日志干净，但一个成交事件都收不到，
+  新开的仓从此裸奔（2026-10-26 实测：裸仓持续 24 小时）。
+  所以**连接级失败（`error`、keepalive 失败）一律关掉 socket 并回调 `onClose`**，
+  由调用方统一重连；单条**消息**处理失败则不拆连接。`onClose` 只通知一次。
+  错误信息必须显式取 `ErrorEvent` 的 `message` / `error.message`——
+  `JSON.stringify(event)` 得到的是 `{}`，断因全丢。
+  判据只有这一份实现，用例在 `tests/user-data-stream.test.ts`。
 - `bridge.ts` — `python -m quant_data` 子进程调用。**只传控制信息**，不传数据。
 - `provider.ts` / `cache.ts` — 既有离线合成链路（`source: 'synthetic'`），行为未变。
 

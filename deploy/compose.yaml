@@ -71,6 +71,9 @@ services:
       # 「页面上改的配置和 /data 里的文件对不上」。
       - ./config/trade-tool.config.json:/data/trade-tool.config.json:ro
     command: ['node', '/app/apps/web/dist/main.js']
+    # 存活探针：只证明进程还在响应，**不查库、不查 schema**。
+    # 别把它当成就绪探针——PG 抖动时重启容器治不了数据库，
+    # 只会把「控制面暂时读不到数据」升级成「控制面一直在重启」。
     healthcheck:
       test:
         [

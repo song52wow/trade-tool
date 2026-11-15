@@ -34,9 +34,11 @@ import { RECONCILE_KIND_INFO, RECONCILE_KINDS } from './reconcile.js';
  *     「这一轮走完了」。
  *   * **同步器自己的故障**（`sync-symbol-error` / `sync-stopped`）——「这个标的不动了」
  *     「整个同步停摆了」。
+ *   * **止盈止损服务自己的故障**（`executor-unavailable`）——「它连不上交易所了」。
  *
- * 最后那两种是 2026-10-25 补上的：同步器此前**一个通知出口都没有**，
- * 标的连续失败被钉死、整个同步停摆，统统只写一行日志——而日志没人盯着。
+ * 最后那三种是 2026-10-25 与 2026-11-06 补上的：同步器此前**一个通知出口都没有**，
+ * 标的连续失败被钉死、整个同步停摆，统统只写一行日志——而日志没人盯着；
+ * executor 同理：私有接口一挂，它既挂不出单、也跑不出对账，于是**连告警的原料都没有**。
  * 那种「最贵的故障不是报错，是没人知道」正是这一层存在的理由（见文件头）。
  *
  * 合成一份而不是两套机制：用户在一个列表里勾，页面也只有一份清单可显示。
@@ -55,6 +57,8 @@ export const NOTIFY_KINDS = [
   'decision-prompt',
   'sync-symbol-error',
   'sync-stopped',
+  'executor-unavailable',
+  'chain-position-alert',
 ] as const;
 
 export type NotifyKind = (typeof NOTIFY_KINDS)[number];
@@ -152,6 +156,14 @@ export const NOTIFY_KIND_INFO: Record<NotifyKind, { label: string; hint: string 
   'sync-stopped': {
     label: '同步停摆',
     hint: '所有在跑的标的都卡住了，同步不再前进——进程可能还活着，但一条数据都没进（附卡住的标的）',
+  },
+  'executor-unavailable': {
+    label: '止盈止损服务不可用',
+    hint: '止盈止损服务连不上交易所私有接口（或它已经不在跑）——它挂不出单，也查不出仓位有没有保护（附最后一条错误）',
+  },
+  'chain-position-alert': {
+    label: '链上仓位异动',
+    hint: '链上那笔流动性仓位的价格/盈亏变了、有人加仓或减仓、或价格出了设定区间（附现价、当前价值与浮动盈亏）',
   },
 };
 

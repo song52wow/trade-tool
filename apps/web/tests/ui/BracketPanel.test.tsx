@@ -4,7 +4,7 @@
 //   * failed 被 limit 截掉时仍要显式提醒——仓位有、但没有保护单是最该被看见的一种；
 //   * 只挂上止盈单（单号不成对）必须标红，不能和「成交后被交易所撤单」显示得一样。
 import './setup.js';
-import { cleanup, render, screen, waitFor } from '@testing-library/react';
+import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { BracketPanel } from '../../ui/src/components/BracketPanel';
@@ -127,5 +127,42 @@ describe('BracketPanel', () => {
     await waitFor(() => {
       expect(screen.getByText(/读取止盈止损记录失败/)).toBeTruthy();
     });
+  });
+
+  it('「拒绝补挂」显眼地显示出来（它与「不需要补挂」是两回事）', async () => {
+    // 第一次调用是列表，第二次是补挂（试算）：服务端说「不敢补」。
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.includes('/reattach')) {
+        return new Response(
+          JSON.stringify({
+            symbol: 'AAAUSDT',
+            placed: 0,
+            dryRun: true,
+            details: [],
+            skips: [],
+            refusal: 'AAAUSDT 的仓位数量与本地记录对不上：不敢补挂',
+            tp1FillRecorded: null,
+          }),
+          { headers: { 'content-type': 'application/json' } },
+        );
+      }
+      return new Response(JSON.stringify(payload()), {
+        headers: { 'content-type': 'application/json' },
+      });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    render(<BracketPanel symbol="AAAUSDT" tick={0} />);
+
+    await waitFor(() => {
+      expect(screen.getByText(/还没有买入成交/)).toBeTruthy();
+    });
+    fireEvent.click(screen.getByText('补挂止盈止损'));
+
+    await waitFor(() => {
+      expect(screen.getByText(/不敢补挂/)).toBeTruthy();
+    });
+    // 而且它**不能**被显示成「仓位有保护，不需要补挂」——那是两回事。
+    expect(screen.queryByText(/不需要补挂/)).toBeNull();
   });
 });

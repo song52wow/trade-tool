@@ -1,23 +1,36 @@
 import { useSyncExternalStore } from 'react';
 
 /**
- * hash 路由（不引入 react-router：仓库没有这个依赖，也不该为一个三页的控制面新增它）。
+ * hash 路由（不引入 react-router：仓库没有这个依赖，也不该为一个控制面新增它）。
  *
- * 三条路由：
- *   `#/`              首页（概览 / 标的集合 / 作业）
- *   `#/symbol/<CODE>` 单标的详情
- *   `#/settings`      运行期设置（凭据 + 止盈止损策略）
+ * 五条路由：
+ *   `#/`                 首页（概览 / 标的集合 / 作业）
+ *   `#/symbol/<CODE>`    单标的详情
+ *   `#/settings`         运行期设置（凭据 + 止盈止损策略）
+ *   `#/chain`            链上仓位**列表**（卡片）
+ *   `#/chain/<KEY>`      某一笔链上仓位的**详情**
  *
  * 走 hash 而不是 history API 的理由很实际：详情页要能被**收藏与分享**（复制地址栏就能
  * 回到同一个标的），而刷新后必须停在当前路由。hash 两条都天然满足，不需要服务端配合。
  */
-export type Route = { kind: 'home' } | { kind: 'symbol'; symbol: string } | { kind: 'settings' };
+export type Route =
+  | { kind: 'home' }
+  | { kind: 'symbol'; symbol: string }
+  | { kind: 'settings' }
+  | { kind: 'chain' }
+  | { kind: 'chain-detail'; positionKey: string };
 
 export const HOME_PATH = '#/';
 export const SETTINGS_PATH = '#/settings';
+export const CHAIN_PATH = '#/chain';
 
 export function symbolPath(symbol: string): string {
   return `#/symbol/${encodeURIComponent(symbol)}`;
+}
+
+/** 某一笔链上仓位的详情页。仓位键是十六进制，编码一下更稳。 */
+export function chainPath(positionKey: string): string {
+  return `#/chain/${encodeURIComponent(positionKey)}`;
 }
 
 /**
@@ -30,6 +43,15 @@ export function parseRoute(hash: string): Route {
   const parts = path.split('/').filter((p) => p !== '');
   if (parts.length === 0) return { kind: 'home' };
   if (parts[0] === 'settings' && parts.length === 1) return { kind: 'settings' };
+  if (parts[0] === 'chain' && parts.length === 1) return { kind: 'chain' };
+  if (parts[0] === 'chain' && parts.length === 2) {
+    try {
+      const positionKey = decodeURIComponent(parts[1] ?? '');
+      return positionKey === '' ? { kind: 'home' } : { kind: 'chain-detail', positionKey };
+    } catch {
+      return { kind: 'home' };
+    }
+  }
   if (parts[0] === 'symbol' && parts.length === 2) {
     try {
       const symbol = decodeURIComponent(parts[1] ?? '');

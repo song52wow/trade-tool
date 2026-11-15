@@ -170,6 +170,51 @@ describe('startPeriodicReconcile', () => {
     expect(() => periodic.stop()).not.toThrow();
   });
 
+  it('上一轮还没跑完时跳过这一轮（不并发写同一份快照）', async () => {
+    // 回归用例：对账要出网，网络慢于间隔时两轮会并发——两轮都写快照，
+    // 页面看到的是「哪轮先跑完」的随机结果，权重还被白花一倍。
+    let calls = 0;
+    let release: (() => void) | undefined;
+    const slow = {
+      positionRisk: (): Promise<never[]> => {
+        calls += 1;
+        return new Promise<never[]>((resolve) => {
+          release = () => resolve([]);
+        });
+      },
+      openAlgoOrders: (): Promise<never[]> => Promise.resolve([]),
+    } as unknown as BinancePrivateClient;
+
+    const timers: { fn: () => void }[] = [];
+    const periodic = startPeriodicReconcile({
+      pool: fakePool().pool,
+      client: slow,
+      config: configWith(60_000),
+      setIntervalImpl: ((fn: () => void) => {
+        timers.push({ fn });
+        return 0 as unknown as NodeJS.Timeout;
+      }) as never,
+      clearIntervalImpl: (() => undefined) as never,
+    });
+
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(calls).toBe(1);
+
+    // 第一轮还挂着，这一轮必须被跳过。
+    timers[0]?.fn();
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(calls).toBe(1);
+
+    // 放行第一轮之后，下一轮照常跑。
+    release?.();
+    await new Promise((resolve) => setImmediate(resolve));
+    timers[0]?.fn();
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(calls).toBe(2);
+
+    periodic.stop();
+  });
+
   it('周期里的一轮失败不影响下一轮继续跑', async () => {
     const calls = { count: 0 };
     const timers: { fn: () => void }[] = [];

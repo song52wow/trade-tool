@@ -10,12 +10,15 @@ import {
   SyncError,
   describeClockSkew,
   type AlertChannel,
+  type AnalystContext,
   type Credentials,
 } from '@trade-tool/core';
 import {
   BinancePrivateClient,
+  EXECUTOR_HEARTBEAT_INTERVAL_MS,
   buildContext,
   createPool,
+  deleteExecutorStatus,
   listUnsettledBrackets,
   openUserDataStream,
   parseAccountUpdate,
@@ -26,6 +29,7 @@ import {
   exchangeEndpointsFromEnv,
   createLlmClient,
   createPromptMirror,
+  loadAgentContext,
   readBars,
 } from '@trade-tool/data';
 
@@ -33,6 +37,7 @@ import type { Pool } from '@trade-tool/data';
 
 import { createAtrProvider } from './atr.js';
 import { createRiskDecider } from './decision.js';
+import { ExecutorHealthMonitor, HEALTH_REPORT_INTERVAL_MS } from './health.js';
 import {
   createPlanExecutor,
   resolveAgentPlanDecision,
@@ -59,6 +64,22 @@ let trailTimer: { stop(): void } | undefined;
  * 它会下真实订单，退出时还在跑就意味着「进程要退了但单还在下」。
  */
 let planTimer: PlanExecutionTimer | undefined;
+/**
+ * 状态心跳与健康汇报的定时器（2026-11-06）。
+ *
+ * 为什么要它们：私有接口全挂时，进程**照样活着**、日志也照样有内容，
+ * 而「止盈止损已经瞎了」这件事没有出口——于是 10-31 到 11-06 那 6 天
+ * 一条消息都没发出去（见 `src/health.ts` 的文件头）。
+ *
+ * 心跳与告警是**两个**定时器：心跳只写一行状态（便宜、频繁），
+ * 告警要走飞书（有网络、有冷却，不能太频繁）。
+ */
+let healthTimer: NodeJS.Timeout | undefined;
+/**
+ * 健康汇报的定时器（2026-11-06）。与心跳分开：
+ * 心跳只写一行状态（10 秒一次），汇报要走飞书（60 秒一次）。
+ */
+let healthReportTimer: NodeJS.Timeout | undefined;
 
 /**
  * 凭据解析：走 `resolveActiveCredentials()`（**库里优先、环境变量兜底**）。
@@ -106,6 +127,18 @@ function createSerialRunner(): (key: string, task: () => Promise<unknown>) => Pr
     });
     return next;
   };
+}
+
+/** 停掉状态心跳与健康汇报的定时器。退出时必须调，否则进程挂着不退出。 */
+function stopHealthTimers(): void {
+  if (healthTimer !== undefined) {
+    clearInterval(healthTimer);
+    healthTimer = undefined;
+  }
+  if (healthReportTimer !== undefined) {
+    clearInterval(healthReportTimer);
+    healthReportTimer = undefined;
+  }
 }
 
 async function main(): Promise<void> {
@@ -185,6 +218,22 @@ async function main(): Promise<void> {
     ...exchangeEndpointsFromEnv(config.executor),
     recvWindowMs: config.executor.recvWindowMs,
   });
+
+  /**
+   * 健康监控（2026-11-06）：私有接口通不通、有没有人在跑。
+   *
+   * 它存在的理由是 2026-11-06 在目标机上实测到的那 6 天静默：
+   * 私有接口被拒 → 挂不出单、跑不出对账 → **连告警的原料都没有**。
+   *
+   * 与对账**共用同一个派发器**：去重与冷却的记账因此是同一份，
+   * 不会出现「同一件事，对账那边压住了、这边又推一遍」。
+   */
+  const health = new ExecutorHealthMonitor({
+    pool,
+    exchange: ctx.exchange,
+    alerts,
+  });
+
   // **先校时钟再做任何私有调用**：本机时钟与交易所差几百毫秒就会让每个签名请求
   // 吃 -1021（挂单、撤单、对账全在里面）。测量走的是无签名的 /fapi/v1/time，
   // 所以时钟不准时它仍然可用。补偿量必须打出来，不可见的补偿等于没补偿。
@@ -226,6 +275,13 @@ async function main(): Promise<void> {
         `${config.executor.llm.fallbackToPolicy ? '失败降级到配置档位' : '失败不挂单'}）`,
     );
   }
+  if (config.executor.trend.enabled) {
+    console.error(
+      `[executor] 趋势分析已开启：${config.executor.trend.interval} 周期 / ` +
+        `${String(config.executor.trend.bars)} 根 K 线` +
+        '（模型定档位时会看到均线、指标、情绪面与程序算好的客观倾向）',
+    );
+  }
 
   /**
    * 读近期 K 线的收益率（喂给模型看走势）。
@@ -251,6 +307,27 @@ async function main(): Promise<void> {
     }
     return returns;
   }
+
+  /**
+   * 行情上下文（v1.1.0）：给止盈止损的档位决策提供**趋势线索**。
+   *
+   * 走的是**和 Agent 完全同一条**取数路径（Python 现算技术面 + 情绪面），
+   * 因此模型看到的技术面与分析师看到的技术面**逐字相同**——
+   * 判据只有一份实现（AGENTS.md §5 第 5 条）。
+   *
+   * 取不到时**抛错**而不是返回空：这个错误会被 `service.ts` 记成一条 warn，
+   * 并让这一笔降级到「只有收益率数列」的提示词。静默返回一个空上下文，
+   * 模型就会在「以为自己看到了趋势」的情况下给档位。
+   */
+  async function loadMarketContext(symbol: string): Promise<AnalystContext> {
+    const bundle = await loadAgentContext(ctx, {
+      symbol,
+      interval: config.executor.trend.interval,
+      bars: config.executor.trend.bars,
+    });
+    return bundle.context;
+  }
+
   // 策略按标的解析：标的覆盖 > 全局默认 > 配置文件。优先级只有 resolvePolicy 一份实现，
   // 控制面预览与这里用的是同一个函数，避免「页面显示的」和「实际挂单的」分叉。
   const tracker = new NetPositionTracker();
@@ -268,6 +345,8 @@ async function main(): Promise<void> {
   async function seedNetPositions(): Promise<void> {
     try {
       const rows = await client.positionRisk();
+      // 私有接口这一下是通的：记一笔（连不上时它就是最早的信号之一）。
+      await health.markPrivateApiSuccess();
       // 双向持仓模式（同标的有 LONG / SHORT 两行）直接拒绝：两行相消得到 0，
       // 会把「仍有仓位」误判成「已平仓」，进而把未终结记录收敛成 cancelled。
       const bySymbol = new Map<string, typeof rows>();
@@ -310,6 +389,9 @@ async function main(): Promise<void> {
       tracker.reset();
       console.error(`[executor] 净仓位播种失败：${(error as Error).message}`);
       console.error('[executor] 暂按空仓起算——在播种成功前，本服务判定的开仓 / 减仓可能是错的');
+      // 私有接口连不上（鉴权被拒 / 时钟越界 / 连都连不上）——记一笔，
+      // 持续下去就会推「止盈止损服务不可用」（见 src/health.ts）。
+      await health.markPrivateApiFailure(error);
     }
   }
 
@@ -330,6 +412,9 @@ async function main(): Promise<void> {
     // 行为与 v0.9.0 之前逐字一致。
     ...(decider === undefined ? {} : { decider }),
     readRecentReturns,
+    // 趋势上下文（v1.1.0）。只有 `executor.trend.enabled` 打开时才接上——
+    // 关着时 `service.ts` 整段跳过，行为与 v1.1.0 之前逐字一致。
+    ...(config.executor.trend.enabled ? { loadMarketContext } : {}),
     // Agent 方案（v1.0.0）。这笔单是**按批准的方案**下的时，
     // 止损止盈用方案里的 ATR 倍数，而不是配置档位——
     // 让人批准的数和实际挂单的数必须是同一个。
@@ -343,11 +428,47 @@ async function main(): Promise<void> {
   await seedNetPositions();
 
   // 自动对账与用户数据流**并行**：它跑得慢或挂掉都不影响挂单（见 reconcile.ts）。
-  reconcileTimer = startPeriodicReconcile({ pool, client, config, alerts });
+  reconcileTimer = startPeriodicReconcile({
+    pool,
+    client,
+    config,
+    alerts,
+    // 对账是 executor 唯一主动读私有侧的动作——它的成败直接说明
+    // 「私有接口通不通」，于是「止盈止损已经瞎了」这件事有了出口。
+    onPrivateApiOutcome: (outcome) => {
+      if (outcome.ok) {
+        void health.markPrivateApiSuccess();
+      } else {
+        void health.markPrivateApiFailure(outcome.error);
+      }
+    },
+  });
 
   // 移动止损定时器与对账定时器**必须分开**（v0.7.0 / AGENTS.md §6.8）：对账是只读的，
   // 而移动止损要下单，合并会让「对账绝不动手」这条保证失守。
   trailTimer = startTrailingTimer(service, config.executor.trailIntervalMs);
+
+  /**
+   * 状态心跳与健康汇报（2026-11-06）。
+   *
+   * 为什么要有：私有接口全挂时，进程**照样活着**、日志也照样有内容，
+   * 而「止盈止损已经瞎了」这件事此前**没有任何出口**——
+   * 于是 2026-10-31 到 11-06 那 6 天里一条消息都没发出来，
+   * 交易所上那个仓位一直是裸的（见 `src/health.ts` 的文件头）。
+   *
+   * 心跳与业务动作**分开**：私有接口全挂时心跳照跳，
+   * 于是控制面能看出「进程活着，但服务不能用」——这正是要显示的两件事。
+   */
+  healthTimer = setInterval(() => {
+    void health.beat();
+  }, EXECUTOR_HEARTBEAT_INTERVAL_MS);
+  healthTimer.unref?.();
+  healthReportTimer = setInterval(() => {
+    void health.report();
+  }, HEALTH_REPORT_INTERVAL_MS);
+  healthReportTimer.unref?.();
+  // 启动时先写一行：控制面立刻能看到「它起来了」，而不是等第一个心跳周期。
+  await health.beat();
 
   /**
    * 自动下单（v1.0.0）。**默认关闭**：`agent.execute.enabled` 缺省 false，
@@ -419,6 +540,8 @@ async function main(): Promise<void> {
         }
       }
       const listenKey = await client.createListenKey();
+      // 私有接口通了（拿到 listenKey 就证明鉴权与网络都通）。
+      await health.markPrivateApiSuccess();
       lastListenKey = listenKey;
       delay = config.executor.reconnectBaseMs;
       console.error(`用户数据流已连接（listenKey ${listenKey.slice(0, 6)}…）`);
@@ -462,6 +585,9 @@ async function main(): Promise<void> {
       closeStream = undefined;
     } catch (error) {
       console.error(`[executor] 用户数据流不可用：${(error as Error).message}`);
+      // 私有接口不可用（鉴权被拒 / 时钟越界 / 连都连不上）——记一笔。
+      // 持续下去就会推「止盈止损服务不可用」（见 src/health.ts）。
+      await health.markPrivateApiFailure(error);
     }
 
     if (stopRequested) break;
@@ -477,6 +603,14 @@ async function main(): Promise<void> {
   reconcileTimer?.stop();
   trailTimer?.stop();
   planTimer?.stop();
+  stopHealthTimers();
+  // 优雅退出时删掉状态行：「行不存在」就是**确切**的「没在跑」，
+  // 而不是「还得靠心跳年龄猜」（与 daemon_heartbeat 同一套语义）。
+  await deleteExecutorStatus(pool, ctx.exchange).catch((error: unknown) => {
+    console.error(
+      `[executor] 删除状态行失败：${error instanceof Error ? error.message : String(error)}`,
+    );
+  });
   await pool.end().catch(() => undefined);
 }
 
@@ -489,6 +623,7 @@ for (const signal of ['SIGINT', 'SIGTERM'] as const) {
     reconcileTimer?.stop();
     trailTimer?.stop();
     planTimer?.stop();
+    stopHealthTimers();
   });
 }
 

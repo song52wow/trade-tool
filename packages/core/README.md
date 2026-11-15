@@ -23,6 +23,7 @@
 | `reconcile.ts`          | 交易对账判据（纯函数，只报告不动手）+ 差异类型清单与中文名                                                        |
 | `risk-ids.ts`           | 条件单编号约定 + `orderType` 归类（对账与下单共用一份）＋ Agent 进场单号（`agentEntryClientOrderId`，带尝试次数） |
 | `risk-policy.ts`        | 止盈止损策略的纯函数（`deriveBracketPlan`、`deriveStagedPlan` 等）                                                |
+| `risk-reattach.ts`      | 手动补挂止盈止损的判据（v1.3.0，纯函数）：该补哪张单、什么情况下不许补 ＋ `detectTp1Fill`（第一段止盈是否已成交） |
 | `secret.ts`             | 凭据静态加密（AES-256-GCM）＋ 模型密钥的加解密（`sealAgentLlmKey`）                                               |
 | `clock-skew.ts`         | 进程启动时测量与交易所的时钟偏移                                                                                  |
 

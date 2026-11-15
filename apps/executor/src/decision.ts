@@ -45,6 +45,7 @@
 import {
   SyncError,
   buildDecisionPrompt,
+  buildTrendDecisionPrompt,
   clampLlmDecision,
   createLogger,
   mergeDecisionIntoPolicy,
@@ -55,6 +56,7 @@ import {
   type DecisionSource,
   type LlmDecision,
   type LlmConfig,
+  type TrendDecisionContext,
 } from '@trade-tool/core';
 import type { LlmClient, PromptMirrorInput } from '@trade-tool/data';
 
@@ -88,6 +90,16 @@ export interface DecideInput {
   baseline: LlmDecision;
   /** 最近若干根 K 线的收益率（百分比数）。 */
   recentReturns: readonly number[];
+  /**
+   * 趋势上下文（v1.1.0）。
+   *
+   * **给了就用它**：提示词换成趋势版（带均线、指标、情绪面、客观倾向），
+   * 决策来源记为 `'llm-trend'`。
+   *
+   * **不给就用 v0.9.0 的老提示词**（只有 ATR 与收益率数列），来源记为 `'llm'`。
+   * 两种来源**分开记**，因为「模型当时看到了什么」正是事后复盘要回答的第一个问题。
+   */
+  trend?: TrendDecisionContext;
 }
 
 /** 决策的结果。 */
@@ -179,7 +191,15 @@ export function createRiskDecider(options: CreateDeciderOptions): RiskDecider {
         ...(atrPercentOfPrice !== undefined ? { atrPercentOfPrice } : {}),
         baseline: input.baseline,
       };
-      const prompt = buildDecisionPrompt(promptContext);
+      // 趋势上下文（v1.1.0）给了就用趋势版提示词：模型看到的是均线、指标、
+      // 情绪面与**程序算好的客观倾向**，而不是一串收益率。
+      //
+      // 两种提示词喂给模型的是**两批不同的输入**，所以决策来源也分开记
+      // （`'llm-trend'` vs `'llm'`）：事后复盘要能回答「模型当时看到了什么」。
+      const prompt =
+        input.trend === undefined
+          ? buildDecisionPrompt(promptContext)
+          : buildTrendDecisionPrompt(input.trend);
       // **同一个数组**既用来调模型、也用来镜像——群里那条与模型看见的逐字相同。
       const messages: AgentPromptMessage[] = [
         {
@@ -234,14 +254,15 @@ export function createRiskDecider(options: CreateDeciderOptions): RiskDecider {
       const decision = clampLlmDecision(parsed.decision);
 
       log.info(
-        `${input.symbol} LLM 决策已采纳：止损 ${String(decision.stopAtrMult)}×ATR / ` +
+        `${input.symbol} LLM 决策已采纳（${input.trend === undefined ? '仅收益率数列' : '趋势上下文'}）：` +
+          `止损 ${String(decision.stopAtrMult)}×ATR / ` +
           `止盈 ${String(decision.takeProfitAtrMult)}×ATR` +
           (parsed.rationale === undefined ? '' : `（${parsed.rationale}）`),
       );
 
       return {
         decision,
-        source: 'llm',
+        source: input.trend === undefined ? 'llm' : 'llm-trend',
         refuse: false,
         ...(parsed.rationale === undefined ? {} : { rationale: parsed.rationale }),
         raw,
@@ -288,9 +309,18 @@ function fallback(
  * 否则「人批准的那份方案」挂出去的止损价与方案页面上写的不一样——
  * 而方案是**人看过才批准**的，它比配置档位更该说话。
  *
+ * **`llm-trend` 也走这条路**（v1.1.0）：它是模型给的档位，与 `llm` 同性质——
+ * 只是模型看到的是趋势上下文而不是收益率数列。
+ *
  * `config` 与 `config-fallback` 不覆盖：它们本来就是策略本身。
  */
 export function applyDecision<T extends LlmDecision>(policy: T, outcome: DecideOutput): T {
-  if (outcome.source !== 'llm' && outcome.source !== 'agent-plan') return policy;
+  if (
+    outcome.source !== 'llm' &&
+    outcome.source !== 'llm-trend' &&
+    outcome.source !== 'agent-plan'
+  ) {
+    return policy;
+  }
   return mergeDecisionIntoPolicy(policy, outcome.decision);
 }

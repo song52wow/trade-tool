@@ -18,6 +18,7 @@ import {
 } from './commands/data.js';
 import { runDbStatus, runMigrate } from './commands/db.js';
 import { runReconcile } from './commands/reconcile.js';
+import { runReattach } from './commands/risk.js';
 import { runSyncStatus } from './commands/sync.js';
 import { collectDiagnostics } from './doctor.js';
 
@@ -310,6 +311,20 @@ program
   .option('--json', '输出 JSON')
   .action(async (options: { symbol?: string; json?: boolean }) => {
     process.exitCode = await runReconcile(options).catch((error: unknown) => {
+      fail(error);
+      return 1;
+    });
+  });
+
+const riskCmd = program.command('risk').description('止盈止损的人工干预（v1.3.0）');
+riskCmd
+  .command('reattach')
+  .description('手动补挂缺失的止盈止损（会真下单；先用 --dry-run 看清楚要挂什么）')
+  .requiredOption('-s, --symbol <symbol>', '要补挂的标的')
+  .option('--dry-run', '只算不挂：打印会挂出哪几张单、各多少钱')
+  .option('--json', '输出 JSON')
+  .action(async (options: { symbol: string; dryRun?: boolean; json?: boolean }) => {
+    process.exitCode = await runReattach(options).catch((error: unknown) => {
       fail(error);
       return 1;
     });

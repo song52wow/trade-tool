@@ -22,8 +22,17 @@ export function SymbolDetail(props: {
   /** 保存提示走同一套横幅，不在详情页另开一套。 */
   notify: (text: string, kind?: 'ok' | 'err') => void;
 }) {
-  const { state, contract, gaps, exchange, desiredState, inCollection, hasHistory, derived } =
-    props.detail;
+  const {
+    state,
+    contract,
+    gaps,
+    gapsTotal,
+    exchange,
+    desiredState,
+    inCollection,
+    hasHistory,
+    derived,
+  } = props.detail;
   return (
     <div>
       {/* K 线放在最上面：这个面板回答的第一个问题是「同步下来的数据长什么样」，
@@ -137,7 +146,17 @@ export function SymbolDetail(props: {
 
       <ReconcilePanel key={props.detail.symbol} symbol={props.detail.symbol} tick={props.tick} />
 
-      <h3 className="section-head">缺口清单（{gaps.length}）</h3>
+      <h3 className="section-head">
+        缺口清单（{gaps.length}
+        {gapsTotal > gaps.length ? ` / 共 ${fmtNumber(gapsTotal)}` : ''}）
+      </h3>
+      {gapsTotal > gaps.length ? (
+        // 列表被截断**必须说出来**：不然「只显示前 200 个」会被读成「只有 200 个」，
+        // 而「缺口不得静默存在」正是这条清单存在的理由（R-11.11）。
+        <p className="muted" style={{ fontSize: 12 }}>
+          只列出最近的 {fmtNumber(gaps.length)} 条，共 {fmtNumber(gapsTotal)} 条。
+        </p>
+      ) : null}
       {gaps.length === 0 ? (
         <p className="muted">没有登记中的缺口。</p>
       ) : (

@@ -98,24 +98,23 @@ export async function insertBars(
   times: readonly number[],
   overrides: Partial<{ close: number; quoteVolume: number | null; trades: number | null }> = {},
 ): Promise<void> {
-  for (const time of times) {
-    await pool.query(
-      `INSERT INTO klines_1m (symbol, time, open, high, low, close, volume, quote_volume, trades)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-       ON CONFLICT (symbol, time) DO NOTHING`,
-      [
-        symbol,
-        time,
-        1.5,
-        2.5,
-        0.5,
-        overrides.close ?? 2.0,
-        10.5,
-        'quoteVolume' in overrides ? overrides.quoteVolume : null,
-        'trades' in overrides ? overrides.trades : null,
-      ],
-    );
-  }
+  if (times.length === 0) return;
+  // **一条语句写完**：逐行 `INSERT` 是 N 次往返，构造 5000 根时就是 5000 次，
+  // 而这些用例本来就要跑一遍 27 个迁移（`aggregate-e2e` / `sync-integration` 的大头）。
+  // `unnest` 把它压成一次往返，行为不变（DO NOTHING 的幂等语义保留）。
+  await pool.query(
+    `INSERT INTO klines_1m (symbol, time, open, high, low, close, volume, quote_volume, trades)
+     SELECT $1, t, 1.5, 2.5, 0.5, $2, 10.5, $3, $4
+       FROM unnest($5::bigint[]) AS t
+     ON CONFLICT (symbol, time) DO NOTHING`,
+    [
+      symbol,
+      overrides.close ?? 2.0,
+      'quoteVolume' in overrides ? overrides.quoteVolume : null,
+      'trades' in overrides ? overrides.trades : null,
+      times,
+    ],
+  );
 }
 
 /** 连续 N 根 1m bar 的开盘时间序列，以 endOpen 为最后一根。 */

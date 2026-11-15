@@ -1,8 +1,16 @@
 export * from './types.js';
 export * from './market-sync.js';
 export * from './risk-policy.js';
+/** 链上（BSC / PancakeSwap V3）仓位的估值口径（v1.2.0）：纯函数，BigInt 记账。 */
+export * from './chain-v3.js';
+/** 链上仓位的告警判据（v1.2.0，纯函数）：该推的推，不该推的别刷屏。 */
+export * from './chain-alert.js';
+/** 链上仓位的外部链接（v1.2.0，纯函数）：区块浏览器与流动性平台，页面与告警共用一份。 */
+export * from './chain-links.js';
 /** LLM 决策的契约与纯函数（v0.9.0）：模型只输出倍数，价格仍由纯函数算。 */
 export * from './llm-decision.js';
+/** 趋势档位决策的契约与纯函数（v1.1.0）：手动挂单后，模型按趋势给止盈止损档位。 */
+export * from './trend-decision.js';
 /** LLM 接入配置的公共部分（v1.0.0）：executor.llm 与 agent.llm 共用一份定义。 */
 export * from './llm-endpoint.js';
 /** 分析师 Agent 的契约与纯函数（v1.0.0）：三面打分，立场由程序合成。 */
@@ -21,8 +29,12 @@ export * from './net-position.js';
 export * from './risk-ids.js';
 /** 交易对账判据（v0.6.0，纯函数，只报告不动手）。 */
 export * from './reconcile.js';
+/** 手动补挂止盈止损的判据（v1.3.0，纯函数）：该补什么、什么情况下不许补。 */
+export * from './risk-reattach.js';
 /** 通知层（v0.8.0，飞书自定义机器人 webhook + 告警去重/冷却）。 */
 export * from './notify.js';
+/** 止盈止损服务自己的健康状态（2026-11-06）：「活着」与「能用」分开记。 */
+export * from './executor-health.js';
 /** 盈亏口径（v0.8.0，一律用计价币算）。 */
 export * from './pnl.js';
 export * from './secret.js';

@@ -62,9 +62,14 @@ describe('seal / open_', () => {
 
   it('密文被篡改时认证标签校验失败', () => {
     const sealed = seal(Buffer.from('secret', 'utf8'), KEY_A);
+    // ⚠️ **必须保证这一字节真的变了**：直接把末字节写成 0x00 的话，
+    // 原始末字节恰好是 0 时（约 1/256 的概率）密文根本没被改过，
+    // 于是解密**成功**、这个用例随机失败（2026-11-06 实测踩到过一次）。
+    // 取反（XOR 0xFF）保证任何情况下都是真的篡改。
+    const last = sealed.ciphertext[sealed.ciphertext.length - 1] ?? 0;
     const tampered = {
       ...sealed,
-      ciphertext: Buffer.concat([sealed.ciphertext.subarray(0, -1), Buffer.from([0])]),
+      ciphertext: Buffer.concat([sealed.ciphertext.subarray(0, -1), Buffer.from([last ^ 0xff])]),
     };
     expect(() => open_(tampered, KEY_A)).toThrow(/解密失败/);
   });

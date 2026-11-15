@@ -458,15 +458,28 @@ export async function assertWatermarkConsistent(
 
 // ---------------------------------------------------------------------- gaps
 
-export async function listGaps(pool: Pool, symbol?: string): Promise<GapRecord[]> {
+/**
+ * 缺口清单。
+ *
+ * `limit` 是**控制面**用的闸门：缺口行数等于历史缺口数，一个被外部挖过很多洞的标的
+ * 能把整份详情响应撑成几 MB，而它挂在 5s 刷新节奏上。**列表可以截断，但总数不截断**
+ * ——调用方必须同时拿到 `pendingGapCount`，否则页面会把「只显示前 200 个」读成
+ * 「只有 200 个缺口」，那正是「缺口不得静默存在」要防的事（R-11.11）。
+ *
+ * CLI 与对账路径不传 `limit`：它们要的就是全量。
+ */
+export async function listGaps(pool: Pool, symbol?: string, limit?: number): Promise<GapRecord[]> {
   try {
+    const limitSql = limit === undefined ? '' : ' LIMIT ' + String(Math.max(0, Math.trunc(limit)));
     const result = symbol
       ? await pool.query<QueryResultRow>(
-          'SELECT symbol, gap_start, gap_end, missing_rows, attempts, last_attempt_at, last_error FROM gaps WHERE symbol = $1 ORDER BY gap_start ASC',
+          'SELECT symbol, gap_start, gap_end, missing_rows, attempts, last_attempt_at, last_error FROM gaps WHERE symbol = $1 ORDER BY gap_start ASC' +
+            limitSql,
           [symbol],
         )
       : await pool.query<QueryResultRow>(
-          'SELECT symbol, gap_start, gap_end, missing_rows, attempts, last_attempt_at, last_error FROM gaps ORDER BY symbol ASC, gap_start ASC',
+          'SELECT symbol, gap_start, gap_end, missing_rows, attempts, last_attempt_at, last_error FROM gaps ORDER BY symbol ASC, gap_start ASC' +
+            limitSql,
         );
     return result.rows.map((row) => ({
       symbol: str(row['symbol']),

@@ -40,6 +40,20 @@ export const overviewFixture: OverviewDto = {
     ageMs: 2_000,
     staleAfterMs: 60_000,
   },
+  // 止盈止损服务：默认给「运行中且私有接口可用」，
+  // 让与它无关的用例不被新横幅影响（用例自己会改这一行来验横幅）。
+  executor: {
+    state: 'running',
+    pid: 4243,
+    startedAt: NOW - 60_000,
+    lastBeatAt: NOW - 2_000,
+    ageMs: 2_000,
+    staleAfterMs: 60_000,
+    privateApiOk: true,
+    lastPrivateOkAt: NOW - 1_000,
+    lastErrorCode: null,
+    lastErrorMessage: null,
+  },
   jobs: { active: 0, recent: [] },
   now: NOW,
 };

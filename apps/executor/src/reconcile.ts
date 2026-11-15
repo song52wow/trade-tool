@@ -26,6 +26,7 @@ import {
 } from '@trade-tool/data';
 
 import { buildReconcileAlert } from './alert.js';
+import { startPeriodicTask } from './periodic.js';
 
 const log = createLogger('reconcile');
 
@@ -43,6 +44,15 @@ export interface PeriodicReconcileDeps {
    * 推一条消息不改任何账本，也不碰交易所。
    */
   alerts?: AlertDispatcher;
+  /**
+   * 私有接口这一轮的结果。**可选**。
+   *
+   * 对账是 executor 唯一会**主动**读交易所私有侧的动作，因此它是
+   * 「私有接口还通不通」最直接的探针：它挂了，止盈止损既挂不出单、
+   * 也查不出仓位有没有保护（2026-11-06 在目标机上实测：私有接口被拒后，
+   * 对账一轮都跑不出来，于是连「仓位没有保护」这条告警都发不出去）。
+   */
+  onPrivateApiOutcome?: (outcome: { ok: true } | { ok: false; error: unknown }) => void;
 }
 
 /**
@@ -62,10 +72,12 @@ export async function runOnce(deps: PeriodicReconcileDeps): Promise<ReconcileRep
       exchange: deps.config.market.exchange,
       now,
     });
+    deps.onPrivateApiOutcome?.({ ok: true });
   } catch (error) {
     log.error(
       `对账本轮失败（不影响挂单）：${error instanceof Error ? error.message : String(error)}`,
     );
+    deps.onPrivateApiOutcome?.({ ok: false, error });
     return null;
   }
 
@@ -157,22 +169,19 @@ export function startPeriodicReconcile(deps: PeriodicReconcileDeps): PeriodicRec
     return { stop: () => undefined };
   }
 
-  const setIntervalImpl =
-    deps.setIntervalImpl ??
-    ((fn: () => void, ms: number) => setInterval(fn, ms) as unknown as NodeJS.Timeout);
-  const clearIntervalImpl =
-    deps.clearIntervalImpl ??
-    ((handle: NodeJS.Timeout) => clearInterval(handle as unknown as number));
-
-  void runOnce(deps);
-  const handle = setIntervalImpl(() => {
-    void runOnce(deps);
-  }, intervalMs);
-  log.info(`自动对账已启用：每 ${String(intervalMs / 1000)} 秒一次（全账户）`);
-
-  return {
-    stop: () => {
-      clearIntervalImpl(handle);
+  return startPeriodicTask({
+    intervalMs,
+    label: '对账',
+    disabledMessage: 'executor.reconcileIntervalMs = 0：自动对账已关闭，只保留手动触发',
+    enabledMessage: (ms) => `自动对账已启用：每 ${String(ms / 1000)} 秒一次（全账户）`,
+    // 对账要出网（positionRisk + openAlgoOrders），慢于间隔时跳过这一轮，
+    // 而不是让两轮并发写同一份快照（5 分钟一轮，跳过值得说一句）。
+    warnOnSkip: true,
+    // `runOnce` 自己兜了异常、永远返回 report|null；这里只要它跑完。
+    tick: async () => {
+      await runOnce(deps);
     },
-  };
+    ...(deps.setIntervalImpl === undefined ? {} : { setIntervalImpl: deps.setIntervalImpl }),
+    ...(deps.clearIntervalImpl === undefined ? {} : { clearIntervalImpl: deps.clearIntervalImpl }),
+  });
 }

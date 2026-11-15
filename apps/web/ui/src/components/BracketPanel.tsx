@@ -1,8 +1,9 @@
 import { useLayoutEffect, useState } from 'react';
 
 import { ApiError, api } from '../api.js';
-import { fmtDate, fmtNumber, fmtTime } from '../format.js';
-import type { BracketDto, BracketsDto, BracketStateDto } from '../../../src/types';
+import { fmtDate, fmtNumber, fmtPriceExact, fmtTime } from '../format.js';
+import type { BracketDto, BracketsDto, BracketStateDto, ReattachDto } from '../../../src/types';
+import { ConfirmDialog } from './ConfirmDialog.js';
 
 const EMPTY_COUNTS: Record<BracketStateDto, number> = {
   armed: 0,
@@ -48,18 +49,6 @@ const STATE_CLASS: Record<BracketStateDto, string> = {
 };
 
 /**
- * 价格格式化：**保留有效精度**，最多 8 位小数，不补尾零。
- *
- * 不能用 `fmtNumber`——它走 `toLocaleString`，对 `0.00123` 这类价格会四舍五入成
- * 舍入后的样子。止盈止损面板上的三个数都是要拿去和下单价对照的，显示层把它们
- * 抹平就等于让用户对着一个看着对、其实不是那个价的数字做决策。
- */
-function fmtPrice(n: number | null | undefined): string {
-  if (n === null || n === undefined || !Number.isFinite(n)) return '—';
-  return n.toLocaleString('zh-CN', { maximumFractionDigits: 8 });
-}
-
-/**
  * 离场价与入场价的百分比距离，保留两位小数。
  *
  * 正负号是给用户看的方向（止盈在上、止损在下），但**不依赖它做判断**——止损位与
@@ -89,6 +78,21 @@ export function BracketPanel(props: { symbol: string; tick: number }) {
   const [error, setError] = useState<string | null>(null);
   const { symbol, tick } = props;
 
+  /**
+   * 手动补挂（v1.3.0）。
+   *
+   * 三步，顺序不能变：**试算 → 确认 → 真的挂**。
+   *
+   * 试算是必须的：补挂会挂出**真实的条件单**，而触发价一旦被穿过，交易所会立刻
+   * 用市价平掉仓位。让用户先看清「要挂哪几张、各多少钱」，再决定要不要挂。
+   */
+  const [reattach, setReattach] = useState<ReattachDto | null>(null);
+  const [confirming, setConfirming] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [actionError, setActionError] = useState<string | null>(null);
+  /** 补挂成功后强制重读一次列表。 */
+  const [reloadKey, setReloadKey] = useState(0);
+
   useLayoutEffect(() => {
     let cancelled = false;
     setLoading(true);
@@ -112,7 +116,39 @@ export function BracketPanel(props: { symbol: string; tick: number }) {
     return () => {
       cancelled = true;
     };
-  }, [symbol, tick]);
+  }, [symbol, tick, reloadKey]);
+
+  /** 试算：只算不挂，把「要挂什么」显示出来。 */
+  async function preview(): Promise<void> {
+    setBusy(true);
+    try {
+      const result = await api.reattach(symbol, true);
+      setReattach(result);
+      setActionError(null);
+      // 只有确实有东西要补时才问「要不要挂」；没有要补的，直接把结论显示出来。
+      setConfirming(result.details.length > 0);
+    } catch (e: unknown) {
+      setActionError(reason(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  /** 真的挂。 */
+  async function confirmReattach(): Promise<void> {
+    setBusy(true);
+    try {
+      const result = await api.reattach(symbol, false);
+      setReattach(result);
+      setConfirming(false);
+      setActionError(null);
+      setReloadKey((key) => key + 1);
+    } catch (e: unknown) {
+      setActionError(reason(e));
+    } finally {
+      setBusy(false);
+    }
+  }
 
   // 必须逐个兜底，不能裸读 `data.countsByState.failed`：后端字段缺失时（旧进程 /
   // 迁移未应用）那会是 `undefined`，`Cannot read properties of undefined` 会把
@@ -126,9 +162,35 @@ export function BracketPanel(props: { symbol: string; tick: number }) {
 
   return (
     <div style={{ marginTop: 18 }}>
-      <h2 style={{ fontSize: 13, color: 'var(--muted)', fontWeight: 500 }}>
-        止盈止损（{failedTotal > 0 ? `${failedTotal} 笔失败` : `${items.length} 条记录`}）
-      </h2>
+      <div
+        style={{
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'space-between',
+          gap: 12,
+          flexWrap: 'wrap',
+        }}
+      >
+        <h2 style={{ fontSize: 13, color: 'var(--muted)', fontWeight: 500, margin: 0 }}>
+          止盈止损（{failedTotal > 0 ? `${failedTotal} 笔失败` : `${items.length} 条记录`}）
+        </h2>
+        {/*
+          补挂是**人工干预**：自动挂单系统出错（用户数据流断了、私有接口被拒、
+          单被人在交易所上撤了）之后，仓位会没有保护。这个按钮是那条人工路径的入口。
+          它**会真下单**，所以先试算、再确认。
+        */}
+        <button onClick={() => void preview()} disabled={busy}>
+          {busy ? '处理中…' : '补挂止盈止损'}
+        </button>
+      </div>
+
+      {actionError !== null ? (
+        <p className="mono" style={{ fontSize: 12, color: 'var(--err)', margin: '8px 0 0' }}>
+          补挂失败：{actionError}
+        </p>
+      ) : null}
+
+      {reattach !== null && actionError === null ? <ReattachResult result={reattach} /> : null}
 
       {error !== null ? (
         <p className="mono" style={{ fontSize: 12, color: 'var(--err)', margin: '8px 0 0' }}>
@@ -187,10 +249,10 @@ export function BracketPanel(props: { symbol: string; tick: number }) {
                     </td>
                     <td data-label="数量">{fmtNumber(b.filledQty)}</td>
                     <td className="mono" data-label="入场价">
-                      {fmtPrice(b.entryPrice)}
+                      {fmtPriceExact(b.entryPrice)}
                     </td>
                     <td className="mono" data-label="止盈价">
-                      {fmtPrice(b.takeProfit)}
+                      {fmtPriceExact(b.takeProfit)}
                       <div className="muted" style={{ fontSize: 11 }}>
                         {pctOf(b.entryPrice, b.takeProfit)}
                       </div>
@@ -198,7 +260,7 @@ export function BracketPanel(props: { symbol: string; tick: number }) {
                     <td className="mono" data-label="止损价">
                       {/* `trailing` 行要显示**当前生效的那一档**，而不是入场时的原始止损：
                           显示后者会让人以为移动止损一直没动过。 */}
-                      {fmtPrice(
+                      {fmtPriceExact(
                         b.state === 'trailing' && b.trailStopPrice ? b.trailStopPrice : b.stopPrice,
                       )}
                       <div className="muted" style={{ fontSize: 11 }}>
@@ -258,6 +320,98 @@ export function BracketPanel(props: { symbol: string; tick: number }) {
           </div>
         </>
       )}
+
+      {confirming && reattach !== null ? (
+        <ConfirmDialog
+          title={`补挂 ${symbol} 的止盈止损`}
+          confirmLabel="确认补挂（真下单）"
+          danger
+          busy={busy}
+          onCancel={() => setConfirming(false)}
+          onConfirm={() => void confirmReattach()}
+        >
+          <p>下面这些是**即将挂到交易所上**的真实条件单：</p>
+          <ul style={{ fontSize: 12, margin: '8px 0' }}>
+            {reattach.details.map((detail, index) => (
+              <li key={`${detail.kind}-${String(index)}`}>{detail.reason}</li>
+            ))}
+          </ul>
+          <p className="muted" style={{ fontSize: 12 }}>
+            条件单是<b>市价</b>平仓单：触发价一旦被穿过，交易所会立刻用市价平掉仓位。
+            补挂本身不改仓位，只补上缺失的那张保护单。
+          </p>
+        </ConfirmDialog>
+      ) : null}
+    </div>
+  );
+}
+
+/** 试算 / 补挂的结果。**每一条都要有说法**——没有「无声跳过」这一档。 */
+function ReattachResult(props: { result: ReattachDto }) {
+  const { result } = props;
+  // 后端字段缺失时（旧进程）不能当成「有拒绝」——那会显示一句 `undefined`。
+  const refusal = result.refusal ?? null;
+  const tp1FillRecorded = result.tp1FillRecorded ?? null;
+  if (refusal === null && result.details.length === 0 && result.skips.length === 0) {
+    return (
+      <p className="muted" style={{ fontSize: 12, margin: '6px 0 0' }}>
+        {result.symbol} 的仓位有保护，不需要补挂。
+      </p>
+    );
+  }
+  return (
+    <div style={{ marginTop: 10 }}>
+      {/*
+        「拒绝补挂」要**显眼**：它是「该补但不敢补」（比如仓位数量与记录对不上，
+        照记录补可能重复减仓）。藏在一堆灰色小字里，等于没有提示（约定 9）。
+      */}
+      {refusal !== null ? (
+        <p className="mono" style={{ fontSize: 12, margin: '4px 0 0', color: 'var(--err)' }}>
+          ✘ {result.symbol}：{refusal}
+        </p>
+      ) : null}
+      {result.details.map((detail, index) => (
+        <p
+          key={`${detail.kind}-${String(index)}`}
+          className="mono"
+          style={{
+            fontSize: 12,
+            margin: '4px 0 0',
+            color:
+              detail.outcome === 'failed'
+                ? 'var(--err)'
+                : detail.outcome === 'placed'
+                  ? 'var(--ok)'
+                  : 'var(--muted)',
+          }}
+        >
+          {detail.outcome === 'placed'
+            ? '✔'
+            : detail.outcome === 'failed'
+              ? '✘'
+              : detail.outcome === 'dry-run'
+                ? '·'
+                : '—'}{' '}
+          {detail.reason}
+          {detail.tpAlgoId !== undefined || detail.slAlgoId !== undefined
+            ? `（止盈 ${fmtNumber(detail.tpAlgoId)}，止损 ${fmtNumber(detail.slAlgoId)}）`
+            : ''}
+        </p>
+      ))}
+      {tp1FillRecorded !== null ? (
+        <p className="muted" style={{ fontSize: 12, margin: '4px 0 0' }}>
+          ℹ {tp1FillRecorded}
+        </p>
+      ) : null}
+      {result.skips.map((skip, index) => (
+        <p
+          key={`skip-${String(index)}`}
+          className="muted"
+          style={{ fontSize: 12, margin: '4px 0 0' }}
+        >
+          — {skip.reason}
+        </p>
+      ))}
     </div>
   );
 }

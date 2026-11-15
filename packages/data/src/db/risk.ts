@@ -464,6 +464,91 @@ export async function claimBracket(pool: Pool, claim: BracketClaim): Promise<Bra
   }
 }
 
+/**
+ * 把**新算出来的计划**写回记录（v1.3.0 手动补挂）。
+ *
+ * 只给「当初没算出档位」的**占位记录**用。占位记录的止损价与止盈价都等于入场价
+ * （表上的 `atr > 0` 与 `stop_price > 0` 两道闸必须过得去，见 `sql/006`），
+ * 而 ATR 写的是 `Number.MIN_VALUE`——那不是一份能挂单的计划。
+ *
+ * 为什么必须写回：补挂挂出去的是**另一个价**，而记录里还留着占位价时，
+ *   * 对账会报一条 `price-mismatch`（本地价 = 入场价 ≠ 交易所上的价）；
+ *   * 「当时为什么止损在那个价」再也答不出来——而这正是 ATR 快照随记录一起存
+ *     的理由（§6.3 第 4 条）。
+ *
+ * 决策留痕一并写回：这一次挂单用的是哪套倍数，是**这一次**的事，
+ * 不该被上一次失败的尝试覆盖。
+ */
+export async function updateBracketPlan(
+  pool: Pool,
+  key: { exchange: string; symbol: string; entryOrderId: string },
+  plan: {
+    stopPrice: number;
+    takeProfit: number;
+    /** 第一段的价与量。不分批形态时都是 `null`。 */
+    tp1Price?: number | null;
+    tp1Qty?: number | null;
+    atr: number;
+    atrPeriod: number;
+    atrInterval: string;
+    atrWindowFrom: number;
+    atrWindowTo: number;
+    /** 决策留痕。与 `claimBracket` 同一份形状。 */
+    decision?: BracketDecision;
+  },
+  now: number,
+): Promise<void> {
+  const decision = plan.decision;
+  try {
+    const result = await pool.query(
+      `UPDATE ${TABLE} SET
+         stop_price = $4, take_profit = $5, tp1_price = $6, tp1_qty = $7,
+         atr = $8, atr_period = $9, atr_interval = $10,
+         atr_window_from = $11, atr_window_to = $12,
+         decision_source = $13, decision_stop_atr_mult = $14,
+         decision_take_profit_atr_mult = $15, decision_take_profit1_ratio = $16,
+         decision_trail_atr_mult = $17, decision_breakeven_after_tp1 = $18,
+         decision_rationale = $19, decision_fallback_reason = $20,
+         decision_raw = $21, decision_at = $22, updated_at = $23
+       WHERE exchange = $1 AND symbol = $2 AND entry_order_id = $3`,
+      [
+        key.exchange,
+        key.symbol,
+        key.entryOrderId,
+        plan.stopPrice,
+        plan.takeProfit,
+        plan.tp1Price ?? null,
+        plan.tp1Qty ?? null,
+        plan.atr,
+        plan.atrPeriod,
+        plan.atrInterval,
+        plan.atrWindowFrom,
+        plan.atrWindowTo,
+        decision?.source ?? 'config',
+        decision?.decision?.stopAtrMult ?? null,
+        decision?.decision?.takeProfitAtrMult ?? null,
+        decision?.decision?.takeProfit1Ratio ?? null,
+        decision?.decision?.trailAtrMult ?? null,
+        decision?.decision?.breakevenAfterTp1 ?? null,
+        decision?.rationale ?? null,
+        decision?.fallbackReason ?? null,
+        decision?.raw ?? null,
+        decision?.at ?? null,
+        now,
+      ],
+    );
+    if (result.rowCount !== 1) {
+      throw new SyncError(
+        'SYNC_ALREADY_RUNNING',
+        `止盈止损记录不存在，无法写回计划：${key.symbol} ${key.entryOrderId}`,
+        key as unknown as Record<string, unknown>,
+      );
+    }
+  } catch (error) {
+    throw toSyncError(error, `写回止盈止损计划失败：${key.symbol} ${key.entryOrderId}`);
+  }
+}
+
 /** 两张条件单都挂上了。回填订单号并置 `armed`。 */
 export async function markBracketArmed(
   pool: Pool,
@@ -747,6 +832,10 @@ export async function reserveTrailStep(
  *
  * `trail_moves` 在这里 +1：它是「成功换过几档」，与「占用了几个号」（`trail_step`）
  * 是一对——两者不等就说明「有尝试没成功」，对账据此判定移动止损在空转（§6.5）。
+ *
+ * **返回实际更新的行数**：调用方据此判断「这次真的记上了」还是「记录已经不在
+ * 移动止损阶段了」（`WHERE` 带了 `state = 'trailing'` 这道闸）。手动补挂会用到它——
+ * 单挂上了而回填没落库，是最不能当下就放过的一种状态（§6.12.1 同一原则）。
  */
 export async function markBracketTrailMoved(
   pool: Pool,
@@ -760,9 +849,9 @@ export async function markBracketTrailMoved(
     slAlgoId: number;
   },
   now: number,
-): Promise<void> {
+): Promise<number> {
   try {
-    await pool.query(
+    const result = await pool.query(
       `UPDATE ${TABLE} SET trail_stop_price = $4, trail_extreme = $5, trail_atr = $6,
          trail_atr_from = $7, trail_atr_to = $8, trail_updated_at = $9, sl_algo_id = $10,
          trail_moves = trail_moves + 1, trail_last_error = NULL, trail_status = 'moved',
@@ -781,6 +870,7 @@ export async function markBracketTrailMoved(
         moved.slAlgoId,
       ],
     );
+    return result.rowCount ?? 0;
   } catch (caught) {
     throw toSyncError(caught, `回填移动止损新档位失败：${key.symbol} ${key.entryOrderId}`);
   }

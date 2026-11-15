@@ -2,6 +2,8 @@ export * from './bridge.js';
 export * from './cache.js';
 export * from './provider.js';
 export * from './market.js';
+/** BSC 链上读取（只读，v1.2.0）：keccak + JSON-RPC + V3 仓位事实。 */
+export * from './bsc-v3.js';
 export * from './db/errors.js';
 export * from './db/migrate.js';
 export * from './db/pool.js';
@@ -15,6 +17,10 @@ export * from './db/credentials.js';
 export * from './db/risk-policy.js';
 /** 飞书通知通道的运行期设置（v0.8.0）：密文落库 + 「哪一份在生效」的解析。 */
 export * from './db/notify.js';
+/** 止盈止损服务自己的状态行（2026-11-06）：「进程活着」与「服务能用」分开记。 */
+export * from './db/executor-status.js';
+/** 链上仓位（v1.2.0）：登记、滚动状态、采样历史与告警记录。 */
+export * from './db/chain-position.js';
 /** 提示词镜像的运行时（v1.0.0）：把发给模型的那一组消息同步推到飞书群。 */
 export * from './prompt-mirror.js';
 export * from './db/sql-files.js';
@@ -33,3 +39,5 @@ export * from './reconcile.js';
 export * from './testing.js';
 /** 测试专用：真库隔离（随机 schema + 从空库跑迁移），详见文件头说明。 */
 export * from './testing-pg.js';
+/** 测试专用：本地假 BSC 节点（JSON-RPC + eth_call），详见文件头说明。 */
+export * from './testing-bsc.js';

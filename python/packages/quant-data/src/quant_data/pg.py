@@ -104,6 +104,26 @@ KNOWN_MIGRATION_VERSIONS: frozenset[str] = frozenset(
         # Python 侧不读写这张表，但版本闸门两个方向都要校，
         # 漏登记会让**所有**碰 PG 的用例报「库比代码新」。
         "022_sync_notify",
+        # v1.1.0：趋势档位决策的来源值（risk_bracket.decision_source 允许 llm-trend）。
+        # Python 侧不读写 risk_bracket，但版本闸门两个方向都要校，
+        # 漏登记会让**所有**碰 PG 的用例报「库比代码新」。
+        "023_trend_decision_source",
+        # 2026-11-06：止盈止损服务自己的状态行（executor_status）。
+        # Python 侧不读写这张表，但版本闸门两个方向都要校，
+        # 漏登记会让**所有**碰 PG 的用例报「库比代码新」。
+        "024_executor_status",
+        # 2026-11-06：通知内容类型多一种「止盈止损服务不可用」
+        #（notify_settings.kinds 扩枚举）。
+        # 同样不读写，但版本闸门两个方向都要校。
+        "025_executor_notify",
+        # v1.2.0：链上仓位的三张表（chain_position / _snapshot / _alert）。
+        # Python 侧不读写，但版本闸门两个方向都要校，
+        # 漏登记会让**所有**碰 PG 的用例报「库比代码新」。
+        "026_chain_position",
+        # v1.2.0：通知内容类型多一种「链上仓位异动」
+        #（notify_settings.kinds 扩枚举）。
+        # 同样不读写，但版本闸门两个方向都要校。
+        "027_chain_notify",
     }
 )
 
@@ -138,6 +158,10 @@ REQUIRED_TABLES: frozenset[str] = frozenset(
         # 而写侧会在一个没有约束的表上悄悄接受脏数据。
         "executor_credentials",
         "risk_policy",
+        # 2026-11-06：止盈止损服务的状态行同样在必需之列——
+        # 缺表等价于「executor 写不进自己的状态」，控制面于是永远显示不出
+        # 「它活着但瞎了」，而那正是 10-31 到 11-06 那 6 天静默的形状。
+        "executor_status",
     }
 )
 
@@ -191,14 +215,16 @@ def _dsn_hint(dsn: str) -> str:
 
 def ensure_schema(conn: DbConn) -> None:
     """校验 schema 已迁移到所需版本（R-1.3）。不匹配就报错，不静默按旧 schema 运行。"""
+    # **一条 SQL 查全部缺表**，而不是每个表一次 `to_regclass`：`REQUIRED_TABLES` 有 21 张，
+    # 逐表查就是 21 次往返——它挂在每个 Python 子进程的启动路径上（每轮同步、每次
+    # `symbols` / `resolve`、控制面每 5s 的 overview 都会走），跨网络时纯属固定开销。
+    # 语义一个字没变：缺表照样逐张报出来（`missingTables` 仍是排好序的全集）。
     missing_tables = sorted(
-        name
-        for name in REQUIRED_TABLES
-        if _require_row(
-            conn.execute("SELECT to_regclass(%s) AS reg", (name,)).fetchone(),
-            f"to_regclass({name})",
-        )["reg"]
-        is None
+        str(row["name"])
+        for row in conn.execute(
+            "SELECT n AS name FROM unnest(%s::text[]) AS n WHERE to_regclass(n) IS NULL",
+            (sorted(REQUIRED_TABLES),),
+        ).fetchall()
     )
     if missing_tables:
         raise SyncError(
@@ -620,23 +646,29 @@ def write_bars(
                         row.trades,
                     )
                 )
-    # 新增行数：先算再写，两条语句在同一个事务里（R-3.5 整批回滚）。
-    added_row = _require_row(
-        conn.execute(
-            "SELECT count(*) AS n FROM stage_bars s"
-            " WHERE NOT EXISTS (SELECT 1 FROM klines_1m k WHERE k.symbol = %s AND k.time = s.time)",
-            (symbol,),
-        ).fetchone(),
-        "count(stage_bars new)",
-    )
+    # 新增行数由 **INSERT 自己**报回来（`RETURNING`），不再先跑一条
+    # `NOT EXISTS` 半连接数一遍：那会让每一行都被主键探测两次（5000 行/批时
+    # 多 5000 次探测；首次全量 370 万行就是 370 万次），而两条语句本来就在
+    # 同一个事务里，数出来的东西与写进去的东西是同一批行。
+    #
+    #   * `do-nothing`：`RETURNING 1` **只返回真正插入的行**，长度就是新增数；
+    #   * `upsert`：返回全部行，用 `xmax = 0` 区分「插入」与「更新」
+    #     （PG 的既有惯用法：新插入的元组没有删除/锁定的 xid）。
     conflict = _CONFLICT_UPSERT if strategy == "upsert" else _CONFLICT_DO_NOTHING
-    conn.execute(
-        "INSERT INTO klines_1m (symbol, time, open, high, low, close, volume, quote_volume, trades)"
-        f" SELECT %s, time, open, high, low, close, volume, quote_volume, trades FROM stage_bars"
-        f" ON CONFLICT (symbol, time) {conflict}",
-        (symbol,),
+    insert_sql = (
+        "INSERT INTO klines_1m"
+        " (symbol, time, open, high, low, close, volume, quote_volume, trades)"
+        " SELECT %s, time, open, high, low, close, volume, quote_volume, trades"
+        " FROM stage_bars"
+        f" ON CONFLICT (symbol, time) {conflict}"
     )
-    return int(added_row["n"])
+    if strategy == "upsert":
+        written = conn.execute(
+            insert_sql + " RETURNING (xmax = 0) AS inserted", (symbol,)
+        ).fetchall()
+        return sum(1 for row in written if row["inserted"])
+    written = conn.execute(insert_sql + " RETURNING 1 AS inserted", (symbol,)).fetchall()
+    return len(written)
 
 
 @dataclass(frozen=True, slots=True)

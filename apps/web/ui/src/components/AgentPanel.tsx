@@ -1,7 +1,7 @@
 import { useLayoutEffect, useState } from 'react';
 
 import { ApiError, api } from '../api.js';
-import { fmtDate, fmtNumber } from '../format.js';
+import { fmtDate, fmtNumber, fmtPriceExact } from '../format.js';
 import type {
   AgentFacetDto,
   AgentReportDto,
@@ -62,17 +62,6 @@ const FACET_LABEL: Record<'technical' | 'sentiment' | 'fundamental', string> = {
   sentiment: '情绪面',
   fundamental: '基本面',
 };
-
-/**
- * 价格格式化：**保留有效精度**，最多 8 位小数。
- *
- * 与止盈止损面板同一个理由：这几个数要拿去和真实下单价对照，显示层把它们抹平
- * 就等于让人对着一个看着对、其实不是那个价的数字做决策。
- */
-function fmtPrice(n: number | null | undefined): string {
-  if (n === null || n === undefined || !Number.isFinite(n)) return '—';
-  return n.toLocaleString('zh-CN', { maximumFractionDigits: 8 });
-}
 
 function FacetRow(props: { name: string; facet: AgentFacetDto }) {
   const { name, facet } = props;
@@ -215,18 +204,18 @@ function PlanBlock(props: { plan: TradingPlanDto; symbol: string; onChanged: () 
     <div>
       <p style={{ margin: '4px 0' }}>
         <b className="mono">
-          {plan.side} {plan.entryType} @ {fmtPrice(plan.entryPrice)}
+          {plan.side} {plan.entryType} @ {fmtPriceExact(plan.entryPrice)}
         </b>
         <span className="muted" style={{ fontSize: 12, marginLeft: 8 }}>
-          数量 {fmtNumber(plan.quantity)} · 名义 {fmtPrice(plan.notional)}
+          数量 {fmtNumber(plan.quantity)} · 名义 {fmtPriceExact(plan.notional)}
         </span>
       </p>
       <p className="mono" style={{ margin: '2px 0', fontSize: 12 }}>
-        止损 {fmtPrice(plan.stopPrice)}　止盈 {fmtPrice(plan.takeProfitPrice)}　R:R{' '}
+        止损 {fmtPriceExact(plan.stopPrice)}　止盈 {fmtPriceExact(plan.takeProfitPrice)}　R:R{' '}
         {plan.riskReward === null ? '—' : plan.riskReward.toFixed(2)}
       </p>
       <p className="muted" style={{ fontSize: 12, margin: '2px 0' }}>
-        这一笔最多亏 {fmtPrice(plan.riskAmount)}
+        这一笔最多亏 {fmtPriceExact(plan.riskAmount)}
         {plan.riskFraction === null ? '' : `（权益的 ${(plan.riskFraction * 100).toFixed(3)}%）`}
         {plan.equitySource === null ? '' : `　权益来源：${plan.equitySource}`}
       </p>
@@ -437,8 +426,8 @@ export function AgentPanel(props: { symbol: string; tick: number }) {
           </p>
           {report.atr !== null ? (
             <p className="muted" style={{ fontSize: 12, margin: '2px 0 0' }}>
-              当时 ATR {fmtPrice(report.atr)}
-              {report.lastClose !== null ? ` · 收盘价 ${fmtPrice(report.lastClose)}` : ''}
+              当时 ATR {fmtPriceExact(report.atr)}
+              {report.lastClose !== null ? ` · 收盘价 ${fmtPriceExact(report.lastClose)}` : ''}
             </p>
           ) : null}
         </>

@@ -13,24 +13,25 @@ node apps/cli/dist/index.js <command>              # 构建产物
 
 ## 命令
 
-| 命令                                         | 作用                                                |
-| -------------------------------------------- | --------------------------------------------------- |
-| `doctor`                                     | 检查 node / pnpm / uv / git 是否就绪                |
-| `config init [--force]`                      | 写入默认 `trade-tool.config.json`                   |
-| `config show`                                | 打印当前生效配置                                    |
-| `db migrate [--json]`                        | 应用迁移（幂等，可重复执行）                        |
-| `db status [--json]`                         | 只读查看 schema 版本比对结果                        |
-| `data fetch -s <S> [-b N] [--source ...]`    | 拉 K 线；`--source binance` 时写 PostgreSQL         |
-| `data sync -s <S> [--from] [--to] [-y]`      | **增量续传（主入口）**；不传 `--from` 即增量语义    |
-| `data backfill -s <S> --from <ms> --to <ms>` | 显式区间回补，恒为 `DO NOTHING`                     |
-| `data verify -s <S>`                         | 全表缺口扫描，重建 `verified_upto` 基线             |
-| `data gaps [-s <S>] [--json]`                | 待回补缺口清单与缺失总行数                          |
-| `data symbols [--source binance] [--json]`   | 运行时列出可同步标的                                |
-| `sync status [-s <S>] [--json]`              | 同步状态与全局汇总（含配额使用率）                  |
-| `backtest [-s -i -b --fast --slow --json]`   | 跑回测，报告写入 `<TRADE_TOOL_HOME>/reports/`       |
-| `agent run [-s <S>] [--json]`                | 跑一轮分析师 + 交易员 Agent（分析 → 出方案 → 落库） |
-| `agent report [-s <S>] [--limit N] [--json]` | **只读**：看库里最近一次报告与方案（不调模型）      |
-| `agent plan <id> --approve \| --reject`      | 预先批准 / 驳回一份方案（两个开关互斥）             |
+| 命令                                         | 作用                                                   |
+| -------------------------------------------- | ------------------------------------------------------ |
+| `doctor`                                     | 检查 node / pnpm / uv / git 是否就绪                   |
+| `config init [--force]`                      | 写入默认 `trade-tool.config.json`                      |
+| `config show`                                | 打印当前生效配置                                       |
+| `db migrate [--json]`                        | 应用迁移（幂等，可重复执行）                           |
+| `db status [--json]`                         | 只读查看 schema 版本比对结果                           |
+| `data fetch -s <S> [-b N] [--source ...]`    | 拉 K 线；`--source binance` 时写 PostgreSQL            |
+| `data sync -s <S> [--from] [--to] [-y]`      | **增量续传（主入口）**；不传 `--from` 即增量语义       |
+| `data backfill -s <S> --from <ms> --to <ms>` | 显式区间回补，恒为 `DO NOTHING`                        |
+| `data verify -s <S>`                         | 全表缺口扫描，重建 `verified_upto` 基线                |
+| `data gaps [-s <S>] [--json]`                | 待回补缺口清单与缺失总行数                             |
+| `data symbols [--source binance] [--json]`   | 运行时列出可同步标的                                   |
+| `sync status [-s <S>] [--json]`              | 同步状态与全局汇总（含配额使用率）                     |
+| `risk reattach -s <S> [--dry-run] [--json]`  | **手动补挂**缺失的止盈止损（会真下单；先 `--dry-run`） |
+| `backtest [-s -i -b --fast --slow --json]`   | 跑回测，报告写入 `<TRADE_TOOL_HOME>/reports/`          |
+| `agent run [-s <S>] [--json]`                | 跑一轮分析师 + 交易员 Agent（分析 → 出方案 → 落库）    |
+| `agent report [-s <S>] [--limit N] [--json]` | **只读**：看库里最近一次报告与方案（不调模型）         |
+| `agent plan <id> --approve \| --reject`      | 预先批准 / 驳回一份方案（两个开关互斥）                |
 
 ## 约定
 
@@ -61,6 +62,15 @@ node apps/cli/dist/index.js <command>              # 构建产物
   命令输出会明确区分这两种情况，不让人误以为单已经下了。
   限价方案在**批准时**就被拒绝并说明原因（限价单可能永远不成交，
   而不成交的仓位没有止损保护）。
+- `risk reattach` 是**会真下单**的命令，与 `reconcile`（只报告）分工明确。
+  `--dry-run` 只算不挂：一单都不发、状态一个不改，输出是「会挂哪几张、各多少钱」。
+  退出码：`0` = 补上了（或演练完成）；`1` = 有东西该补但**没补上**（被拒绝或失败）——
+  那不是运行失败，是**还没修好**，需要人接着管；抛错（→ 1）才是压根没查成。
+  补不上的常见原因有三个，输出里会写明：现价已经越过触发价（挂上去会立刻市价平仓）、
+  本地记录当初压根没算出档位（此时会按当前策略档位现算）、
+  以及**交易所的仓位数量与本地记录对不上**（仓位被手工动过、第一段只成交了一部分、
+  或者又加了仓）——此时**拒绝补挂**并说清是哪几个数对不上，**不猜**。
+  「拒绝补挂」与「不需要补挂」在输出里是**两回事**：前者走 `✘` 开头，后者是 `✔`。
 
 ## 测试
 

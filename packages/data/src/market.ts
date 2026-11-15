@@ -23,6 +23,7 @@ import {
 import { runPython, type PythonRuntime } from './bridge.js';
 import { pythonEnvFromEnv } from './exchange-endpoints.js';
 import { parseMinNotional, parseMinQty, parseStepSize, parseTickSize } from './binance-private.js';
+import type { IndicatorInterval } from './db/indicators.js';
 import * as repo from './db/repo.js';
 import { buildDsn, connectionOptions, type ConnectionOptions, type Pool } from './db/pool.js';
 
@@ -618,8 +619,8 @@ export async function getAllStates(ctx: MarketContext): Promise<SymbolSyncState[
   return repo.listStates(ctx.pool, ctx.exchange);
 }
 
-export async function getGaps(ctx: MarketContext, symbol?: string) {
-  return repo.listGaps(ctx.pool, symbol);
+export async function getGaps(ctx: MarketContext, symbol?: string, limit?: number) {
+  return repo.listGaps(ctx.pool, symbol, limit);
 }
 
 export async function getSymbolEntries(ctx: MarketContext): Promise<SymbolEntry[]> {
@@ -635,10 +636,33 @@ export async function getSummary(ctx: MarketContext): Promise<SyncSummary> {
     // 传**实际启用的派生周期**：`aggregateIntervals: []` 时 `derived` 必须是空数组，
     // 否则 `sync status` 会打印四行「0 行 / 0.00 MB」——那是「未启用派生」被显示成
     // 「启用了但还没聚合」（R-8.4 / AC-22）。只启用子集时同理，不能把没启用的报成 0。
-    repo.readGlobalSummary(ctx.pool, ctx.exchange, ctx.config.data.aggregateIntervals),
+    repo.readGlobalSummary(
+      ctx.pool,
+      ctx.exchange,
+      ctx.config.data.aggregateIntervals,
+      summaryIndicatorIntervals(ctx.config.data),
+    ),
     getRateLimitStatus(ctx),
   ]);
   return { ...global, rateLimit };
+}
+
+/**
+ * 汇总里该不该统计指标表：`indicatorSpecs` 七个键全空 = **指标层关闭** → `null`。
+ *
+ * 为什么单独抽出来：`readGlobalSummary` 的 `indicatorIntervals` 形参缺省是
+ * `INDICATOR_INTERVALS`（「全启用」），调用方漏传就会去数 7 张空的指标表
+ * ——每次 14 条查询、其中 7 条是全表 `count(*)`，而控制面每 5s 调一次
+ * （2026-11-12 实测 `/api/overview` 813ms）。而且「关闭」被报成「0 行」，
+ * 页面会显示成「已启用但还没物化」。
+ *
+ * 纯函数：不读时钟、不做 IO，因此可以被单测直接覆盖。
+ */
+export function summaryIndicatorIntervals(
+  data: Pick<DataConfig, 'indicatorSpecs' | 'indicatorIntervals'>,
+): readonly IndicatorInterval[] | null {
+  const enabled = Object.values(data.indicatorSpecs).some((specs) => specs.length > 0);
+  return enabled ? data.indicatorIntervals : null;
 }
 
 /**

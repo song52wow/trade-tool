@@ -15,6 +15,7 @@
 
 import { createLogger } from '@trade-tool/core';
 
+import { startPeriodicTask } from './periodic.js';
 import type { ExecutorService, TrailReport } from './service.js';
 
 const log = createLogger('executor');
@@ -39,48 +40,20 @@ export function startTrailingTimer(
   intervalMs: number,
   options: StartTrailingOptions = {},
 ): TrailingTimer {
-  if (intervalMs === 0) {
-    log.info('executor.trailIntervalMs = 0：移动止损自动重算已关闭');
-    return { stop: () => undefined };
-  }
-
-  const setIntervalImpl =
-    options.setIntervalImpl ?? ((fn, ms) => setInterval(fn, ms) as unknown as NodeJS.Timeout);
-  const clearIntervalImpl =
-    options.clearIntervalImpl ?? ((handle) => clearInterval(handle as unknown as number));
-
-  let running = false;
-  const tick = (): void => {
-    // 防重入：上一轮还没跑完就跳过这一轮，而不是让两轮同时挂撤同一张单。
-    if (running) return;
-    running = true;
-    void service
-      .trailOnce()
-      .then((report: TrailReport) => {
-        if (report.moved > 0 || report.failed > 0 || report.advanced > 0) {
-          log.info(
-            `移动止损一轮：推进 ${report.advanced} / 换档 ${report.moved} / 未变 ${report.unchanged} / ` +
-              `失败 ${report.failed} / 跳过 ${report.skipped}`,
-          );
-        }
-      })
-      .catch((error: unknown) => {
-        log.error(
-          `移动止损本轮失败（不影响挂单）：${error instanceof Error ? error.message : String(error)}`,
+  return startPeriodicTask({
+    intervalMs,
+    label: '移动止损',
+    disabledMessage: 'executor.trailIntervalMs = 0：移动止损自动重算已关闭',
+    enabledMessage: (ms) => `移动止损已启用：每 ${String(ms / 1000)} 秒重算一次`,
+    tick: async () => {
+      const report: TrailReport = await service.trailOnce();
+      if (report.moved > 0 || report.failed > 0 || report.advanced > 0) {
+        log.info(
+          `移动止损一轮：推进 ${report.advanced} / 换档 ${report.moved} / 未变 ${report.unchanged} / ` +
+            `失败 ${report.failed} / 跳过 ${report.skipped}`,
         );
-      })
-      .finally(() => {
-        running = false;
-      });
-  };
-
-  tick();
-  const handle = setIntervalImpl(tick, intervalMs);
-  log.info(`移动止损已启用：每 ${String(intervalMs / 1000)} 秒重算一次`);
-
-  return {
-    stop(): void {
-      clearIntervalImpl(handle);
+      }
     },
-  };
+    ...options,
+  });
 }

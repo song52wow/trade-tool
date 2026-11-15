@@ -11,7 +11,7 @@
  * 都要能事后查出「这次是模型定的还是配置定的」。
  */
 
-import { configSchema, type TradeToolConfig } from '@trade-tool/core';
+import { configSchema, type AnalystContext, type TradeToolConfig } from '@trade-tool/core';
 import type { OrderTradeUpdate, Pool } from '@trade-tool/data';
 import { describe, expect, it, vi } from 'vitest';
 
@@ -237,6 +237,12 @@ function makeService(
   deps: {
     llm?: DeciderStub;
     fallbackToPolicy?: boolean;
+    /** 是否开启趋势分析（v1.1.0）。关着时整段不取行情上下文。 */
+    trend?: boolean;
+    /** 行情上下文。`null` = 取不到（库里没有派生 K 线等）。 */
+    marketContext?: AnalystContext | null;
+    /** 取行情上下文时抛这个错。 */
+    marketContextError?: string;
   } = {},
 ): {
   service: ReturnType<typeof createExecutorService>;
@@ -256,6 +262,10 @@ function makeService(
         baseUrl: 'https://example.invalid/v1',
         model: 'test-model',
         fallbackToPolicy: deps.fallbackToPolicy ?? true,
+      },
+      trend: {
+        ...BASE_CONFIG.executor.trend,
+        enabled: deps.trend === true,
       },
     },
   };
@@ -278,6 +288,16 @@ function makeService(
       applyFill: () => ({ positionAfter: 1, applied: true }),
     },
     ...(decider === undefined ? {} : { decider }),
+    ...(deps.trend === true
+      ? {
+          loadMarketContext: async () => {
+            if (deps.marketContextError !== undefined) {
+              throw new Error(deps.marketContextError);
+            }
+            return deps.marketContext ?? null;
+          },
+        }
+      : {}),
     resolvePolicy: async () => ({
       atrPeriod: 14,
       atrInterval: '1m',
@@ -455,5 +475,136 @@ describe('LLM 决策：模型不可靠时不能做出危险的事', () => {
     expect(outcome).toBe('failed');
     // 一张单都没挂：宁可裸着，也不要在模型不可用时按不明档位挂。
     expect(placer.calls).toHaveLength(0);
+  });
+});
+
+/**
+ * 一份行情上下文（v1.1.0）。这里的值只用来验证「趋势线索进了提示词」，
+ * 不参与算价——算价永远只看 ATR 与倍数。
+ */
+const MARKET_CONTEXT: AnalystContext = {
+  symbol: 'BTCUSDT',
+  asOfMs: 1_700_000_000_000,
+  technical: {
+    interval: '1h',
+    bars: 300,
+    lastClose: 100,
+    atr: 500,
+    atrPeriod: 14,
+    atrPercentOfPrice: 0.05,
+    ma: [{ kind: 'sma', bars: 20, value: 101 }],
+    macd: { dif: 1, dea: 0.5, hist: 0.5 },
+    rsi: [{ period: 14, value: 62 }],
+    boll: { upper: 110, mid: 100, lower: 90 },
+    kdj: { k: 70, d: 65, j: 80 },
+    obv: { value: 1, change: 1 },
+    recentReturns: [0.1, 0.2],
+    pricePercentile: 0.7,
+    objectiveBias: 0.5,
+    objectiveNotes: ['收盘价 > MA20（+1）'],
+  },
+  sentiment: {
+    fundingRate: 0.0001,
+    fundingRateAnnualized: 0.1,
+    nextFundingTimeMs: null,
+    markPrice: 100,
+    indexPrice: 100,
+    basisBps: 1,
+    openInterest: 1,
+    openInterestChangePct: 1,
+    longShortRatio: 1.2,
+    takerBuySellRatio: 1.1,
+    notes: [],
+  },
+  fundamental: {
+    contractType: 'PERPETUAL',
+    onboardDateMs: null,
+    tickSize: 0.1,
+    stepSize: 0.001,
+    minQty: 0.001,
+    quoteVolume24h: 1,
+    trades24h: 1,
+    priceChangePct24h: 1,
+    carryCostAnnualized: 0.1,
+    notes: [],
+  },
+  baseline: { stopAtrMult: 2, takeProfitAtrMult: 3 },
+};
+
+/** 把模型实际看到的提示词记下来的替身。 */
+function llmCapturing(content: string, seen: string[]): DeciderStub {
+  return {
+    complete: async (messages) => {
+      seen.push(messages.map((m) => m.content).join('\n'));
+      return content;
+    },
+  };
+}
+
+describe('趋势档位决策（v1.1.0）：手动挂单后模型按趋势给档位', () => {
+  it('开了趋势分析 → 模型看到趋势线索，决策来源记成 llm-trend', async () => {
+    const seen: string[] = [];
+    const { service, pool } = makeService({
+      llm: llmCapturing(JSON.stringify(VALID_DECISION), seen),
+      trend: true,
+      marketContext: MARKET_CONTEXT,
+    });
+    const outcome = await service.handleFill(fillEvent());
+    expect(outcome).toBe('armed');
+    // 趋势线索确实进了提示词。
+    expect(seen[0]).toContain('客观倾向分：0.50');
+    expect(seen[0]).toContain('收盘价 > MA20（+1）');
+    // 决策来源与 v0.9.0 的 'llm' **分开记**：
+    // 「模型当时看到了什么」是事后复盘要回答的第一个问题。
+    expect(pool.claimed[0]?.decisionSource).toBe('llm-trend');
+  });
+
+  it('趋势上下文里的 ATR 不许以数值进提示词（口径混了止损会差一个数量级）', async () => {
+    const seen: string[] = [];
+    const { service } = makeService({
+      llm: llmCapturing(JSON.stringify(VALID_DECISION), seen),
+      trend: true,
+      marketContext: MARKET_CONTEXT,
+    });
+    await service.handleFill(fillEvent());
+    // 趋势周期（1h）的 ATR = 500，不许出现。
+    expect(seen[0]).not.toContain('ATR(14)：500');
+    // 算价基准 ATR（测试替身固定 10）必须在。
+    expect(seen[0]).toContain('ATR(1m, 14)：10');
+  });
+
+  it('取不到行情上下文 → 降级到只有收益率数列，仓位仍然受保护', async () => {
+    const { service, placer, pool } = makeService({
+      llm: llmReturning(JSON.stringify(VALID_DECISION)),
+      trend: true,
+      marketContext: null,
+    });
+    const outcome = await service.handleFill(fillEvent());
+    // 关键：**仍然挂上了**（不是裸仓）。
+    expect(outcome).toBe('armed');
+    expect(placer.calls.find((c) => c.stopPrice !== 0)?.stopPrice).toBe(75);
+    // 降级是**看得见的**：来源不再是 llm-trend。
+    expect(pool.claimed[0]?.decisionSource).toBe('llm');
+  });
+
+  it('取行情上下文失败 → 同样降级，不让一笔成交裸奔', async () => {
+    const { service, placer, pool } = makeService({
+      llm: llmReturning(JSON.stringify(VALID_DECISION)),
+      trend: true,
+      marketContextError: 'Python 子进程退出码 1',
+    });
+    const outcome = await service.handleFill(fillEvent());
+    expect(outcome).toBe('armed');
+    expect(placer.calls.find((c) => c.stopPrice !== 0)?.stopPrice).toBe(75);
+    expect(pool.claimed[0]?.decisionSource).toBe('llm');
+  });
+
+  it('没开趋势分析 → 整段不取，行为与 v1.1.0 之前逐字一致', async () => {
+    const { service, pool } = makeService({
+      llm: llmReturning(JSON.stringify(VALID_DECISION)),
+    });
+    const outcome = await service.handleFill(fillEvent());
+    expect(outcome).toBe('armed');
+    expect(pool.claimed[0]?.decisionSource).toBe('llm');
   });
 });

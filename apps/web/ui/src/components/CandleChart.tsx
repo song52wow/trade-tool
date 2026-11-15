@@ -1,6 +1,12 @@
 import { useLayoutEffect, useRef, useState } from 'react';
 
 import type { BarDto } from '../../../src/types';
+import { fmtPrice } from '../format.js';
+import { fmtClock, fmtStamp, priceTicks, timeTicksByBar, useMeasuredWidth } from '../chart.js';
+
+// 既有测试从 CandleChart 取这两个刻度函数；转发一次，避免测试跟着搬家（AGENTS §5-5：转发可以）。
+export { priceTicks };
+export { timeTicksByBar as timeTicks };
 import { describeSpan, gapStats } from './gaps.js';
 
 // 缺口统计住在 gaps.ts（纯计算，1m 与派生周期共用），这里转出以保持
@@ -156,33 +162,6 @@ export function lastLabelCollides(layout: CandleLayout, lastClose: number): bool
   return Math.abs(priceLabelY - volumeLabelY) < 12;
 }
 
-/** 轴刻度取 1/2/5×10ⁿ 的「好看」步长，避免出现 0.0037 这种刻度。 */
-function niceStep(raw: number): number {
-  const exp = Math.floor(Math.log10(raw));
-  const base = 10 ** exp;
-  const f = raw / base;
-  const mult = f <= 1 ? 1 : f <= 2 ? 2 : f <= 5 ? 5 : 10;
-  return mult * base;
-}
-
-export function priceTicks(lo: number, hi: number, count = 5): number[] {
-  if (!Number.isFinite(lo) || !Number.isFinite(hi) || hi <= lo) return [lo];
-  const step = niceStep((hi - lo) / count);
-  const ticks: number[] = [];
-  for (let v = Math.ceil(lo / step) * step; v <= hi + step * 1e-9 && ticks.length < 12; v += step) {
-    ticks.push(v);
-  }
-  return ticks;
-}
-
-export function timeTicks(t0: number, t1: number, count = 6, barMs = DEFAULT_BAR_MS): number[] {
-  if (t1 <= t0) return [t0];
-  const step = Math.max(barMs, Math.round((t1 - t0) / count / barMs) * barMs);
-  const ticks: number[] = [];
-  for (let t = t0; t <= t1; t += step) ticks.push(t);
-  return ticks;
-}
-
 /**
  * 价格格式化：按量级定小数位。
  *
@@ -191,47 +170,8 @@ export function timeTicks(t0: number, t1: number, count = 6, barMs = DEFAULT_BAR
  * 6 − 整数位数，夹在 2~8），而不是保留固定位数：既不丢低价标的的精度，也不会让
  * 高价标的的轴标签刷一屏零。末尾的零交给 `maximumFractionDigits` 去掉。
  */
-export function fmtPrice(value: number): string {
-  if (!Number.isFinite(value)) return '—';
-  const abs = Math.abs(value);
-  if (abs === 0) return '0';
-  if (abs >= 1000) return value.toLocaleString('zh-CN', { maximumFractionDigits: 1 });
-  const digits = Math.min(8, Math.max(2, 6 - Math.ceil(Math.log10(abs) + 1)));
-  return value.toLocaleString('zh-CN', { maximumFractionDigits: digits });
-}
-
-function fmtClock(ms: number): string {
-  return new Date(ms).toLocaleTimeString('zh-CN', {
-    hour12: false,
-    hour: '2-digit',
-    minute: '2-digit',
-  });
-}
-
-function fmtStamp(ms: number): string {
-  return new Date(ms).toLocaleString('zh-CN', { hour12: false });
-}
 
 /** 量容器宽高用 ResizeObserver 量；jsdom / 老浏览器没有它时退回默认宽度，图照常出。 */
-function useMeasuredWidth(): [React.RefObject<HTMLDivElement | null>, number] {
-  const ref = useRef<HTMLDivElement | null>(null);
-  const [width, setWidth] = useState(DEFAULT_WIDTH);
-  useLayoutEffect(() => {
-    const el = ref.current;
-    if (el === null) return;
-    const apply = (w: number) => {
-      if (w > 0) setWidth(w);
-    };
-    apply(el.clientWidth);
-    if (typeof ResizeObserver === 'undefined') return;
-    const observer = new ResizeObserver((entries) => {
-      for (const entry of entries) apply(entry.contentRect.width);
-    });
-    observer.observe(el);
-    return () => observer.disconnect();
-  }, []);
-  return [ref, width];
-}
 
 function Tooltip(props: { bar: BarDto; x: number; y: number; plotRight: number }) {
   const { bar, x, y, plotRight } = props;
@@ -280,7 +220,7 @@ export function CandleChart(props: {
   interval?: string;
 }) {
   const bars = props.bars;
-  const [ref, width] = useMeasuredWidth();
+  const [ref, width] = useMeasuredWidth(DEFAULT_WIDTH);
   const [hover, setHover] = useState<number | null>(null);
   const height = props.height ?? HEIGHT;
   const barMs = props.barMs ?? DEFAULT_BAR_MS;
@@ -346,7 +286,7 @@ export function CandleChart(props: {
           </g>
         ))}
 
-        {timeTicks(layout.t0, layout.t1, 6, barMs).map((t) => (
+        {timeTicksByBar(layout.t0, layout.t1, 6, barMs).map((t) => (
           <text
             key={`t-${String(t)}`}
             x={xOf(layout, t)}

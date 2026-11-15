@@ -1148,6 +1148,16 @@ def test_migrations_are_idempotent(conn: DbConn, pg_dsn: str) -> None:
         "021_fee_asset",
         # 2026-10-25：通知内容类型多两种同步器故障（notify_settings.kinds 扩枚举）
         "022_sync_notify",
+        # v1.1.0：趋势档位决策的来源值（decision_source 允许 llm-trend）
+        "023_trend_decision_source",
+        # 2026-11-06：止盈止损服务自己的状态行
+        "024_executor_status",
+        # 2026-11-06：通知内容类型多一种「止盈止损服务不可用」
+        "025_executor_notify",
+        # v1.2.0：链上仓位的三张表
+        "026_chain_position",
+        # v1.2.0：通知内容类型多一种「链上仓位异动」
+        "027_chain_notify",
     ]
     pg.ensure_schema(conn)
 

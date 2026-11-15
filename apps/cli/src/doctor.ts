@@ -5,6 +5,7 @@ import {
   loadConfigOrDefault,
   loadProjectEnv,
   parseSecretKey,
+  readOptionalSecretKey,
   SECRET_KEY_ENV,
 } from '@trade-tool/core';
 import {
@@ -90,13 +91,18 @@ async function probeNotify(): Promise<ProbeResult> {
     const config = await loadConfigOrDefault();
     pool = createPool(config.database);
     // 主密钥没注入就读不到控制面录入的那一份——如实按「读不到」处理，不当成「没配」。
-    const masterKey = (() => {
-      try {
-        return parseSecretKey(process.env[SECRET_KEY_ENV]);
-      } catch {
-        return null;
-      }
-    })();
+    // 但**格式错了必须报出来**：把它也吞成 null，doctor 会说「没配」，
+    // 而真实原因是主密钥写坏了——两者的处置完全不同（`secret.ts` 的注释明令禁止）。
+    let masterKey: Buffer | null;
+    try {
+      masterKey = readOptionalSecretKey();
+    } catch (error) {
+      return {
+        name: 'notify',
+        ok: false,
+        detail: (error as Error).message.split('\n')[0] ?? 'unknown',
+      };
+    }
     const status = await readNotifyStatus({ pool, masterKey, config: config.notify });
     const from = status.source === 'panel' ? '控制面录入' : `配置文件 + 环境变量`;
     const address = status.configured ? `末 4 位 ${status.hint ?? '—'}` : '无地址';

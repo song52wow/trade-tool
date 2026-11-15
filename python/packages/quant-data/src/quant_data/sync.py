@@ -675,6 +675,22 @@ def _advance_progress(
     return total_rows
 
 
+def _rows_after_round(writer: DbConn, state: pg.DbRow | None, symbol: str) -> int:
+    """本轮结束时的入库行数。
+
+    ``sync_state.rows`` 由 :func:`_advance_progress` **每批**按新增行数累加，
+    因此本轮写完它已经是准的；这里再对 ``klines_1m`` 做一次
+    ``SELECT count(*) WHERE symbol = …`` 纯属重复劳动——单标的 370 万行时
+    每轮 100–300ms，而同步轮默认 15 秒一次（2026-11-12 审计实测的口径）。
+
+    只有状态行缺失时（老库 / 被外部删过行）才退回精确计数：那时增量基线本来就不存在，
+    数一遍是**唯一**能给出正确值的办法。
+    """
+    if state is not None and state.get("rows") is not None:
+        return int(state["rows"])
+    return pg.count_rows(writer, symbol)
+
+
 def _stream_pull_and_write(
     writer: DbConn,
     opts: SyncOptions,
@@ -1246,7 +1262,12 @@ def run_sync(opts: SyncOptions) -> dict[str, object]:
                 now_ms=now,
                 status="error" if stuck else "running",
                 watermark=watermark,
-                rows=pg.count_rows(writer, item.symbol),
+                # `rows` 取**本轮已维护好的增量值**，不再整轮重数一遍
+                # （2026-11-12：这里原本每轮都对 klines_1m 做一次
+                # `SELECT count(*) WHERE symbol=…`，单标的 370 万行时
+                # 100–300ms/轮；而 `_advance_progress` 每批已经把它加好了）。
+                # 只有状态行缺失（老库 / 外部删行）时才退回精确计数。
+                rows=_rows_after_round(writer, state, item.symbol),
                 pending_gaps=gaps_pending,
                 last_success_at=now,
                 **plan_patch,

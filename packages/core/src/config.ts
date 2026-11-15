@@ -36,7 +36,14 @@ export const marketSchema = z.object({
 });
 
 export const backtestSchema = z.object({
-  strategy: z.string().min(1).default('ma-cross'),
+  /**
+   * 回测参数（`fast` / `slow` 等）。
+   *
+   * ⚠️ 这里**没有** `strategy` 字段：2026-11-12 之前它存在但从未被读取
+   * （Python 侧把 `"ma-cross"` 硬编码），是 AGENTS §7 登记的「死配置」，已删除。
+   * 要支持第二个策略，先补**策略注册 / 分派层**，再把字段加回来——
+   * 否则又是一份「配了却不生效」的配置。
+   */
   params: z.record(z.string(), z.union([z.string(), z.number(), z.boolean()])).default({}),
 });
 
@@ -277,6 +284,37 @@ export const llmSchema = llmEndpointSchema
   });
 
 /**
+ * 趋势分析配置（v1.1.0）：止盈止损的档位要不要**按趋势**由模型给。
+ *
+ * 它是 v0.9.0 那个 `executor.llm` 的**加料**，不是替代：
+ *
+ * - `llm.enabled = false` → 这一整段**不参与**，行为与 v0.9.0 之前逐字一致。
+ * - `llm.enabled = true` 且 `trend.enabled = false` → v0.9.0 的老样子：
+ *   模型只看到 ATR 与近期收益率数列。
+ * - 两者都开 → 模型看到**完整的趋势上下文**（程序算好的客观倾向 + 均线 /
+ *   指标 / 情绪面），决策来源记为 `'llm-trend'`。
+ *
+ * ## 为什么趋势分析周期只接受派生周期
+ *
+ * `15m / 1h / 4h / 1d`——技术面靠派生 K 线算，而 `1m` 上做指标物化是容量结论
+ * （单标的约 4.3 GB）。这是 Python 侧 `market_context` 的硬口径，
+ * 写别的周期会在取数时报 `CONFIG_INVALID`，**不回落**到别的周期。
+ */
+export const executorTrendSchema = z.object({
+  /**
+   * 是否让趋势上下文参与档位决策。
+   *
+   * **默认关闭**：它多一次取数（Python 子进程）与一次模型调用，
+   * 而两者都在「成交 → 挂单」之间的裸仓窗口里。
+   */
+  enabled: z.boolean().default(false),
+  /** 趋势分析用的派生周期。 */
+  interval: z.enum(['15m', '1h', '4h', '1d']).default('1h'),
+  /** 技术面计算用多少根已收盘 K 线。 */
+  bars: z.number().int().positive().max(1_500).default(300),
+});
+
+/**
  * 止盈止损执行服务配置（v0.4.0 `executor` 段）。
  *
  * 每一项都会变成**真实的平仓指令**，因此默认值取保守的一侧：
@@ -403,6 +441,13 @@ export const executorSchema = z.object({
    * 决策来源记为 `'policy'`。
    */
   llm: llmSchema.default({}),
+  /**
+   * 趋势分析（v1.1.0）。给止盈止损的档位决策**加料**用的。
+   *
+   * 它只影响**模型看到什么**，不影响模型能输出什么——模型仍然只出倍数，
+   * 价格仍然由纯函数算（AGENTS.md §5 第 13 条）。
+   */
+  trend: executorTrendSchema.default({}),
 });
 
 /**
@@ -636,6 +681,94 @@ export const agentSchema = z.object({
     .default({}),
 });
 
+/**
+ * 链上仓位监控配置（v1.2.0）。
+ *
+ * ## 为什么整段默认关闭
+ *
+ * 这是一个**新入口**（`apps/chain-monitor`）：开了就会出网读链。
+ * 「装了包就在跑」不是这个仓库的风格——服务默认不启动，
+ * 要盯哪一笔仓位由配置明说（AGENTS.md 约定 8：配置缺失就报错，不要猜）。
+ */
+export const chainPositionSchema = z.object({
+  /** 链标识（当前只有 `bsc`）。 */
+  chain: z.string().min(1).default('bsc'),
+  /** 仓位管理器（PositionManager）合约地址。 */
+  positionManager: z.string().regex(/^0x[0-9a-fA-F]{40}$/, '合约地址格式不对'),
+  /** 池子地址。 */
+  pool: z.string().regex(/^0x[0-9a-fA-F]{40}$/, '合约地址格式不对'),
+  /** 区间内的两个 token 合约地址。 */
+  token0: z.string().regex(/^0x[0-9a-fA-F]{40}$/, '合约地址格式不对'),
+  token1: z.string().regex(/^0x[0-9a-fA-F]{40}$/, '合约地址格式不对'),
+  /** 仓位 NFT 的 tokenId（十进制字符串；用字符串是因为它是链上原样，不该被当成浮点）。 */
+  tokenId: z.string().regex(/^\d+$/, 'tokenId 必须是十进制数字'),
+  /** 仓位持有人地址。 */
+  owner: z.string().regex(/^0x[0-9a-fA-F]{40}$/, '合约地址格式不对'),
+  /** 投入时两个币的数量（**原始单位**，18 位小数的整数字符串）。 */
+  depositAmount0: z.string().regex(/^\d+$/, '数量必须是整数字符串'),
+  depositAmount1: z.string().regex(/^\d+$/, '数量必须是整数字符串'),
+  /** 投入那笔交易的哈希（给人查的；出问题时报出来有用）。 */
+  depositTx: z
+    .string()
+    .regex(/^0x[0-9a-fA-F]{64}$/)
+    .optional(),
+  /** 两个币的显示符号（只为展示，不参与任何判据）。 */
+  symbol0: z.string().optional(),
+  symbol1: z.string().optional(),
+});
+
+export const chainSchema = z
+  .object({
+    /**
+     * 是否启动链上监控。缺省 false。
+     *
+     * 关着时 `apps/chain-monitor` 启动即退出（跟 executor 一样），
+     * 不出网、不建连接。
+     */
+    enabled: z.boolean().default(false),
+    /**
+     * BSC 节点地址（按顺序试，全挂了才算失败）。
+     *
+     * 公共节点**不给查历史状态**（`eth_call` 带区块号一律 403），
+     * 所以「存入时的价格」只能从投入数量反推——口径在
+     * `packages/core/src/chain-v3.ts`。
+     */
+    rpcEndpoints: z
+      .array(z.string().min(1))
+      .min(1)
+      .default([
+        'https://bsc-dataseed.binance.org',
+        'https://bsc-dataseed1.defibit.io',
+        'https://bsc-dataseed2.binance.org',
+        'https://bsc.publicnode.com',
+      ]),
+    /** 多久轮询一次（毫秒）。缺省 15 分钟。 */
+    pollIntervalMs: z
+      .number()
+      .int()
+      .positive()
+      .min(30_000)
+      .default(15 * 60_000),
+    /** 要盯的仓位。空数组 = 一笔都不盯（页面会显示「尚未配置」）。 */
+    positions: z.array(chainPositionSchema).default([]),
+    /** 什么时候才值得推一条到飞书（阈值 + 冷却，刷屏的告警等于没接）。 */
+    thresholds: z
+      .object({
+        /** 价格较上次推送变动超过这个百分比（百分点）就推。 */
+        priceMovePct: z.number().positive().default(1.5),
+        /** 盈亏较上次推送变动超过这么多个百分点就推。 */
+        pnlMovePp: z.number().positive().default(1.5),
+        /** 两次推送之间至少隔这么久（毫秒）。 */
+        cooldownMs: z
+          .number()
+          .int()
+          .nonnegative()
+          .default(30 * 60_000),
+      })
+      .default({}),
+  })
+  .default({});
+
 export const configSchema = z.object({
   version: z.literal(1).default(1),
   market: marketSchema,
@@ -647,6 +780,7 @@ export const configSchema = z.object({
   executor: executorSchema.default({}),
   notify: notifySchema.default({}),
   agent: agentSchema.default({}),
+  chain: chainSchema.default({}),
 });
 
 export type MarketConfig = z.infer<typeof marketSchema>;
@@ -659,6 +793,15 @@ export type LlmConfig = z.infer<typeof llmSchema>;
 export type NotifyConfig = z.infer<typeof notifySchema>;
 export type AgentConfig = z.infer<typeof agentSchema>;
 export type AgentLlmConfig = z.infer<typeof agentLlmSchema>;
+/** 链上仓位监控配置（v1.2.0）。 */
+export type ChainConfig = z.infer<typeof chainSchema>;
+/**
+ * zod schema 推出的类型。
+ *
+ * 名字带 `Schema` 后缀，与 `chain-v3.ts` 里的 `ChainPositionConfig` 区分开——
+ * 同一概念不许有两个类型名（AGENTS.md §5 第 5 条；`RemovePolicySchema` 是同样的做法）。
+ */
+export type ChainPositionConfigSchema = z.infer<typeof chainPositionSchema>;
 // 注意：`RemovePolicy` 这个类型名归 market-sync.ts 所有，config 只导出 zod schema，
 // 避免同一概念在两个模块各有一个类型名。
 export type RemovePolicySchema = z.infer<typeof removePolicySchema>;
@@ -667,7 +810,7 @@ export type TradeToolConfig = z.infer<typeof configSchema>;
 export function defaultConfig(): TradeToolConfig {
   return configSchema.parse({
     market: { symbol: 'BTCUSDT', interval: '1h' },
-    backtest: { strategy: 'ma-cross', params: { fast: 20, slow: 60 } },
+    backtest: { params: { fast: 20, slow: 60 } },
     data: {},
     database: {},
     sync: {},

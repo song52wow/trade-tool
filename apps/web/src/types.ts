@@ -5,16 +5,26 @@
  * `../src/types.js` 引用而不会把服务端代码拖进前端产物，也不需要重复一份声明。
  */
 import type {
+  ChainApy,
+  ChainPositionLinks,
   ContractSpec,
   DesiredState,
   GapRecord,
+  ReconcileDifference,
+  ReconcileReport,
   RemovePolicy,
   StoredInterval,
   SyncPlanEstimate,
   SyncSummary,
   SymbolSyncState,
 } from '@trade-tool/core';
-import type { SchemaStatus } from '@trade-tool/data';
+import type {
+  BracketRecord,
+  BracketState,
+  ExecutorStatusView,
+  NotifyStatus,
+  SchemaStatus,
+} from '@trade-tool/data';
 
 export type LifecycleAction = 'start' | 'pause' | 'resume';
 /**
@@ -72,7 +82,10 @@ export interface SymbolRowDto {
 
 export interface SymbolDetailDto extends SymbolRowDto {
   contract: ContractSpec | null;
+  /** 缺口清单（最多 200 条；**总数在 `gapsTotal`**）。 */
   gaps: GapRecord[];
+  /** 该标的的缺口**总数**。列表被截断时页面必须能说出「还有多少条没显示」。 */
+  gapsTotal: number;
   estimate: SyncPlanEstimate | null;
   /**
    * 每周期的「已入库桶数 / 被扣留桶数 / 扣留原因」（v0.2.0 R-7.5 / AC-15）。
@@ -152,52 +165,15 @@ export type DerivedIntervalDto =
  * 而 `armed` 是两张单都在——把这两种显示成同一个「已保护」，页面上就看不出
  * 「止盈已经走了一半」这件要紧事。
  */
-export type BracketStateDto =
-  'armed' | 'partial_armed' | 'trailing' | 'take_profit' | 'stop_loss' | 'cancelled' | 'failed';
-
 /**
- * 一条止盈止损记录（`risk_bracket` 表的一行）。
+ * 止盈止损记录与状态：**形状归 `packages/data` 所有**，这里只转发。
  *
- * `tpAlgoId` / `slAlgoId` 可为 null：**两张单要么都挂上要么都不挂**（v0.4.0 规则 5），
- * 所以出现「有止盈单号、无止损单号」本身就是一条 `failed` 记录，页面要把这种不完整
- * 如实显示成异常，而不是把 null 悄悄渲染成「—」当作正常。
+ * 原来这份 DTO 是手抄的（还把 `positionSide` 放宽成了 `string`），后果是
+ * `BracketRecord` 加一列时页面不会报错——类型看着对，运行时字段却少一个。
+ * 手抄一份就等于给自己留了一条静默漂移的路。
  */
-export interface BracketDto {
-  /** 幂等锚点：同一笔买入成交只处理一次（v0.4.0 规则 4）。 */
-  entryOrderId: string;
-  exchange: string;
-  symbol: string;
-  entryPrice: number;
-  entryTime: number;
-  filledQty: number;
-  positionSide: string;
-  /** 计算止损用的 ATR 值。atr = 0 是非法的（止损会正好落在入场价上），页面要能看出异常。 */
-  atr: number;
-  atrPeriod: number;
-  atrInterval: string;
-  /** ATR 取数窗口的毫秒时间戳区间——已收盘 bar 的尾段（v0.4.0 规则 1 / 2）。 */
-  atrWindowFrom: number;
-  atrWindowTo: number;
-  stopPrice: number;
-  takeProfit: number;
-  tpAlgoId: number | null;
-  slAlgoId: number | null;
-  /**
-   * v0.7.0 第一段与移动止损的档位（NULL = 未进入该阶段）。
-   *
-   * 页面必须能把 `trailing` 行的「当前那一档」显示出来：只显示 `stopPrice`
-   * （入场时的原始止损）会让人以为移动止损根本没动过。
-   */
-  tp1AlgoId: number | null;
-  tp1Price: number | null;
-  trailStopPrice: number | null;
-  /** 本轮没有移动（或移动失败）的原因。常驻可见，不静默跳过。 */
-  trailLastError: string | null;
-  state: BracketStateDto;
-  lastError: string | null;
-  createdAt: number;
-  updatedAt: number;
-}
+export type BracketStateDto = BracketState;
+export type BracketDto = BracketRecord;
 
 /** `/brackets` 的回包。`limit` 是**实际生效**的上限，页面据此说明是否被截断。 */
 export interface BracketsDto {
@@ -243,23 +219,7 @@ export interface CredentialWriteBody {
  * 通知设置状态。**没有明文地址，也没有密文**——与凭据那条线同一套规矩：
  * 控制面从设计上就没有把凭据显示出来的能力。
  */
-export interface NotifyStatusDto {
-  /** 生效的那一档是否启用推送。 */
-  enabled: boolean;
-  /** 生效的那一档**要通知哪些内容**（交易对账的差异类型 id）。 */
-  kinds: readonly string[];
-  repeatCooldownMs: number;
-  /** 生效的那一档有没有地址。 */
-  configured: boolean;
-  /** 地址末 4 位，纯展示用，不是机密。 */
-  hint: string | null;
-  /** 有没有配签名密钥。 */
-  secretConfigured: boolean;
-  /** 生效来源：`panel` = 控制面录入；`config` = 配置文件 + 环境变量。 */
-  source: 'panel' | 'config';
-  /** 生效来源是 `config` 时，地址取自哪个环境变量（排障要看）。 */
-  webhookEnv: string;
-  secretEnv: string;
+export type NotifyStatusDto = NotifyStatus & {
   /**
    * **可勾选的内容目录**（服务端下发的唯一来源）。
    *
@@ -267,24 +227,9 @@ export interface NotifyStatusDto {
    * 没跟上，用户就永远勾不到它。
    */
   topics: NotifyKindDto[];
-  /**
-   * 面板那一档的状态。**无论它是否生效都在这里**——
-   * 「面板里配过、但当前生效的是配置文件那一档」必须看得见。
-   */
-  panel: {
-    configured: boolean;
-    hint: string | null;
-    enabled: boolean;
-    kinds: readonly string[];
-    repeatCooldownMs: number;
-    updatedAt: number | null;
-    /** `null` = 读不到（主密钥没注入，解不开密文）——不是「没配」。 */
-    secretConfigured: boolean | null;
-  } | null;
-  updatedAt: number | null;
   /** 主密钥是否已注入环境变量。没注入时页面必须**明确说不能保存**，而不是存完失败。 */
   masterKeyReady: boolean;
-}
+};
 
 /**
  * 一项「要通知的内容」。
@@ -421,11 +366,21 @@ export interface DaemonStatusDto {
   staleAfterMs: number;
 }
 
+/**
+ * 止盈止损服务（executor）的状态（2026-11-06）。
+ *
+ * **两个正交维度**：进程在不在（`state`）、私有接口通不通（`privateApiOk`）。
+ * 合成一个「在线」会骗人：私有接口全挂时心跳照跳，页面显示「在线」，
+ * 而它一单都挂不出去——2026-10-31 到 11-06 那 6 天静默就是这么来的。
+ */
+export type ExecutorStatusDto = ExecutorStatusView;
+
 export interface OverviewDto {
   schema: SchemaStatus;
   summary: SyncSummary;
   exchange: ExchangeOverviewDto;
   daemon: DaemonStatusDto;
+  executor: ExecutorStatusDto;
   jobs: { active: number; recent: JobDto[] };
   now: number;
 }
@@ -454,6 +409,59 @@ export type {
   ReconcileReport,
   ReconcileSeverity,
 } from '@trade-tool/core';
+
+/**
+ * 一条差异 + **服务端下发的文案**。
+ *
+ * 页面原来自己有一份 `KIND_LABEL`（AGENTS §7 第 6 条登记的已知漂移）：
+ * 同一个差异类型在两个地方各起一句中文，改一处另一处不知道。
+ * 现在文案的唯一来源是 core 的 `RECONCILE_KIND_INFO`，由服务端随 DTO 带下来——
+ * 与通知内容目录（`topics`）同一个做法：**页面不抄判据侧的词表**。
+ */
+export type ReconcileDifferenceDto = ReconcileDifference & {
+  label: string;
+  hint: string;
+};
+
+export type ReconcileReportDto = Omit<ReconcileReport, 'differences'> & {
+  differences: ReconcileDifferenceDto[];
+};
+
+/**
+ * 手动补挂止盈止损的结果（v1.3.0）。
+ *
+ * 它是**一次人工干预**的回执：每一笔都有说法（补了什么、为什么、挂没挂上），
+ * 没有「无声跳过」这一档。
+ */
+export interface ReattachDto {
+  symbol: string;
+  /** 真的挂上了几笔。 */
+  placed: number;
+  /** 这一轮是演练（只算不挂）。 */
+  dryRun: boolean;
+  details: {
+    kind: string;
+    symbol: string;
+    /** 本地记录的入场单号；`null` = 本地没有记录（裸仓），补挂时新建了一条。 */
+    entryOrderId: string | null;
+    outcome: 'placed' | 'dry-run' | 'skipped' | 'failed';
+    reason: string;
+    tpAlgoId?: number;
+    slAlgoId?: number;
+  }[];
+  /** 不补挂但要让人知道的事。 */
+  skips: { symbol: string; entryOrderId: string | null; reason: string }[];
+  /**
+   * 拒绝补挂的原因。`null` = 没有拒绝。
+   *
+   * 「拒绝」与「不需要补挂」是两回事：前者是**该补但不敢补**
+   * （比如交易所的仓位数量与本地记录对不上，照记录补可能重复减仓），
+   * 它必须在页面上显眼地显示出来（约定 9）。
+   */
+  refusal: string | null;
+  /** 补记了「第一段止盈已成交」这个事实时的人话说明。`null` = 没有补记。 */
+  tp1FillRecorded: string | null;
+}
 
 /** 增删标的的请求体。删除必须显式给处置策略，不做隐式删除（R-18.3）。 */
 export interface AddSymbolBody {
@@ -625,4 +633,124 @@ export interface AgentViewDto {
   symbol: string;
   report: AgentReportDto | null;
   plan: TradingPlanDto | null;
+}
+
+// ------------------------------------------------- 链上仓位（v1.2.0）
+
+/**
+ * 一笔链上流动性仓位在控制面上的**当前**状态。
+ *
+ * 来源是 `chain_position` 那一行 LEFT JOIN 出来的**最近一次采样**：
+ * 链上事实由 `apps/chain-monitor` 读链后落库，控制面只读本地表，
+ * 因此这条接口可以挂在页面的刷新节奏上（纯读，不出网）。
+ *
+ * ## 为什么这些字段可以是 `null`
+ *
+ * 「还没采过样」是**正常状态**（仓位刚登记、monitor 还没跑第一轮），
+ * 与「采到了但价格是 0」完全不是一回事。因此凡是来自采样的数字都允许为
+ * `null`，页面显示成「—」。把它们兜成 0 就是谎报：0 会被当成「这个仓位一文不值」。
+ *
+ * 代价是页面要处理 null —— 但那是**页面该做的事**，服务端替它编一个数字
+ * 只会把「没数据」伪装成「有数据」（AGENTS.md 约定 9：不静默兜底）。
+ */
+export interface ChainPositionDto {
+  /** 链上身份：keccak(仓位管理器, 下界 tick, 上界 tick)。 */
+  positionKey: string;
+  chain: string;
+  /** 两个币的显示符号。库里允许为空（只登记了地址没填符号）。 */
+  symbol0: string | null;
+  symbol1: string | null;
+  /** 仓位 NFT 的 tokenId（十进制字符串）。 */
+  tokenId: string;
+  /** 仓位持有人地址。 */
+  owner: string;
+  /** 仓位管理器（PositionManager）合约地址。 */
+  positionManager: string;
+  /** 池子合约地址。 */
+  pool: string;
+  /** 区间里 token0 / token1 的合约地址。 */
+  token0: string;
+  token1: string;
+  /**
+   * 外部链接（区块浏览器 / 流动性平台）。
+   *
+   * **服务端算好给页面**：浏览器端不能 import `@trade-tool/core` 的运行时
+   * （barrel 带着 node 内置模块，打包会炸），而链接的拼法必须只有一份实现——
+   * 页面自己再拼一次，改了域名只改了一边，另一边就成了死链。
+   *
+   * 链不认识时**全部为 `null`**（不猜域名），页面据此不显示链接。
+   */
+  links: ChainPositionLinks;
+  /**
+   * 年化收益率（APY）。
+   *
+   * 口径在 core 的 `computeChainApy`：**最近 7 天实际收到的手续费** ÷ 投入成本，
+   * 按窗口长度年化。算不出来时 `apyPct` 为 `null`，`note` 里说清原因
+   * （没采样 / 成本没算出来 / 窗口内手续费被领取过 / 采样不到一天）。
+   */
+  apy: ChainApy;
+  /** 最近一次采样价；还没采过样时为 `null`。 */
+  price: number | null;
+  /** 区间下界的价格（由下界 tick 换算）。**不依赖采样**，永远有值。 */
+  priceLower: number;
+  /** 区间上界的价格（由上界 tick 换算）。 */
+  priceUpper: number;
+  /** 当前价格是否落在区间内；还没采过样时为 `null`（不是 false）。 */
+  inRange: boolean | null;
+  /** 当前价值（计价币）。 */
+  valueUsdt: number | null;
+  /** 投入成本（滚动记账；加减仓时随之调整）。 */
+  costUsdt: number;
+  /** 已实现盈亏（加减仓时结算的那部分）。 */
+  realizedUsdt: number;
+  /** 浮动盈亏（计价币，含手续费）。 */
+  pnlUsdt: number | null;
+  /**
+   * 浮动盈亏**百分数**（`-0.25` 表示 -0.25%）。
+   *
+   * ⚠️ 单位是「百分数」而不是「比率」——与 `core` 的口径一致
+   * （`computeChainPositionSnapshot` 里乘过 100）。页面直接显示即可，
+   * **不要再乘一次 100**。
+   */
+  pnlPct: number | null;
+  /** 累计未领手续费折成计价币后的金额。 */
+  feeUsdt: number | null;
+  /** 当前持仓构成，**原始单位**（1e18 = 1 个币）的十进制字符串。 */
+  amount0: string | null;
+  amount1: string | null;
+  /**
+   * 当前流动性，**链上原始值**的十进制字符串。
+   *
+   * ⚠️ 它是 Uniswap V3 的 **L 值（Q96 刻度）**，**不是**代币数量——
+   * 除以 1e18 会得到一个没有单位的数。页面上原样显示（只加千分位），
+   * 用途是让人看出「这笔仓位被加仓 / 减仓了」。
+   */
+  liquidity: string | null;
+  /** 最后一次采样成功/失败的时刻（epoch ms）。 */
+  lastPollAt: number | null;
+  /** 最后一次**真的推出去**的告警时刻（epoch ms）。 */
+  lastAlertAt: number | null;
+  /** 最后一次采样的错误原话；成功时为 `null`。 */
+  lastError: string | null;
+  /** 投入那笔交易的哈希（给人查的）。 */
+  depositTx: string | null;
+}
+
+/**
+ * 一次采样的结果（画曲线与看趋势用）。
+ *
+ * `ts` 是**毫秒**（仓库约定：时间一律毫秒 bigint，不是 ISO 字符串），
+ * 横轴要按时间排布，转字符串就得多解析一次。
+ */
+export interface ChainSnapshotDto {
+  ts: number;
+  /** 区块高度（字符串：它可能超出 `Number.MAX_SAFE_INTEGER`）。 */
+  block: string;
+  price: number;
+  valueUsdt: number;
+  pnlUsdt: number;
+  /** 百分数（`-0.25` 表示 -0.25%），与 `ChainPositionDto.pnlPct` 同口径。 */
+  pnlPct: number;
+  feeUsdt: number;
+  inRange: boolean;
 }

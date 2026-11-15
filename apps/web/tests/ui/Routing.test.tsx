@@ -33,17 +33,38 @@ afterEach(() => {
 });
 
 describe('hash 路由解析', () => {
-  it('三条路由各自解析，认不出的回首页而不是空白', () => {
+  it('五条路由各自解析，认不出的回首页而不是空白', () => {
     expect(parseRoute('')).toEqual({ kind: 'home' });
     expect(parseRoute('#/')).toEqual({ kind: 'home' });
     expect(parseRoute('#/settings')).toEqual({ kind: 'settings' });
+    expect(parseRoute('#/chain')).toEqual({ kind: 'chain' });
     expect(parseRoute('#/symbol/AAAUSDT')).toEqual({ kind: 'symbol', symbol: 'AAAUSDT' });
+    // 链上仓位的详情：卡片点进去就是它
+    expect(parseRoute('#/chain/0xabc')).toEqual({ kind: 'chain-detail', positionKey: '0xabc' });
     // 带百分号编码的标的来回一圈
     expect(parseRoute('#/symbol/A%2FB')).toEqual({ kind: 'symbol', symbol: 'A/B' });
     // 认不出 / 残缺 / 非法转义：都给首页这个明确落点
     expect(parseRoute('#/nope')).toEqual({ kind: 'home' });
     expect(parseRoute('#/symbol')).toEqual({ kind: 'home' });
     expect(parseRoute('#/symbol/%E0%A4%A')).toEqual({ kind: 'home' });
+    // 链上仓位的详情只有一层子路径，多一层就是认不出
+    expect(parseRoute('#/chain/0xabc/extra')).toEqual({ kind: 'home' });
+  });
+});
+
+describe('链上仓位路由', () => {
+  it('地址是 #/chain 时直接进链上仓位页，而不是先闪一下首页', async () => {
+    window.location.hash = '#/chain';
+    stubFetch({
+      ...handlers(),
+      '/api/chain/positions': { items: [] },
+    });
+
+    render(<App />);
+
+    // 空状态也是**正常状态**：要显示「尚未配置」，不能是一片空白
+    await waitFor(() => expect(screen.getByText(/尚未配置链上仓位/)).toBeTruthy());
+    expect(screen.queryByText('标的集合')).toBeNull();
   });
 });
 

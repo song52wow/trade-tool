@@ -338,6 +338,51 @@ function sideMatches(position: PositionSide, record: 'LONG' | 'SHORT'): boolean 
   return position === 'BOTH' || position === record;
 }
 
+/**
+ * 这一行**此刻在交易所上该有**哪些条件单。
+ *
+ * 这是「该有什么」的**事实判据**（§6.5 第 5 条）：对账用它判断「少了谁」，
+ * 手动补挂用它判断「补谁」。**只有这一份实现**——两处各写一遍，
+ * 就会出现「对账说缺止损、页面却没有补挂按钮」这类对不上的现象，
+ * 而那正是这个仓库最忌讳的分裂。
+ *
+ * | state           | 交易所上该有的单            |
+ * | --------------- | --------------------------- |
+ * | `failed`        | 一张都没有（占坑成功、下单失败） |
+ * | `armed`         | 止盈（全平）+ 止损（全平）    |
+ * | `partial_armed` | 第一段止盈（带数量）+ 止损     |
+ * | `trailing`      | **只有止损一张**             |
+ *
+ * `partial_armed` 且 `tp1_filled_at` 有值时例外：第一段**已经成交**，
+ * 那张单本来就会消失，此刻只剩止损（§6.3 第 10 条）。
+ *
+ * ## `facts`：把「第一段已成交」这个事实**覆盖**进来
+ *
+ * 库里那一列（`tp1_filled_at`）由**用户数据流**写，而用户数据流**可能当时不在**
+ * ——第一段止盈成交了、没人看见，库里就还留着「该有第一段止盈单」。
+ * 手动补挂这时若照着库里补，会**再挂一张**（重复减仓，见 `packages/core/src/risk-reattach.ts`
+ * 的 `detectTp1Fill`）。补挂路径拿交易所的**实际仓位**核对过之后，用这个参数
+ * 把事实告诉这里。
+ *
+ * 默认为 `undefined` = **认库里的列**，因此对账的行为一字不变。
+ */
+export function expectedBracketOrders(
+  record: LocalBracket,
+  facts?: { tp1Filled?: boolean },
+): BracketTag[] {
+  const tp1Filled = facts?.tp1Filled ?? record.tp1FilledAt !== null;
+  switch (record.state) {
+    case 'failed':
+      return ['tp', 'sl'];
+    case 'armed':
+      return ['tp', 'sl'];
+    case 'partial_armed':
+      return tp1Filled ? ['sl'] : ['tp', 'sl'];
+    case 'trailing':
+      return ['sl'];
+  }
+}
+
 function inSymbolScope(symbol: string, scope: string | null): boolean {
   return scope === null || symbol === scope;
 }
@@ -428,8 +473,12 @@ export function reconcileBrackets(input: ReconcileInput): ReconcileReport {
     // 止损：三态都该有一张（`trailing` 只有这一张）。缺它就是裸仓，critical。
     // 比价用 `effectiveStopPrice`：移动止损每次调档都会改 `trail_stop_price`，
     // 拿入场那一档去比，每次都会报一条假的价格不符。
+    //
+    // 「该有什么」由 `expectedBracketOrders` 判定（与手动补挂共用一份），
+    // 而**该有的那一张不见了**才是差异。
+    const expected = expectedBracketOrders(record);
     const stopPrice = effectiveStopPrice(record);
-    if (sl === undefined) {
+    if (expected.includes('sl') && sl === undefined) {
       differences.push({
         kind: 'missing-stop-order',
         severity: 'critical',
@@ -443,7 +492,7 @@ export function reconcileBrackets(input: ReconcileInput): ReconcileReport {
           entryPrice: record.entryPrice,
         },
       });
-    } else if (!samePrice(sl.triggerPrice, stopPrice)) {
+    } else if (sl !== undefined && !samePrice(sl.triggerPrice, stopPrice)) {
       differences.push({
         kind: 'price-mismatch',
         severity: 'warning',
@@ -518,10 +567,9 @@ export function reconcileBrackets(input: ReconcileInput): ReconcileReport {
       record.state === 'partial_armed' ? requireTp1Price(record) : record.takeProfit;
     if (tp === undefined) {
       // 「第一段已成交」的行：止盈单**本来就会消失**（它成交了，交易所自动撤掉）。
-      // 报「止盈单不见了」是假警报——事实由 `tp1_filled_at` 记着。
-      // 没有这个标记的 `partial_armed` 行才是真的缺单（那张单还没成交就不见了）。
-      const tp1Filled = record.state === 'partial_armed' && record.tp1FilledAt !== null;
-      if (!tp1Filled) {
+      // 报「止盈单不见了」是假警报——事实由 `tp1_filled_at` 记着，
+      // 而「这一态该有没有止盈单」由 `expectedBracketOrders` 判定（它知道这件事）。
+      if (expected.includes('tp')) {
         differences.push({
           kind: 'missing-take-profit-order',
           severity: 'warning',

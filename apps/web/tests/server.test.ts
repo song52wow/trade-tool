@@ -8,6 +8,7 @@ import { describe, expect, it } from 'vitest';
 
 import { DEFAULT_BRACKET_LIMIT, MAX_BAR_LIMIT, MAX_BRACKET_LIMIT } from '../src/bars.js';
 import { buildApp, type WebDeps } from '../src/server.js';
+import type { BracketRecord } from '@trade-tool/data';
 import type {
   BracketsDto,
   ErrorBody,
@@ -93,13 +94,33 @@ function fakeDeps(overrides: Partial<WebDeps> = {}): WebDeps & { calls: string[]
           ageMs: 2_000,
           staleAfterMs: 60_000,
         },
+        // 默认给「运行中且私有接口可用」，让与它无关的用例不被新横幅影响
+        executor: {
+          state: 'running',
+          pid: 4243,
+          startedAt: NOW - 60_000,
+          lastBeatAt: NOW - 2_000,
+          ageMs: 2_000,
+          staleAfterMs: 60_000,
+          privateApiOk: true,
+          lastPrivateOkAt: NOW - 1_000,
+          lastErrorCode: null,
+          lastErrorMessage: null,
+        },
         jobs: { active: 0, recent: [] },
         now: NOW,
       }) satisfies OverviewDto,
     listSymbols: async () => [row('AAAUSDT')],
     getSymbol: async (symbol) =>
       symbol === 'AAAUSDT'
-        ? { ...row(symbol), contract: null, gaps: [], estimate: null, derived: {} }
+        ? {
+            ...row(symbol),
+            contract: null,
+            gaps: [],
+            gapsTotal: 0,
+            estimate: null,
+            derived: {},
+          }
         : null,
     listExchangeSymbols: async (options) => {
       calls.push(`exchange:${String(options?.refresh ?? false)}`);
@@ -147,6 +168,14 @@ function fakeDeps(overrides: Partial<WebDeps> = {}): WebDeps & { calls: string[]
     listAgentView: async (symbol) => {
       calls.push(`agent:${symbol}`);
       return { symbol, report: null, plan: null };
+    },
+    listChainPositions: async () => {
+      calls.push('chain:positions');
+      return [];
+    },
+    listChainSnapshots: async (positionKey, options) => {
+      calls.push(`chain:snapshots:${positionKey}:${String(options.limit)}`);
+      return [];
     },
     getAgentLlmStatus: async () => {
       calls.push('agentLlm:get');
@@ -248,6 +277,18 @@ function fakeDeps(overrides: Partial<WebDeps> = {}): WebDeps & { calls: string[]
         counts: { critical: 0, warning: 0, total: 0 },
         differences: [],
         scope: { localUnsettled: 0, exchangePositions: 0, exchangeAlgoOrders: 0 },
+      };
+    },
+    reattach: async (symbol, options) => {
+      calls.push(`reattach:${symbol}:${String(options?.dryRun === true)}`);
+      return {
+        symbol,
+        placed: 0,
+        dryRun: options?.dryRun === true,
+        details: [],
+        skips: [],
+        refusal: null,
+        tp1FillRecorded: null,
       };
     },
     getCredentialStatus: async () => ({
@@ -379,12 +420,70 @@ function fakeDeps(overrides: Partial<WebDeps> = {}): WebDeps & { calls: string[]
   return Object.assign(base, overrides, { calls });
 }
 
+/** 一条完整的止盈止损记录：只覆盖用例关心的字段，其余取「刚挂上、没进入任何后续阶段」的默认值。 */
+function bracketDefaults(): Omit<BracketRecord, 'symbol' | 'entryOrderId'> {
+  const t = NOW - 3_600_000;
+  return {
+    exchange: 'binance',
+    entryPrice: 100,
+    entryTime: t,
+    filledQty: 1,
+    positionSide: 'LONG',
+    atr: 2,
+    atrPeriod: 14,
+    atrInterval: '1h',
+    atrWindowFrom: NOW - 7_200_000,
+    atrWindowTo: t,
+    stopPrice: 96,
+    takeProfit: 108,
+    tpAlgoId: 1,
+    slAlgoId: 2,
+    tp1AlgoId: null,
+    tp1Qty: null,
+    tp1Price: null,
+    tp1FilledQty: null,
+    tp1FilledAt: null,
+    trailExtreme: null,
+    trailStopPrice: null,
+    trailAtr: null,
+    trailAtrFrom: null,
+    trailAtrTo: null,
+    trailUpdatedAt: null,
+    trailLastError: null,
+    trailStep: 0,
+    trailMoves: 0,
+    trailStatus: 'idle',
+    closedQty: 0,
+    exitNotional: 0,
+    feeAmount: 0,
+    feeAsset: null,
+    feeFxRate: null,
+    decisionSource: 'config',
+    decisionStopAtrMult: null,
+    decisionTakeProfitAtrMult: null,
+    decisionTakeProfit1Ratio: null,
+    decisionTrailAtrMult: null,
+    decisionBreakevenAfterTp1: null,
+    decisionRationale: null,
+    decisionFallbackReason: null,
+    decisionRaw: null,
+    decisionAt: null,
+    state: 'armed',
+    lastError: null,
+    createdAt: t,
+    updatedAt: t,
+  };
+}
+
 describe('buildApp 路由', () => {
-  it('GET /api/health', async () => {
+  it('GET /api/health 是**存活**探针：不查库、不查 schema', async () => {
     const app = buildApp(fakeDeps());
     const res = await app.request('/api/health');
     expect(res.status).toBe(200);
-    await expect(res.json()).resolves.toEqual({ ok: true });
+    const body = (await res.json()) as { ok: boolean; probe: string };
+    expect(body.ok).toBe(true);
+    // 显式标出它只是 liveness：部署脚本不该把它当成「服务可用」。
+    expect(body.probe).toBe('liveness');
   });
 
   it('GET /api/overview 汇总 schema、配额与标的数', async () => {
@@ -897,31 +996,13 @@ describe('POST /api/symbols/:symbol/aggregate', () => {
           symbol,
           limit: options.limit,
           items: [
+            // 完整的一条 BracketRecord：DTO 现在**直接转发** data 的类型，
+            // 所以这里必须给全字段（少一个 tsc 就会报——这正是要的效果：
+            // 表加一列，测试夹具也得跟着建，不会静默少一个字段）。
             {
-              entryOrderId: 'order-1',
-              exchange: 'binance',
+              ...bracketDefaults(),
               symbol,
-              entryPrice: 100,
-              entryTime: NOW - 3_600_000,
-              filledQty: 1,
-              positionSide: 'LONG',
-              atr: 2,
-              atrPeriod: 14,
-              atrInterval: '1h',
-              atrWindowFrom: NOW - 7_200_000,
-              atrWindowTo: NOW - 3_600_000,
-              stopPrice: 96,
-              takeProfit: 108,
-              tpAlgoId: 1,
-              slAlgoId: 2,
-              tp1AlgoId: null,
-              tp1Price: null,
-              trailStopPrice: null,
-              trailLastError: null,
-              state: 'armed' as const,
-              lastError: null,
-              createdAt: NOW - 3_600_000,
-              updatedAt: NOW - 3_600_000,
+              entryOrderId: 'order-1',
             },
           ],
           // 有 2 笔 failed，但当前 items 里一条都没有——这正是 countsByState 存在的理由。

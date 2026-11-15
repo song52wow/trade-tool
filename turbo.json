@@ -17,14 +17,13 @@
       "outputs": ["dist/**"]
     },
     "typecheck": {
-      "dependsOn": ["^build"],
+      "dependsOn": ["build", "^build"],
       "inputs": ["src/**", "ui/**", "tests/**", "tsconfig.json", "ui/tsconfig.json"]
     },
     "test": {
-      "dependsOn": ["^build"],
-      "inputs": ["src/**", "tests/**", "vitest.config.ts"]
+      "dependsOn": ["build", "^build"],
+      "inputs": ["src/**", "tests/**", "vitest.config.ts", "sql/**", "package.json"]
     },
-    "lint": {},
     "dev": {
       "cache": false,
       "persistent": true

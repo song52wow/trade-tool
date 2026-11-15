@@ -3,6 +3,7 @@ import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } fr
 
 import { ApiError, api } from './api.js';
 import { fmtAgo, fmtDuration, fmtNumber, fmtPercent } from './format.js';
+import { ChainPositionPanel } from './components/ChainPositionPanel.js';
 import { ConfirmDialog } from './components/ConfirmDialog.js';
 import { OverviewCards } from './components/OverviewCards.js';
 import { SettingsPage } from './components/SettingsPage.js';
@@ -10,7 +11,8 @@ import { SymbolPage } from './components/SymbolPage.js';
 import { SymbolPicker } from './components/SymbolPicker.js';
 import { SymbolTable } from './components/SymbolTable.js';
 import { ThemeToggle } from './components/ThemeToggle.js';
-import { HOME_PATH, SETTINGS_PATH, navigate, symbolPath, useRoute } from './router.js';
+import { CHAIN_PATH, HOME_PATH, SETTINGS_PATH, navigate, symbolPath, useRoute } from './router.js';
+import { DAEMON_LABEL } from './labels.js';
 import type { JobDto, OverviewDto, SymbolRowDto } from '../../src/types';
 
 const REFRESH_MS = 5_000;
@@ -29,16 +31,6 @@ type Pending =
   | { kind: 'verify'; symbol: string }
   | { kind: 'aggregate'; symbol: string }
   | { kind: 'remove'; symbol: string; policy: RemovePolicy };
-
-/**
- * 守护进程三态的中文标签。与 `OverviewCards` 里那份**逐字相同**——
- * 两处各写一份的话，迟早会有一处先改掉，用户看到两个不同的说法。
- */
-const DAEMON_LABEL: Record<OverviewDto['daemon']['state'], string> = {
-  running: '运行中',
-  stale: '心跳超时',
-  stopped: '未运行',
-};
 
 /**
  * 迁移版本压成短形式：`015_restore_llm_params_check` → `015`。
@@ -300,12 +292,33 @@ export function App() {
           </button>
 
           <nav className="nav" aria-label="主导航">
+            {/*
+              「概览」的当前态：首页**与**单标的详情都算概览的一部分
+              （详情页回答的仍是「这个标的怎么样」）。
+
+              链上仓位是**另一件事**（BSC 上的流动性仓位，不是币安合约），
+              所以它有自己的入口，不跟概览混在一起——两个不同的东西挤在
+              同一个按钮里，用户点之前得先猜这一页会显示什么。
+            */}
             <button
-              className={`nav-link${route.kind === 'settings' ? '' : ' current'}`}
+              className={`nav-link${
+                route.kind === 'home' || route.kind === 'symbol' ? ' current' : ''
+              }`}
               onClick={() => navigate(HOME_PATH)}
-              aria-current={route.kind === 'settings' ? undefined : 'page'}
+              aria-current={route.kind === 'home' || route.kind === 'symbol' ? 'page' : undefined}
             >
               概览
+            </button>
+            <button
+              className={`nav-link${
+                route.kind === 'chain' || route.kind === 'chain-detail' ? ' current' : ''
+              }`}
+              onClick={() => navigate(CHAIN_PATH)}
+              aria-current={
+                route.kind === 'chain' || route.kind === 'chain-detail' ? 'page' : undefined
+              }
+            >
+              链上仓位
             </button>
             <button
               className={`nav-link${route.kind === 'settings' ? ' current' : ''}`}
@@ -422,6 +435,34 @@ export function App() {
           </div>
         ) : null}
 
+        {/* 止盈止损服务不可用时，仓位是裸的——这条必须常驻可见（2026-11-06 补）。
+            私有接口全挂时它**照样活着**，页面若只显示「在线」，就是一个会骗人的界面：
+            2026-10-31 到 11-06 那 6 天里它一单都挂不出去，而没有人知道。 */}
+        {overview &&
+        overview.executor.state === 'running' &&
+        overview.executor.privateApiOk === false ? (
+          <div className="banner">
+            止盈止损服务连不上交易所私有接口：
+            <b>它挂不出止盈止损单，也查不出仓位有没有保护</b>。
+            <div className="muted" style={{ fontSize: 12, marginTop: 4 }}>
+              先查三样：API key 是否还有效、出口 IP 是否在白名单里、
+              <code>executor.environment</code> 是不是 live（沙箱不认主网密钥，报的错一模一样）。
+              {overview.executor.lastErrorMessage !== null ? (
+                <> · 最后一条错误：{overview.executor.lastErrorMessage}</>
+              ) : null}
+            </div>
+          </div>
+        ) : null}
+        {overview && overview.executor.state === 'stopped' ? (
+          <div className="banner">
+            止盈止损服务未运行：<b>交易所有仓位的话，它们是裸的</b>。
+            <div className="muted" style={{ fontSize: 12, marginTop: 4 }}>
+              它默认不启动（<code>executor.enabled = false</code>，会真实下单）。 目标机上用{' '}
+              <code>docker compose --profile executor up -d executor</code> 启动。
+            </div>
+          </div>
+        ) : null}
+
         {/*
           三条路由各自只渲染自己那部分内容：详情页不重复概览卡片，设置页也不。
           概览卡片回答的是「全局现在怎么样」，详情页回答的是「这个标的怎么样」，
@@ -436,6 +477,7 @@ export function App() {
                 exchangeStale={overview.exchange.stale}
                 exchangeAgeMs={overview.exchange.ageMs}
                 daemon={overview.daemon}
+                executor={overview.executor}
                 now={now}
                 activeJobs={overview.jobs.active}
               />
@@ -590,6 +632,25 @@ export function App() {
         ) : null}
 
         {route.kind === 'settings' ? <SettingsPage symbols={symbols} notify={notify} /> : null}
+
+        {/*
+          链上仓位（BSC / PancakeSwap V3）。**独立页面**而不是首页下面的一块：
+          它与币安合约的标的集合完全是两件事（不同的标的、不同的数据来源、
+          不同的刷新节奏），混在首页里会让人以为它属于合约那一套。
+
+          `tick` 跟着全局刷新走：这一页是**纯读本地库**（链上事实由
+          `apps/chain-monitor` 落库），因此可以挂在 5s 的节奏上。
+
+          列表与详情是**两条路由**（`#/chain` 与 `#/chain/<仓位键>`）：
+          卡片点进去就是详情，浏览器的前进/后退也能用——详情页不该是组件内部状态。
+        */}
+        {route.kind === 'chain' || route.kind === 'chain-detail' ? (
+          <ChainPositionPanel
+            tick={tick}
+            now={now}
+            positionKey={route.kind === 'chain-detail' ? route.positionKey : null}
+          />
+        ) : null}
 
         {/*
           弹窗与 toast 放在**页面内容之后**：确认按钮与行内按钮同名时，

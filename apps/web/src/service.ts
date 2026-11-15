@@ -2,19 +2,25 @@ import {
   INTERVAL_MS,
   NOTIFY_KIND_INFO,
   NOTIFY_KINDS,
+  RECONCILE_KIND_INFO,
   SyncError,
   assertApprovable,
   autoExecutableProblem,
+  buildChainPositionLinks,
+  computeChainApy,
   createNotifier,
   loadConfigOrDefault,
   parseSecretKey,
+  readOptionalSecretKey,
   percentToRatio,
+  priceFromTick,
   ratioToPercent,
   describeClockSkew,
   SECRET_KEY_ENV,
   STORED_INTERVALS,
   type GapRecord,
   type RemovePolicy,
+  type SyncSummary,
   type SymbolEntry,
   type SymbolSyncState,
   type TradeToolConfig,
@@ -45,6 +51,9 @@ import {
   writeRiskPolicy as writeRiskPolicyRow,
   listExchangeSymbols,
   readDaemonHeartbeat,
+  readExecutorStatus,
+  EXECUTOR_STALE_AFTER_MS,
+  pendingGapCount,
   readDerivedIntervals,
   readLatestBars,
   readLatestReconciliation,
@@ -52,6 +61,10 @@ import {
   readLatestTradingPlan,
   readTradingPlanById,
   updateTradingPlanStatus,
+  listChainPositions,
+  listChainSnapshots,
+  type ChainPositionViewRow,
+  type ChainSnapshotRow,
   readAgentLlmStatus,
   readAgentLlmPanelTarget,
   writeAgentLlmSettings as writeAgentLlmSettingsRow,
@@ -63,12 +76,15 @@ import {
   syncSymbol,
   verifySymbol,
   type AnalystReportRow,
+  type ListSymbolsResult,
   type MarketContext,
   type Pool,
   type TradingPlanRow,
   exchangeEndpointsFromEnv,
 } from '@trade-tool/data';
 import { createSyncService, HEARTBEAT_INTERVAL_MS, type SyncService } from '@trade-tool/sync';
+// 手动补挂止盈止损（v1.3.0）：编排与自动路径**同一份**实现（apps/executor/src/reattach.ts）。
+import { createAtrProvider, createReattacher } from '@trade-tool/executor';
 
 import { clampBarLimit, MAX_BRACKET_LIMIT } from './bars.js';
 import { JobRegistry, type JobRunnerOptions } from './jobs.js';
@@ -103,15 +119,18 @@ function requireMasterKey(): Buffer {
  * 配置」后面，是凭空加一道门槛。
  */
 function masterKeyOrNull(): Buffer | null {
-  const raw = process.env[SECRET_KEY_ENV];
-  if (raw === undefined || raw.trim() === '') return null;
-  return requireMasterKey();
+  // 「没配 → null；配错 → 抛」这条判据只有 core 一份（`readOptionalSecretKey`）。
+  // 手写一遍 `raw === '' ? null : parse(raw)` 会把「格式错」也吞成 null，
+  // 而那正是 `secret.ts` 明令禁止的区分丢失。
+  return readOptionalSecretKey();
 }
 import type {
   AgentReportDto,
   AgentViewDto,
   BarDto,
   BracketsDto,
+  ChainPositionDto,
+  ChainSnapshotDto,
   CredentialStatusDto,
   NotifyStatusDto,
   AgentLlmStatusDto,
@@ -119,7 +138,10 @@ import type {
   RiskPolicyViewDto,
   TradingPlanDto,
   DaemonStatusDto,
+  ExecutorStatusDto,
   ReconcileReport,
+  ReconcileReportDto,
+  ReattachDto,
   ExchangeListDto,
   OverviewDto,
   SymbolDetailDto,
@@ -130,6 +152,23 @@ export interface WebRuntime extends WebDeps {
   /** schema 闸门：库与代码版本不一致时抛错，不让页面在旧结构上继续操作（R-1.3 / R-19.7）。 */
   assertSchema(): Promise<void>;
   close(): Promise<void>;
+}
+
+/**
+ * 给每条差异补上**中文文案**（唯一来源：core 的 `RECONCILE_KIND_INFO`）。
+ *
+ * `kind` 是判据侧的标识；页面只负责渲染，不再自己维护一份词表——那份词表
+ * 就是 AGENTS §7 第 6 条登记的漂移（两边的措辞本来就不一样，改一处另一处不知道）。
+ * 纯函数、不碰 IO，所以可以直接单测。
+ */
+export function withReconcileKindLabels(report: ReconcileReport): ReconcileReportDto {
+  return {
+    ...report,
+    differences: report.differences.map((item) => ({
+      ...item,
+      ...RECONCILE_KIND_INFO[item.kind],
+    })),
+  };
 }
 
 /**
@@ -151,12 +190,81 @@ export function createWebRuntime(config: TradeToolConfig): WebRuntime {
 
   const entries = (): Promise<SymbolEntry[]> => service.primitives.listSymbols();
 
-  const allRows = async () =>
-    mergeSymbolRows({
-      entries: await entries(),
-      states: await states(),
+  /**
+   * 标的行 = 标的集合（`symbols`）+ 每个标的的同步状态（`sync_state`）。
+   *
+   * 两条查询**并行**：它们互不依赖，串行只是历史写法。控制面每 5s 会读一次
+   * （`/api/symbols`），详情页再读一次——串行就是白等一次往返。
+   */
+  const allRows = async () => {
+    const [entryRows, stateRows] = await Promise.all([entries(), states()]);
+    return mergeSymbolRows({
+      entries: entryRows,
+      states: stateRows,
       fallbackExchange: ctx.exchange,
     });
+  };
+
+  /**
+   * 带 TTL 的进程内缓存（按 key）。**只用于「挂在 5s 轮询上的只读汇总」**：
+   * 那些数的变化是分钟级的，而重新算一次要出 Python 子进程或扫表。
+   *
+   * 为什么不放进 `packages/data`：缓存失效策略是**控制面的展示需求**
+   * （同一进程、同一个 tick 内复用），放进数据层会让 CLI / 守护进程也吃到陈旧值。
+   *
+   * `inflight` 合并同一 key 的并发请求：一个 tick 里多开一个标签页不该让
+   * 「fork 一次 python」变成「fork 两次」。
+   */
+  function keyedTtlCache<T>(ttlMs: number) {
+    const values = new Map<string, { at: number; value: T }>();
+    const inflight = new Map<string, Promise<T>>();
+    return async (key: string, load: () => Promise<T>): Promise<T> => {
+      const now = Date.now();
+      const hit = values.get(key);
+      if (hit !== undefined && now - hit.at < ttlMs) return hit.value;
+      const pending = inflight.get(key);
+      if (pending !== undefined) return pending;
+      const next: Promise<T> = load()
+        .then((value) => {
+          values.set(key, { at: Date.now(), value });
+          return value;
+        })
+        .finally(() => {
+          inflight.delete(key);
+        });
+      inflight.set(key, next);
+      return next;
+    };
+  }
+
+  /**
+   * exchangeInfo 摘要的缓存时长（60s）。
+   *
+   * `/api/overview` 只用它的四个标量（数量 / 缓存时刻 / 年龄 / 是否过期），而拿到它们
+   * 要 **fork 一个 Python 子进程**（≈0.55s：解释器 + psycopg/numpy 导入 + 读 1MB
+   * exchangeInfo.json + 建连接 + schema 闸门）。5s 一轮 = 每小时 720 次，
+   * 而这份元数据的 TTL 本身就是 1 小时（`data.metadataTtlMs`）。
+   */
+  const EXCHANGE_SUMMARY_TTL_MS = 60_000;
+
+  /** 全局汇总的缓存时长（30s）：它包含多张表的 `count(*)`，变化是分钟级的。 */
+  const SUMMARY_TTL_MS = 30_000;
+
+  /**
+   * 详情页一次最多带多少条缺口。
+   *
+   * 缺口行数等于历史缺口数；200 条足以看清「洞在哪、漏了多少」，
+   * 而总数由 `gapsTotal` 单独给出，页面据此说明「还有 N 条未显示」。
+   */
+  const GAP_LIMIT = 200;
+
+  /** 详情页里「变化很慢」的两块：合约规格快照与派生桶统计。 */
+  const DETAIL_SLOW_TTL_MS = 30_000;
+
+  const cachedExchangeSummary = keyedTtlCache<ListSymbolsResult>(EXCHANGE_SUMMARY_TTL_MS);
+  const cachedSummary = keyedTtlCache<SyncSummary>(SUMMARY_TTL_MS);
+  const cachedContract = keyedTtlCache<SymbolDetailDto['contract']>(DETAIL_SLOW_TTL_MS);
+  const cachedDerived = keyedTtlCache<SymbolDetailDto['derived']>(DETAIL_SLOW_TTL_MS);
 
   const jobs = new JobRegistry({
     runFull: async (symbol) => ({ ...(await syncSymbol(ctx, symbol, {})) }),
@@ -191,6 +299,20 @@ export function createWebRuntime(config: TradeToolConfig): WebRuntime {
     return { ...beat, staleAfterMs: daemonStaleMs };
   };
 
+  /**
+   * 止盈止损服务（executor）的状态（2026-11-06）。
+   *
+   * **为什么单独一读，而不是并进 daemon 那一行**：它们是两个进程、两种失效方式。
+   * executor 可以在「心跳照跳」的同时「私有接口全挂」——那时候页面若只显示
+   * 「在线」，用户看到的就是一个会骗人的界面（2026-10-31 到 11-06 那 6 天）。
+   */
+  const executorStatus = async (now: number): Promise<ExecutorStatusDto> => {
+    const status = await readExecutorStatus(pool, ctx.exchange, EXECUTOR_STALE_AFTER_MS, now);
+    return { ...status, staleAfterMs: EXECUTOR_STALE_AFTER_MS };
+  };
+
+  const withKindLabels = withReconcileKindLabels;
+
   return {
     // assertSchemaVersion 在版本不匹配时抛错；匹配时返回值对调用方没有意义。
     assertSchema: async () => {
@@ -199,11 +321,19 @@ export function createWebRuntime(config: TradeToolConfig): WebRuntime {
 
     async getOverview(): Promise<OverviewDto> {
       const now = Date.now();
-      const [schema, summary, exchange, daemon] = await Promise.all([
+      // 三档节奏：
+      //   * 进程/库的**当前**状态（schema、心跳、executor）→ 每次都读（都是单行查询）；
+      //   * 全局汇总（多表计数）→ 30s 缓存；
+      //   * exchangeInfo 摘要 → 60s 缓存（它要 fork 一个 Python 子进程）。
+      // 后两者挂在 5s 轮询上时，原本是「每次轮询都重新付一遍」，而它们的变化
+      // 本来就是分钟级的（2026-11-12 实测 /api/overview 813ms，其中大头是这两项）。
+      // 注意：**缓存的是数据，不是判断**——`stale` 仍由数据层算，这里只复用结果。
+      const [schema, summary, exchange, daemon, executor] = await Promise.all([
         schemaStatus(pool),
-        service.primitives.getSummary(),
-        listExchangeSymbols(ctx),
+        cachedSummary('summary', () => service.primitives.getSummary()),
+        cachedExchangeSummary('exchange', () => listExchangeSymbols(ctx)),
         daemonStatus(now),
+        executorStatus(now),
       ]);
       return {
         schema,
@@ -216,6 +346,7 @@ export function createWebRuntime(config: TradeToolConfig): WebRuntime {
           stale: exchange.stale,
         },
         daemon,
+        executor,
         jobs: { active: jobs.activeCount(), recent: jobs.list().slice(0, 5) },
         now,
       };
@@ -228,16 +359,26 @@ export function createWebRuntime(config: TradeToolConfig): WebRuntime {
     async getSymbol(symbol): Promise<SymbolDetailDto | null> {
       const row = (await allRows()).find((r) => r.symbol === symbol) ?? null;
       if (row === null) return null;
-      // 合约规格是快照：拿不到（缓存过期且出网失败）不该让整个详情页打不开，
-      // 但必须显式是 null 让页面显示「未知」，不拿旧值假装有。
-      const contract = await resolveContract(ctx, symbol).catch(() => null);
-      // 派生统计（R-7.5 / AC-15）：让用户能回答「为什么没有 4h 蜡烛」。
-      // 传**实际启用的周期集合**而不是布尔：R-9.1 允许只启用一个子集，没启用的周期
-      // 必须如实返回 withheldReason='disabled'，而不是报 0 个桶（AC-22）。
-      const derived = await readDerivedIntervals(pool, symbol, STORED_INTERVALS, {
-        enabled: config.data.aggregateIntervals,
-      });
-      return { ...row, contract, gaps: await getGaps(ctx, symbol), estimate: null, derived };
+      // 三块数据互不依赖 → 并行。其中前两块变化很慢（合约规格是快照、派生桶是分钟级），
+      // 各缓存 30s：详情页现在跟着 5s 轮询刷新，而这两块各要一次子进程 / 一个多周期聚合。
+      // 缺口清单**截断到 200 条**，但总数另算：列表可以少，总数不能少
+      // （「缺口不得静默存在」）。见 SymbolDetailDto 的 gapsTotal。
+      const [contract, derived, gaps, gapsTotal] = await Promise.all([
+        // 合约规格：拿不到（缓存过期且出网失败）不该让整个详情页打不开，
+        // 但必须显式是 null 让页面显示「未知」，不拿旧值假装有——因此**失败不进缓存**。
+        cachedContract(symbol, () => resolveContract(ctx, symbol)).catch(() => null),
+        // 派生统计（R-7.5 / AC-15）：让用户能回答「为什么没有 4h 蜡烛」。
+        // 传**实际启用的周期集合**而不是布尔：R-9.1 允许只启用一个子集，没启用的周期
+        // 必须如实返回 withheldReason='disabled'，而不是报 0 个桶（AC-22）。
+        cachedDerived(symbol, () =>
+          readDerivedIntervals(pool, symbol, STORED_INTERVALS, {
+            enabled: config.data.aggregateIntervals,
+          }),
+        ),
+        getGaps(ctx, symbol, GAP_LIMIT),
+        pendingGapCount(pool, symbol),
+      ]);
+      return { ...row, contract, gaps, gapsTotal, estimate: null, derived };
     },
 
     async listExchangeSymbols(options): Promise<ExchangeListDto> {
@@ -314,6 +455,34 @@ export function createWebRuntime(config: TradeToolConfig): WebRuntime {
     estimate: (symbol) => estimateFirstPull(ctx, symbol),
 
     /**
+     * 链上仓位列表（v1.2.0）：**只读**本地表。
+     *
+     * 纯读：只打 PG，不读链、不出网，因此能挂在页面的 5s 刷新节奏上。
+     *
+     * 链上事实由 `apps/chain-monitor` 读链后落库，这里只读已经算好的账——
+     * 口径（成本、盈亏、手续费）由 `packages/core` 的纯函数算，
+     * 控制面**不重算一遍**（§5 第 4 条：纯函数只有一份实现）。
+     */
+    async listChainPositions(): Promise<ChainPositionDto[]> {
+      const rows = await listChainPositions(pool);
+      return rows.map(toChainPositionDto);
+    },
+
+    /**
+     * 某一笔仓位的采样历史（v1.2.0）：**只读**本地表。
+     *
+     * 服务端**升序**返回（库里是倒序取最近 N 条再翻转的），
+     * 这样页面画曲线时横轴按时间排布不需要再自己排一次。
+     */
+    async listChainSnapshots(
+      positionKey: string,
+      options: { limit: number },
+    ): Promise<ChainSnapshotDto[]> {
+      const rows = await listChainSnapshots(pool, positionKey, options.limit);
+      return rows.map(toChainSnapshotDto);
+    },
+
+    /**
      * 分析师报告与执行方案（v1.0.0）：**只读**本地表。
      *
      * 纯读：只打 PG，不调模型、不出网、不下单，因此能挂在页面的 5s 刷新节奏上。
@@ -369,12 +538,13 @@ export function createWebRuntime(config: TradeToolConfig): WebRuntime {
      * 「我现在就想看一眼」的补充。从没跑过时返回 `null` ——「还没对过账」与
      * 「对过了、一致」在界面上必须能分开说。
      */
-    async latestReconciliation(): Promise<ReconcileReport | null> {
+    async latestReconciliation(): Promise<ReconcileReportDto | null> {
       // 空串 = 全账户范围，与 executor 自动对账的范围一致。
-      return readLatestReconciliation(pool, ctx.exchange, '');
+      const report = await readLatestReconciliation(pool, ctx.exchange, '');
+      return report === null ? null : withKindLabels(report);
     },
 
-    async reconcile(symbol: string): Promise<ReconcileReport> {
+    async reconcile(symbol: string): Promise<ReconcileReportDto> {
       const credentials = await resolveActiveCredentials({
         pool,
         masterKey: masterKeyOrNull(),
@@ -399,7 +569,65 @@ export function createWebRuntime(config: TradeToolConfig): WebRuntime {
       // 手动这一轮也落快照：否则界面会继续显示**上一次自动**的结果，
       // 而用户刚刚点的按钮看起来像什么都没发生。
       await recordReconciliation(pool, report, Date.now());
-      return report;
+      return withKindLabels(report);
+    },
+
+    /**
+     * **手动补挂**止盈止损（v1.3.0）：**会真下单**。
+     *
+     * 它与 `reconcile` 是一对，分工写死在 §6.5 第 1 条：
+     *   * `reconcile` **只报告、绝不动手**——补挂一张止损会平掉真实仓位且不可逆；
+     *   * 修复是**人工决定**，这条路由就是那条决定之后的动作。
+     *
+     * 因此它与页面上其他只读接口不同：
+     *   * **要签名访问交易所私有接口**（读持仓与挂单 + 下单），因此只在用户点按钮时跑；
+     *   * `symbol` 必填——一个能被随手连点的接口不该按全账户的价走；
+     *   * 写操作，来源校验（`checkOrigin`）照旧。
+     *
+     * ⚠️ **控制面不许再起守护进程**（§6.6 第 2 条）：这里只跑**一次**，
+     * 没有定时器，也不写 `desired_state`。
+     */
+    async reattach(symbol: string, options: { dryRun?: boolean } = {}): Promise<ReattachDto> {
+      const credentials = await resolveActiveCredentials({
+        pool,
+        masterKey: masterKeyOrNull(),
+        exchange: ctx.exchange,
+        apiKeyEnv: config.executor.apiKeyEnv,
+        apiSecretEnv: config.executor.apiSecretEnv,
+      });
+      const client = new BinancePrivateClient({
+        credentials,
+        ...exchangeEndpointsFromEnv(config.executor),
+        recvWindowMs: config.executor.recvWindowMs,
+      });
+      // 补挂也要校时钟：不然每个签名请求都 -1021，而「查失败」与「挂不上」
+      // 在界面上必须能分开说。
+      const skew = await client.measureClockSkew();
+      console.error(`[web] 手动补挂前校时：${describeClockSkew(skew)}`);
+      const atr = createAtrProvider({
+        runtime: ctx.runtime,
+        dsn: ctx.dsn,
+        config: config.executor,
+        timeoutMs: config.data.timeoutMs,
+      });
+      const reattacher = createReattacher({
+        pool,
+        config,
+        client,
+        placer: client,
+        atr,
+        resolvePolicy: async (target) => resolvePolicy(pool, ctx.exchange, target, config.executor),
+      });
+      const report = await reattacher.run(symbol, { dryRun: options.dryRun === true });
+      return {
+        symbol: report.symbol,
+        placed: report.placed,
+        dryRun: report.dryRun,
+        details: report.details,
+        skips: report.skips,
+        refusal: report.refusal,
+        tp1FillRecorded: report.tp1FillRecorded,
+      };
     },
 
     /**
@@ -788,4 +1016,97 @@ export async function applyTradingPlanStatus(input: {
     throw new SyncError('DB_UNIQUE_VIOLATION', `方案 ${planId} 读不到了`, { planId });
   }
   return toTradingPlanDto(updated);
+}
+
+// ------------------------------------------- 链上仓位的 DTO 转换（v1.2.0）
+
+/**
+ * 库里的仓位行 → 页面用的仓位。
+ *
+ * **只搬运，不重算**：成本、已实现盈亏、浮动盈亏、手续费都是 `apps/chain-monitor`
+ * 算好落库的，这里原样透出。控制面再算一遍就是**第二份实现**——两处口径一旦漂移，
+ * 就会出现「告警里说赚 3 块、页面上写亏 2 块」，而谁也不知道该信谁（§5 第 4 条）。
+ *
+ * 唯一在这里算的是**区间上下界的价格**：`tick → price` 用 core 的 `priceFromTick`
+ * （§5 第 5 条：同一概念只有一个名字），页面侧不另写一份 `1.0001^tick`。
+ *
+ * **外部链接也是在这里给的**（core 的 `buildChainPositionLinks`）：
+ * 浏览器端不能 import `@trade-tool/core` 的运行时，而链接的拼法必须只有一份。
+ *
+ * 导出来是为了**能被测**（与 `applyTradingPlanStatus` 同一理由）：这条映射要对着
+ * 真库验「字段没错位」，而不必起整个控制面。
+ */
+export function toChainPositionDto(row: ChainPositionViewRow): ChainPositionDto {
+  return {
+    positionKey: row.positionKey,
+    chain: row.chain,
+    symbol0: row.symbol0,
+    symbol1: row.symbol1,
+    tokenId: row.tokenId,
+    owner: row.owner,
+    positionManager: row.positionManager,
+    pool: row.pool,
+    token0: row.token0,
+    token1: row.token1,
+    links: buildChainPositionLinks({
+      chain: row.chain,
+      pool: row.pool,
+      positionManager: row.positionManager,
+      tokenId: row.tokenId,
+      owner: row.owner,
+      depositTx: row.depositTx,
+      token0: row.token0,
+      token1: row.token1,
+    }),
+    // 年化：窗口两端的手续费与时刻都来自采样表，口径在 core（§5 第 4 条：纯函数）。
+    apy: computeChainApy({
+      feeStartUsdt: row.windowFeeUsdt,
+      feeNowUsdt: row.lastFeeUsdt,
+      tsStartMs: row.windowTs,
+      tsNowMs: row.lastTs,
+      capitalUsdt: row.costUsdt,
+    }),
+    price: row.lastPrice,
+    priceLower: priceFromTick(row.tickLower),
+    priceUpper: priceFromTick(row.tickUpper),
+    inRange: row.lastInRange,
+    valueUsdt: row.lastValueUsdt,
+    costUsdt: row.costUsdt,
+    realizedUsdt: row.realizedUsdt,
+    pnlUsdt: row.lastPnlUsdt,
+    pnlPct: row.lastPnlPct,
+    feeUsdt: row.lastFeeUsdt,
+    amount0: row.lastAmount0,
+    amount1: row.lastAmount1,
+    // 「当前流动性」取的是**最近一次采样里的**那个（`snapshotLiquidity`），
+    // 不是滚动状态里的 `lastLiquidity`（那是上一轮记下的，用来发现加减仓）。
+    // 两者在 SQL 里曾经同名、后者盖掉了前者（2026-11-11 实测踩过）。
+    liquidity: row.snapshotLiquidity,
+    lastPollAt: row.lastPollAt,
+    lastAlertAt: row.lastAlertAt,
+    lastError: row.lastError,
+    depositTx: row.depositTx,
+  };
+}
+
+/**
+ * 一次采样 → 页面用的采样点。
+ *
+ * `amount0` / `amount1` / `liquidity` 这三列**不往外传**：页面画曲线只要
+ * 时间、价格、价值、盈亏、手续费与区间内外，原始单位的持仓构成由当前那一条
+ * 提供就行。少传一列是首屏响应小一点，不是信息缺失。
+ *
+ * 导出来是为了**能被测**（与 `toChainPositionDto` 同一理由）。
+ */
+export function toChainSnapshotDto(row: ChainSnapshotRow): ChainSnapshotDto {
+  return {
+    ts: row.ts,
+    block: row.block,
+    price: row.price,
+    valueUsdt: row.valueUsdt,
+    pnlUsdt: row.pnlUsdt,
+    pnlPct: row.pnlPct,
+    feeUsdt: row.feeUsdt,
+    inRange: row.inRange,
+  };
 }

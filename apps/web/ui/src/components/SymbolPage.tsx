@@ -1,4 +1,4 @@
-import { useLayoutEffect, useMemo, useState } from 'react';
+import { useLayoutEffect, useMemo, useRef, useState } from 'react';
 
 import { ApiError, api } from '../api.js';
 import { HOME_PATH, navigate, symbolPath } from '../router.js';
@@ -31,21 +31,55 @@ export function SymbolPage(props: {
   /** 保存提示走同一套横幅。 */
   notify: (text: string, kind?: 'ok' | 'err') => void;
 }) {
+  /**
+   * 详情页内几个**重面板**（K 线 / 止盈止损 / Agent / 对账）的刷新节奏：
+   * 每 3 次全局刷新（约 15s）一次。
+   *
+   * 为什么分档：全局 5s 的节奏是为「进程在不在、同步跑到哪」这类**状态**设的；
+   * 而 K 线一次 300 根、方案与对账读的是分钟级变化的数据，5s 重取只是在重复传输。
+   * 详情本身（行数 / 缺口 / 派生桶）仍按 5s 走——它是「现在到底怎么样」。
+   *
+   * 不做成每个面板各自 `setInterval`：多个定时器会让同一屏出现多个时间基准，
+   * 关掉自动刷新后还有面板在动（R-19 的诚实性要求）。
+   */
+  const panelTick = Math.floor(props.tick / 3);
+
   const [detail, setDetail] = useState<SymbolDetailDto | null>(null);
   const [error, setError] = useState<string | null>(null);
+  /** 上一轮的取数控制器：换标的或下一次刷新时**取消**它，避免慢请求层层叠加。 */
+  const inFlight = useRef<AbortController | null>(null);
 
+  // 换标的：旧详情与旧错误立刻清掉，别让上一个标的的数据短暂冒充新的。
+  // 同一标的的 5s 刷新**不清**——否则每轮都闪一次「读取中」，而画面其实只是更新。
   useLayoutEffect(() => {
-    let cancelled = false;
-    setDetail(null);
+    setDetail((prev) => (prev !== null && prev.symbol !== props.symbol ? null : prev));
     setError(null);
+  }, [props.symbol]);
+
+  /**
+   * 详情取数挂在**全局刷新节奏**（`props.tick`）上，不是只在换标的时读一次。
+   *
+   * 之前这里只有 `[props.symbol]`，而错误横幅写着「每 5s 自动重试」——那句话是假的：
+   * 后端抖一下之后详情就永久停在错误态，同步进行中的「已入库行数 / 缺口 / 派生桶」
+   * 也永远不动，同一屏的 K 线却在每 5s 刷新（两个时间基准）。
+   *
+   * 取消上一轮是配套的：这张页面的服务端要读库 + 算派生统计，慢的时候会超过 5s；
+   * 不取消就会叠请求。`AbortError` 不是错误，静默丢弃。
+   */
+  useLayoutEffect(() => {
+    inFlight.current?.abort();
+    const controller = new AbortController();
+    inFlight.current = controller;
     void api
-      .symbol(props.symbol)
+      .symbol(props.symbol, { signal: controller.signal })
       .then((d) => {
-        if (!cancelled) setDetail(d);
+        setDetail(d);
+        setError(null);
       })
       .catch((e: unknown) => {
+        // 主动取消：不是失败，什么都不做。
+        if (controller.signal.aborted) return;
         // 读取失败必须**常驻可见**：详情读不出来却显示成空详情，等于谎报「这个标的数据正常」。
-        if (cancelled) return;
         setError(
           e instanceof ApiError
             ? `[${e.code}] ${e.message}`
@@ -55,9 +89,9 @@ export function SymbolPage(props: {
         );
       });
     return () => {
-      cancelled = true;
+      controller.abort();
     };
-  }, [props.symbol]);
+  }, [props.symbol, props.tick]);
 
   const options = useMemo(() => props.symbols.map((s) => s.symbol), [props.symbols]);
   /** 上一 / 下一个按页面上给出的顺序走，列表为空时禁用而不是悄悄不动。 */
@@ -129,7 +163,7 @@ export function SymbolPage(props: {
             onVerify={props.onVerify}
             aggregating={props.aggregating}
             onAggregate={props.onAggregate}
-            tick={props.tick}
+            tick={panelTick}
             notify={props.notify}
           />
         )}

@@ -17,6 +17,28 @@ import {
 } from '@trade-tool/data';
 
 import { SyncDaemon } from '../src/daemon.js';
+/**
+ * 轮询等待一个条件成立（最多 `timeoutMs`）。
+ *
+ * 这里刻意**不用固定 sleep**：这个文件跑在 turbo 的并行任务里，同一台机器上
+ * `packages/data` 的迁移与 Python 子进程会把 CPU 占满——固定等 60ms 在空机上够，
+ * 在并发下就不够，于是「慢标的不堵住别人」这条用例会偶发假红
+ * （2026-11-12 全量 `pnpm check` 实测过一次）。等待条件成立才有意义，
+ * 等一个固定时长本质是在赌调度速度。
+ */
+async function waitUntil(
+  predicate: () => boolean,
+  label: string,
+  timeoutMs = 5_000,
+): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (predicate()) return;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  throw new Error(`等待超时（${String(timeoutMs)}ms）：${label}`);
+}
+
 import { SyncControl } from '../src/primitives.js';
 import { createSyncService } from '../src/service.js';
 
@@ -905,11 +927,12 @@ describe('慢标的不堵住别人（调度不再等整轮）', () => {
     });
     await daemon.start();
 
-    // 等 SLOW 真的卡住，再给 FAST 几轮时间
-    await new Promise((r) => setTimeout(r, 60));
+    // 等 SLOW 真的卡住、且 FAST 至少跑过一轮（并发下不能用固定 sleep）。
+    await waitUntil(() => slowStarted && fastRuns >= 1, 'SLOW 卡住且 FAST 跑过至少一轮');
     expect(slowStarted, 'SLOW 应该已经卡在那一轮里').toBe(true);
     const runsWhileSlowStuck = fastRuns;
-    await new Promise((r) => setTimeout(r, 250));
+    // 再等 FAST 至少多跑两轮：证明它没有被卡住的 SLOW 拖住。
+    await waitUntil(() => fastRuns >= runsWhileSlowStuck + 2, 'SLOW 卡着时 FAST 继续被调度');
 
     // 关键断言：SLOW 卡着的时候，FAST 仍然被反复调度。
     // 旧写法下这里是 1（FAST 在第一轮跑完就一直等 SLOW），现在应当 ≥ 3。

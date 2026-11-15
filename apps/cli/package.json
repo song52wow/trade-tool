@@ -28,10 +28,11 @@
     "clean": "rm -rf dist"
   },
   "dependencies": {
+    "@trade-tool/agent": "workspace:*",
     "@trade-tool/core": "workspace:*",
     "@trade-tool/data": "workspace:*",
-    "commander": "^12.1.0",
-    "@trade-tool/agent": "workspace:*"
+    "@trade-tool/executor": "workspace:*",
+    "commander": "^12.1.0"
   },
   "devDependencies": {
     "@trade-tool/tsconfig": "workspace:*",

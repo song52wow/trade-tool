@@ -17,8 +17,7 @@
 
 import {
   describeClockSkew,
-  parseSecretKey,
-  SECRET_KEY_ENV,
+  readOptionalSecretKey,
   SyncError,
   type ReconcileReport,
 } from '@trade-tool/core';
@@ -45,9 +44,8 @@ export interface ReconcileCommandOptions {
  * 是凭空加一道门槛。
  */
 function masterKeyOrNull(): Buffer | null {
-  const raw = process.env[SECRET_KEY_ENV];
-  if (raw === undefined || raw.trim() === '') return null;
-  return parseSecretKey(raw);
+  // 判据只有 core 一份：没配 → null，配错 → 抛（不要吞成「没配」）。
+  return readOptionalSecretKey();
 }
 
 function render(report: ReconcileReport): void {

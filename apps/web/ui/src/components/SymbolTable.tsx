@@ -1,4 +1,5 @@
 import { fmtAgo, fmtBytes, fmtNumber, fmtTime } from '../format.js';
+import { DESIRED_STATE_LABEL, SYNC_STATUS_LABEL } from '../labels.js';
 import type { SymbolRowDto } from '../../../src/types.js';
 
 const STATUS_TAG: Record<string, string> = {
@@ -51,7 +52,17 @@ export function SymbolTable(props: {
                 <tr
                   key={symbol}
                   className={`clickable${props.selected === symbol ? ' selected' : ''}`}
+                  // 键盘可达：这张表是进入详情页的**唯一入口**，只挂 onClick 的话
+                  // Tab 永远到不了它（`styles.css` 里那条 `tr.clickable:focus-visible`
+                  // 也就永远不会触发）。Enter / 空格与点击等价。
+                  tabIndex={0}
                   onClick={() => props.onSelect(symbol)}
+                  onKeyDown={(event) => {
+                    if (event.key !== 'Enter' && event.key !== ' ') return;
+                    // 空格默认会滚动页面——在「行」上按空格是选择，不是翻页。
+                    event.preventDefault();
+                    props.onSelect(symbol);
+                  }}
                 >
                   {/*
                     `data-label` 是**列名**，窄屏下由 CSS 变成行内标签（`::before`）。
@@ -77,14 +88,17 @@ export function SymbolTable(props: {
                     ) : (
                       <span
                         className={`tag ${row.desiredState === 'running' ? 'running' : 'paused'}`}
+                        title={row.desiredState}
                       >
-                        {row.desiredState}
+                        {DESIRED_STATE_LABEL[row.desiredState]}
                       </span>
                     )}
                   </td>
                   <td data-label="实际状态">
                     {state ? (
-                      <span className={STATUS_TAG[state.status] ?? 'tag'}>{state.status}</span>
+                      <span className={STATUS_TAG[state.status] ?? 'tag'} title={state.status}>
+                        {SYNC_STATUS_LABEL[state.status] ?? state.status}
+                      </span>
                     ) : (
                       <span className="tag muted">未开始</span>
                     )}

@@ -52,10 +52,13 @@ import {
   deriveTrailingPlan,
   parseBracketClientOrderId,
   signedFillDelta,
+  toTrendDecisionContext,
+  type AnalystContext,
   type ExecutorConfig,
   type StagedPlan,
   type TradeToolConfig,
   type TrailingReason,
+  type TrendDecisionContext,
 } from '@trade-tool/core';
 import {
   claimBracket,
@@ -82,6 +85,7 @@ import {
 } from '@trade-tool/data';
 
 import type { AtrProvider, AtrSnapshot } from './atr.js';
+import { placeBracketOrders } from './bracket-orders.js';
 import { applyDecision, type DecideOutput, type RiskDecider } from './decision.js';
 import type { AgentPlanDecision } from './plan-execution.js';
 
@@ -201,6 +205,22 @@ export interface ExecutorServiceDeps {
    * 缺了不报错——决策器会把 `recentReturns` 留空，模型少一个参考维度而已。
    */
   readRecentReturns?: (symbol: string, limit: number) => Promise<readonly number[]>;
+  /**
+   * 取行情上下文（v1.1.0）。
+   *
+   * 给它，模型在定档位时就能看到**程序算好的客观倾向 + 均线 / 指标 / 情绪面**，
+   * 而不只是最近若干根 K 线的收益率数列。手动挂单的场景靠这条接上趋势分析。
+   *
+   * **不传则整段跳过**，行为与 v1.1.0 之前逐字一致——
+   * 这样「没开趋势分析」的执行器与之前没有任何区别。
+   *
+   * 返回 `null` = 这个标的取不到行情上下文（库里没有它的派生 K 线等）。
+   * 那时**不当作错误**：降级到只有收益率数列的提示词，决策来源随之记成 `'llm'`。
+   *
+   * 它只负责**取数**：成交价、方向与算价基准 ATR 由本模块自己补上，
+   * 映射由 `toTrendDecisionContext` 这个纯函数做（AGENTS.md 约定 4）。
+   */
+  loadMarketContext?: (symbol: string) => Promise<AnalystContext | null>;
   /**
    * 告警派发器（v0.8.0）。**可选**：不传就只记日志。
    *
@@ -1297,72 +1317,35 @@ export function createExecutorService(deps: ExecutorServiceDeps): ExecutorServic
   async function placePair(update: OrderTradeUpdate, plan: StagedPlan): Promise<HandleOutcome> {
     const entryOrderId = String(update.orderId);
     const key = { exchange, symbol: update.symbol, entryOrderId };
-    const workingType = settings.workingType;
-    const priceProtect = settings.priceProtect;
 
-    // 先挂**止盈**、再挂**止损**：反过来的话，止盈挂上后止损失败、
-    // 我们连一张可以撤的单都没有，仓位直接裸奔。
-    let tpAlgoId: number | undefined;
-    let slAlgoId: number | undefined;
-    try {
-      // 止盈单的三种形态只在这一处分叉（`mode` 是纯函数给的，不在这里判断比例）：
-      //   * single —— 全平 `closePosition`，v0.4.0 行为，交易所负责自动撤单；
-      //   * full   —— 全平 `closePosition`，但用第一段的价；同样不需要本地撤单；
-      //   * partial—— 带数量 + reduceOnly，**放弃**自动撤单，由本地在净额归零时撤。
-      const tp =
-        plan.mode === 'partial' && plan.tp1Qty !== null
-          ? await placer.placeQuantityOrder({
-              symbol: update.symbol,
-              side: plan.exitSide,
-              type: 'TAKE_PROFIT_MARKET',
-              stopPrice: plan.takeProfitPrice,
-              quantity: plan.tp1Qty,
-              reduceOnly: true,
-              clientAlgoId: bracketClientOrderId(TP_TAG, entryOrderId),
-              workingType,
-              priceProtect,
-            })
-          : await placer.placeClosePositionOrder({
-              symbol: update.symbol,
-              side: plan.exitSide,
-              type: 'TAKE_PROFIT_MARKET',
-              // `takeProfitPrice` 就是这一形态**实际挂出去**的价：
-              // single 用整段倍数算，full 用第一段倍数算（纯函数里已统一）。
-              stopPrice: plan.takeProfitPrice,
-              clientAlgoId: bracketClientOrderId(TP_TAG, entryOrderId),
-              workingType,
-              priceProtect,
-            });
-      tpAlgoId = tp.algoId;
-      const sl = await placer.placeClosePositionOrder({
-        symbol: update.symbol,
-        side: plan.exitSide,
-        type: 'STOP_MARKET',
-        stopPrice: plan.stopPrice,
-        clientAlgoId: bracketClientOrderId(SL_TAG, entryOrderId),
-        workingType,
-        priceProtect,
-      });
-      slAlgoId = sl.algoId;
-    } catch (error) {
-      // 撤掉可能已经挂上的那张：留一张没有对单的止盈/止损，比两张都没有更糟。
-      let cancelNote = '';
-      const algoId = tpAlgoId ?? slAlgoId;
-      if (algoId !== undefined) {
-        try {
-          await placer.cancelAlgoOrder(algoId);
-          cancelNote = `；已撤掉先挂上的条件单 ${algoId}`;
-        } catch (cancelError) {
-          cancelNote = `；**撤单也失败了**（条件单 ${algoId} 可能仍在交易所挂着）：${reasonOf(cancelError)}`;
-        }
-      }
-      const reason = `${reasonOf(error)}${cancelNote}`;
+    // 挂单这一步与「手动补挂」共用同一份实现（`bracket-orders.ts`）：
+    // 自定义号的派生、方向、数量对齐、失败回滚，两条路必须逐字一致。
+    //
+    // `only` 决定止盈单的**形态**：分批形态的第一段止盈是**带数量**的那张
+    // （`placeQuantityOrder`），不分批时是全平那张（`placeClosePositionOrder`）。
+    // 两者与 `closePosition` 互斥（官方明确），挂错形态交易所会拒。
+    const result = await placeBracketOrders({
+      placer,
+      symbol: update.symbol,
+      entryOrderId,
+      positionSide: plan.positionSide,
+      takeProfitPrice: plan.takeProfitPrice,
+      // 分批形态才带数量；其余形态这张单不带数量，因此不读 `LOT_SIZE`。
+      tp1Qty: plan.mode === 'partial' ? plan.tp1Qty : null,
+      stopPrice: plan.stopPrice,
+      only: plan.mode === 'partial' ? ['tp1', 'sl'] : ['tp', 'sl'],
+      workingType: settings.workingType,
+      priceProtect: settings.priceProtect,
+    });
+
+    if (result.error !== null || result.tpAlgoId === null || result.slAlgoId === null) {
+      const reason = `${result.error ?? '未知原因'}${result.cancelNote ?? ''}`;
       await markBracketFailed(
         pool,
         key,
         {
-          ...(tpAlgoId !== undefined ? { tpAlgoId } : {}),
-          ...(slAlgoId !== undefined ? { slAlgoId } : {}),
+          ...(result.tpAlgoId !== null ? { tpAlgoId: result.tpAlgoId } : {}),
+          ...(result.slAlgoId !== null ? { slAlgoId: result.slAlgoId } : {}),
         },
         reason,
         now(),
@@ -1371,20 +1354,12 @@ export function createExecutorService(deps: ExecutorServiceDeps): ExecutorServic
       return 'failed';
     }
 
+    const tpAlgoId = result.tpAlgoId;
+    const slAlgoId = result.slAlgoId;
     if (plan.mode === 'partial') {
-      await markBracketPartialArmed(
-        pool,
-        key,
-        { tp1AlgoId: tpAlgoId as number, slAlgoId: slAlgoId as number },
-        now(),
-      );
+      await markBracketPartialArmed(pool, key, { tp1AlgoId: tpAlgoId, slAlgoId: slAlgoId }, now());
     } else {
-      await markBracketArmed(
-        pool,
-        key,
-        { tpAlgoId: tpAlgoId as number, slAlgoId: slAlgoId as number },
-        now(),
-      );
+      await markBracketArmed(pool, key, { tpAlgoId: tpAlgoId, slAlgoId: slAlgoId }, now());
     }
     log.info(`${update.symbol} 止盈止损已挂上：${describeStaged(plan)}`);
 
@@ -1540,6 +1515,38 @@ export function createExecutorService(deps: ExecutorServiceDeps): ExecutorServic
       }
     }
 
+    // 趋势上下文（v1.1.0）：模型看到的不再只是一串收益率。
+    //
+    // 取不到时**降级到 v0.9.0 的老提示词**（只用 ATR 与收益率数列），
+    // 而不是「因为没有趋势就不问模型」——模型仍然参与决策，只是输入少了一维。
+    // 降级是**看得见的**：决策来源会记成 `'llm'` 而不是 `'llm-trend'`，
+    // 事后查库一眼能看出这一笔没吃到趋势上下文。
+    let trend: TrendDecisionContext | undefined;
+    if (deps.loadMarketContext !== undefined && settings.trend.enabled) {
+      try {
+        const analyst = await deps.loadMarketContext(update.symbol);
+        if (analyst === null) {
+          log.warn(
+            `${update.symbol} 没有取到行情上下文：模型这次只用收益率数列（决策来源会记成 llm）`,
+          );
+        } else {
+          // 映射是纯函数（core）：成交价、方向与**算价基准 ATR** 由本模块补上，
+          // 均线 / 布林这些绝对价在 core 里换成「相对成交价的百分比」——
+          // 符号不会算错，模型只读结论。
+          trend = toTrendDecisionContext({
+            analyst,
+            side: update.side,
+            entryPrice: update.averagePrice,
+            atr: snapshot.atr,
+            atrInterval: snapshot.interval,
+            atrPeriod: snapshot.period,
+          });
+        }
+      } catch (error) {
+        log.warn(`${update.symbol} 取行情上下文失败，模型这次只用收益率数列：${reasonOf(error)}`);
+      }
+    }
+
     const outcome = await deps.decider.decide({
       symbol: update.symbol,
       side: update.side,
@@ -1555,6 +1562,7 @@ export function createExecutorService(deps: ExecutorServiceDeps): ExecutorServic
         breakevenAfterTp1: policy.breakevenAfterTp1,
       },
       recentReturns,
+      ...(trend === undefined ? {} : { trend }),
     });
 
     // 降级必须可见：除了落库（`decision_fallback_reason`），还要能被告警看到。

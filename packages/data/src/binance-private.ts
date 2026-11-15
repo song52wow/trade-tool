@@ -424,6 +424,95 @@ export function isAlgoOrderGone(error: unknown): boolean {
 }
 
 /**
+ * 「私有接口**不可用**」的错误码。
+ *
+ * 币安的口径（核对于 2026-11-06）：
+ *   * `-2015 Invalid API-key, IP, or permissions for action` —— key 无效、
+ *     IP 不在白名单、或没有交易权限。**一句话盖住三种情况**，所以排查时
+ *     不能只当它是「IP 不对」（2026-10-23 在 90 机器上就误判过一次：
+ *     实际是配置写成了 demo，配的是主网密钥）；
+ *   * `-2014 API-key format invalid` —— key 本身坏了；
+ *   * `-1021 Timestamp for this request is outside of the recvWindow` ——
+ *     签名时间戳越界（时钟没校准，或补偿算错，见 §6.3 第 8 条）；
+ *   * `-1022 Signature for this request is not valid` —— 签名本身不对。
+ *
+ * ⚠️ **限频（`-1003` / `-1008`）不在这里**：限频是「现在慢」，不是「不能用」，
+ * 它自己会过去。把它算成「不可用」会让告警在每次高峰都响一次。
+ */
+const PRIVATE_API_UNUSABLE_EXCHANGE_CODES = new Set([-2015, -2014, -1021, -1022]);
+
+/**
+ * 网络层失败的特征（Node 的 fetch 失败时抛的就是这些）。
+ *
+ * `fetch failed` 是 undici 的包装消息，真正的错在 `cause` 里，
+ * 而 `cause` 不是 `Error` 时 `String()` 只剩那句包装——
+ * 所以这里既看消息文本，也看 `cause` 的文本。
+ */
+const NETWORK_FAILURE_MARKERS = [
+  'fetch failed',
+  'ECONNREFUSED',
+  'ECONNRESET',
+  'ETIMEDOUT',
+  'ENOTFOUND',
+  'EAI_AGAIN',
+  'EPIPE',
+  'UND_ERR',
+  'socket hang up',
+  'proxy',
+];
+
+/**
+ * 这个错误是不是意味着「**私有接口不可用**」。
+ *
+ * 与「一次业务失败」严格分开：
+ *   * 余额不足（`-2019`）、参数非法（`-1100`）、标的不存在（`-1121`）——
+ *     这些是**这一笔**的问题，接口本身好得很；
+ *   * 鉴权被拒（`-2015`）、时钟越界（`-1021`）、连都连不上——
+ *     这些是**整条接口**的问题：挂单、查仓位、续期 listenKey 全都过不去。
+ *
+ * 为什么要分：只有后者才配得上「止盈止损服务不可用」这条告警。
+ * 把「下单被拒」说成「服务不可用」，处置方向就错了（前者改单，后者改配置）。
+ *
+ * @param error 任意异常。`SyncError` 看 `details.exchangeCode` 与 `details.status`；
+ *               其它异常按网络失败特征认。
+ */
+export function isPrivateApiUnusableError(error: unknown): boolean {
+  if (error instanceof SyncError) {
+    if (error.code === 'EXCHANGE_ERROR') {
+      const raw = error.details['exchangeCode'];
+      const code = typeof raw === 'number' ? raw : Number(raw);
+      if (Number.isFinite(code) && PRIVATE_API_UNUSABLE_EXCHANGE_CODES.has(code)) return true;
+      const status = Number(error.details['status']);
+      // 401/403：签名没被接受（key 无效或 IP 不在白名单）。
+      if (status === 401 || status === 403) return true;
+      return false;
+    }
+    // 配置类错误（缺 key、端点不对）：接口**一定**用不了。
+    if (error.code === 'CONFIG_INVALID') return true;
+    return false;
+  }
+  const text = collectErrorText(error);
+  return NETWORK_FAILURE_MARKERS.some((marker) => text.includes(marker));
+}
+
+/** 把异常连同它的 `cause` 链摊成一段文本，用于特征匹配。 */
+function collectErrorText(error: unknown): string {
+  const parts: string[] = [];
+  let current: unknown = error;
+  for (let depth = 0; depth < 5 && current !== undefined && current !== null; depth += 1) {
+    if (current instanceof Error) {
+      parts.push(current.message);
+      const cause = (current as { cause?: unknown }).cause;
+      current = cause;
+      continue;
+    }
+    parts.push(String(current));
+    break;
+  }
+  return parts.join(' | ');
+}
+
+/**
  * 从 exchangeInfo 的原始条目里取最小价格变动（`PRICE_FILTER.tickSize`）。
  *
  * 取的是**库里的** `contract_spec.raw`（不是实时再拉一次）：止盈止损要按 tick 对齐，
@@ -1088,7 +1177,16 @@ export interface UserDataStreamOptions {
   /** 每条事件回调。返回的 Promise 会被 await：处理失败不该把连接拖垮。 */
   onEvent: (payload: Record<string, unknown>) => void | Promise<void>;
   onError?: (error: Error) => void;
-  /** 连接断开（含服务端关闭）。**重连逻辑挂在这里**——不接就等于静默停推。 */
+  /**
+   * 连接断开（含服务端关闭）。**重连逻辑挂在这里**——不接就等于静默停推。
+   *
+   * ⚠️ **出错也会走这里**（2026-10-26 实测踩到）：Node 的 `WebSocket` 在代理掐断隧道时
+   * 可能**只派发 `error`、不派发 `close`**。若 `onError` 只记日志而重连只挂在 `onClose` 上，
+   * 那个 `await` 就永远不返回——进程活着、日志干净，但**一个成交事件都收不到**。
+   * 表现是「开了止盈止损却没挂上」，而且裸仓能持续一整天没人知道。
+   *
+   * 所以：**`onError` 之后必须走到 `onClose`**（见 {@link openUserDataStream}）。
+   */
   onClose?: (reason: string) => void;
   /** keepalive 回调。listenKey 30 分钟过期，不续期就静默停推。 */
   onKeepAlive?: (listenKey: string) => Promise<void> | void;
@@ -1103,11 +1201,43 @@ export interface UserDataStreamHandle {
 }
 
 /**
+ * 把 WebSocket 的 `error` 事件变成**一句能查的话**。
+ *
+ * 为什么不能直接 `JSON.stringify(event)`：Node 的 `WebSocket` 派发的是 `ErrorEvent`，
+ * 它的 `message` / `error` 都是**不可枚举**属性，于是 `JSON.stringify` 得到 `{}`——
+ * 2026-10-26 实测踩到：连接被代理掐断时，日志里只剩一句
+ * `用户数据流出错：{}`，**断在哪、为什么断，一点线索都没有**。
+ */
+function describeSocketError(event: unknown): string {
+  if (event instanceof Error) return event.message;
+  if (typeof event === 'object' && event !== null) {
+    const record = event as { message?: unknown; error?: unknown; code?: unknown };
+    const message = typeof record.message === 'string' ? record.message : '';
+    const inner = record.error;
+    const innerMessage =
+      inner instanceof Error ? inner.message : typeof inner === 'string' ? inner : '';
+    const code =
+      typeof record.code === 'string' || typeof record.code === 'number' ? String(record.code) : '';
+    const parts = [message, innerMessage, code].filter((part) => part !== '');
+    if (parts.length > 0) return parts.join(' / ');
+  }
+  const text = String(event);
+  // 兜底也别给一个空串：空串读起来像「没有错误信息」，更像没查清。
+  return text === '' || text === '[object Object]' ? '未知错误（事件里没有可读信息）' : text;
+}
+
+/**
  * 打开用户数据流。
  *
  * 重连是**必需**而不是锦上添花：长连断开后若不重连，页面/日志一切正常，
  * 但服务实际上已经不再收到任何成交——一个「看起来在跑、其实不设止损」的进程，
  * 比直接崩掉危险得多。
+ *
+ * ⚠️ **出错也必须走到 `onClose`**（2026-10-26 实测踩到）：Node 的 `WebSocket` 在代理掐断
+ * 隧道时可能**只派发 `error`、不派发 `close`**。重连若只挂在 `onClose` 上，那个 `await`
+ * 就永远不返回——进程活着、日志干净，但**一个成交事件都收不到**，新开的仓从此裸奔。
+ * 因此这里让 `error` **主动关掉 socket**，由 `close` 统一收口：出错的连接一律重连，
+ * 而不是留在那里假装自己还活着。
  */
 export function openUserDataStream(options: UserDataStreamOptions): UserDataStreamHandle {
   const setIntervalImpl =
@@ -1117,11 +1247,44 @@ export function openUserDataStream(options: UserDataStreamOptions): UserDataStre
 
   let socket: WebSocket | undefined;
   let keepAlive: NodeJS.Timeout | undefined;
+  /** 调用方主动关闭（`handle.close()`）。 */
   let closed = false;
+  /** `onClose` 只通知一次——错误与关闭可能都发生，两个都得听。 */
+  let notified = false;
 
   const report = (error: unknown): void => {
     const err = error instanceof Error ? error : new Error(String(error));
     options.onError?.(err);
+  };
+
+  /**
+   * 通知调用方「这条连接结束了」，并且**只通知一次**。
+   *
+   * 重连挂在它上面：它不响，重连就不会发生（§6.3.1）。
+   */
+  const notifyClose = (reason: string): void => {
+    if (notified) return;
+    notified = true;
+    options.onClose?.(reason);
+  };
+
+  /**
+   * 关掉这条连接并通知调用方。
+   *
+   * **先关 socket、再通知**：反过来的话，调用方已经开了新连接，旧连接却还活着——
+   * 同一笔成交事件会被处理两次。
+   */
+  const closeConnection = (reason: string): void => {
+    if (keepAlive !== undefined) {
+      clearIntervalImpl(keepAlive);
+      keepAlive = undefined;
+    }
+    try {
+      socket?.close();
+    } catch (error) {
+      report(error);
+    }
+    notifyClose(reason);
   };
 
   const connect = (): void => {
@@ -1135,6 +1298,10 @@ export function openUserDataStream(options: UserDataStreamOptions): UserDataStre
               await options.onKeepAlive?.(options.listenKey);
             } catch (error) {
               report(error);
+              // **续期失败 = 这条流活不过 30 分钟**，而它「看起来」还连着。
+              // 不断掉它，就是让它静静地死：届时刻意断开，而调用方毫不知情。
+              // 因此这里主动收口，让调用方重连（§6.3.1）。
+              closeConnection('keepalive-failed');
             }
           })();
         },
@@ -1148,18 +1315,28 @@ export function openUserDataStream(options: UserDataStreamOptions): UserDataStre
           const payload = JSON.parse(raw) as Record<string, unknown>;
           await options.onEvent(payload);
         } catch (error) {
+          // **单条消息处理失败不拆连接**：一条坏消息不代表流坏了。
+          // 只记日志（§5 第 9 条：错误要可见）。
           report(error);
         }
       })();
     };
     socket.onerror = (event: unknown) => {
-      report(new Error(`用户数据流出错：${JSON.stringify(event)}`));
+      report(new Error(`用户数据流出错：${describeSocketError(event)}`));
+      // **出错即收口**：这是本次修复的核心（见上面的说明）。
+      //
+      // Node 的 `WebSocket` 在代理掐断隧道时可能**只派发 `error`、不派发 `close`**。
+      // 若这里只记日志，重连就永远等不到那个 `await` 返回——进程活着、日志干净，
+      // 但一个成交事件都收不到（2026-10-26 实测：裸仓持续 24 小时没人知道）。
+      closeConnection('error');
     };
     socket.onclose = () => {
-      if (keepAlive !== undefined) clearIntervalImpl(keepAlive);
+      if (keepAlive !== undefined) {
+        clearIntervalImpl(keepAlive);
+        keepAlive = undefined;
+      }
       // 主动 close() 不回调 onClose：那是调用方自己在收尾，不该再触发一次重连。
-      if (!closed) options.onClose?.('closed');
-      else options.onClose?.('local');
+      notifyClose(closed ? 'local' : 'closed');
     };
   };
 
@@ -1168,7 +1345,10 @@ export function openUserDataStream(options: UserDataStreamOptions): UserDataStre
   return {
     close(): void {
       closed = true;
-      if (keepAlive !== undefined) clearIntervalImpl(keepAlive);
+      if (keepAlive !== undefined) {
+        clearIntervalImpl(keepAlive);
+        keepAlive = undefined;
+      }
       socket?.close();
     },
   };
