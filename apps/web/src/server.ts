@@ -303,6 +303,28 @@ export function buildApp(deps: WebDeps): Hono {
   });
 
   /**
+   * **手动补挂**止盈止损（v1.3.0）：**会真下单**。
+   *
+   * 为什么是 POST 而不是 GET：它会改变交易所上的状态（挂出真实的条件单），
+   * GET 必须是幂等且无副作用的。
+   *
+   * `dryRun` 缺省为**假**——调用方必须显式说「只算不挂」才不挂。
+   * 反过来（缺省不挂、显式才挂）会让「忘了传参数」变成一次静默的空操作，
+   * 而用户以为已经补上了（约定 9：看起来成功其实什么都没做）。
+   *
+   * 页面默认先跑一次 `dryRun` 把要挂什么显示出来，用户确认后才发真的那次。
+   *
+   * ⚠️ **必须注册在 `/api/symbols/:symbol/:action` 之前**（2026-11-15 部署实测踩到）：
+   * 路由按**注册顺序**匹配，后注册同形状的路径会被前面的遮蔽。补挂路由写在后面时，
+   * 请求被通用 `:action` 路由接走 → 报「未知操作：reattach」，功能看起来完全没上线。
+   */
+  app.post('/api/symbols/:symbol/reattach', async (c) => {
+    const symbol = normalizeSymbol(c.req.param('symbol'));
+    const body = await bodyOf<{ dryRun?: boolean }>(c).catch(() => ({}) as { dryRun?: boolean });
+    return c.json(await deps.reattach(symbol, { dryRun: body?.dryRun === true }));
+  });
+
+  /**
    * 一个路径两种动作，避免注册两个同路径 handler（后者会被前者遮蔽）。
    * 生命周期立即返回（幂等，R-17.2/17.6）；重活儿返回 202 + job id。
    */
@@ -440,22 +462,9 @@ export function buildApp(deps: WebDeps): Hono {
   });
 
   /**
-   * **手动补挂**止盈止损（v1.3.0）：**会真下单**。
-   *
-   * 为什么是 POST 而不是 GET：它会改变交易所上的状态（挂出真实的条件单），
-   * GET 必须是幂等且无副作用的。
-   *
-   * `dryRun` 缺省为**假**——调用方必须显式说「只算不挂」才不挂。
-   * 反过来（缺省不挂、显式才挂）会让「忘了传参数」变成一次静默的空操作，
-   * 而用户以为已经补上了（约定 9：看起来成功其实什么都没做）。
-   *
-   * 页面默认先跑一次 `dryRun` 把要挂什么显示出来，用户确认后才发真的那次。
+   * **手动补挂**止盈止损（v1.3.0）的路由注册在**上面**
+   * （`/api/symbols/:symbol/reattach`，必须早于通用 `:action` 路由）。
    */
-  app.post('/api/symbols/:symbol/reattach', async (c) => {
-    const symbol = normalizeSymbol(c.req.param('symbol'));
-    const body = await bodyOf<{ dryRun?: boolean }>(c).catch(() => ({}) as { dryRun?: boolean });
-    return c.json(await deps.reattach(symbol, { dryRun: body?.dryRun === true }));
-  });
 
   /** 规模预估（R-8.3）：首次全量前必须先算给人看，确认弹窗的数据就来自这里。 */
   app.get('/api/symbols/:symbol/estimate', async (c) => {

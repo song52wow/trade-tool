@@ -542,6 +542,40 @@ describe('buildApp 路由', () => {
     expect(res.status).toBe(400);
   });
 
+  /**
+   * 补挂路由必须**早于**通用 `:action` 路由注册。
+   *
+   * 2026-11-15 部署到 90 之后实测踩到：补挂路由写在通用路由**后面**，
+   * 路由按注册顺序匹配 → 请求被 `/api/symbols/:symbol/:action` 接走，
+   * 报「未知操作：reattach」，页面上的按钮看起来就是「功能没上线」。
+   *
+   * 纯函数层面看不出这种问题——**必须真的打一次这个 URL**才拦得住。
+   */
+  it('POST /api/symbols/:symbol/reattach 命中补挂，而不是通用动作路由', async () => {
+    const deps = fakeDeps();
+    const app = buildApp(deps);
+
+    const res = await app.request('/api/symbols/AAAUSDT/reattach', {
+      method: 'POST',
+      body: JSON.stringify({ dryRun: true }),
+      headers: { 'content-type': 'application/json' },
+    });
+
+    expect(res.status).toBe(200);
+    expect(deps.calls).toContain('reattach:AAAUSDT:true');
+  });
+
+  /** 挪动补挂路由之后，通用动作路由**仍然**要能正常命中。 */
+  it('POST /api/symbols/:symbol/resume 仍然走生命周期动作', async () => {
+    const deps = fakeDeps();
+    const app = buildApp(deps);
+
+    const res = await app.request('/api/symbols/AAAUSDT/resume', { method: 'POST' });
+
+    expect(res.status).toBe(200);
+    expect(deps.calls).toContain('resume:AAAUSDT');
+  });
+
   it('DELETE 不给 policy 时默认 keep，且不隐式删除', async () => {
     const deps = fakeDeps();
     const app = buildApp(deps);
